@@ -68,7 +68,7 @@ bun add @syrkos/filaxis    # 或 npm install @syrkos/filaxis
 ## Benchmark（真实运维盲测）
 
 三季同模型盲测（flash 级子代理、跨地域多跳、零提示黑盒、`directBypass = 0`）的完整
-A/B/C 对照报告见 [benchmark.md](./benchmark.md)。最新一季（跨海六故障点黑盒）总账：
+A/B/C 对照报告见 [benchmark.md](./benchmark.md)。最新一季（六故障点黑盒）总账：
 
 | 组别 | 方式 | 步数 | 耗时 | 失败/重试 | 总 Token（含 cache） |
 |---|---|---:|---:|---:|---:|

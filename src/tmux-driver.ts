@@ -7,6 +7,7 @@
  * nohup 会话语义（经 TerminalManager 会话 shell 执行）。
  * terminalId 绑定 + cwd 恢复 + destroy 时 nohup 后台进程显式清理。
  */
+import * as crypto from "node:crypto";
 import type {
     RuntimeDriver, FileSystemDriver, FileEntry, ExecOptions, ExecResult, RuntimeDescriptor,
 } from "./driver.js";
@@ -227,7 +228,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // 白名单字符集 [a-zA-Z0-9_-] 内无任何 shell 元字符
         const sessionId =
             `${opts?.name ? sanitizeSessionName(opts.name) + "-" : "tsess-"}` +
-            Math.random().toString(16).slice(2, 8);
+            crypto.randomBytes(3).toString("hex");
         const base = `/tmp/filaxis-sessions/${sessionId}`;
         // 子 shell + 上下换行（孪生对齐审计·二十期 #2 + M4 在 remote/local 修后 tmux
         // execSession 才出生、带病出厂）：大括号形态下业务命令显式 `exit 7` 退出**整个

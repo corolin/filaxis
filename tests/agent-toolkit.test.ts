@@ -28,7 +28,7 @@ describe("createAgentToolkit（反馈 #3）", () => {
     test("工具定义 + run_command 退出码是数据", async () => {
         const tk = createAgentToolkit(new RuntimeStack());
         expect(tk.tools.map((t) => t.function.name)).toEqual([
-            "run_batch", // 置顶（第十三季跨海黑盒：Lazy schema 按序读——run_batch 排第 7 被漏读）
+            "run_batch", // 置顶（第十三季黑盒：Lazy schema 按序读——run_batch 排第 7 被漏读）
             "run_command", "spawn_and_observe", "stop_and_verify",
             "read_file", "edit_file", "observe_stream", // 第六季盲测扩三件
             "push_ssh", "push_into", "list_layers", "remove_layer", // 第十季层族

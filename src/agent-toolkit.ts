@@ -78,7 +78,7 @@ export interface AgentToolkitOptions {
 
 /** 工具定义单一来源（REQ-0003 MCP tools/list 同源序列化——零漂移） */
 export const TOOL_DEFS: AgentToolDef[] = [
-    // run_batch 置顶（第十三季跨海黑盒实测：Lazy schema 按序读 6 个基础
+    // run_batch 置顶（第十三季黑盒实测：Lazy schema 按序读 6 个基础
     // .json 就动手——run_batch 排第 7 被漏读，排查期连续 6 步串行 read_file
     // 单文件 89s/次。排序即发现面：高杠杆批处理工具必须在懒加载首屏）
     {

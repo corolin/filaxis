@@ -186,7 +186,8 @@ export function parseProbeOutput(stdout: string): LayerEnvironmentSpec {
 
 function extractVersion(raw: string): string | undefined {
     if (!raw) return undefined;
-    const m = raw.match(/(\d+(\.\d+)+[a-z0-9._-]*)/i) || raw.match(/version\s+(\S+)/i) || raw.match(/(\d+\.\d+)/);
+    const bounded = raw.slice(0, 256);
+    const m = bounded.match(/(\d+(?:\.\d+)+(?:[a-z_-][a-z0-9._-]*)?)/i) || bounded.match(/version\s+(\S+)/i) || bounded.match(/(\d+\.\d+)/);
     return m?.[1];
 }
 
@@ -298,7 +299,8 @@ export function matchLayers(cfg: LayerEnvConfigFile, needs: string[]): LayerMatc
     for (const [key, entry] of Object.entries(cfg.layers)) {
         const spec = entry.environment;
         const ok = needs.every((need) => {
-            const vm = need.match(/^([a-zA-Z][a-zA-Z0-9_-]*)(>=|<=|>|<|=)?\s*([\d.]+)?$/);
+            if (need.length > 128) return false;
+            const vm = need.match(/^([a-zA-Z][a-zA-Z0-9_-]*)(?:(>=|<=|>|<|=)\s*(\d+(?:\.\d+)*))?$/);
             if (!vm) return false;
             const name = vm[1]!.toLowerCase();
             const op = vm[2];

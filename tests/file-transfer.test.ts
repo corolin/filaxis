@@ -61,7 +61,7 @@ function mockRemote() {
             return { stdout: "FX_MV_OK", exitCode: 0 };
         }
         // forceInplace 形态（显式请求保留 inode 写）——cat src > "$tgt" && rm src
-        mm = cmd.match(/^cat '(.+?)' > .+? && rm -f '(.+?)' && echo FX_MV_CAT$/);
+        mm = cmd.match(/^cat '([^']+)' > [^&]+ && rm -f '([^']+)' && echo FX_MV_CAT$/);
         if (mm) {
             const b = files.get(mm[1]!);
             if (!b) return { stdout: "", exitCode: 1 };
@@ -69,7 +69,7 @@ function mockRemote() {
             files.delete(mm[1]!);
             return { stdout: "FX_MV_CAT", exitCode: 0 };
         }
-        mm = cmd.match(/^base64 -d < '(.*?)' > '(.*?)'(?: && rm -f '(.*?)')?$/);
+        mm = cmd.match(/^base64 -d < '([^']*)' > '([^']*)'(?: && rm -f '([^']*)')?$/);
         if (mm) {
             const src = files.get(mm[1]!);
             if (!src) return { stdout: "", exitCode: 1 }; // 真实 shell：源不存在 decode 失败（Astra 六轮 #2 mock 失真根因）
@@ -178,7 +178,7 @@ describe("putFile/getFile（AC-15）", () => {
         const remote = mockRemote();
         // 扩 mock：BSD 命令形态
         const bsdExec: TransferExec = async (cmd) => {
-            let m = cmd.match(/^base64 -D < '(.*?)' > '(.*?)'(?: && rm -f '(.*?)')?$/);
+            let m = cmd.match(/^base64 -D < '([^']*)' > '([^']*)'(?: && rm -f '([^']*)')?$/);
             if (m) {
                 files2.set(m[2]!, Buffer.from(files2.get(m[1]!)?.toString("utf-8") ?? "", "base64"));
                 if (m[3]) files2.delete(m[3]);
@@ -272,7 +272,7 @@ describe("putFile（真实 shell 回归）", () => {
         writeFileSync(join(dirR, "dst1.bin"), "PRECIOUS");
         // 注入：chunk 正常落盘后追加非法 base64 字符 → decode invalid input 失败
         const evil: TransferExec = async (cmd) => {
-            const m = cmd.match(/^printf %s '.*' >> '(.+)'$/);
+            const m = cmd.match(/^printf %s '[^']*' >> '([^']+)'$/);
             if (m) {
                 const r = await realExec(cmd);
                 if (r.exitCode !== 0) return r;
