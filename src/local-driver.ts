@@ -153,6 +153,12 @@ export class LocalRuntimeDriver implements RuntimeDriver {
             // 字符上限——file-transfer 48K chunk 命令本机层 ENAMETOOLONG；与 ssh
             // execChannel 同形态。sh -s 把 stdin 整流消费为脚本，脚本内 cat/wc 再读
             // stdin = EOF——与旧 stdin:"ignore" 语义一致，零行为变化）
+            // timeoutMs 守卫前置（Sol 五十四期 P1-1）：曾放在 spawn 后——非法值
+            // （0/负/NaN）虽报参数错但命令已写出副作用（测试文件已创建）。
+            // spawn 前拒绝=零副作用
+            if (options?.timeoutMs != null && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) {
+                throw new Error(`timeoutMs 非法（${options.timeoutMs}）——须为正整数毫秒`);
+            }
             const p = spawn(this.shell, ["-s"], {
                 env,
                 cwd,
@@ -212,11 +218,6 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                 if (onAbort) signal?.removeEventListener("abort", onAbort);
             };
 
-            // timeoutMs 守卫（Hydrogen R9 #4）：0/负/NaN 曾被 falsy 判断静默禁用
-            // （永不超时）或立即触发——显式拒绝
-            if (options?.timeoutMs != null && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) {
-                throw new Error(`timeoutMs 非法（${options.timeoutMs}）——须为正整数毫秒`);
-            }
             const timeout = options?.timeoutMs ? setTimeout(() => {
                 if (settled) return;
                 settled = true;

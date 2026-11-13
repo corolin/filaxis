@@ -96,6 +96,12 @@ export class McpServer {
             this.replyErr(id, -32700, "Parse error: invalid JSON");
             return;
         }
+        if (msg === null || typeof msg !== "object") {
+            // JSON null/标量防御（Sol 五十四期 P1-4）：null 是合法 JSON——解析成功
+            // 后 `"id" in null` 抛 TypeError 逃出监听器崩进程
+            this.replyErr(null, -32600, `Invalid Request: expected object, got ${msg === null ? "null" : typeof msg}`);
+            return;
+        }
         if (!("id" in msg) || msg.id === undefined || msg.id === null) return; // 通知（notifications/initialized 等）——无响应
         const req = msg as JsonRpcRequest; // id 已非空（上方守卫）
         this.dispatch(req).catch((e) => {

@@ -135,6 +135,7 @@ export class StreamSessionManager {
         if (m) m.refCount++;
 
         child.stdout?.on("data", (d: Buffer) => {
+            if (entry.finalized) return; // 终态守卫（Sol 54 P2-13：onScreen 曾漏拦——stop 后迟到 stdout 仍触发屏回调）
             const text = entry.decoders.stdout.write(d); // 跨块 UTF-8 安全解码
             if (entry.opts?.onScreen) {
                 if (!entry.screen) entry.screen = new Vt100Screen();

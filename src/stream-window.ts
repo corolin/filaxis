@@ -48,6 +48,9 @@ type Transport =
     | { kind: "local"; child: ChildProcess }
     | { kind: "remote"; manager: StreamSessionManager; sessionId: string };
 
+/** 同名重开续编锚（模块级——直接 close() 也登记；Registry stop 时并入自己的表） */
+const __seqAnchors = new Map<string, number>();
+
 export class StreamWindow {
     private frames: StreamFrame[] = [];
     private nextSeq = 1;
@@ -93,7 +96,13 @@ export class StreamWindow {
             // keep 下限 0（Hydrogen R2 #5，对齐 session-buffer 同款修复）：
             // maxLineBytes < 后缀长度时裸减法=负索引，越截越长
             const keep = Math.max(0, this.maxLineBytes - TRUNC_SUFFIX.length);
-            line = line.slice(0, keep) + TRUNC_SUFFIX;
+            let cut = line.slice(0, keep);
+            // 孤立高代理剥除（Sol 54 P2-19：UTF-16 切点落代理对中间——孤立
+            // 高代理编码后 4 字节+占位低代理缺失=乱码；剥 1 码元即可）
+            if (/[\uD800-\uDBFF]$/.test(cut) && /[\uDC00-\uDFFF]/.test(line.slice(keep, keep + 1))) {
+                cut = cut.slice(0, -1);
+            }
+            line = cut + TRUNC_SUFFIX;
         }
         const seq = this.nextSeq++;
         this.allocated = seq; // 已分配锚（空窗续编/超前判定用——非缓冲末帧）
@@ -106,7 +115,8 @@ export class StreamWindow {
             this.frames = this.frames.slice(-this.maxFrames);
         }
         this._stale = false; // 新帧到达 = 流复活
-        this.lastActivityAt = Date.now();
+        // lastActivityAt 不在此刷（Sol 54 P2-18）：持续输出曾无限推迟 TTL——
+        // 「注意力」=被消费（peek），非数据到达。无人看的窗照收
     }
 
     /** 最近 n 帧 */
@@ -137,7 +147,10 @@ export class StreamWindow {
         // 空洞双形态（五十期 #1 → R6 #3 修正）：①环形覆盖 ②游标超前。sinceSeq>0 曾
         // 把「从头读但历史已滚出」屏蔽——新消费者传 0 也会无感知丢帧（空窗 oldest=0
         // 本就不触发①，无需 sinceSeq 守卫）
-        if (this.oldestSeq > sinceSeq + 1 || sinceSeq > this.allocatedSeq) result.gap = true;
+        // 空洞三形态：①环形覆盖 ②游标超前 ③零容量丢帧（Sol 54 P2-16：帧全弃
+        // oldestSeq=0 ①不触发——allocatedSeq 有分配但 buffer 空=消费者注定拿不到）
+        if (this.oldestSeq > sinceSeq + 1 || sinceSeq > this.allocatedSeq
+            || (this.frames.length === 0 && this.allocatedSeq > sinceSeq)) result.gap = true;
         if (consumerId) {
             const lastSeq = frames.length ? frames[frames.length - 1]!.seq : sinceSeq;
             this.consumers.set(consumerId, Math.max(lastSeq, sinceSeq));
@@ -165,6 +178,9 @@ export class StreamWindow {
     close(): void {
         if (this._closed) return;
         this._closed = true;
+        // 续编锚登记（Sol 54 P2-17）：直接 close() 曾绕过 Registry.stop——同名重开
+        // 帧号归零，旧游标跳过新首帧。模块级锚表使任何关闭路径都被下一窗继承
+        __seqAnchors.set(this.name, this.allocated);
         try {
             if (this.transport?.kind === "local") {
                 this.transport.child.kill("SIGTERM");
@@ -217,20 +233,28 @@ class LineSplitter {
                 // 无换行尾段：仅以**本行已有长度**判定封顶（Sol 五十二期 #2：曾按
                 // 整块长度判定——后续行数据计入首行长度，同批短行被误截断；逐行
                 // 判定后 12B 上限下 "12345678\nOK\nZ\n" 三行全完整）
-                if (this.buf.length + data.length > this.maxBytes) {
+                // 行尾 CR 不计正文长度（Sol 54 P2-15）：12 字符+CRLF 曾超 12 上限
+                // 被截——CR 是行终止符一半不是内容
+                const dataBody = data.endsWith("\r") ? data.slice(0, -1) : data;
+                if (this.buf.length + dataBody.length > this.maxBytes) {
                     const keep = Math.max(0, this.maxBytes - TRUNC_SUFFIX.length); // 负索引防护
-                    this.buf = (this.buf + data).slice(0, keep) + TRUNC_SUFFIX;
+                    let cut = (this.buf + dataBody).slice(0, keep);
+                    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1); // 孤立高代理剥除（同 push）
+                    this.buf = cut + TRUNC_SUFFIX;
                     this.capped = true;
                 } else {
-                    this.buf += data;
+                    this.buf += data; // CR 保留在 buf（成行时剥）——长度判定用 body
                 }
                 return; // 尾段已并入 buf，等下一个 chunk
             }
             // 本 chunk 内有换行：当前行 = buf + data 头段；按**当前行长度**判定封顶
-            const seg = data.slice(0, nl);
+            const segRaw = data.slice(0, nl);
+            const seg = segRaw.endsWith("\r") ? segRaw.slice(0, -1) : segRaw; // CR 剥后再判长（同上）
             if (this.buf.length + seg.length > this.maxBytes) {
                 const keep = Math.max(0, this.maxBytes - TRUNC_SUFFIX.length);
-                onLine((this.buf + seg).slice(0, keep) + TRUNC_SUFFIX);
+                let cutL = (this.buf + seg).slice(0, keep);
+                if (/[\uD800-\uDBFF]$/.test(cutL)) cutL = cutL.slice(0, -1);
+                onLine(cutL + TRUNC_SUFFIX);
             } else {
                 const clean = (this.buf + seg).replace(/\r$/, "");
                 if (clean !== "") onLine(clean);
@@ -295,7 +319,7 @@ export class StreamWindowRegistry {
     private readonly lastSeqByName = new Map<string, number>();
     private readonly sweeper: ReturnType<typeof setInterval>;
     /** 已 dispose（Astra 四十期 #2）：在途 open 的迟注册收割依据 + 后续 open 早拒 */
-    private disposed = false;
+    private _disposed = false;
     private readonly idleTtlMs: number;
     private readonly shell: string;
     private readonly log: FilaxisLogger;
@@ -319,7 +343,7 @@ export class StreamWindowRegistry {
         maxLineBytes?: number;
         manager?: StreamSessionManager;
     }): Promise<StreamWindow> {
-        if (this.disposed) throw new Error("StreamWindowRegistry 已 dispose——重建实例（或模块单例重取）后再开窗");
+        if (this._disposed) throw new Error("StreamWindowRegistry 已 dispose——重建实例（或模块单例重取）后再开窗");
         const existing = this.windows.get(opts.name);
         if ((existing && !existing.closed) || this.pendingNames.has(opts.name)) {
             throw new Error(`观察窗 '${opts.name}' 已存在或正在打开（stop 后可重建）`);
@@ -331,7 +355,7 @@ export class StreamWindowRegistry {
             const source = opts.name.split(":").slice(-1)[0] ?? opts.name;
             const win = new StreamWindow(
                 opts.name, layerAlias, source, opts.command, opts.maxFrames, opts.maxLineBytes,
-                this.lastSeqByName.get(opts.name) ?? 0, // 同名重开续编（五十期 #1）
+                this.lastSeqByName.get(opts.name) ?? __seqAnchors.get(opts.name) ?? 0, // 续编（五十期+Sol54 P2-17 直接 close 也锚）
             );
             winRef = win;
 
@@ -355,16 +379,22 @@ export class StreamWindowRegistry {
                 // 多字节字符解成 U+FFFD（首块尾巴+次块开头各一个）。StringDecoder
                 // 持回不完整字节序列，流终 residual 经 end() 补齐——真截断至多一个
                 // 替换符（对应物理事实），不再拆成两个。
+                let finalized = false; // 声明前置（data 守卫引用）
                 const outDecoder = new StringDecoder("utf-8");
                 const errDecoder = new StringDecoder("utf-8");
-                child.stdout?.on("data", (d: Buffer) => outSplitter.push(outDecoder.write(d), (l) => win.push(l)));
-                child.stderr?.on("data", (d: Buffer) => errSplitter.push(errDecoder.write(d), (l) => win.push(l)));
+                child.stdout?.on("data", (d: Buffer) => {
+                    if (finalized) return; // 收尾后迟到 data 丢弃（Sol 54 P2-14）：曾继续推帧把 stale 复活成活跃
+                    outSplitter.push(outDecoder.write(d), (l) => win.push(l));
+                });
+                child.stderr?.on("data", (d: Buffer) => {
+                    if (finalized) return;
+                    errSplitter.push(errDecoder.write(d), (l) => win.push(l));
+                });
                 // 收尾统一到 close（Astra 三十九期 #2）：exit≠stdio 排空终点——
                 // `RE → exit → ADY\n → close` 合法顺序（pipe 缓冲未读尽时 data 迟到
                 // 于 exit 常见）下，exit 上冲刷把半行 RE 提前成帧、迟到的 ADY 又复
                 // 活 stale。close=stdio 全关的真终点，残余字节/半行在此一次冲刷；
                 // exit 只挂 2s 兜底（close 永不到的异常流序），两路幂等先到者收尾
-                let finalized = false;
                 const finalize = () => {
                     if (finalized) return;
                     finalized = true;
@@ -413,7 +443,8 @@ export class StreamWindowRegistry {
 
     stop(name: string): void {
         const win = this.require(name);
-        this.lastSeqByName.set(name, win.allocatedSeq); // 续编锚（allocatedSeq——空窗〔重开后未收帧〕的 newestSeq=0 不再归零覆盖，五十一期 #1）
+        this.lastSeqByName.set(name, win.allocatedSeq); // 续编锚
+        __seqAnchors.delete(name); // 模块锚已并入（清防增长）（allocatedSeq——空窗〔重开后未收帧〕的 newestSeq=0 不再归零覆盖，五十一期 #1）
         win.close();
         this.windows.delete(name);
     }
@@ -461,8 +492,12 @@ export class StreamWindowRegistry {
         }
     }
 
+    get disposed(): boolean { return this._disposed; }
+
     dispose(): void {
-        this.disposed = true; // 先置位：并发在途 open 在注册前检查到此标志即自收割
+        const wasD = this._disposed;
+        this._disposed = true;
+        void wasD; // 先置位：并发在途 open 在注册前检查到此标志即自收割
         clearInterval(this.sweeper);
         for (const name of [...this.windows.keys()]) this.stop(name);
     }
@@ -471,6 +506,7 @@ export class StreamWindowRegistry {
 /** 模块级单例（消费方共享；多实例场景自行 new Registry） */
 let _registry: StreamWindowRegistry | null = null;
 export function getStreamWindowRegistry(): StreamWindowRegistry {
+    if (_registry && _registry.disposed) _registry = null; // dispose 后重建（Sol 54 P2-20：曾返回死对象 open 永拒）
     if (!_registry) _registry = new StreamWindowRegistry();
     return _registry;
 }

@@ -231,29 +231,69 @@ export class LayerEnvStore {
         }
     }
 
-    /** 原子写：tmp + rename */
+    /** 原子写（公共）：抢跨实例文件锁后走 saveLocked */
     async save(cfg: LayerEnvConfigFile): Promise<void> {
+        const release = await this.acquireLock();
+        try {
+            await this.saveLocked(cfg);
+        } finally {
+            await release();
+        }
+    }
+
+    /** 无锁写（调用方持锁）：tmp+rename 原子落位
+     *  tmp 带进程 nonce（Hydrogen R2 #7）：固定名跨进程踩踏/rename ENOENT */
+    private async saveLocked(cfg: LayerEnvConfigFile): Promise<void> {
         await mkdir(dirname(this.path), { recursive: true });
-        // tmp 带进程 nonce（Hydrogen R2 #7）：固定名跨进程（多 CLI 并发 probe）互相
-        // 踩踏/触发 rename ENOENT；rename 仍原子，各自 tmp 独占互不干扰
         const tmp = `${this.path}.${process.pid}-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 6)}.tmp`;
         await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
         await rename(tmp, this.path);
         this.cache = null; // 失效缓存（下次 load 重 stat）
     }
 
+    /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */
+    private async acquireLock(): Promise<() => Promise<void>> {
+        const lock = `${this.path}.lock`;
+        const { open, unlink } = await import("node:fs/promises");
+        let fh: Awaited<ReturnType<typeof open>> | null = null;
+        for (let attempt = 0; attempt < 50; attempt++) {
+            try {
+                fh = await open(lock, "wx");
+                break;
+            } catch (e) {
+                if ((e as { code?: string }).code !== "EEXIST") throw e;
+                try {
+                    const st = await stat(lock);
+                    if (Date.now() - st.mtimeMs > 5_000) await unlink(lock).catch(() => undefined);
+                } catch { /* 锁文件刚好消失 */ }
+                await new Promise((r) => setTimeout(r, 100));
+            }
+        }
+        if (!fh) throw new Error(`LayerEnvStore 写锁超时: ${lock}`);
+        return async () => {
+            await fh!.close().catch(() => undefined);
+            await unlink(lock).catch(() => undefined);
+        };
+    }
+
     /** 写入/更新一层规格；漂移检测：指纹不一致标 stale 不自动覆盖（显式 force 才覆写）。
-     *  实例内串行（写链）——并发 upsert 不丢更新。 */
+     *  **跨实例锁包裹整个读-改-写**（Sol 54 P2-9）：writeChain 只串行化本实例——
+     *  两实例并发 upsert 曾各自 load 后 save，后写覆盖前写丢 key。 */
     async upsert(key: string, entry: LayerEnvEntry, force = false): Promise<{ stale: boolean }> {
         const run = this.writeChain.then(async () => {
-            const cfg = await this.load();
-            const existing = cfg.layers[key];
-            if (existing && !force && existing.fingerprint !== entry.fingerprint) {
-                return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+            const release = await this.acquireLock();
+            try {
+                const cfg = await this.load();
+                const existing = cfg.layers[key];
+                if (existing && !force && existing.fingerprint !== entry.fingerprint) {
+                    return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+                }
+                cfg.layers[key] = entry;
+                await this.saveLocked(cfg);
+                return { stale: false } as const;
+            } finally {
+                await release();
             }
-            cfg.layers[key] = entry;
-            await this.save(cfg);
-            return { stale: false } as const;
         });
         this.writeChain = run.catch(() => undefined); // 失败不堵后续写
         return run;

@@ -96,6 +96,9 @@ export async function putContent(
     // 分块尺寸可调（真机实证：tmux server 单命令 ~16-24K 即 "command too long"——
     // 键入通道的调用方须传小 chunk；ssh exec 通道 stdin 传命令不受限，缺省 48K）
     const chunkSize = opts.chunkB64 ?? CHUNK_B64;
+    if (!Number.isFinite(chunkSize) || chunkSize <= 0) {
+        throw new Error(`chunkB64 非法（${opts.chunkB64}）——须为正数（0/负曾使循环反复发空块永不前进）`);
+    }
     let level: "sha256" | "size";
     try {
         if (!b64.length) {
@@ -213,6 +216,11 @@ async function verify(
     expectSha: string,
 ): Promise<{ verified: boolean; detail: string; level: "sha256" | "size" }> {
     const sz = await exec(`wc -c < ${q(remotePath)}`);
+    if (sz.exitCode !== 0) {
+        // 校验命令失败（Sol 54 P2-12）：wc 退出 1 输出仍可能可解析——曾据错误
+        // 输出报 verified:true（下载落盘+假校验双害）。命令失败=校验不成立
+        return { verified: false, detail: `size 校验命令失败（exit=${sz.exitCode}）`, level: "size" };
+    }
     const size = parseInt((sz.stdout || "").trim(), 10);
     if (size !== expectSize) return { verified: false, detail: `size 不一致（远端 ${size} ≠ 本地 ${expectSize}）`, level: "size" };
     if (!dialect.sha256.length) {

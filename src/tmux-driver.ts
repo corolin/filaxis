@@ -230,11 +230,6 @@ export class TmuxSessionDriver implements RuntimeDriver {
             `${opts?.name ? sanitizeSessionName(opts.name) + "-" : "tsess-"}` +
             crypto.randomBytes(3).toString("hex");
         const base = `/tmp/filaxis-sessions/${sessionId}`;
-        // 子 shell + 上下换行（孪生对齐审计·二十期 #2 + M4 在 remote/local 修后 tmux
-        // execSession 才出生、带病出厂）：大括号形态下业务命令显式 `exit 7` 退出**整个
-        // 包装 shell**——.code 永不写（进程已死但 stopSession 恒查不到终态）；单行拼接
-        // 下业务尾注释 `cmd # cmt` 吞掉 `; }` 同病。子 shell 隔离 + 换行双防
-        const wrapped = `(\n${command}\n); echo $? > ${base}.code`;
         // cd 显式失败码（R3 同款：`cd X &&` 前缀在 & 后台化下失败不可探测——幽灵会话）
         const cd = opts?.cwd ? `cd ${q(opts.cwd)} || exit 1; ` : "";
         // env 内联前缀（十轮 envPrefixOf 同款；execSession 的 env 此前被静默忽略——
@@ -245,6 +240,11 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 return `${k}=${q(v)}`;
             }).join(" ") + " "
             : "";
+        // 子 shell + 上下换行（孪生对齐审计·二十期 #2 + M4 在 remote/local 修后 tmux
+        // execSession 才出生、带病出厂）：大括号形态下业务命令显式 `exit 7` 退出**整个
+        // 包装 shell**——.code 永不写（进程已死但 stopSession 恒查不到终态）；单行拼接
+        // 下业务尾注释 `cmd # cmt` 吞掉 `; }` 同病。子 shell 隔离 + 换行双防
+        const wrapped = `(\n${envPrefix}${command}\n); echo $? > ${base}.code`; // env 前缀进子 shell（同 remote）
         // 启动握手（孪生对齐审计·二十一期 remote 模板漏改）：分号链里 mkdir 失败/
         // cd 失败被 & 吞/重定向失败/nohup 127 都不影响父 shell——$! 照样返回 PID =
         // 幽灵会话（.pid 空/指向已死壳，execSession 谎报成功）。wrapper 亲写 .pid +
@@ -259,7 +259,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
             `( mkdir -p /tmp/filaxis-sessions 2>/dev/null || { echo FX_MKDIR_FAIL; exit 1; }; ` +
             // setsid 进程组（Hydrogen R5 #3）：wrapper 自成组长——stopSession 组杀全树
             // （单杀主 PID 漏孙进程后探针见主死=谎报 stopped）。缺席平台 pgid≠pid 自动回落
-            `${cd}${envPrefix}__fx_sets=""; command -v setsid >/dev/null 2>&1 && __fx_sets=setsid; ` +
+            `${cd}__fx_sets=""; command -v setsid >/dev/null 2>&1 && __fx_sets=setsid; ` +
             `$__fx_sets nohup sh -c ${q(`echo $$ > ${base}.pid.tmp; mv ${base}.pid.tmp ${base}.pid; ps -o pgid= -p $$ 2>/dev/null | tr -d ' 
 ' > ${base}.pgid; ${wrapped}`)} > ${q(base)}.out 2> ${q(base)}.err < /dev/null & ` +
             `__fx_n=0; while [ ! -f ${q(base)}.pid ] && [ $__fx_n -lt 30 ]; do sleep 0.1; __fx_n=$((__fx_n+1)); done; ` +
