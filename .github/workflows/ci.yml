@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bun:
+    name: Bun 全量（类型/边界/单测/集成）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install
+      - run: bun run typecheck
+      - run: bun run check:boundaries
+      # ── 真机环境：tmux + 自环 sshd（FILAXIS_IT 门控集成用例）──
+      - name: Provision tmux + loopback sshd
+        run: |
+          sudo apt-get update && sudo apt-get install -y tmux openssh-server
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" || true
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo service ssh start || sudo systemctl start ssh || true
+          ssh -o StrictHostKeyChecking=accept-new localhost 'echo loopback-ok'
+      - name: 全量测试（含真机集成）
+        run: bun test
+        env:
+          FILAXIS_IT: "1"
+          FILAXIS_IT_SSH: localhost
+
+  node:
+    name: Node LTS 兼容（类型/边界/内核真跑）
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2 # 装依赖仍走 bun（Node 侧用包管理器无关的 node_modules）
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: bun install
+      - run: node_modules/.bin/tsc --noEmit
+      - run: node scripts/check-boundaries.ts # 纯 node: API——Node 直接跑即兼容实证
+      # Node 运行时真跑内核示例（tsx 处理 .js→.ts 解析——devDep 面，不触内核零依赖红线）
+      - run: npx -y tsx examples/agent-tools.ts
+      # npx 兼容实证：编译版 CLI 在纯 Node 下真跑（发布包 bin 指向 dist/bin/filaxis.js）
+      # bash -e 模式下 node 以 3 退出即 fail——`|| test` 形态断言退出码透传
+      - run: bun run build
+      - run: node dist/bin/filaxis.js exec -- "echo NPX_OK && exit 3" || test $? -eq 3

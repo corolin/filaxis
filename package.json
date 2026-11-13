@@ -1,0 +1,49 @@
+{
+  "name": "@syrkos/filaxis",
+  "version": "0.1.0",
+  "description": "牵丝 Filaxis — 面向自动化与 Agent 的远程执行运行时 SDK（Syrkos · 漩核）。千里一线，执行有迹。",
+  "type": "module",
+  "license": "Apache-2.0",
+  "module": "src/index.ts",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "node": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check:boundaries": "bun scripts/check-boundaries.ts",
+    "build": "bun build src/index.ts --target node --outdir dist && bun build bin/filaxis.ts --target node --outfile dist/bin/filaxis.js && bunx tsc --emitDeclarationOnly --declaration --outDir dist --target es2022 --module esnext --moduleResolution bundler --skipLibCheck src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "files": [
+    "CHANGELOG.md",
+    "src",
+    "dist",
+    "docs/skills",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "AGENTS.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/corolin/filaxis"
+  },
+  "bin": {
+    "filaxis": "dist/bin/filaxis.js",
+    "filaxis-mcp": "./bin/filaxis-mcp.ts"
+  }
+}

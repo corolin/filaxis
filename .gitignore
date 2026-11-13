@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.log
+.tmp*/
+.DS_Store
+.npmrc
+dist/
+
+# 仓内私有档（本地保留，不随 git/GitHub——REQ 工程/盲测报告/对账档案）
+.spec-prd/
+docs/*
+!docs/skills/
+drafts/
