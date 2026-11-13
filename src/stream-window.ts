@@ -49,7 +49,9 @@ type Transport =
     | { kind: "remote"; manager: StreamSessionManager; sessionId: string };
 
 /** 同名重开续编锚（模块级——直接 close() 也登记；Registry stop 时并入自己的表） */
+/** 续编锚（Sol 55 P2-H）：键带 namespace——模块级裸键曾串到其他注册表 */
 const __seqAnchors = new Map<string, number>();
+const __anchorKey = (ns: string, name: string): string => `${ns}::${name}`;
 
 export class StreamWindow {
     private frames: StreamFrame[] = [];
@@ -58,6 +60,7 @@ export class StreamWindow {
      *  未收到帧）的 newestSeq=0，用它续锚会把已存帧号归零覆盖、peekSince 误报
      *  gap。allocatedSeq 恒等于「本窗生命周期内发出的最大 seq」（含续编起点） */
     private allocated = 0;
+    private readonly anchorNs: string;
     private _stale = false;
     private _closed = false;
     private readonly consumers = new Map<string, number>();
@@ -74,7 +77,9 @@ export class StreamWindow {
         /** 帧号起点（Registry 同名重开续编——五十期 #1：文档承诺「重开续编」
          *  但实现归零，旧游标 peekSince 静默漏帧且 gap 不置位） */
         seqStart = 0,
+        anchorNs = "__bare__", // 裸窗全局 namespace（Registry 窗注入自身实例 id）
     ) {
+        this.anchorNs = anchorNs;
         this.nextSeq = seqStart + 1;
         this.allocated = seqStart;
     }
@@ -92,16 +97,18 @@ export class StreamWindow {
     push(text: string): void {
         if (this._closed) return;
         let line = text;
-        if (line.length > this.maxLineBytes) {
+        // 字节口径（Sol 55 P2-G）：UTF-16 码元曾当字节——10 个「中」20 码元
+        // 过 13 上限检查却占 30 UTF-8 字节透传。上限名是 LineBytes——按字节判
+        if (Buffer.byteLength(line, "utf-8") > this.maxLineBytes) {
             // keep 下限 0（Hydrogen R2 #5，对齐 session-buffer 同款修复）：
             // maxLineBytes < 后缀长度时裸减法=负索引，越截越长
-            const keep = Math.max(0, this.maxLineBytes - TRUNC_SUFFIX.length);
-            let cut = line.slice(0, keep);
+            const keepBytes = Math.max(0, this.maxLineBytes - Buffer.byteLength(TRUNC_SUFFIX, "utf-8"));
+            let cut = line.slice(0, keepBytes); // 码元粗切——下方字节复核回退
             // 孤立高代理剥除（Sol 54 P2-19：UTF-16 切点落代理对中间——孤立
             // 高代理编码后 4 字节+占位低代理缺失=乱码；剥 1 码元即可）
-            if (/[\uD800-\uDBFF]$/.test(cut) && /[\uDC00-\uDFFF]/.test(line.slice(keep, keep + 1))) {
-                cut = cut.slice(0, -1);
-            }
+            // 字节复核回退 + 孤立高代理剥除（Sol 54 P2-19 简化合并）
+            while (Buffer.byteLength(cut, "utf-8") > keepBytes && cut.length > 0) cut = cut.slice(0, -1);
+            if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
             line = cut + TRUNC_SUFFIX;
         }
         const seq = this.nextSeq++;
@@ -180,7 +187,7 @@ export class StreamWindow {
         this._closed = true;
         // 续编锚登记（Sol 54 P2-17）：直接 close() 曾绕过 Registry.stop——同名重开
         // 帧号归零，旧游标跳过新首帧。模块级锚表使任何关闭路径都被下一窗继承
-        __seqAnchors.set(this.name, this.allocated);
+        __seqAnchors.set(__anchorKey(this.anchorNs, this.name), this.allocated);
         try {
             if (this.transport?.kind === "local") {
                 this.transport.child.kill("SIGTERM");
@@ -235,10 +242,13 @@ class LineSplitter {
                 // 判定后 12B 上限下 "12345678\nOK\nZ\n" 三行全完整）
                 // 行尾 CR 不计正文长度（Sol 54 P2-15）：12 字符+CRLF 曾超 12 上限
                 // 被截——CR 是行终止符一半不是内容
+                // 跨块 CRLF（Sol 55 P2-F）：\r 留在上一块尾 buf——判长时同属行终止符
+                // 不计（`abcdefghijkl\r`+`\n` 分块曾 13>12 截断）；字节口径（P2-G）
+                const bufBody = this.buf.endsWith("\r") ? this.buf.slice(0, -1) : this.buf;
                 const dataBody = data.endsWith("\r") ? data.slice(0, -1) : data;
-                if (this.buf.length + dataBody.length > this.maxBytes) {
+                if (Buffer.byteLength(bufBody + dataBody, "utf-8") > this.maxBytes) {
                     const keep = Math.max(0, this.maxBytes - TRUNC_SUFFIX.length); // 负索引防护
-                    let cut = (this.buf + dataBody).slice(0, keep);
+                    let cut = (bufBody + dataBody).slice(0, keep);
                     if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1); // 孤立高代理剥除（同 push）
                     this.buf = cut + TRUNC_SUFFIX;
                     this.capped = true;
@@ -250,13 +260,14 @@ class LineSplitter {
             // 本 chunk 内有换行：当前行 = buf + data 头段；按**当前行长度**判定封顶
             const segRaw = data.slice(0, nl);
             const seg = segRaw.endsWith("\r") ? segRaw.slice(0, -1) : segRaw; // CR 剥后再判长（同上）
-            if (this.buf.length + seg.length > this.maxBytes) {
+            const bufHere = this.buf.endsWith("\r") ? this.buf.slice(0, -1) : this.buf; // 跨块 CR 同罪
+            if (Buffer.byteLength(bufHere + seg, "utf-8") > this.maxBytes) { // 字节口径（P2-G）
                 const keep = Math.max(0, this.maxBytes - TRUNC_SUFFIX.length);
-                let cutL = (this.buf + seg).slice(0, keep);
+                let cutL = (bufHere + seg).slice(0, keep);
                 if (/[\uD800-\uDBFF]$/.test(cutL)) cutL = cutL.slice(0, -1);
                 onLine(cutL + TRUNC_SUFFIX);
             } else {
-                const clean = (this.buf + seg).replace(/\r$/, "");
+                const clean = (bufHere + seg).replace(/\r$/, "");
                 if (clean !== "") onLine(clean);
             }
             this.buf = "";
@@ -317,6 +328,8 @@ export class StreamWindowRegistry {
     /** 同名重开的帧号续编锚（Astra 五十期 #1）：stop 记下末帧号，重开同名窗的
      *  新帧从冻结 seq 之后继续——文档「重开续编」承诺的兑现；旧消费者游标直接有效 */
     private readonly lastSeqByName = new Map<string, number>();
+    /** 续编锚 namespace（实例 id——跨注册表隔离） */
+    private readonly anchorNs = `reg-${Math.random().toString(36).slice(2, 10)}`;
     private readonly sweeper: ReturnType<typeof setInterval>;
     /** 已 dispose（Astra 四十期 #2）：在途 open 的迟注册收割依据 + 后续 open 早拒 */
     private _disposed = false;
@@ -355,7 +368,7 @@ export class StreamWindowRegistry {
             const source = opts.name.split(":").slice(-1)[0] ?? opts.name;
             const win = new StreamWindow(
                 opts.name, layerAlias, source, opts.command, opts.maxFrames, opts.maxLineBytes,
-                this.lastSeqByName.get(opts.name) ?? __seqAnchors.get(opts.name) ?? 0, // 续编（五十期+Sol54 P2-17 直接 close 也锚）
+                __seqAnchors.get(__anchorKey(this.anchorNs, opts.name)) ?? this.lastSeqByName.get(opts.name) ?? 0, this.anchorNs, // 续编 close 锚优先+ns 隔离（Sol 55 P2-H）
             );
             winRef = win;
 
@@ -444,7 +457,7 @@ export class StreamWindowRegistry {
     stop(name: string): void {
         const win = this.require(name);
         this.lastSeqByName.set(name, win.allocatedSeq); // 续编锚
-        __seqAnchors.delete(name); // 模块锚已并入（清防增长）（allocatedSeq——空窗〔重开后未收帧〕的 newestSeq=0 不再归零覆盖，五十一期 #1）
+        __seqAnchors.delete(__anchorKey(this.anchorNs, name)); // ns 键清理（Sol 55 P2-H）（allocatedSeq——空窗〔重开后未收帧〕的 newestSeq=0 不再归零覆盖，五十一期 #1）
         win.close();
         this.windows.delete(name);
     }

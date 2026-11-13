@@ -109,6 +109,11 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
     for (const s of plan.steps) {
         if (!s.id) throw new Error(`批次计划非法：存在无 id 步骤`);
         if (byId.has(s.id)) throw new Error(`批次计划非法：id 重复 '${s.id}'`);
+        // kind 前置校验（Sol 55 P2-E）：未知 kind 曾在 runStep 执行中才抛——计划里
+        // 合法步骤已跑过（exec 已执行）才报未知类型。零副作用阶段拦死
+        if (s.kind !== "exec" && s.kind !== "edit" && s.kind !== "read") {
+            throw new Error(`批次计划非法：未知 kind '${(s as { kind: string }).kind}'（合法: exec|edit|read）——校验先行，合法步骤零执行`);
+        }
         byId.set(s.id, s);
     }
     for (const s of plan.steps) {

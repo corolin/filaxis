@@ -103,7 +103,7 @@ export class RemoteSessionManager {
         const envPrefix = opts.env
             ? Object.entries(opts.env).map(([k, v]) => {
                 if (!ENV_NAME_RE.test(k)) throw new Error(`非法环境变量名（会话启动拒绝）: ${k}`);
-                return `${k}=${q(v)}`;
+                return `export ${k}=${q(v)}`; // export 形态（Sol 55 P2-D）：裸赋值前缀 VAR=v cmd 只作用 cmd——子 shell 后续命令丢变量
             }).join(" ") + " "
             : "";
         // 子 shell + 上下换行（审计 M4 + Astra 二十轮 #2）：大括号形态下业务命令的
@@ -285,10 +285,12 @@ export class RemoteSessionManager {
                 // 探针输出必须可判读（Sol 五十四期 P1-2）：退出码非零/输出为空=
                 // 核实通道失灵——既非 ALIVE 亦非 DEAD，死亡未证实，不得报 stopped
                 if (r.exitCode !== 0) return null;
-                const out = r.stdout;
-                if (out.includes("ALIVE")) return true;
-                if (out.includes("DEAD")) return false;
-                return null; // 词不达意——探针失败同罪
+                // 精确 token 匹配（Sol 55 P1-A）：子串匹配曾把 "NOT DEAD" 判死——
+                // 输出须是且仅是探针词（trim 后全等），否则=探针失败归 null
+                const token = r.stdout.trim();
+                if (token === "ALIVE") return true;
+                if (token === "DEAD") return false;
+                return null;
             };
             await treeKill("TERM");
             let alive = await treeProbe();

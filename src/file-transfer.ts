@@ -228,6 +228,10 @@ async function verify(
         return { verified: true, detail: "size-only（sha256 原语缺席）", level: "size" };
     }
     const sh = await exec(`${dialect.sha256.join(" ")} < ${q(remotePath)}`);
+    if (sh.exitCode !== 0) {
+        // sha 命令失败（Sol 55 P2-C）：wc 已查——sha 同罪（exit 1+匹配输出曾仍 verified）
+        return { verified: false, detail: `sha256 校验命令失败（exit=${sh.exitCode}）`, level: "sha256" };
+    }
     const remoteSha = (sh.stdout || "").replace(/[^0-9a-f]/g, "");
     if (!remoteSha.includes(expectSha)) {
         return { verified: false, detail: `sha256 不一致（远端 ${remoteSha.slice(0, 16)}… ≠ 本地 ${expectSha.slice(0, 16)}…）`, level: "sha256" };

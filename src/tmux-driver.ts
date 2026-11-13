@@ -237,7 +237,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
         const envPrefix = opts?.env
             ? Object.entries(opts.env).map(([k, v]) => {
                 if (!ENV_NAME_RE.test(k)) throw new Error(`非法环境变量名（会话启动拒绝）: ${k}`);
-                return `${k}=${q(v)}`;
+                return `export ${k}=${q(v)}`; // export 形态（Sol 55 P2-D 同 remote）
             }).join(" ") + " "
             : "";
         // 子 shell + 上下换行（孪生对齐审计·二十期 #2 + M4 在 remote/local 修后 tmux

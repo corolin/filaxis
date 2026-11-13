@@ -253,12 +253,19 @@ export class LayerEnvStore {
 
     /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */
     private async acquireLock(): Promise<() => Promise<void>> {
+        // mkdir 前置（Sol 55 P2-A）：曾先开锁文件——新目录首写 ENOENT（目录创建
+        // 在 saveLocked 的锁内执行不到）
+        await mkdir(dirname(this.path), { recursive: true });
         const lock = `${this.path}.lock`;
-        const { open, unlink } = await import("node:fs/promises");
+        const { open, unlink, readFile } = await import("node:fs/promises");
+        // 锁内 nonce（Sol 55 P2-B）：陈锁回收后旧 holder 释放曾误删新 holder 的锁
+        // （A>5s→B 回收接管→A 释放删 B 锁→C 闯入）——释放只删**自己的**锁
+        const myToken = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         let fh: Awaited<ReturnType<typeof open>> | null = null;
         for (let attempt = 0; attempt < 50; attempt++) {
             try {
                 fh = await open(lock, "wx");
+                await fh.write(myToken);
                 break;
             } catch (e) {
                 if ((e as { code?: string }).code !== "EEXIST") throw e;
@@ -270,9 +277,14 @@ export class LayerEnvStore {
             }
         }
         if (!fh) throw new Error(`LayerEnvStore 写锁超时: ${lock}`);
+        const held = fh;
         return async () => {
-            await fh!.close().catch(() => undefined);
-            await unlink(lock).catch(() => undefined);
+            await held.close().catch(() => undefined);
+            // 只删自己的锁（nonce 比对——陈锁被回收后这里 token 不匹配即放弃）
+            try {
+                const cur = await readFile(lock, "utf-8");
+                if (cur.trim() === myToken) await unlink(lock);
+            } catch { /* 已被回收/删除 */ }
         };
     }
 
