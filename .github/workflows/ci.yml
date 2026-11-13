@@ -13,7 +13,7 @@ jobs:
     name: Bun 全量（类型/边界/单测/集成）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -42,11 +42,11 @@ jobs:
       matrix:
         node: [24]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2 # 装依赖仍走 bun（Node 侧用包管理器无关的 node_modules）
         with:
           bun-version: 1.4.4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - run: bun install
