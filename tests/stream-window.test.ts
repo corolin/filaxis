@@ -65,7 +65,7 @@ describe("StreamWindow（帧/peek/游标/stale）", () => {
         const w = new StreamWindow("t3", "local", "t3", "x", 10, 20);
         w.push("x".repeat(100));
         expect(w.peekLast(1).frames[0]!.text.endsWith("…[truncated]")).toBe(true);
-        expect(w.peekLast(1).frames[0]!.text.length).toBe(20);
+        expect(Buffer.byteLength(w.peekLast(1).frames[0]!.text, "utf-8")).toBe(20); // 字节口径（Sol 55 P2-G——「…」3 字节后缀实测 20B 上限精确）
     });
 });
 
@@ -282,6 +282,7 @@ describe("五十期：续编/翻页/快照隔离", () => {
 // 归零覆盖已存帧号+空窗 peekSince 误报 gap；#2 本地窗 LineSplitter 未完成行随输出无限涨
 // （32MiB 无换行堆涨 32MiB——maxLineBytes 只在成行后截）。
 const NL51 = "\n";
+const CR55 = "\r";
 describe("五十一期：空窗续锚 + 未完成行封顶", () => {
     test("#1 空窗不归零续锚：重开空窗 peekSince 不误报 gap，再关再开首帧续编", () => {
         const w1 = new StreamWindow("t:chain", "local", "t", "x", 10, 1024);
@@ -317,7 +318,7 @@ describe("五十一期：空窗续锚 + 未完成行封顶", () => {
         await new Promise((r) => setTimeout(r, 30));
         const frames = win.peekLast(5).frames;
         expect(frames.length).toBe(1);
-        expect(frames[0]!.text.length).toBe(64);        // 封顶 ≤ maxLineBytes（修前：8MiB 堆涨）
+        expect(Buffer.byteLength(frames[0]!.text, "utf-8")).toBe(64);   // 封顶 ≤ maxLineBytes 字节口径（Sol 55 P2-G；修前 8MiB 堆涨）
         expect(frames[0]!.text.endsWith("…[truncated]")).toBe(true);
         // 一致性：整行一次喂（同字节）→ 输出逐字节同
         const procs2: FakeChild[] = [];
@@ -372,5 +373,55 @@ describe("五十二期：迭代扫描 + 逐行截断 + 零容量", () => {
         for (let i = 0; i < 10; i++) w2.push("F" + i);
         expect(w2.peekLast(0).frames).toEqual([]); // 修前：全部 10 帧
         expect(w2.peekLast(-3).frames).toEqual([]); // 负数同样空
+    });
+});
+
+// GPT Sol 五十五期：跨块 CRLF 仍截断（buf 尾 CR 留块未剥）+ 字节口径（UTF-16 码元曾当字节）。
+describe("五十五期：跨块 CRLF + 字节口径", () => {
+    test("P2-F abcdefghijkl<CR> 与 <LF> 分块到达——正文完整不截断", async () => {
+        const procs: FakeChild[] = [];
+        const reg = new StreamWindowRegistry({
+            shell: BASH,
+            spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+        });
+        const win = await reg.open({ name: "t:crlf55", command: "x", maxLineBytes: 12 });
+        const c = procs[0]!;
+        c.emitOut("abcdefghijkl" + CR55); // 上块：正文+CR（无换行）
+        c.emitOut(NL51);                 // 下块：只有换行——成行
+        await new Promise((r) => setTimeout(r, 30));
+        expect(win.peekLast(5).frames.map((f) => f.text)).toEqual(["abcdefghijkl"]); // 修前截断标记
+        reg.dispose();
+    }, 15_000);
+
+    test("P2-G 字节口径：10 个「中」30 字节超 13 上限必截断（UTF-16 码元曾透传）", () => {
+        const w = new StreamWindow("t56", "local", "t", "x", 10, 25); // 后缀 14B——上限须大于后缀
+        w.push("中".repeat(10)); // 30B
+        const t = w.peekLast(1).frames[0]!.text;
+        expect(Buffer.byteLength(t, "utf-8")).toBeLessThanOrEqual(25); // 修前 30B 透传
+        expect(t.endsWith("…[truncated]")).toBe(true);
+    });
+});
+
+// GPT Sol 五十六期：export 分号分隔（曾吞首命令）/ 正文 CR 不随分块消失 / 后缀超上限硬切。
+describe("五十六期", () => {
+    test("#3 正文 CR 跨块保留（abc<CR> + XYZ<LF> 分块 → abcCRXYZ 不丢 CR）", async () => {
+        const procs: FakeChild[] = [];
+        const reg = new StreamWindowRegistry({
+            shell: BASH,
+            spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+        });
+        const win = await reg.open({ name: "t:cr56", command: "x", maxLineBytes: 64 });
+        procs[0]!.emitOut("abc\r");
+        procs[0]!.emitOut("XYZ\n");
+        await new Promise((r) => setTimeout(r, 30));
+        expect(win.peekLast(5).frames.map((f) => f.text)).toEqual(["abc\rXYZ"]); // 修前 abcXYZ（CR 被剥）
+        reg.dispose();
+    }, 15_000);
+    test("#4 maxLineBytes 12 < 后缀 14B → 硬切 12B 无后缀（不超限）", () => {
+        const w = new StreamWindow("t57", "local", "t", "x", 10, 12);
+        w.push("X".repeat(40));
+        const t = w.peekLast(1).frames[0]!.text;
+        expect(Buffer.byteLength(t, "utf-8")).toBeLessThanOrEqual(12); // 修前 14B（后缀本身超限）
+        expect(t.endsWith("…[truncated]")).toBe(false); // 放不进即放弃后缀
     });
 });

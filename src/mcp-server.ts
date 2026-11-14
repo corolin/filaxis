@@ -92,8 +92,19 @@ export class McpServer {
         } catch {
             // 解析失败：若可提取 id 则按规范回 Parse error（-32700）
             const idMatch = trimmed.match(/"id"\s*:\s*(\d+|"[^"]*")/);
-            const id = idMatch ? JSON.parse(idMatch[1]!) as number | string : null;
+            // 兜底 parse 防炸（Sol 55 P1-B）：畸形串的 id 片段可能截出半个字符串——
+            // 二次 JSON.parse 再抛即逃出监听器崩进程；失败 id=null 照常回错
+            let id: number | string | null = null;
+            if (idMatch) {
+                try { id = JSON.parse(idMatch[1]!) as number | string; } catch { id = null; }
+            }
             this.replyErr(id, -32700, "Parse error: invalid JSON");
+            return;
+        }
+        if (msg === null || typeof msg !== "object") {
+            // JSON null/标量防御（Sol 五十四期 P1-4）：null 是合法 JSON——解析成功
+            // 后 `"id" in null` 抛 TypeError 逃出监听器崩进程
+            this.replyErr(null, -32600, `Invalid Request: expected object, got ${msg === null ? "null" : typeof msg}`);
             return;
         }
         if (!("id" in msg) || msg.id === undefined || msg.id === null) return; // 通知（notifications/initialized 等）——无响应

@@ -96,10 +96,6 @@ export class RemoteSessionManager {
             `${opts.name ? sanitizeSessionName(opts.name) + "-" : "rsess-"}` +
             crypto.randomBytes(4).toString("hex");
         const base = `${this.logDir}/${sessionId}`;
-        // 子 shell + 上下换行（审计 M4 + Astra 二十轮 #2）：大括号形态下业务命令的
-        // 显式 `exit 7` 会退出**整个包装 shell**——.code 永不写入（进程已死但管理器
-        // 恒 running）。子 shell 隔离：exit 只退 ( )，外层 `$?` 照记；尾注释吞码同防
-        const wrapped = `(\n${command}\n); echo $? > ${base}.code`;
         // cd 显式失败码（`cd X || exit 1`——& 只后台化 nohup 行，失败可探测）
         const cd = opts.cwd ? `cd ${q(opts.cwd)} || exit 1; ` : "";
         // 环境经临时赋值前缀注入（VAR='V' cmd 形态——nohup 及其子进程继承）；
@@ -107,9 +103,13 @@ export class RemoteSessionManager {
         const envPrefix = opts.env
             ? Object.entries(opts.env).map(([k, v]) => {
                 if (!ENV_NAME_RE.test(k)) throw new Error(`非法环境变量名（会话启动拒绝）: ${k}`);
-                return `${k}=${q(v)}`;
-            }).join(" ") + " "
+                return `export ${k}=${q(v)}`; // export 形态（Sol 55 P2-D）：裸赋值前缀 VAR=v cmd 只作用 cmd——子 shell 后续命令丢变量
+            }).join("; ") + "; " // 分号分隔（Sol 56 P2-1）：曾空格连接 export K=v cmd——export 吞 cmd 当变量名参数
             : "";
+        // 子 shell + 上下换行（审计 M4 + Astra 二十轮 #2）：大括号形态下业务命令的
+        // 显式 `exit 7` 会退出**整个包装 shell**——.code 永不写入（进程已死但管理器
+        // 恒 running）。子 shell 隔离：exit 只退 ( )，外层 `$?` 照记；尾注释吞码同防
+        const wrapped = `(\n${envPrefix}${command}\n); echo $? > ${base}.code`; // env 前缀进子 shell（Sol 54 P2-7：外层前缀只作用于第一条 ; 命令）
         // 启动握手（Astra 二十一轮 P2 + 二十二期 #1）：分号链里 mkdir 失败/重定向失败/
         // nohup 本身 127（命令不存在）都不影响父 shell——$! 照样返回 PID = 幽灵会话。
         // `.out` 存在只证明 shell 打开了重定向，**不证明进程拉起**。真正的启动确认由
@@ -121,7 +121,7 @@ export class RemoteSessionManager {
         // setsid 缺席（macOS 等）→ $SETS 空=无前缀，.pgid≠$$ → 停止侧自动回落旧路径
         const r = await this.exec(
             `mkdir -p ${q(this.logDir)} 2>/dev/null || { echo FX_MKDIR_FAIL; exit 1; }; ` +
-            `${cd}${envPrefix}__fx_sets=""; command -v setsid >/dev/null 2>&1 && __fx_sets=setsid; ` +
+            `${cd}__fx_sets=""; command -v setsid >/dev/null 2>&1 && __fx_sets=setsid; ` +
             `$__fx_sets nohup sh -c ${q(`echo $$ > ${base}.pid.tmp; mv ${base}.pid.tmp ${base}.pid; ps -o pgid= -p $$ 2>/dev/null | tr -d ' \\n' > ${base}.pgid; ${wrapped}`)} > ${q(base)}.out 2> ${q(base)}.err < /dev/null & ` +
             `__fx_n=0; while [ ! -f ${q(base)}.pid ] && [ $__fx_n -lt 30 ]; do sleep 0.1; __fx_n=$((__fx_n+1)); done; ` +
             `[ -f ${q(base)}.pid ] || { echo FX_SPAWN_FAIL; exit 1; }; ` +
@@ -282,12 +282,23 @@ export class RemoteSessionManager {
                     `if [ -n "$g" ] && [ "$g" = "${e.pid}" ]; then /bin/kill -0 -- "-$g" 2>/dev/null && echo ALIVE || echo DEAD; ` +
                     `else kill -0 ${e.pid} 2>/dev/null && echo ALIVE || echo DEAD; fi`,
                 );
-                return r.stdout.includes("ALIVE");
+                // 探针输出必须可判读（Sol 五十四期 P1-2）：退出码非零/输出为空=
+                // 核实通道失灵——既非 ALIVE 亦非 DEAD，死亡未证实，不得报 stopped
+                if (r.exitCode !== 0) return null;
+                // 精确 token 匹配（Sol 55 P1-A）：子串匹配曾把 "NOT DEAD" 判死——
+                // 输出须是且仅是探针词（trim 后全等），否则=探针失败归 null
+                const token = r.stdout.trim();
+                if (token === "ALIVE") return true;
+                if (token === "DEAD") return false;
+                return null;
             };
             await treeKill("TERM");
-            if (await treeProbe()) {
+            let alive = await treeProbe();
+            if (alive === null) return { status: "unknown" };
+            if (alive) {
                 await treeKill("KILL");
-                if (await treeProbe()) return { status: "unknown" }; // KILL 后组内仍活（不可中断态）——不虚报 stopped
+                alive = await treeProbe();
+                if (alive === null || alive) return { status: "unknown" }; // KILL 后探针失灵或仍活——不虚报 stopped
             }
             // 死亡已核实（自审补漏）：KILL 杀死不写 .code——被杀前的输出尾行同样喂
             // watcher 后再 finalize（与 .code 命中路径同权）
@@ -326,6 +337,7 @@ export class RemoteSessionManager {
                 `if [ -n "$g" ] && [ "$g" = "${e.pid}" ]; then /bin/kill -0 -- "-$g" 2>/dev/null && echo Y || echo N; ` +
                 `else kill -0 ${e.pid} 2>/dev/null && echo Y || echo N; fi`,
             );
+            if (alive.exitCode !== 0) return { status: "unknown" }; // 探测命令失败不判 running（Sol 57 P1-2）
             return alive.stdout.includes("Y") ? { status: "running" } : { status: "unknown" }; // 死了但无 .code=死因不明
         } catch {
             return { status: "unknown" };

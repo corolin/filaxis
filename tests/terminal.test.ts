@@ -359,7 +359,8 @@ describe("tmux execSession 启动握手（孪生对齐审计）", () => {
         await expect(drv.execSession("x", { env: { "BAD;NAME": "1" } })).rejects.toThrow(/非法环境变量名/);
         await drv.execSession("x", { cwd: "/tmp", env: { FXK: "V1" } });
         expect(seen).toContain("cd '/tmp' || exit 1");  // 修前：cd && 前缀（失败被 & 吞）
-        expect(seen).toContain("FXK='V1'");              // 修前：env 被静默忽略
+        expect(seen).toContain("FXK=");                  // env 进子 shell（Sol 54 P2-7：前缀形态变更——外层只作用首命令曾丢变量）
+        expect(seen).toContain("x");                     // 业务命令仍在
     });
 
     // Astra 四十期 #1：会话名原文拼 sessionId → 未引用路径 = 命令注入（真 Bash

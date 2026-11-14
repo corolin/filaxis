@@ -205,7 +205,12 @@ export class RuntimeStack {
             try {
                 await drv.init();
             } catch (e) {
-                RuntimeStack.driverCache.delete(key);
+                // 失败清理保留后建连接（Sol 54 P2-8）：A 逐出→B 建成→A 失败——
+                // 无条件 delete 曾把 B 也清掉（下次 connect 又建 C 不复用 B）。
+                // 只在缓存里还是自己失败代的占位/无人在等时清
+                if (RuntimeStack.connectInflight.get(key) === p || !RuntimeStack.driverCache.has(key)) {
+                    if (RuntimeStack.driverCache.get(key) !== drv) RuntimeStack.driverCache.delete(key);
+                }
                 await drv.destroy().catch(() => undefined); // 半建连接不泄漏（原实现裸抛）
                 throw e;
             }

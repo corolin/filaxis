@@ -231,29 +231,109 @@ export class LayerEnvStore {
         }
     }
 
-    /** 原子写：tmp + rename */
+    /** 原子写（公共）：抢跨实例文件锁后走 saveLocked */
     async save(cfg: LayerEnvConfigFile): Promise<void> {
+        const release = await this.acquireLock();
+        try {
+            await this.saveLocked(cfg);
+        } finally {
+            await release.finalize();
+        }
+    }
+
+    /** 无锁写（调用方持锁）：tmp+rename 原子落位
+     *  tmp 带进程 nonce（Hydrogen R2 #7）：固定名跨进程踩踏/rename ENOENT */
+    private async saveLocked(cfg: LayerEnvConfigFile): Promise<void> {
         await mkdir(dirname(this.path), { recursive: true });
-        // tmp 带进程 nonce（Hydrogen R2 #7）：固定名跨进程（多 CLI 并发 probe）互相
-        // 踩踏/触发 rename ENOENT；rename 仍原子，各自 tmp 独占互不干扰
         const tmp = `${this.path}.${process.pid}-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 6)}.tmp`;
         await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
         await rename(tmp, this.path);
         this.cache = null; // 失效缓存（下次 load 重 stat）
     }
 
+    /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */
+    private async acquireLock(): Promise<(() => Promise<void>) & { verifyHeld(): Promise<boolean>; finalize(): Promise<void> }> {
+        // mkdir 前置（Sol 55 P2-A）：曾先开锁文件——新目录首写 ENOENT（目录创建
+        // 在 saveLocked 的锁内执行不到）
+        await mkdir(dirname(this.path), { recursive: true });
+        const lock = `${this.path}.lock`;
+        const { open, unlink, readFile } = await import("node:fs/promises");
+        // 锁内 nonce（Sol 55 P2-B）：陈锁回收后旧 holder 释放曾误删新 holder 的锁
+        // （A>5s→B 回收接管→A 释放删 B 锁→C 闯入）——释放只删**自己的**锁
+        const myToken = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        let fh: Awaited<ReturnType<typeof open>> | null = null;
+        for (let attempt = 0; attempt < 50; attempt++) {
+            try {
+                fh = await open(lock, "wx");
+                await fh.write(myToken);
+                break;
+            } catch (e) {
+                if ((e as { code?: string }).code !== "EEXIST") throw e;
+                try {
+                    const st = await stat(lock);
+                    if (Date.now() - st.mtimeMs > 5_000) await unlink(lock).catch(() => undefined);
+                } catch { /* 锁文件刚好消失 */ }
+                await new Promise((r) => setTimeout(r, 100));
+            }
+        }
+        if (!fh) throw new Error(`LayerEnvStore 写锁超时: ${lock}`);
+        const held = fh;
+        return Object.assign(
+            async () => { await held.close().catch(() => undefined); },
+            {
+                /** 写前复核：锁文件 token 仍是自己的（被陈锁回收即 false） */
+                async verifyHeld(): Promise<boolean> {
+                    try {
+                        const cur = await readFile(lock, "utf-8");
+                        return cur.trim() === myToken;
+                    } catch {
+                        return false;
+                    }
+                },
+                /** 收尾：关句柄 + 只删自己的锁（nonce 比对） */
+                async finalize(): Promise<void> {
+                    await held.close().catch(() => undefined);
+                    try {
+                        const cur = await readFile(lock, "utf-8");
+                        if (cur.trim() === myToken) await unlink(lock);
+                    } catch { /* 已被回收/删除 */ }
+                },
+            },
+        );
+    }
+
     /** 写入/更新一层规格；漂移检测：指纹不一致标 stale 不自动覆盖（显式 force 才覆写）。
-     *  实例内串行（写链）——并发 upsert 不丢更新。 */
+     *  **跨实例锁包裹整个读-改-写**（Sol 54 P2-9）：writeChain 只串行化本实例——
+     *  两实例并发 upsert 曾各自 load 后 save，后写覆盖前写丢 key。 */
     async upsert(key: string, entry: LayerEnvEntry, force = false): Promise<{ stale: boolean }> {
         const run = this.writeChain.then(async () => {
-            const cfg = await this.load();
-            const existing = cfg.layers[key];
-            if (existing && !force && existing.fingerprint !== entry.fingerprint) {
-                return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+            // 锁属复核重试环（Sol 56 P2-2）：暂停的旧 holder 曾在陈锁回收+新 holder
+            // 写完后恢复——saveLocked 无锁属检查直接覆盖新数据。写前复核锁 token
+            // 仍是自己的；被回收（token 不匹配）则重试整轮（重新拿锁+重读+重合并）
+            for (let round = 0; round < 3; round++) {
+                const release = await this.acquireLock();
+                try {
+                    const cfg = await this.load();
+                    const existing = cfg.layers[key];
+                    if (existing && !force && existing.fingerprint !== entry.fingerprint) {
+                        return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+                    }
+                    cfg.layers[key] = entry;
+                    await this.saveLocked(cfg);
+                    // 写后复核（Sol 57 P2-1）：verify→write 间隙锁被回收+新 holder 写入
+                    // 后，旧 holder 的写曾覆盖新数据（beta 被 alpha 盖）。写后 verify 失败
+                    // 即整轮重试：重新拿锁+**重读盘上最新**（新 holder 的 key 保留）+
+                    // 重合并自己 key——最终态两方 key 都在，后写 key 后赢（单 key 冲突
+                    // = last-writer-wins 可接受）
+                    if (await release.verifyHeld()) {
+                        return { stale: false } as const;
+                    }
+                    // 锁被回收——本轮放弃，loop 重新拿锁重读（新 holder 的写入经重读保留）
+                } finally {
+                    await release.finalize();
+                }
             }
-            cfg.layers[key] = entry;
-            await this.save(cfg);
-            return { stale: false } as const;
+            throw new Error(`LayerEnvStore upsert 锁属复核三轮失败（持续被回收）: ${key}`);
         });
         this.writeChain = run.catch(() => undefined); // 失败不堵后续写
         return run;

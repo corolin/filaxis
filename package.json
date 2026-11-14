@@ -17,7 +17,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "check:boundaries": "bun scripts/check-boundaries.ts",
-    "build": "bun build src/index.ts --target node --outdir dist && bun build bin/filaxis.ts --target node --outfile dist/bin/filaxis.js && bunx tsc --emitDeclarationOnly --declaration --outDir dist --target es2022 --module esnext --moduleResolution bundler --skipLibCheck src/index.ts"
+    "build": "bun build src/index.ts --target node --outdir dist && bun build bin/filaxis.ts --target node --outfile dist/bin/filaxis.js && bun build bin/filaxis-mcp.ts --target node --outfile dist/bin/filaxis-mcp.js && bunx tsc --emitDeclarationOnly --declaration --outDir dist --target es2022 --module esnext --moduleResolution bundler --skipLibCheck src/index.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -44,6 +44,6 @@
   },
   "bin": {
     "filaxis": "dist/bin/filaxis.js",
-    "filaxis-mcp": "./bin/filaxis-mcp.ts"
+    "filaxis-mcp": "./dist/bin/filaxis-mcp.js"
   }
 }
