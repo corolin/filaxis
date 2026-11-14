@@ -554,6 +554,7 @@ describe("Sol 63：归属隔离/锁内重读/读穿完整提交/回拨还原", (
                     });
             } catch (e) { aErr = e; }
             expect(aErr).toBeInstanceOf(Error); // 落位后锁失拦下
+            await relA.finalize(); // 白锁句柄必关（flake 治理：此行曾在改写中丢失——句柄滞留到 GC 报 FileHandle 错、随机砸中后续任意用例=五轮 flake 真凶）
             const retry = await a.upsert("k", mk63("old")); // A 正门重试
             expect(retry).toEqual({ stale: true }); // 修前：stale:false（回拨序戳让陈值看起来更新）
             const cfg = await new LayerEnvStore(p).load(true);
@@ -881,3 +882,21 @@ describe("Sol 69：传递闭包", () => {
         }
     }, 15_000);
 });
+
+// flake 治理排障（Sol 69 后专项）：全量下 GC 报「FileHandle closed during
+// garbage collection (env.json.lock)」——锁句柄泄漏被算到当时在跑的用例头上。
+test("锁句柄零泄漏（强制 GC 不报 FileHandle 错误）", async () => {
+    // 重放典型生命周期后强制 GC——若有未 finalize 的锁句柄，Bun.gc 会当场抛错
+    const dir = mkdtempSync(join(tmpdir(), "fx-env-gc-"));
+    try {
+        const p = join(dir, "env.json");
+        const s = new LayerEnvStore(p);
+        await s.upsert("a", { connection: { driver: "local" }, environment: {}, discovered_at: "", fingerprint: "f" });
+        await s.load();
+        await s.save({ layers: {} });
+        Bun.gc(true);
+        expect(true).toBe(true); // GC 无抛错=句柄全关
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}, 15_000);

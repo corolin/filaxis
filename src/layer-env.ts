@@ -612,6 +612,7 @@ export class LayerEnvStore {
                 /** 收尾：关句柄 + 只删自己的锁（nonce 比对） */
                 async finalize(): Promise<void> {
                     store.selfLockDepth = Math.max(0, store.selfLockDepth - 1);
+
                     await held.close().catch(() => undefined);
                     try {
                         const cur = await readFile(lock, "utf-8");

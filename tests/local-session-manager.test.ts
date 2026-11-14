@@ -35,7 +35,7 @@ describe("LocalSessionManager", () => {
         expect(exit.exitCode).toBe(3);
         expect(existsSync(`${h.logBase}.out`)).toBe(true);
         expect(existsSync(`${h.logBase}.err`)).toBe(true);
-    });
+    }, 30_000); // flake 治理：waitFor 期限 20s > bun 默认 5s 预算——须显式盖过
 
     test("双流物理分离：.out/.err 各归各（FEAT-04 落盘协议）", async () => {
         const m = new LocalSessionManager();
@@ -46,7 +46,7 @@ describe("LocalSessionManager", () => {
         const err = await m.readLog(h.sessionId, { stream: "stderr" });
         expect(out).toBe("to-out");
         expect(err).toBe("to-err");
-    });
+    }, 30_000); // flake 治理：无预算撞 bun 5s 默认——全量并发下冷启动可超（Sol 65 实锤）
 
     test("watcher 命中事件带 stream 字段；thenStop 收摊", async () => {
         const m = new LocalSessionManager();
@@ -59,7 +59,7 @@ describe("LocalSessionManager", () => {
         expect(match.matchedLine).toContain("GO");
         // thenStop → 会话被终止（SIGTERM）→ exit 事件
         await waitFor(() => events.some((e) => e.type === "exit"));
-    }, 20_000); // bun 用例级默认 5s——Windows 新 shell 路径首启+Defender 扫描累计超限
+    }, 30_000); // flake 治理：预算曾与 waitFor 期限（20s）齐平——负载下零余量（Sol 69 实锤）；Windows 新 shell 首启+Defender 扫描另加余量
 
     test("stop 长跑进程：SIGTERM → exit 事件", async () => {
         const m = new LocalSessionManager();
@@ -69,7 +69,7 @@ describe("LocalSessionManager", () => {
         await waitFor(() => events.some((e) => e.type === "exit"));
         const entry = m.list().find((s) => s.sessionId === h.sessionId);
         expect(entry?.running).toBe(false);
-    }, 20_000); // stop 核实窗（TERM→查→KILL→查）+ Windows Defender 扫描可超 bun 默认 5s（Sol 57/58 双轮环境 flake）
+    }, 30_000); // 预算盖过 waitFor 期限（flake 治理）；stop 核实窗（TERM→查→KILL→查）+ Defender 扫描余量（Sol 57/58 双轮环境 flake）
 
     test("tailLines：行对象按到达序混合双流", async () => {
         const m = new LocalSessionManager();
@@ -81,7 +81,7 @@ describe("LocalSessionManager", () => {
         expect(streams).toContain("stdout:one");
         expect(streams).toContain("stderr:two");
         expect(streams).toContain("stdout:three");
-    });
+    }, 30_000); // flake 治理：无预算撞 bun 5s 默认
 
     test("不存在/已回收的会话 → 显式错误", () => {
         const m = new LocalSessionManager();
@@ -118,7 +118,7 @@ describe("ready() 就绪握手（AC-13）", () => {
         } finally {
             await m.stop(h.sessionId).catch(() => undefined);
         }
-    });
+    }, 20_000); // flake 治理：内部有界等待 4s+ready 3s+stop 核实——默认 5s 预算必不够
 
     test("增量匹配：ready 在前，标记在后", async () => {
         const m = new LocalSessionManager();
@@ -129,7 +129,7 @@ describe("ready() 就绪握手（AC-13）", () => {
         } finally {
             await m.stop(h.sessionId).catch(() => undefined);
         }
-    });
+    }, 20_000); // flake 治理：ready 5s+stop 核实——默认 5s 预算零余量（Sol 66 实锤）
 
     test("超时：自动 stop 清理（reject 且清理路径触发）", async () => {
         const m = new LocalSessionManager();
