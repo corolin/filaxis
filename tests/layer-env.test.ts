@@ -1050,3 +1050,47 @@ describe("Sol 73：数组层表与空版本旁路", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十四期 P1-3：`{"layers":{"one":null}}`（全无效条目）曾以有效档身份
+// 参与版本裁决——压过可恢复前代、null 落进主档。空对象 {} 是合法清空态不废；
+// 混入 null 的有效档由 mergeLayers 跳过 null。
+describe("Sol 74：null 条目档", () => {
+    const mk74 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("全 null 条目旁路不作锚——有效前代胜出", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env74-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { base: mk74("base") }, _fx_rev: "5000000000000-1-mm74" }));
+            writeFileSync(`${p}.111-222-nnnn.fx-old`, JSON.stringify({ layers: { one: null }, _fx_rev: "9000000000000-1-null74" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.base).toBeTruthy(); // 主档键如常
+            expect(cfg.layers.one).toBeUndefined(); // 修前：null 落进结果
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("混入 null 的有效档：null 条目不落盘（有效条目照常）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env74b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { good: mk74("good"), bad: null }, _fx_rev: "9000000000000-1-mix74" }));
+            const s = new LayerEnvStore(p);
+            const cfg = await s.load();
+            expect(cfg.layers.good).toBeTruthy();
+            expect(cfg.layers.bad).toBeUndefined(); // null 不并入
+            await s.upsert("next", mk74("next"));
+            const onDisk = JSON.parse(readFileSync(p, "utf-8")) as LayerEnvConfigFile;
+            expect(onDisk.layers.bad).toBeUndefined(); // 压实不写 null
+            expect(onDisk.layers.good).toBeTruthy();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

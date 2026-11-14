@@ -70,9 +70,21 @@ export class TmuxSessionDriver implements RuntimeDriver {
                     let b64 = "";
                     for (let off = 1; off <= total; off += 8_000) {
                         const pg = await self.exec(`tail -c +${off} ${q(tmp)} | head -c 8000`);
+                        // 分页凭证纪律（Sol 74 P1-2）：管道尾 rc 只反映 head——中转文件
+                        // 被删/读取失败曾静默跳页，9KB 源文件返回 5.9KB 还正常完成。
+                        // 逐页退出码入闸 + 末尾长度对账（解码字节 == wc 实测源大小）
+                        if (pg.exitCode !== 0) {
+                            throw new Error(`readFile 分页读失败（页偏移 ${off} 退出码 ${pg.exitCode}）: ${p}`);
+                        }
                         b64 += (pg.stdout || "").replace(/\s+/g, "");
                     }
-                    return Buffer.from(b64, "base64").toString("utf-8");
+                    const content = Buffer.from(b64, "base64");
+                    if (content.length !== size) {
+                        throw new Error(
+                            `readFile 长度对账失败（解码 ${content.length}B ≠ 源 ${size}B——分页途中丢页/截断）: ${p}`,
+                        );
+                    }
+                    return content.toString("utf-8");
                 } finally {
                     await self.exec(`rm -f ${q(tmp)}`).catch(() => undefined);
                 }
@@ -128,11 +140,15 @@ export class TmuxSessionDriver implements RuntimeDriver {
     /** init：无 terminalId 则 spawn；有则验证存活（跨进程重连语义）；cwd 恢复 */
     async init(): Promise<void> {
         if (!this.descriptor.terminalId) {
-            this.descriptor.terminalId = await this.terminal.spawnSession(
+            const terminalId = await this.terminal.spawnSession(
                 this.descriptor.driver,
                 this.descriptor.target,
                 this.descriptor.config,
             );
+            // 克隆而非原地补写（Sol 74 #4）：调用方的 descriptor 对象曾被告就地
+            // 添 terminalId——同描述符二次建层算键即含 terminalId→缓存 miss→
+            // 双实例共指同一 tmux 会话，destroy 一个连坐杀掉另一层在用的会话
+            this.descriptor = { ...this.descriptor, terminalId };
         } else {
             // 重连探活（Hydrogen R9 #3）：restore(snap) 携 terminalId 时曾静默成功——
             // 宿主重启/tmux server 已退要到首次 exec 才报错。显式 has-session 探测，
@@ -142,7 +158,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
             }
         }
-        if (this.descriptor.cwd) {
+        if (this.descriptor.cwd && this.descriptor.terminalId) {
             try {
                 await this.terminal.runCommand(
                     this.descriptor.terminalId,
@@ -295,16 +311,38 @@ export class TmuxSessionDriver implements RuntimeDriver {
     }
     async tailSession(sessionId: string, lines = 50): Promise<string[]> {
         const base = this.sessionBase(sessionId);
-        const r = await this.exec(`tail -n ${lines} ${q(`${base}.out`)} 2>/dev/null || true`);
+        // 存在性纪律（Sol 74 #7）：`|| true` 曾把缺失会话的日志当空数组——调用方
+        // 无法区分「没有输出」与「日志不存在」。test -r 门 + 退出码入闸
+        const r = await this.exec(`test -r ${q(`${base}.out`)} || exit 9; tail -n ${lines} ${q(`${base}.out`)} 2>/dev/null`);
+        if (r.exitCode !== 0) {
+            throw new Error(`会话日志读取失败（tailSession exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
+        }
         return r.stdout.split("\n").filter(Boolean);
     }
     async readSessionLog(sessionId: string, opts?: ReadLogOptions): Promise<string> {
         const base = this.sessionBase(sessionId);
         const suffix = opts?.stream === "stderr" ? ".err" : ".out";
-        let cmd = `cat ${q(base + suffix)} 2>/dev/null || true`;
-        if (opts?.offsetLines) cmd += ` | tail -n +${opts.offsetLines + 1}`; // 偏移（Hydrogen R10 #2：曾静默忽略）
-        if (opts?.lines) cmd += ` | tail -n ${opts.lines}`;
-        return (await this.exec(cmd)).stdout.replace(/\n$/, "");
+        // 存在性纪律（Sol 74 #7 同 tailSession）：可读性门 + 退出码入闸；lines 截断
+        // 走临时文件中转（管道尾 rc 只反映末命令——与 remote readLog 同款）
+        const rd = q(base + suffix);
+        let cmd: string;
+        if (opts?.lines != null) {
+            const readCmd = opts?.offsetLines ? `tail -n +${opts.offsetLines + 1} ${rd}` : `cat ${rd}`;
+            cmd = `test -r ${rd} || exit 9; ` +
+                `__fx_d="\${TMPDIR:-/tmp}"; [ -d "$__fx_d" ] && [ -w "$__fx_d" ] || __fx_d=/tmp; ` +
+                `__fx_t="$__fx_d/fx-rl-$$-${Math.random().toString(36).slice(2, 6)}"; ` +
+                `{ ${readCmd} > "$__fx_t" 2>/dev/null || { rm -f "$__fx_t"; exit 9; }; }; ` +
+                `{ tail -n ${opts.lines} "$__fx_t"; }; __fx_rc=$?; rm -f "$__fx_t"; exit $__fx_rc`;
+        } else {
+            cmd = opts?.offsetLines
+                ? `test -r ${rd} || exit 9; tail -n +${opts.offsetLines + 1} ${rd}`
+                : `test -r ${rd} || exit 9; cat ${rd}`;
+        }
+        const r = await this.exec(cmd);
+        if (r.exitCode !== 0) {
+            throw new Error(`会话日志读取失败（readSessionLog exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
+        }
+        return r.stdout.replace(/\n$/, "");
     }
     watchSession(_sessionId: string, _opts: WatchOptions): { cancel(): void } {
         throw new Error("tmux 后端会话 watcher 属 M2 观察流批次（stream-session 落位后接入）");
@@ -317,8 +355,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // 只有 ALIVE 才进入「身份戳守卫 TERM → 核实窗轮询」
         const probe = (
             `if [ -f ${q(base)}.code ]; then echo CODE:$(cat ${q(base)}.code); ` +
+            // 组感知存活（Sol 74 P1-1）：.pgid==pid 时探**整组**（/bin/kill 绝对
+            // 路径——dash 内建不认负 PID）——组长先退、孙进程持组存活曾报 DEAD
+            // →stopped（孙进程实际还在跑）。组内任一存活=ALIVE
             `elif [ -f ${q(base)}.pid ]; then p=$(cat ${q(base)}.pid); ` +
-            `if kill -0 "$p" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; ` +
+            `g=$(cat ${q(base)}.pgid 2>/dev/null); ` +
+            `if [ -n "$g" ] && [ "$g" = "$p" ]; then ` +
+            `if /bin/kill -0 -- "-$g" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; ` +
+            `else if kill -0 "$p" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; fi; ` +
             `else echo NOEV; fi`
         );
         // 探针解析（Astra 四十三期 #2）：CODE 须**整行全数字**（`CODE:7oops` 这种损坏
@@ -394,8 +438,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
         const base = this.sessionBase(sessionId);
         const r = await this.exec(
             `if [ -f ${q(base)}.code ]; then echo CODE:$(cat ${q(base)}.code); ` +
+            // 组感知存活（Sol 74 P1-1 同 stopSession）：孙进程持组=running——
+            // 组模式先探组（/bin/kill 负 PID），组长活着才做 .st 身份核验；
+            // 组长已死组仍活（孙进程当家）=RUNNING（会话语义=整棵命令树）
             `elif [ -f ${q(base)}.pid ]; then p=$(cat ${q(base)}.pid); ` +
-            `if kill -0 "$p" 2>/dev/null; then ` +
+            `g=$(cat ${q(base)}.pgid 2>/dev/null); ` +
+            `if [ -n "$g" ] && [ "$g" = "$p" ]; then ` +
+            `if /bin/kill -0 -- "-$g" 2>/dev/null; then echo RUNNING; else echo DEAD; fi; ` +
+            `elif kill -0 "$p" 2>/dev/null; then ` +
             `s=$(cat ${q(base)}.st 2>/dev/null); c=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); ` +
             `if [ -z "$s" ] || [ "$s" = "$c" ]; then echo RUNNING; else echo STALE; fi; ` + // 复用：活着但身份不符
             `else echo DEAD; fi; ` +

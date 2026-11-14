@@ -208,7 +208,10 @@ const ASIDE_SUFFIX = ".fx-old";
 function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     const layers = (src as LayerEnvConfigFile | null)?.layers;
     if (!layers || typeof layers !== "object") return;
-    for (const [k, v] of Object.entries(layers)) dst.layers[k] = v;
+    // null/非对象条目跳过（Sol 74 P1-3）：曾原样并入——无效条目随压实写进主档
+    for (const [k, v] of Object.entries(layers)) {
+        if (v != null && typeof v === "object") dst.layers[k] = v as LayerEnvEntry;
+    }
 }
 
 /** 盘面档位（Sol 62 P2-4 序戳 + Sol 66 #3 血统 → Sol 67 集合血统）：rev=文档
@@ -368,9 +371,13 @@ export class LayerEnvStore {
      *  无 layers 结构，与截断 JSON 同罪（视同坏档不作锚） */
     private static docHasLayers(d: FxDoc): boolean {
         const layers = (d.parsed as LayerEnvConfigFile | null | undefined)?.layers;
-        // 数组非档（Sol 73 P1）：`{"layers":[]}` 曾通过 typeof object 检查——
-        // Object.entries 语义上会把 [] 当空层表，锚点误判同坏 JSON
-        return layers != null && typeof layers === "object" && !Array.isArray(layers);
+        if (layers == null || typeof layers !== "object" || Array.isArray(layers)) return false;
+        // 全无效条目（非空却无一有效）=无效档（Sol 74 P1-3）：`{"layers":{"one":null}}`
+        // 曾以有效档身份参与版本裁决——压过可恢复前代。注意空对象 `{}` 是整档
+        // 替换的合法清空态（store 自写），不在废档之列；混入 null 的档有效，
+        // null 条目由 mergeLayers 跳过（不当数据落盘）
+        const vals = Object.values(layers);
+        return vals.length === 0 || vals.some((v) => v != null && typeof v === "object");
     }
 
     /** seen 传递闭包：锚点的有效知悉=自身 seen ∪ 各被收录档的 seen（链式回收） */

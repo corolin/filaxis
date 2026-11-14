@@ -1117,3 +1117,36 @@ describe("Sol 72：实例核对逐出", () => {
         RuntimeStack.evictDriver(desc);
     }, 15_000);
 });
+
+// GPT Sol 七十四期 #6：自定义工厂让同一 driver 挂两个描述符键——homeKeys 曾只
+// 记最后一个键，销毁后另一键仍能拿到已销毁实例。集合化：全部键实例核对清。
+describe("Sol 74：homeKeys 多键", () => {
+    test("共享 driver 两键：两层移除销毁后，按任一描述符重连拿新实例", async () => {
+        const shared = new MockLayerDriver({ driver: "shared74" } as RuntimeDescriptor) as unknown as RuntimeDriver;
+        let served = 0;
+        const stack = new RuntimeStack();
+        // 前两次（初始两键）吐同一实例（模拟工厂层共享）；之后吐新件——
+        // 若缓存清理正确，重连必走工厂拿新实例
+        const factory = () => {
+            served++;
+            return (served <= 2 ? shared : new MockLayerDriver({ driver: "fresh74" } as RuntimeDescriptor)) as unknown as RuntimeDriver;
+        };
+        stack.registerDriver("dA", factory);
+        stack.registerDriver("dB", factory);
+        await stack.addLayer("a", { driver: "dA", target: "x" });
+        await stack.addLayer("b", { driver: "dB", target: "x" });
+        expect(stack.layer("a").driver).toBe(shared);
+        expect(stack.layer("b").driver).toBe(shared); // 同实例挂两键
+        await stack.removeLayer("a", { destroy: true });
+        await stack.removeLayer("b", { destroy: true });
+        await new Promise((r) => setTimeout(r, 30));
+        expect((shared as unknown as MockLayerDriver).destroyed).toBe(true);
+        // 修前：dA 键残留——按 dA 重连拿回已销毁实例
+        const again = await stack.connect({ driver: "dA", target: "x" } as RuntimeDescriptor);
+        expect(again).not.toBe(shared);
+        expect((again as unknown as MockLayerDriver).destroyed).toBe(false);
+        RuntimeStack.evictDriver({ driver: "dA", target: "x" } as RuntimeDescriptor);
+        RuntimeStack.evictDriver({ driver: "dB", target: "x" } as RuntimeDescriptor);
+        await (again as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+});

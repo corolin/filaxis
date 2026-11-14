@@ -2,7 +2,7 @@
  * 持久会话子系统单测（纯逻辑全测；tmux 真机集成条件跳过——本机无 tmux）
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OutputBuffer } from "../src/terminal/output-buffer.js";
@@ -460,4 +460,112 @@ describe("tmux execSession 启动握手（孪生对齐审计）", () => {
         expect((await drv.stopSession("tsess-corrupt")).status).toBe("unknown"); // 修前：exited/7
         expect((await drv.verifySession("tsess-corrupt")).status).toBe("unknown"); // 修前：exited/7
     });
+});
+
+// GPT Sol 七十四期：P1-1 stop/verify 只核实组长（孙进程持组曾报 stopped/DEAD）；
+// P1-2 大文件分页读中转被删曾静默返回残缺；#4 init 原地改写调用方 descriptor
+// （双实例共指同一会话）；#7 日志缺失当空。stub 终端 + 真 shell（探针跑真 /proc）。
+describe("Sol 74：tmux 会话语义", () => {
+    const shPath = () => Bun.which("sh")!;
+    /** stub 终端：runCommand 直通真 sh——探针/文件命令全真跑 */
+    const stubTerminal = (hooks: { onPage?: (cmd: string) => void } = {}) => ({
+        spawnSession: async () => "fx74",
+        runCommand: async (_id: string, cmd: string, _t?: number) => {
+            hooks.onPage?.(cmd);
+            const p = Bun.spawn([shPath(), "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            p.stdin.write(cmd);
+            await p.stdin.end();
+            const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            return { stdout, stderr: "", exitCode: code };
+        },
+        destroySession: async () => undefined,
+    });
+    const drvOf = (hooks?: Parameters<typeof stubTerminal>[0]) =>
+        new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "fx74", config: { launchCmd: "bash" } } as never,
+            { terminalManager: stubTerminal(hooks) as never },
+        );
+
+    test.skipIf(!Bun.which("sh"))("P1-1 组长死孙进程活：verify=running、stop 组杀后收口", async () => {
+        const sh = shPath();
+        // 造孤儿进程组：setsid 的 sh 立即退出、sleep 孙进程持组存活（全程
+        // stdio 重定向——管道被孙进程持有会拖住 spawn 语义）
+        const g = Bun.spawnSync([sh, "-c",
+            "setsid sh -c 'sleep 4 >/dev/null 2>&1 </dev/null' >/dev/null 2>&1 </dev/null & " +
+            "sleep 0.3; p=$(pgrep -x sleep | head -1); [ -n \"$p\" ] && ps -o pgid= -p \"$p\" | tr -d ' '"]);
+        const pgid = g.stdout.toString().trim();
+        if (!/^\d+$/.test(pgid)) return; // 无 setsid/pgrep/ps——环境不适用（CI Linux 矩阵覆盖）
+        mkdirSync("/tmp/filaxis-sessions", { recursive: true });
+        const sid = `fxgr74${Math.random().toString(36).slice(2, 6)}`;
+        const base = `/tmp/filaxis-sessions/${sid}`;
+        writeFileSync(`${base}.pid`, pgid);
+        writeFileSync(`${base}.pgid`, pgid);
+        try {
+            const drv = drvOf();
+            expect((await drv.verifySession(sid)).status).toBe("running"); // 修前：组长死组活被报 DEAD→unknown
+            const st = await drv.stopSession(sid); // 组杀收口（TERM 组 → 核实窗 → 最多 KILL）
+            expect(["stopped", "unknown"]).toContain(st.status);
+        } finally {
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code; kill -TERM -- -${pgid} 2>/dev/null; true`]);
+        }
+    }, 20_000);
+
+    test.skipIf(!Bun.which("sh"))("P1-2 分页读中转被删：拒绝（不返回残缺）", async () => {
+        const d = mkdtempSync(join(tmpdir(), "fx-pg74-")).replace(/\\/g, "/");
+        const src = `${d}/big.txt`;
+        writeFileSync(src, "x".repeat(9_000));
+        let page = 0;
+        const drv = drvOf({ onPage: (cmd) => {
+            // 第二页读取前删掉中转 b64——上游 tail 失败
+            if (cmd.startsWith("tail -c +8001")) {
+                page++;
+                Bun.spawnSync([shPath(), "-c", `rm -f /tmp/filaxis-read-*.b64`]);
+            }
+        } });
+        await expect(drv.fs.readFile(src)).rejects.toThrow(/分页读失败|长度对账/); // 修前：~5922B 正常完成
+    }, 20_000);
+
+    test("#4 init 克隆：调用方 descriptor 不被补写 terminalId", async () => {
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", config: { launchCmd: "bash" } } as never,
+            { terminalManager: stubTerminal() as never },
+        );
+        const callerDesc = { driver: "tmux", config: { launchCmd: "bash" } } as never;
+        const drv2 = new TmuxSessionDriver(callerDesc, { terminalManager: stubTerminal() as never });
+        await drv2.init();
+        expect((callerDesc as { terminalId?: string }).terminalId).toBeUndefined(); // 修前：被告改写（二次建层键漂移→双实例）
+        expect(drv2.descriptor.terminalId).toBe("fx74");
+        void drv;
+    }, 10_000);
+
+    test.skipIf(!Bun.which("sh"))("#7 日志缺失：tailSession/readSessionLog 拒绝（不当空日志）", async () => {
+        const drv = drvOf();
+        await expect(drv.tailSession("fxnope74")).rejects.toThrow(/不作日志凭证/); // 修前：[]
+        await expect(drv.readSessionLog("fxnope74")).rejects.toThrow(/不作日志凭证/); // 修前：""
+    }, 15_000);
+
+    test("#5 registry 探测异常保守保留（仅 exit 1=不存在才删）", async () => {
+        const real = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        const mk = async () => {
+            const dir = mkdtempSync(join(tmpdir(), "fx-reg74-"));
+            const reg = new SessionRegistry(() => dir);
+            await reg.save({ id: "z74", driver: "tmux", createdAt: new Date().toISOString(), lastUsedAt: new Date().toISOString() } as never);
+            return { dir, reg };
+        };
+        try {
+            // 探测被信号终止（exit 143——Sol 74 #5）：保守保留
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 143 });
+            const a = await mk();
+            await a.reg.init();
+            expect(existsSync(join(a.dir, "z74.json"))).toBe(true); // 修前：当会话已死亡删掉 profile
+            // tmux 语义码 1=会话不存在：删除
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 1 });
+            const b = await mk();
+            await b.reg.init();
+            expect(existsSync(join(b.dir, "z74.json"))).toBe(false);
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real;
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real;
+        }
+    }, 10_000);
 });

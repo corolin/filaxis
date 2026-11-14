@@ -226,7 +226,7 @@ export class RuntimeStack {
             // 建后即变；removeLayer 按描述符算键逐出=键不匹配旧缓存残留，重连
             // 拿回已销毁实例。不重挂键（descriptor 可能丢 config 信息、砸键控
             // 缓存）——逐出按「本 driver 实际挂在哪个键」实例核对（evictDriverHome）
-            RuntimeStack.driverHomeKeys.set(drv, key);
+            { const keys = RuntimeStack.driverHomeKeys.get(drv) ?? new Set<string>(); keys.add(key); RuntimeStack.driverHomeKeys.set(drv, keys); }
             this.log.info(`[Filaxis] 新建连接: ${descriptor.driver}/${descriptor.target ?? "local"}`);
             return drv;
         })();
@@ -258,12 +258,17 @@ export class RuntimeStack {
 
     /** 逐出缓存（销毁归调用方——先 evict 再 destroy，避免销毁竞态复用）。
      *  ns：命名空间（默认共享缓存传 ""；自定义工厂的 stack 内部逐出走自身 ns） */
-    /** 实例逐出（Sol 73 #3）：按 homeKey 找到本 driver 实际挂载键——缓存里
-     *  就是它才清（同键别代/同 driver 键不匹配都不误伤） */
+    /** 实例逐出（Sol 73 #3 → Sol 74 #6 多键全清）：本 driver 挂载的**全部**键
+     *  逐个实例核对清（缓存里就是它才清——同键别代不误伤） */
     static evictDriverHome(drv: RuntimeDriver): RuntimeDriver | undefined {
-        const key = RuntimeStack.driverHomeKeys.get(drv);
-        if (key == null) return undefined;
-        return RuntimeStack.evictByKey(key);
+        const keys = RuntimeStack.driverHomeKeys.get(drv);
+        if (keys == null || keys.size === 0) return undefined;
+        let evicted: RuntimeDriver | undefined;
+        for (const key of [...keys]) {
+            const r = RuntimeStack.evictByKey(key);
+            if (r) evicted = r;
+        }
+        return evicted;
     }
 
     static evictDriver(d: RuntimeDescriptor, ns = ""): RuntimeDriver | undefined {
@@ -274,7 +279,7 @@ export class RuntimeStack {
     private static evictByKey(key: string): RuntimeDriver | undefined {
         const drv = RuntimeStack.driverCache.get(key);
         RuntimeStack.driverCache.delete(key);
-        if (drv) RuntimeStack.driverHomeKeys.delete(drv);
+        if (drv) RuntimeStack.driverHomeKeys.get(drv)?.delete(key); // 集合化（Sol 74 #6）：摘本键，同 driver 他键保留
         // in-flight 一并清（自挖 S3）：建链中的同指纹并发不再搭已逐出连接的
         // 车。注：已在途的建链 Promise 完成时仍会 set 回缓存（毫秒级窗口，
         // removeLayer/destroy 实路径在连接建成后才会 evict——接受并声明）
@@ -321,10 +326,11 @@ export class RuntimeStack {
     /** 已调度延迟销毁的 driver（Sol 71 #2 去重）：定时器触发前的重复移除不再
      *  二次调度 destroy */
     private static readonly destroyScheduled = new WeakSet<RuntimeDriver>();
-    /** driver 实际挂载的缓存键（Sol 73 #3）：建链时 descriptor 可能被 init 补写
-     *  （tmux terminalId）——事后按描述符算键与实际键不一致；按实例记键，
-     *  逐出实例核对（不重挂——descriptor 可能丢 config、砸键控缓存） */
-    private static readonly driverHomeKeys = new Map<RuntimeDriver, string>();
+    /** driver 实际挂载的缓存键集合（Sol 73 #3 → Sol 74 #6 集合化）：建链时
+     *  descriptor 可能被 init 补写（tmux terminalId）——按描述符算键与实际键
+     *  不一致；自定义工厂还可让**同一 driver 挂多键**（曾只记一个键——销毁后
+     *  另一键仍能拿到已销毁实例）。按实例记全部键，逐出实例核对全清 */
+    private static readonly driverHomeKeys = new Map<RuntimeDriver, Set<string>>();
     private activeName?: string;
 
     /** 层注册表只读视图 */
