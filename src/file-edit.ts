@@ -190,13 +190,16 @@ interface StampedRead {
  *  printf | base64 -d：GNU/busybox 出 filaxis → -d，BSD → -D（行为判定）。 */
 async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRead> {
     // NAME_MAX 安全基底（Hydrogen R5 #5）：.fx-tmp/.fx-lock 后缀拼接近上限 basename
-    // 会 ENAMETOOLONG——接近上限截前段+短 hash（文件本体走目标原路径不受影响）
+    // 会 ENAMETOOLONG——接近上限截前段+短 hash（文件本体走目标原路径不受影响）。
+    // hash 取名内容确定性摘要（Sol 60 P2-4）：随机后缀曾使同一长文件名的两次
+    // 编辑各持各的 fx-lock——flock 互斥对同目标失效；确定性基底=同目标必同锁
+    //（tmp/lock 同名碰撞由 flock 覆盖——与短名路径行为一致）
     const fxBase = (() => {
         const slash = path.lastIndexOf("/");
         const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
         const name = slash >= 0 ? path.slice(slash + 1) : path;
         if (name.length + ".filaxis-lock-xxxxxxxx".length <= 255) return path;
-        const h = Math.random().toString(16).slice(2, 10);
+        const h = crypto.createHash("sha256").update(name).digest("hex").slice(0, 8);
         return dir + name.slice(0, Math.max(1, 255 - 32)) + "~" + h;
     })();
     // 读原文件用**原路径**（Sol 57 P2-5）：fxBase 是缩短名——曾拿缩短路径去读/戳

@@ -454,3 +454,20 @@ describe("五十九期：封顶末尾 CR 分治", () => {
         expect(await run(["abc\r\n"])).toEqual(["abc"]);
     }, 15_000);
 });
+
+// GPT Sol 六十期 P2-6：完整行路径双重剥 CR——seg 已剥 CRLF 的 \r，clean 再剥一次
+// 把「正文 CR+CRLF」叠字符的正文 CR 吃掉（abc\r\r\n 实测得 "abc"，应为 "abc\r"）。
+describe("六十期：正文 CR+CRLF 叠字符", () => {
+    test("abc<CR><CR><LF> → abc<CR>（正文 CR 保留）", async () => {
+        const procs: FakeChild[] = [];
+        const reg = new StreamWindowRegistry({
+            shell: BASH,
+            spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+        });
+        const win = await reg.open({ name: "t:cr60", command: "x", maxLineBytes: 64 });
+        procs[0]!.emitOut("abc\r\r\n");
+        await new Promise((r) => setTimeout(r, 30));
+        expect(win.peekLast(2).frames.map((f) => f.text)).toEqual(["abc\r"]); // 修前 "abc"
+        reg.dispose();
+    }, 15_000);
+});

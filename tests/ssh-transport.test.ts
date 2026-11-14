@@ -859,3 +859,23 @@ describe("Sol 59：poll 探针脏结果不判死", () => {
         expect(exit.exitCode).toBeNull(); // 无 .code 的外部死亡 → unknown 退出码
     }, 15_000);
 });
+
+// GPT Sol 六十期 P2-5：verify() 存活探针 includes("Y") 子串匹配——"NOT Y" 等
+// 非标准输出曾判 running。改精确单标记（与 Sol 59 P1-2 的 poll 探针同口径）。
+describe("Sol 60：verify 探针精确匹配", () => {
+    test("stdout ‘NOT Y’ exit 0 → unknown；精确 ‘Y’ → running", async () => {
+        const remote = fakeRemote();
+        let probe: { stdout: string; exitCode: number } | null = null;
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("g=$(cat ") && cmd.includes("kill -0") && probe) return probe;
+            if (/^cat \S+\.code/.test(cmd)) return { stdout: "", exitCode: 0 }; // .code 恒缺席
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("sleep 60");
+        probe = { stdout: "NOT Y", exitCode: 0 };
+        expect((await m.verify(h.sessionId)).status).toBe("unknown"); // 修前：running
+        probe = { stdout: "Y\n", exitCode: 0 };
+        expect((await m.verify(h.sessionId)).status).toBe("running");
+    }, 15_000);
+});

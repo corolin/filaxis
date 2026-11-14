@@ -305,7 +305,11 @@ class LineSplitter {
                     onLine(cutL + TRUNC_SUFFIX);
                 }
             } else {
-                const clean = (bufHere + seg).replace(/\r$/, "");
+                // 不再二次剥 CR（Sol 60 P2-6）：seg 已剥 CRLF 的 \r（segRaw 尾 \r），
+                // 此处 bufHere+seg 若仍以 \r 收尾只可能是「正文 CR+CRLF」叠字符
+                //（abc\r\r\n → seg="abc\r"）——再剥会把正文 CR 吃掉（实测 abc\r\r\n
+                // 曾得 "abc"）。跨块 CRLF 的 \r 已由 bufHere 的收紧规则处理
+                const clean = bufHere + seg;
                 if (clean !== "") onLine(clean);
             }
             this.buf = "";

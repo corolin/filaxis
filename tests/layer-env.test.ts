@@ -2,7 +2,7 @@
  * 层环境规格单测（AC-17：解析纯函数/身份键/漂移/匹配/持久化）
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, renameSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, renameSync, utimesSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -218,6 +218,85 @@ describe("Sol 59：跨实例并发提交不丢更新（link-CAS 舞步）", () =
             writeFileSync(p, JSON.stringify({ layers: { fresh: entry({ os: "fresh" }) } }));
             const cfg2 = await new LayerEnvStore(p).load(true);
             expect(Object.keys(cfg2.layers).sort()).toEqual(["fresh", "live"]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 六十期：link-CAS 协议三洞——P1 陈锁穿透后「data 恒胜」在同键冲突选错
+// 赢家（旁路里 B 的新值 mtime 更晚却被 A 的陈值压住）；P2-2 舞步不移开自己造的
+// 旁路（整档替换已删的层被恢复协议复活）；P2-3 老化旁路只删不写（恢复条目读
+// 一次即蒸发）。
+describe("Sol 60：link-CAS 协议收口", () => {
+    const mk = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("P1 同键穿透：A 复核后暂停→B 改同键→A 恢复——B 新值胜出、A 得 stale", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env60-"));
+        try {
+            const p = join(dir, "env.json");
+            const a = new LayerEnvStore(p);
+            const b = new LayerEnvStore(p);
+            const relA = await (a as unknown as { acquireLock: () => Promise<{ verifyHeld(): Promise<boolean>; finalize(): Promise<void> }> }).acquireLock();
+            const cfgA = await a.load();
+            cfgA.layers.k = mk("old");
+            let aErr: unknown = null;
+            try {
+                await (a as unknown as { saveLocked: (cfg: LayerEnvConfigFile, v?: () => Promise<boolean>) => Promise<void> })
+                    .saveLocked(cfgA, async () => {
+                        const held = await relA.verifyHeld();
+                        await new Promise((r) => setTimeout(r, 5_300)); // 暂停过陈锁阈
+                        await b.upsert("k", mk("new")); // B 回收接管——同键改新值
+                        return held;
+                    });
+            } catch (e) { aErr = e; }
+            expect(aErr).toBeInstanceOf(Error); // 落位后复核拦下（修前：落位成功=B 被盖）
+            // A 走正门重试：mtime 升序合并（旁路 B-new mtime 晚于 data A-old）→ B 新值在场
+            // → 指纹不符 → stale:true（修前：data 恒胜吞掉 B 新值 → stale:false 且盘上 old）
+            const retry = await a.upsert("k", mk("old"));
+            expect(retry).toEqual({ stale: true });
+            await relA.finalize();
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（B 的已提交新值被覆盖）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("P2-2 整档替换的删除语义：save({}) 后已删层不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env60b-"));
+        try {
+            const p = join(dir, "env.json");
+            const s = new LayerEnvStore(p);
+            await s.save({ layers: { alpha: mk("alpha") } });
+            await s.save({ layers: {} }); // 整档替换=显式清空
+            const cfg = await new LayerEnvStore(p).load(); // 修前：移开旁路并入 → alpha 复活
+            expect(Object.keys(cfg.layers)).toEqual([]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2-3 老化旁路先压实后清：恢复条目持久化（读一次不蒸发）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env60c-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { current: mk("current") } }));
+            const aside = `${p}.777-aged.fx-old`;
+            writeFileSync(aside, JSON.stringify({ layers: { onlyAside: mk("onlyAside") } }));
+            const old = new Date(Date.now() - 11 * 60_000);
+            utimesSync(aside, old, old); // 超过 10min 压实阈值
+            const cfg1 = await new LayerEnvStore(p).load();
+            expect(Object.keys(cfg1.layers).sort()).toEqual(["current", "onlyAside"]);
+            // 修前：只删不写——第二次读 onlyAside 蒸发。修后：压实已持久（data 含并入态+旁路清除）
+            const cfg2 = await new LayerEnvStore(p).load();
+            expect(Object.keys(cfg2.layers).sort()).toEqual(["current", "onlyAside"]);
+            expect(existsSync(aside)).toBe(false); // 旁路已清（内容在 data 里）
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

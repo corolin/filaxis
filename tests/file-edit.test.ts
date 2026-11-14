@@ -421,3 +421,28 @@ describe("Sol 59：长文件名编辑落位原路径", () => {
         rmSync(d, { recursive: true, force: true });
     }, 30_000);
 });
+
+// GPT Sol 六十期 P2-4：长文件名缩短基底的 hash 曾取随机——同一 240 字符文件的
+// 两次编辑各持各的 .fx-lock，flock 对同目标的核验/写回互斥失效。确定性摘要
+//（sha256(name) 前 8）= 同目标必同锁。
+describe("Sol 60：长文件名同锁", () => {
+    test("同一 240 字符文件两次编辑——fx-lock 路径一致", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-lock60-")).replace(/\\/g, "/");
+        const name = "K".repeat(240) + ".env";
+        const p = `${d}/${name}`;
+        writeFileSync(p, "OLD=1\n");
+        const realExec = drv.exec.bind(drv);
+        const lockPaths = new Set<string>();
+        (drv as unknown as { exec: unknown }).exec = async (cmd: string, o?: unknown) => {
+            const m = String(cmd).match(/9>(\S+)/); // 舞步命令的 fd 9 锁重定向
+            if (m) lockPaths.add(m[1]!);
+            return await realExec(cmd, o as never);
+        };
+        await editFile(drv, p, "OLD=1", "NEW=2");
+        await editFile(drv, p, "NEW=2", "NEW=3");
+        expect(lockPaths.size).toBe(1); // 修前：随机 hash → 两个不同锁路径
+        expect(readFileSync(p, "utf-8")).toBe("NEW=3\n");
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});

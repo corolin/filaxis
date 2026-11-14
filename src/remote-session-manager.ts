@@ -338,7 +338,9 @@ export class RemoteSessionManager {
                 `else kill -0 ${e.pid} 2>/dev/null && echo Y || echo N; fi`,
             );
             if (alive.exitCode !== 0) return { status: "unknown" }; // 探测命令失败不判 running（Sol 57 P1-2）
-            return alive.stdout.includes("Y") ? { status: "running" } : { status: "unknown" }; // 死了但无 .code=死因不明
+            // 精确单标记（Sol 60 P2-5）：includes("Y") 曾把 "NOT Y" 等非标准输出判
+            // running——与 poll 探针（Sol 59 P1-2）同口径，trim 后恰为 "Y" 才判活
+            return (alive.stdout || "").trim() === "Y" ? { status: "running" } : { status: "unknown" }; // 死了但无 .code=死因不明
         } catch {
             return { status: "unknown" };
         }
