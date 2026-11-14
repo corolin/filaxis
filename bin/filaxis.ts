@@ -67,7 +67,12 @@ function parseOpts(argv: string[]): {
         if (noMoreOpts) { o.positional.push(a); continue; }
         if (a === "--") { noMoreOpts = true; continue; } // 命令分隔符：终止选项解析
         switch (a) {
-            case "--host": o.host = argv[++i]; break;
+            case "--host": {
+                const v = argv[++i];
+                if (!v) throw new Error("--host 需要目标（user@host 形态）");
+                o.host = v;
+                break;
+            }
             case "--user": o.user = argv[++i]; break;
             case "--port": o.port = numArg(argv, i); i++; break;
             case "--key": o.key = argv[++i]; break;
@@ -81,7 +86,12 @@ function parseOpts(argv: string[]): {
             case "--forward": o.forward.push(argv[++i]!); break;
             case "--host-key": o.hostKey = argv[++i]; break;
             case "--known-hosts": o.knownHosts = argv[++i]; break;
-            case "--layer": o.layer = argv[++i]; break;
+            case "--layer": {
+                const v = argv[++i];
+                if (!v) throw new Error(`--layer 需要层名（收到缺失——曾静默落本机执行）`); // Sol 57 P1-1
+                o.layer = v;
+                break;
+            }
             case "--timeout": o.timeout = numArg(argv, i, { positive: true }); i++; break; // 正数（Hydrogen R9 #4：0/负数曾静默禁用或立即杀）
             case "--duration": o.duration = numArg(argv, i, { positive: true }); i++; break;
             case "--stream": o.stream = argv[++i]; break;
@@ -384,7 +394,15 @@ async function main() {
                 }
                 const filtered = (o.stream && o.stream !== "both") ? lines.filter((l) => l.stream === o.stream) : lines;
                 for (const l of filtered) console.log(`[${l.stream}] ${l.text}`);
-                await drv.stopSession(h.sessionId).catch(() => undefined);
+                const stopR = await drv.stopSession(h.sessionId).catch(() => undefined);
+                // stop unknown 接核实（Sol 57 P2-7 同 toolkit——吞掉改带终态警示）
+                if (stopR && stopR.status === "unknown") {
+                    let vStatus = "unknown";
+                    try { vStatus = (await drv.verifySession(h.sessionId)).status; } catch { /* 核实失败保 unknown */ }
+                    if (vStatus === "running") {
+                        console.error(`[filaxis] 停止结果未知且核实显示**任务仍在运行**——会话 ${h.sessionId} 日志 ${h.logBase}，勿盲目重试`);
+                    }
+                }
                 break;
             }
             case "batch": {

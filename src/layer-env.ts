@@ -319,11 +319,16 @@ export class LayerEnvStore {
                         return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
                     }
                     cfg.layers[key] = entry;
+                    await this.saveLocked(cfg);
+                    // 写后复核（Sol 57 P2-1）：verify→write 间隙锁被回收+新 holder 写入
+                    // 后，旧 holder 的写曾覆盖新数据（beta 被 alpha 盖）。写后 verify 失败
+                    // 即整轮重试：重新拿锁+**重读盘上最新**（新 holder 的 key 保留）+
+                    // 重合并自己 key——最终态两方 key 都在，后写 key 后赢（单 key 冲突
+                    // = last-writer-wins 可接受）
                     if (await release.verifyHeld()) {
-                        await this.saveLocked(cfg);
                         return { stale: false } as const;
                     }
-                    // 锁被回收——本轮放弃，loop 重新拿锁重读（新 holder 的写入不丢）
+                    // 锁被回收——本轮放弃，loop 重新拿锁重读（新 holder 的写入经重读保留）
                 } finally {
                     await release.finalize();
                 }

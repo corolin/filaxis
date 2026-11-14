@@ -252,14 +252,27 @@ class LineSplitter {
                 // 不计（`abcdefghijkl\r`+`\n` 分块曾 13>12 截断）；字节口径（P2-G）
                 const bufBody = this.buf.endsWith("\r") ? this.buf.slice(0, -1) : this.buf;
                 const dataBody = data.endsWith("\r") ? data.slice(0, -1) : data;
+                // 判长/封顶解耦（Sol 57 P2-3/4）：判长用 body（CRLF 乐观不计）；
+                // 封顶切**原文**（buf+data raw）——正文 CR 不丢；后缀放不进硬切（同 push）
                 if (Buffer.byteLength(bufBody + dataBody, "utf-8") > this.maxBytes) {
-                    const keep = Math.max(0, this.maxBytes - TRUNC_SUFFIX.length); // 负索引防护
-                    let cut = (bufBody + dataBody).slice(0, keep);
-                    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1); // 孤立高代理剥除（同 push）
-                    this.buf = cut + TRUNC_SUFFIX;
+                    const suffixBytes = Buffer.byteLength(TRUNC_SUFFIX, "utf-8");
+                    const raw = this.buf + data;
+                    if (this.maxBytes < suffixBytes) {
+                        // 后缀放不进：硬切原文到上限字节（Sol 57 P2-4——不再「只剩标记」）
+                        let hard = raw.slice(0, this.maxBytes);
+                        while (Buffer.byteLength(hard, "utf-8") > this.maxBytes && hard.length > 0) hard = hard.slice(0, -1);
+                        if (/[\uD800-\uDBFF]$/.test(hard)) hard = hard.slice(0, -1);
+                        this.buf = hard;
+                    } else {
+                        const keepBytes = this.maxBytes - suffixBytes;
+                        let cut = raw.slice(0, keepBytes); // 原文切（CR 计 1 字节内容——Sol 57 P2-3）
+                        while (Buffer.byteLength(cut, "utf-8") > keepBytes && cut.length > 0) cut = cut.slice(0, -1);
+                        if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+                        this.buf = cut + TRUNC_SUFFIX;
+                    }
                     this.capped = true;
                 } else {
-                    this.buf += data; // CR 保留在 buf（成行时剥）——长度判定用 body
+                    this.buf += data; // CR 保留（成行时按 CRLF/内容分治）
                 }
                 return; // 尾段已并入 buf，等下一个 chunk
             }

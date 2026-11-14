@@ -337,6 +337,7 @@ export class RemoteSessionManager {
                 `if [ -n "$g" ] && [ "$g" = "${e.pid}" ]; then /bin/kill -0 -- "-$g" 2>/dev/null && echo Y || echo N; ` +
                 `else kill -0 ${e.pid} 2>/dev/null && echo Y || echo N; fi`,
             );
+            if (alive.exitCode !== 0) return { status: "unknown" }; // 探测命令失败不判 running（Sol 57 P1-2）
             return alive.stdout.includes("Y") ? { status: "running" } : { status: "unknown" }; // 死了但无 .code=死因不明
         } catch {
             return { status: "unknown" };

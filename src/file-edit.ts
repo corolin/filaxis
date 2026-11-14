@@ -199,10 +199,13 @@ async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRea
         const h = Math.random().toString(16).slice(2, 10);
         return dir + name.slice(0, Math.max(1, 255 - 32)) + "~" + h;
     })();
-    const qp = q(fxBase);
+    // 读原文件用**原路径**（Sol 57 P2-5）：fxBase 是缩短名——曾拿缩短路径去读/戳
+    // 原文件（240 字符合法文件名报不存在）。fxBase 只服务 .fx-tmp/.fx-lock 同目录
+    // 伴生文件的 NAME_MAX 安全
+    const qpRead = q(path);
     const readCmd =
-        `${statCmdOf(qp)}; ${shaCmdOf(qp)}; echo __FXS__; ` +
-        `printf ZmlsYXhpcw== | base64 -d 2>/dev/null; echo __FXD__; base64 < ${qp} 2>/dev/null`;
+        `${statCmdOf(qpRead)}; ${shaCmdOf(qpRead)}; echo __FXS__; ` +
+        `printf ZmlsYXhpcw== | base64 -d 2>/dev/null; echo __FXD__; base64 < ${qpRead} 2>/dev/null`;
     const r = await drv.exec(readCmd, { timeoutMs: 30_000 });
     const [stampPart, restPart] = (r.stdout || "").split("__FXS__");
     const originStampRaw = (stampPart ?? "").trim();
@@ -230,7 +233,8 @@ async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRea
             `目标文件含非 UTF-8 字节（受控编辑契约=仅 UTF-8 文本；GBK/Latin-1/二进制文件的 toString("utf-8") 会产生不可逆 U+FFFD，静默写回=永久损坏未触碰区域）: ${path}`,
         );
     }
-    return { qp, statStamp, shaStamp, dec, origin, content0 };
+    const qp = q(fxBase); // tmp/lock 伴生文件锚（NAME_MAX 安全形态）
+    return { qp, statStamp, shaStamp, dec, origin, content0 }; // qp=fxBase 引用（tmp/lock 用）；读原文件已改走 qpRead（Sol 57 P2-5）
 }
 
 /** CAS 原子写回（戳比对 + tmp 写 + mv + 新戳回执——远端一条命令原子完成） */

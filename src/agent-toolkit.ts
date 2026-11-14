@@ -508,8 +508,22 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const stopR = await drv.stopSession(h.sessionId).catch(() => undefined);
                 // 快照语义：停止结果不进返回承诺，但终态确定即清归属（顺线扫——
                 // 未清会让后续 stop_and_verify 落到初始层白跑）；unknown 保留归属可核实
-                if (stopR && stopR.status !== "unknown") sessionOwner.delete(h.sessionId);
-                return { session_id: h.sessionId, lines: filtered };
+                let terminal: { stop_status: string; verify_status?: string } | undefined;
+                if (stopR && stopR.status !== "unknown") {
+                    sessionOwner.delete(h.sessionId);
+                } else if (stopR) {
+                    // stop unknown 静默吞改核实（Sol 57 P2-7）：unknown 时任务可能仍在
+                    // 跑——接 verifySession 实测并把终态信息带进结果（调用方可分支）
+                    terminal = { stop_status: "unknown" };
+                    try {
+                        const v = await drv.verifySession(h.sessionId);
+                        terminal.verify_status = v.status;
+                        // 只在**确证 exited** 才清归属（Sol 57 修正：verify unknown/
+                        // running 时归属保留——stop_and_verify 仍按归属层核实）
+                        if (v.status === "exited") sessionOwner.delete(h.sessionId);
+                    } catch { terminal.verify_status = "unknown"; }
+                }
+                return { session_id: h.sessionId, lines: filtered, ...(terminal ?? {}) };
             },
             // ── 层族（第十季命名层注册表）──
             async push_ssh({ host, port, user, key, jump, name }) {
