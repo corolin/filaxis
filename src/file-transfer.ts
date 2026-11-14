@@ -195,7 +195,16 @@ export async function getFile(
     const v = await verify(exec, dialect, remotePath, content.length, localSha);
     if (!v.verified) throw new TransferVerificationError("get", v.detail);
     // 本地临时 + rename 原子落位（写中途失败/磁盘满不留半截；并发本地写互不干扰）
-    const localTmp = `${localPath}.filaxis-get-${randomBytes(6).toString("hex")}`;
+    // 本地临时名 NAME_MAX 安全（Sol 58 P2-5）：240 字符目标名+后缀曾超 255B——
+    // 创建失败下载不落盘。超限时截 basename 前段+短 hash 保唯一
+    const localTmp = (() => {
+        const suffix = `.filaxis-get-${randomBytes(6).toString("hex")}`;
+        const sep = Math.max(localPath.lastIndexOf("/"), localPath.lastIndexOf("\\"));
+        const dir = sep >= 0 ? localPath.slice(0, sep + 1) : "";
+        const name = sep >= 0 ? localPath.slice(sep + 1) : localPath;
+        if (name.length + suffix.length <= 255) return localPath + suffix;
+        return dir + name.slice(0, 255 - suffix.length - 9) + "~" + randomBytes(4).toString("hex") + suffix;
+    })();
     try {
         await fs.writeFile(localTmp, content);
         await fs.rename(localTmp, localPath);

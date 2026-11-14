@@ -69,7 +69,7 @@ describe("LocalSessionManager", () => {
         await waitFor(() => events.some((e) => e.type === "exit"));
         const entry = m.list().find((s) => s.sessionId === h.sessionId);
         expect(entry?.running).toBe(false);
-    });
+    }, 20_000); // stop 核实窗（TERM→查→KILL→查）+ Windows Defender 扫描可超 bun 默认 5s（Sol 57/58 双轮环境 flake）
 
     test("tailLines：行对象按到达序混合双流", async () => {
         const m = new LocalSessionManager();

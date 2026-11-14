@@ -234,7 +234,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
         const cd = opts?.cwd ? `cd ${q(opts.cwd)} || exit 1; ` : "";
         // env 内联前缀（十轮 envPrefixOf 同款；execSession 的 env 此前被静默忽略——
         // nohup 后台跑无 send-keys 回显污染问题，支持优于静默丢弃）
-        const envPrefix = opts?.env
+        const envPrefix = opts?.env && Object.keys(opts.env).length > 0
             ? Object.entries(opts.env).map(([k, v]) => {
                 if (!ENV_NAME_RE.test(k)) throw new Error(`非法环境变量名（会话启动拒绝）: ${k}`);
                 return `export ${k}=${q(v)}`; // export 形态（Sol 55 P2-D 同 remote）

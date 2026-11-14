@@ -100,7 +100,7 @@ export class RemoteSessionManager {
         const cd = opts.cwd ? `cd ${q(opts.cwd)} || exit 1; ` : "";
         // 环境经临时赋值前缀注入（VAR='V' cmd 形态——nohup 及其子进程继承）；
         // 变量名校验（自排查 R2，对齐十轮 ENV_NAME_RE 标准——防拼接注入）
-        const envPrefix = opts.env
+        const envPrefix = opts.env && Object.keys(opts.env).length > 0
             ? Object.entries(opts.env).map(([k, v]) => {
                 if (!ENV_NAME_RE.test(k)) throw new Error(`非法环境变量名（会话启动拒绝）: ${k}`);
                 return `export ${k}=${q(v)}`; // export 形态（Sol 55 P2-D）：裸赋值前缀 VAR=v cmd 只作用 cmd——子 shell 后续命令丢变量
@@ -250,7 +250,7 @@ export class RemoteSessionManager {
             // 先查 .code（审计 H3）：轮询间隙已自然退出的进程——直接采纳真实退出码
             // finalize（exited），绝不向可能已被系统复用的 PID 盲发 kill（误杀无辜进程）
             const code = await this.exec(`cat ${q(e.base)}.code 2>/dev/null || true`);
-            const codeStr = (code.stdout || "").trim();
+            const codeStr = code.exitCode === 0 ? (code.stdout || "").trim() : ""; // 命令失败不采信输出（Sol 57/58 P1-2）
             if (codeStr !== "" && /^\d+$/.test(codeStr)) {
                 await this.flushTail(e); // 终态冲刷（二十三期 #2——尾行喂 watcher）
                 this.finalize(e, parseInt(codeStr, 10));
@@ -320,7 +320,7 @@ export class RemoteSessionManager {
         if (e.pid == null) return { status: "unknown" };
         try {
             const code = await this.exec(`cat ${q(e.base)}.code 2>/dev/null || true`);
-            const codeStr = (code.stdout || "").trim();
+            const codeStr = code.exitCode === 0 ? (code.stdout || "").trim() : ""; // 命令失败不采信输出（Sol 57/58 P1-2）
             if (codeStr !== "" && /^\d+$/.test(codeStr)) {
                 await this.flushTail(e); // 终态冲刷（二十三期 #2——尾行喂 watcher）
                 this.finalize(e, parseInt(codeStr, 10));
@@ -443,7 +443,7 @@ export class RemoteSessionManager {
             });
             // 终态：.code 文件在场 = 进程已退出（nohup 包装的 echo 已落盘）
             const code = await this.exec(`cat ${entry.base}.code 2>/dev/null || true`);
-            const codeStr = (code.stdout || "").trim();
+            const codeStr = code.exitCode === 0 ? (code.stdout || "").trim() : ""; // 命令失败不采信输出（Sol 57/58 P1-2）
             if (codeStr !== "" && /^\d+$/.test(codeStr)) {
                 await this.flushTail(entry); // 终态冲刷：无尾换行的末行也喂 watcher
                 this.finalize(entry, parseInt(codeStr, 10));

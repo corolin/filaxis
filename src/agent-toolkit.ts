@@ -505,7 +505,11 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     await postLaunchFail(drv, h, "观察输出读取失败", err);
                 }
                 const filtered = (stream && stream !== "both") ? lines!.filter((l) => l.stream === stream) : lines!;
-                const stopR = await drv.stopSession(h.sessionId).catch(() => undefined);
+                // 停止通道异常不再吞（Sol 58 P2-6）：catch(() => undefined) 曾把
+                // stopSession 抛错吞成普通快照——归 unknown 路径接 verify 同权处理
+                const stopR = await drv.stopSession(h.sessionId).catch(
+                    (e: unknown) => ({ status: "unknown", stopError: e instanceof Error ? e.message : String(e) }) as { status: "unknown"; stopError?: string },
+                );
                 // 快照语义：停止结果不进返回承诺，但终态确定即清归属（顺线扫——
                 // 未清会让后续 stop_and_verify 落到初始层白跑）；unknown 保留归属可核实
                 let terminal: { stop_status: string; verify_status?: string } | undefined;

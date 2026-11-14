@@ -304,8 +304,8 @@ async function casWrite(
     const cmd =
         `( if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
         `else echo FX_DEGRADED_NO_LOCK; fi; ` +
-        `if [ "$(${statCmdOf(sr.qp)})" = "${sr.statStamp}" ] && ` +
-        `[ "$(${shaCmdOf(sr.qp)})" = "${sr.shaStamp}" ]; then ` +
+        `if [ "$(${statCmdOf(q(path))})" = "${sr.statStamp}" ] && ` + // 核验走**原路径**（Sol 58 P2-4——fxBase 缩短名曾致 CAS 假冲突）
+        `[ "$(${shaCmdOf(q(path))})" = "${sr.shaStamp}" ]; then ` +
         `printf %s ${q(newB64)} | ${sr.dec} > ${sr.qp}.fx-tmp && { ${tgtSetup}${place}; }; ` +
         `else echo FX_CAS_FAIL; fi ) 9>${sr.qp}.fx-lock`;
     const cas = await drv.exec(cmd, { timeoutMs: 30_000 });

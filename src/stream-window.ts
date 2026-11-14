@@ -281,10 +281,21 @@ class LineSplitter {
             const seg = segRaw.endsWith("\r") ? segRaw.slice(0, -1) : segRaw; // CR 剥后再判长（同上）
             const bufHere = (this.buf.endsWith("\r") && data[0] === "\n") ? this.buf.slice(0, -1) : this.buf; // 跨块 CRLF 收紧（Sol 56 P2-3）：buf 尾 \r 仅在 data 以 \n 开头才是 CRLF——正文 CR（abc\rXYZ\n）是内容
             if (Buffer.byteLength(bufHere + seg, "utf-8") > this.maxBytes) { // 字节口径（P2-G）
-                const keep = Math.max(0, this.maxBytes - TRUNC_SUFFIX.length);
-                let cutL = (bufHere + seg).slice(0, keep);
-                if (/[\uD800-\uDBFF]$/.test(cutL)) cutL = cutL.slice(0, -1);
-                onLine(cutL + TRUNC_SUFFIX);
+                // 与 push/tail 同款截断规则（Sol 58 P2-3）：后缀放不进硬切到上限字节
+                // ——曾用码元 keep 产「…[truncate」形态（同输入分块方式曾变结果）
+                const suffixBytes = Buffer.byteLength(TRUNC_SUFFIX, "utf-8");
+                if (this.maxBytes < suffixBytes) {
+                    let hard = (bufHere + seg).slice(0, this.maxBytes);
+                    while (Buffer.byteLength(hard, "utf-8") > this.maxBytes && hard.length > 0) hard = hard.slice(0, -1);
+                    if (/[\uD800-\uDBFF]$/.test(hard)) hard = hard.slice(0, -1);
+                    onLine(hard);
+                } else {
+                    const keepBytes = this.maxBytes - suffixBytes;
+                    let cutL = (bufHere + seg).slice(0, keepBytes);
+                    while (Buffer.byteLength(cutL, "utf-8") > keepBytes && cutL.length > 0) cutL = cutL.slice(0, -1);
+                    if (/[\uD800-\uDBFF]$/.test(cutL)) cutL = cutL.slice(0, -1);
+                    onLine(cutL + TRUNC_SUFFIX);
+                }
             } else {
                 const clean = (bufHere + seg).replace(/\r$/, "");
                 if (clean !== "") onLine(clean);

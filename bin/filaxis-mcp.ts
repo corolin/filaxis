@@ -25,7 +25,12 @@ const o: {
 for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     switch (a) {
-        case "--host": o.host = argv[++i]; break;
+        case "--host": {
+            const v = argv[++i];
+            if (!v) { console.error("filaxis-mcp: --host 需要目标（user@host）——缺值曾静默落本机"); process.exit(2); }
+            o.host = v;
+            break;
+        }
         case "--port": o.port = parseInt(argv[++i]!, 10); break;
         case "--user": o.user = argv[++i]; break;
         case "--key": o.key = argv[++i]; break;

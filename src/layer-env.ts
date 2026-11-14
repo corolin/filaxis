@@ -241,12 +241,22 @@ export class LayerEnvStore {
         }
     }
 
-    /** 无锁写（调用方持锁）：tmp+rename 原子落位
-     *  tmp 带进程 nonce（Hydrogen R2 #7）：固定名跨进程踩踏/rename ENOENT */
-    private async saveLocked(cfg: LayerEnvConfigFile): Promise<void> {
+    /** 无锁写（调用方持锁）：tmp+rename 原子落位。
+     *  rename 前锁属复核（Sol 58 P2-1）：写前复核后→写入期间锁被回收+新 holder
+     *  写入→旧 holder rename 覆盖新数据（retry 重读时新数据已被盖）。复核内联到
+     *  rename 紧前——窗口从「整个写入」收窄到 check→rename 的 syscall 间隙；复核
+     *  失败抛哨兵（rename 未发生，盘上新 holder 数据完好），上层重试重读合并 */
+    private async saveLocked(
+        cfg: LayerEnvConfigFile,
+        verifyHeld?: () => Promise<boolean>,
+    ): Promise<void> {
         await mkdir(dirname(this.path), { recursive: true });
         const tmp = `${this.path}.${process.pid}-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 6)}.tmp`;
         await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
+        if (verifyHeld && !(await verifyHeld())) {
+            await (await import("node:fs/promises")).unlink(tmp).catch(() => undefined);
+            throw new Error("__FX_LOCK_LOST__"); // 哨兵：rename 未发生
+        }
         await rename(tmp, this.path);
         this.cache = null; // 失效缓存（下次 load 重 stat）
     }
@@ -319,16 +329,15 @@ export class LayerEnvStore {
                         return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
                     }
                     cfg.layers[key] = entry;
-                    await this.saveLocked(cfg);
-                    // 写后复核（Sol 57 P2-1）：verify→write 间隙锁被回收+新 holder 写入
-                    // 后，旧 holder 的写曾覆盖新数据（beta 被 alpha 盖）。写后 verify 失败
-                    // 即整轮重试：重新拿锁+**重读盘上最新**（新 holder 的 key 保留）+
-                    // 重合并自己 key——最终态两方 key 都在，后写 key 后赢（单 key 冲突
-                    // = last-writer-wins 可接受）
-                    if (await release.verifyHeld()) {
+                    try {
+                        // rename 紧前复核（Sol 58 P2-1）：失败时 rename 未发生，盘上
+                        // 新 holder 数据完好——本轮放弃，loop 重新拿锁+重读+重合并
+                        await this.saveLocked(cfg, () => release.verifyHeld());
                         return { stale: false } as const;
+                    } catch (e) {
+                        if (e instanceof Error && e.message === "__FX_LOCK_LOST__") continue; // 重试
+                        throw e;
                     }
-                    // 锁被回收——本轮放弃，loop 重新拿锁重读（新 holder 的写入经重读保留）
                 } finally {
                     await release.finalize();
                 }

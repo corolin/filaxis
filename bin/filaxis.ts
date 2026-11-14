@@ -394,7 +394,7 @@ async function main() {
                 }
                 const filtered = (o.stream && o.stream !== "both") ? lines.filter((l) => l.stream === o.stream) : lines;
                 for (const l of filtered) console.log(`[${l.stream}] ${l.text}`);
-                const stopR = await drv.stopSession(h.sessionId).catch(() => undefined);
+                const stopR = await drv.stopSession(h.sessionId).catch(() => ({ status: "unknown" }) as { status: "unknown" }); // 异常归 unknown（Sol 58 P2-6）
                 // stop unknown 接核实（Sol 57 P2-7 同 toolkit——吞掉改带终态警示）
                 if (stopR && stopR.status === "unknown") {
                     let vStatus = "unknown";
