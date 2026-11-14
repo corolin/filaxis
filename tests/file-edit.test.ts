@@ -446,3 +446,35 @@ describe("Sol 60：长文件名同锁", () => {
         rmSync(d, { recursive: true, force: true });
     }, 30_000);
 });
+
+// GPT Sol 六十一期 P1：读往返内戳-正文混版——stat/sha 戳与 base64 正文在同一
+// 命令里先后读取，其间文件被并发换版（戳=A、正文=短暂出现的 B、写回前恢复 A）
+// 时 CAS 戳写回时仍匹配，B 的正文却被当底稿写回。修：正文摘要与同次 sha 戳互核。
+describe("Sol 61：读往返内戳-正文互核", () => {
+    test("sha 戳与 base64 正文来自不同版本 → EditConflictError（B 正文不落盘）", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-mix61-")).replace(/\\/g, "/");
+        const p = `${d}/mix.env`;
+        const bFile = `${d}/version-b.env`;
+        writeFileSync(p, "KEEP=A\nMODE=0\n");
+        writeFileSync(bFile, "KEEP=B\nMODE=0\n");
+        const realExec = drv.exec.bind(drv);
+        let injected = false;
+        (drv as unknown as { exec: unknown }).exec = async (cmd: string, o?: unknown) => {
+            if (!injected && cmd.includes("__FXS__")) {
+                injected = true;
+                // 在 sha 戳（__FXS__ 前段）与 base64 正文（__FXD__ 后段）之间插入
+                // 「文件短暂变为 B」——戳=A、正文=B
+                const sabotaged = cmd.replace("echo __FXD__; base64", `echo __FXD__; cat '${bFile}' > '${p}'; base64`);
+                const r = await realExec(sabotaged, o as never);
+                writeFileSync(p, "KEEP=A\nMODE=0\n"); // 恢复原版——写回时 CAS 戳必匹配
+                return r;
+            }
+            return await realExec(cmd, o as never);
+        };
+        // 修前：CAS 匹配（盘上是 A）→ 以 B 的正文为底稿替换 MODE → KEEP=B 落盘
+        await expect(editFile(drv, p, "MODE=0", "MODE=1")).rejects.toMatchObject({ name: "EditConflictError" });
+        expect(readFileSync(p, "utf-8")).toBe("KEEP=A\nMODE=0\n"); // 未被写坏
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});

@@ -302,3 +302,67 @@ describe("Sol 60：link-CAS 协议收口", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 六十一期 P2 三件：历史旁路复活整档删除（舞步只消自己的旁路）；
+// mtime 平局 data 后入压住旁路新值；load 返回缓存别名——upsert 写前改缓存对象、
+// 写失败后同实例读到未落盘条目。
+describe("Sol 61：协议三缝", () => {
+    const mk61 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("P2 历史旁路不复活整档删除（崩溃遗留 .fx-old 随舞步一并消费）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env61a-"));
+        try {
+            const p = join(dir, "env.json");
+            const s = new LayerEnvStore(p);
+            await s.save({ layers: { live: mk61("live") } });
+            // 预置崩溃遗留旁路（非本次舞步产物）
+            writeFileSync(`${p}.999-crash.fx-old`, JSON.stringify({ layers: { retired: mk61("retired") } }));
+            await s.save({ layers: {} }); // 整档替换=显式清空
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(Object.keys(cfg.layers)).toEqual([]); // 修前：retired 经历史旁路复活
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2 mtime 平局旁路胜（旧 data 不再压住新旁路）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env61b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { k: mk61("old") } }));
+            const aside = `${p}.888-tie.fx-old`;
+            writeFileSync(aside, JSON.stringify({ layers: { k: mk61("new") } }));
+            const t = new Date(Date.now() - 60_000); // 同一时刻（新鲜——不触压实）
+            utimesSync(p, t, t);
+            utimesSync(aside, t, t);
+            const cfg = await new LayerEnvStore(p).load();
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（data 平局压住）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2 写失败不污染同实例缓存（load 不再外泄缓存别名）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env61c-"));
+        try {
+            const p = join(dir, "env.json");
+            const s = new LayerEnvStore(p);
+            await s.upsert("real", mk61("real")); // 落盘 + 预热缓存
+            // 注入写失败：upsert 在 load 后已改 cfg.layers——别名泄漏曾把 ghost
+            // 塞进缓存对象，写失败后同实例仍读到
+            (s as unknown as { saveLocked: unknown }).saveLocked = async () => { throw new Error("disk full"); };
+            await expect(s.upsert("ghost", mk61("ghost"))).rejects.toThrow(/disk full/);
+            const same = await s.load(); // 同实例——修前：ghost 在缓存里
+            expect(Object.keys(same.layers)).toEqual(["real"]);
+            const fresh = await new LayerEnvStore(p).load();
+            expect(Object.keys(fresh.layers)).toEqual(["real"]); // 盘上对照（本就无 ghost）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

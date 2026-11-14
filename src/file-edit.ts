@@ -85,7 +85,11 @@ const statCmdOf = (f: string) => `stat -c '%Y %s' ${f} 2>/dev/null || stat -f '%
  */
 export const shaCmdOf = (f: string) =>
     `{ sha256sum ${f} 2>/dev/null || sha256 -q ${f} 2>/dev/null || ` +
-    `openssl dgst -sha256 ${f} 2>/dev/null | awk '{print $NF}'; } | head -c 12`;
+    // tr 剥 GNU 反斜杠转义标记（Sol 61 P1 排障实锤）：MSYS2/git-bash 下反斜杠
+    // 路径的 sha256sum 输出行以 \ 前缀标记文件名含字面反斜杠（\digest *path）
+    // ——首 12 字节戳曾混入标记字符。读戳/写验两侧同脏自洽从未暴露，戳-正文
+    // 互核第一次真正比对出脏值。tr 剥掉后两种路径形态同口径
+    `openssl dgst -sha256 ${f} 2>/dev/null | awk '{print $NF}'; } | tr -d '\\\\' | head -c 12`;
 
 /** 本地 sha 前 12 位（与 shaCmdOf 远端输出同口径——写后回验比对用） */
 const shaCmdOfContent = (content: string) =>
@@ -234,6 +238,15 @@ async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRea
     if (!Buffer.from(content0, "utf-8").equals(raw)) {
         throw new Error(
             `目标文件含非 UTF-8 字节（受控编辑契约=仅 UTF-8 文本；GBK/Latin-1/二进制文件的 toString("utf-8") 会产生不可逆 U+FFFD，静默写回=永久损坏未触碰区域）: ${path}`,
+        );
+    }
+    // 戳-正文互核（Sol 61 P1）：stat/sha 戳与 base64 正文在同一命令里先后读取
+    // ——其间文件被并发换版（戳=A、正文=短暂出现的 B、写回前恢复 A）时 CAS 戳
+    // 在写回时仍匹配（盘上确实回到 A），却把 B 的正文当底稿写回。正文摘要必须
+    // 与同次取得的 sha 戳一致——不一致=读往返内被换版，拒绝
+    if (shaCmdOfContent(content0) !== shaStamp) {
+        throw new EditConflictError(
+            `读往返内文件被并发改写（同次取得的 stat/sha 戳与 base64 正文来自不同版本——正文摘要 ${shaCmdOfContent(content0)} ≠ 读时戳 ${shaStamp}）: ${path}`,
         );
     }
     const qp = q(fxBase); // tmp/lock 伴生文件锚（NAME_MAX 安全形态）

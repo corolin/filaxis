@@ -254,24 +254,29 @@ export class LayerEnvStore {
         } catch { /* 缺席——旁路承载 */ }
         if (asides.length === 0) {
             if (!hasData) {
-                const cfg: LayerEnvConfigFile = { layers: {} };
-                this.cache = { mtimeMs: 0, cfg };
-                return cfg;
+                this.cache = { mtimeMs: 0, cfg: { layers: {} } };
+                return { layers: {} };
             }
-            if (!force && this.cache?.mtimeMs === mtimeMs) return this.cache.cfg;
+            // 缓存命中也返回副本（Sol 61 P2-4）：缓存对象外泄别名曾被 upsert 的
+            // layers[key]=entry 就地污染——写失败后同实例读到未落盘条目
+            if (!force && this.cache?.mtimeMs === mtimeMs) return { layers: { ...this.cache.cfg.layers } };
         }
         // mtime 升序逐档并入（Sol 60 P1）：陈锁穿透后 data（A 陈值）与旁路（B
         // 新值）同键冲突——「data 恒胜」选错赢家。link/rename 都保 mtime：档位
         // mtime=其 tmp 写入时间=提交新旧的可靠序（正常序旁路旧 data 新——正常
-        // 提交仍胜出；穿透序 B 的 tmp 写于 A 暂停之后——B 胜出）
-        const docs: Array<{ mtimeMs: number; text: string }> = [];
+        // 提交仍胜出；穿透序 B 的 tmp 写于 A 暂停之后——B 胜出）。
+        // 平局旁路胜（Sol 61 P2-3）：mtime 相同时 data 后入曾覆盖旁路新值——
+        // 排序键补 aside 位使 data 在平局时排前（并入序后者覆盖→旁路胜）。
+        // 粗钟/同毫秒平局两难（崩溃于落位后的 data 反被旁路旧值盖）选护已提交
+        // 值——错误侧靠指纹 stale 重探自愈
+        const docs: Array<{ mtimeMs: number; aside: boolean; text: string }> = [];
         for (const a of asides) {
-            try { docs.push({ mtimeMs: a.mtimeMs, text: await readFile(a.p, "utf-8") }); } catch { /* 竞态消失 */ }
+            try { docs.push({ mtimeMs: a.mtimeMs, aside: true, text: await readFile(a.p, "utf-8") }); } catch { /* 竞态消失 */ }
         }
         if (hasData) {
-            try { docs.push({ mtimeMs: mtimeMs, text: await readFile(this.path, "utf-8") }); } catch { /* data 缺席竞态 */ }
+            try { docs.push({ mtimeMs: mtimeMs, aside: false, text: await readFile(this.path, "utf-8") }); } catch { /* data 缺席竞态 */ }
         }
-        docs.sort((x, y) => x.mtimeMs - y.mtimeMs);
+        docs.sort((x, y) => x.mtimeMs - y.mtimeMs || (x.aside ? 1 : 0) - (y.aside ? 1 : 0));
         const cfg: LayerEnvConfigFile = { layers: {} };
         for (const d of docs) {
             try { mergeLayers(cfg, JSON.parse(d.text)); } catch { /* 坏档跳过（原「坏文件不崩」语义放宽为旁路仍并入） */ }
@@ -284,10 +289,10 @@ export class LayerEnvStore {
             try {
                 await this.compact(aged);
             } catch { /* 锁竞争等——留待下次 load */ }
-            return cfg;
+            return { layers: { ...cfg.layers } };
         }
         this.cache = { mtimeMs, cfg };
-        return cfg;
+        return { layers: { ...cfg.layers } };
     }
 
     /** 压实：锁内重读合并态 → 舞步落位（成功即自消其旁路）→ 清 aged。
@@ -304,15 +309,15 @@ export class LayerEnvStore {
         }
     }
 
-    /** 盘面全量读（旁路+data 按 mtime 升序并——load 的纯读核，无缓存/无压实副作用） */
+    /** 盘面全量读（旁路+data 按 mtime 升序并（平局旁路胜）——load 的纯读核，无缓存/无压实副作用） */
     private async readMergedRaw(): Promise<LayerEnvConfigFile> {
         const asides = await this.listAsides();
-        const docs: Array<{ mtimeMs: number; text: string }> = [];
+        const docs: Array<{ mtimeMs: number; aside: boolean; text: string }> = [];
         for (const a of asides) {
-            try { docs.push({ mtimeMs: a.mtimeMs, text: await readFile(a.p, "utf-8") }); } catch { /* 竞态消失 */ }
+            try { docs.push({ mtimeMs: a.mtimeMs, aside: true, text: await readFile(a.p, "utf-8") }); } catch { /* 竞态消失 */ }
         }
-        try { docs.push({ mtimeMs: (await stat(this.path)).mtimeMs, text: await readFile(this.path, "utf-8") }); } catch { /* 缺席 */ }
-        docs.sort((x, y) => x.mtimeMs - y.mtimeMs);
+        try { docs.push({ mtimeMs: (await stat(this.path)).mtimeMs, aside: false, text: await readFile(this.path, "utf-8") }); } catch { /* 缺席 */ }
+        docs.sort((x, y) => x.mtimeMs - y.mtimeMs || (x.aside ? 1 : 0) - (y.aside ? 1 : 0));
         const cfg: LayerEnvConfigFile = { layers: {} };
         for (const d of docs) {
             try { mergeLayers(cfg, JSON.parse(d.text)); } catch { /* 坏档跳过 */ }
@@ -355,6 +360,9 @@ export class LayerEnvStore {
         const uniq = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const tmp = `${this.path}.${uniq}.tmp`;
         const aside = `${this.path}.${uniq}${ASIDE_SUFFIX}`;
+        // 舞步开场旁路快照（Sol 61 P2-2）：成功收尾时一并消费——上轮只消自己的
+        // 旁路，崩溃遗留的历史旁路仍会把整档替换已删的层复活
+        const preAsides = (await this.listAsides()).map((a) => a.p);
         await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
         if (verifyHeld && !(await verifyHeld())) {
             await unlink(tmp).catch(() => undefined);
@@ -384,11 +392,13 @@ export class LayerEnvStore {
         if (verifyHeld && !(await verifyHeld())) {
             throw new Error("__FX_LOCK_LOST__");
         }
-        // 成功收尾：消费自己移开的旁路（Sol 60 P2-2）——保留它会让整档替换已删
-        // 的层在下次 load 复活（恢复协议撤销删除语义）。post-check 通过=本舞步
-        // 持锁期间无他方提交：upsert 的 cfg 基线（锁内 load）⊇ 旁路内容；save
-        // 的整档替换语义本就覆盖删除。中止/崩溃路径不消费——旁路是恢复锚
+        // 成功收尾：消费自己移开的旁路 + 舞步开场在场的历史旁路（Sol 60 P2-2 +
+        // Sol 61 P2-2）——保留它们会让整档替换已删的层经恢复协议复活。post-check
+        // 通过=本舞步持锁期间无他方提交：upsert 的 cfg 基线（锁内 load）⊇ 旁路
+        // 内容；save 的整档替换语义本就覆盖删除。中止/崩溃路径不消费——旁路是
+        // 恢复锚
         await unlink(aside).catch(() => undefined);
+        for (const p of preAsides) await unlink(p).catch(() => undefined);
     }
 
     /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */
