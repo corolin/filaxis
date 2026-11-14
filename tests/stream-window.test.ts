@@ -401,3 +401,27 @@ describe("五十五期：跨块 CRLF + 字节口径", () => {
         expect(t.endsWith("…[truncated]")).toBe(true);
     });
 });
+
+// GPT Sol 五十六期：export 分号分隔（曾吞首命令）/ 正文 CR 不随分块消失 / 后缀超上限硬切。
+describe("五十六期", () => {
+    test("#3 正文 CR 跨块保留（abc<CR> + XYZ<LF> 分块 → abcCRXYZ 不丢 CR）", async () => {
+        const procs: FakeChild[] = [];
+        const reg = new StreamWindowRegistry({
+            shell: BASH,
+            spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+        });
+        const win = await reg.open({ name: "t:cr56", command: "x", maxLineBytes: 64 });
+        procs[0]!.emitOut("abc\r");
+        procs[0]!.emitOut("XYZ\n");
+        await new Promise((r) => setTimeout(r, 30));
+        expect(win.peekLast(5).frames.map((f) => f.text)).toEqual(["abc\rXYZ"]); // 修前 abcXYZ（CR 被剥）
+        reg.dispose();
+    }, 15_000);
+    test("#4 maxLineBytes 12 < 后缀 14B → 硬切 12B 无后缀（不超限）", () => {
+        const w = new StreamWindow("t57", "local", "t", "x", 10, 12);
+        w.push("X".repeat(40));
+        const t = w.peekLast(1).frames[0]!.text;
+        expect(Buffer.byteLength(t, "utf-8")).toBeLessThanOrEqual(12); // 修前 14B（后缀本身超限）
+        expect(t.endsWith("…[truncated]")).toBe(false); // 放不进即放弃后缀
+    });
+});

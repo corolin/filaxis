@@ -238,7 +238,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
             ? Object.entries(opts.env).map(([k, v]) => {
                 if (!ENV_NAME_RE.test(k)) throw new Error(`非法环境变量名（会话启动拒绝）: ${k}`);
                 return `export ${k}=${q(v)}`; // export 形态（Sol 55 P2-D 同 remote）
-            }).join(" ") + " "
+            }).join("; ") + "; " // 分号分隔（Sol 56 P2-1）：曾空格连接 export K=v cmd——export 吞 cmd 当变量名参数
             : "";
         // 子 shell + 上下换行（孪生对齐审计·二十期 #2 + M4 在 remote/local 修后 tmux
         // execSession 才出生、带病出厂）：大括号形态下业务命令显式 `exit 7` 退出**整个

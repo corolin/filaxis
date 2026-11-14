@@ -100,16 +100,22 @@ export class StreamWindow {
         // 字节口径（Sol 55 P2-G）：UTF-16 码元曾当字节——10 个「中」20 码元
         // 过 13 上限检查却占 30 UTF-8 字节透传。上限名是 LineBytes——按字节判
         if (Buffer.byteLength(line, "utf-8") > this.maxLineBytes) {
-            // keep 下限 0（Hydrogen R2 #5，对齐 session-buffer 同款修复）：
-            // maxLineBytes < 后缀长度时裸减法=负索引，越截越长
-            const keepBytes = Math.max(0, this.maxLineBytes - Buffer.byteLength(TRUNC_SUFFIX, "utf-8"));
-            let cut = line.slice(0, keepBytes); // 码元粗切——下方字节复核回退
-            // 孤立高代理剥除（Sol 54 P2-19：UTF-16 切点落代理对中间——孤立
-            // 高代理编码后 4 字节+占位低代理缺失=乱码；剥 1 码元即可）
-            // 字节复核回退 + 孤立高代理剥除（Sol 54 P2-19 简化合并）
-            while (Buffer.byteLength(cut, "utf-8") > keepBytes && cut.length > 0) cut = cut.slice(0, -1);
-            if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
-            line = cut + TRUNC_SUFFIX;
+            // 上限容不下后缀（Sol 56 P2-4）：maxLineBytes 12 < 后缀 14B 曾输出
+            // 14B 仍超限。后缀放不进即放弃后缀硬切到上限（截断事实保真优于标记）
+            const suffixBytes = Buffer.byteLength(TRUNC_SUFFIX, "utf-8");
+            if (this.maxLineBytes < suffixBytes) {
+                let hard = line.slice(0, this.maxLineBytes);
+                while (Buffer.byteLength(hard, "utf-8") > this.maxLineBytes && hard.length > 0) hard = hard.slice(0, -1);
+                if (/[\uD800-\uDBFF]$/.test(hard)) hard = hard.slice(0, -1);
+                line = hard;
+            } else {
+                const keepBytes = this.maxLineBytes - suffixBytes;
+                let cut = line.slice(0, keepBytes); // 码元粗切——下方字节复核回退
+                // 孤立高代理剥除（Sol 54 P2-19：切点落代理对中间——孤立高代理乱码）
+                while (Buffer.byteLength(cut, "utf-8") > keepBytes && cut.length > 0) cut = cut.slice(0, -1);
+                if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+                line = cut + TRUNC_SUFFIX;
+            }
         }
         const seq = this.nextSeq++;
         this.allocated = seq; // 已分配锚（空窗续编/超前判定用——非缓冲末帧）
@@ -260,7 +266,7 @@ class LineSplitter {
             // 本 chunk 内有换行：当前行 = buf + data 头段；按**当前行长度**判定封顶
             const segRaw = data.slice(0, nl);
             const seg = segRaw.endsWith("\r") ? segRaw.slice(0, -1) : segRaw; // CR 剥后再判长（同上）
-            const bufHere = this.buf.endsWith("\r") ? this.buf.slice(0, -1) : this.buf; // 跨块 CR 同罪
+            const bufHere = (this.buf.endsWith("\r") && data[0] === "\n") ? this.buf.slice(0, -1) : this.buf; // 跨块 CRLF 收紧（Sol 56 P2-3）：buf 尾 \r 仅在 data 以 \n 开头才是 CRLF——正文 CR（abc\rXYZ\n）是内容
             if (Buffer.byteLength(bufHere + seg, "utf-8") > this.maxBytes) { // 字节口径（P2-G）
                 const keep = Math.max(0, this.maxBytes - TRUNC_SUFFIX.length);
                 let cutL = (bufHere + seg).slice(0, keep);

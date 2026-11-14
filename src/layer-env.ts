@@ -237,7 +237,7 @@ export class LayerEnvStore {
         try {
             await this.saveLocked(cfg);
         } finally {
-            await release();
+            await release.finalize();
         }
     }
 
@@ -252,7 +252,7 @@ export class LayerEnvStore {
     }
 
     /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */
-    private async acquireLock(): Promise<() => Promise<void>> {
+    private async acquireLock(): Promise<(() => Promise<void>) & { verifyHeld(): Promise<boolean>; finalize(): Promise<void> }> {
         // mkdir 前置（Sol 55 P2-A）：曾先开锁文件——新目录首写 ENOENT（目录创建
         // 在 saveLocked 的锁内执行不到）
         await mkdir(dirname(this.path), { recursive: true });
@@ -278,14 +278,28 @@ export class LayerEnvStore {
         }
         if (!fh) throw new Error(`LayerEnvStore 写锁超时: ${lock}`);
         const held = fh;
-        return async () => {
-            await held.close().catch(() => undefined);
-            // 只删自己的锁（nonce 比对——陈锁被回收后这里 token 不匹配即放弃）
-            try {
-                const cur = await readFile(lock, "utf-8");
-                if (cur.trim() === myToken) await unlink(lock);
-            } catch { /* 已被回收/删除 */ }
-        };
+        return Object.assign(
+            async () => { await held.close().catch(() => undefined); },
+            {
+                /** 写前复核：锁文件 token 仍是自己的（被陈锁回收即 false） */
+                async verifyHeld(): Promise<boolean> {
+                    try {
+                        const cur = await readFile(lock, "utf-8");
+                        return cur.trim() === myToken;
+                    } catch {
+                        return false;
+                    }
+                },
+                /** 收尾：关句柄 + 只删自己的锁（nonce 比对） */
+                async finalize(): Promise<void> {
+                    await held.close().catch(() => undefined);
+                    try {
+                        const cur = await readFile(lock, "utf-8");
+                        if (cur.trim() === myToken) await unlink(lock);
+                    } catch { /* 已被回收/删除 */ }
+                },
+            },
+        );
     }
 
     /** 写入/更新一层规格；漂移检测：指纹不一致标 stale 不自动覆盖（显式 force 才覆写）。
@@ -293,19 +307,28 @@ export class LayerEnvStore {
      *  两实例并发 upsert 曾各自 load 后 save，后写覆盖前写丢 key。 */
     async upsert(key: string, entry: LayerEnvEntry, force = false): Promise<{ stale: boolean }> {
         const run = this.writeChain.then(async () => {
-            const release = await this.acquireLock();
-            try {
-                const cfg = await this.load();
-                const existing = cfg.layers[key];
-                if (existing && !force && existing.fingerprint !== entry.fingerprint) {
-                    return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+            // 锁属复核重试环（Sol 56 P2-2）：暂停的旧 holder 曾在陈锁回收+新 holder
+            // 写完后恢复——saveLocked 无锁属检查直接覆盖新数据。写前复核锁 token
+            // 仍是自己的；被回收（token 不匹配）则重试整轮（重新拿锁+重读+重合并）
+            for (let round = 0; round < 3; round++) {
+                const release = await this.acquireLock();
+                try {
+                    const cfg = await this.load();
+                    const existing = cfg.layers[key];
+                    if (existing && !force && existing.fingerprint !== entry.fingerprint) {
+                        return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+                    }
+                    cfg.layers[key] = entry;
+                    if (await release.verifyHeld()) {
+                        await this.saveLocked(cfg);
+                        return { stale: false } as const;
+                    }
+                    // 锁被回收——本轮放弃，loop 重新拿锁重读（新 holder 的写入不丢）
+                } finally {
+                    await release.finalize();
                 }
-                cfg.layers[key] = entry;
-                await this.saveLocked(cfg);
-                return { stale: false } as const;
-            } finally {
-                await release();
             }
+            throw new Error(`LayerEnvStore upsert 锁属复核三轮失败（持续被回收）: ${key}`);
         });
         this.writeChain = run.catch(() => undefined); // 失败不堵后续写
         return run;
