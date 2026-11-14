@@ -211,6 +211,24 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     for (const [k, v] of Object.entries(layers)) dst.layers[k] = v;
 }
 
+/** 盘面档位（Sol 62 P2-4 序戳）：rev=文档内嵌 _fx_rev（提交时刻——比 mtime 更
+ *  可靠的新旧序，rename/link 迁移不损），坏档 parsed=null（mergeLayers 自验证跳过） */
+interface FxDoc {
+    mtimeMs: number;
+    aside: boolean;
+    rev: string | null;
+    parsed: unknown;
+}
+
+function makeDoc(mtimeMs: number, aside: boolean, text: string): FxDoc {
+    try {
+        const d = JSON.parse(text) as { _fx_rev?: unknown };
+        return { mtimeMs, aside, rev: typeof d._fx_rev === "string" ? d._fx_rev : null, parsed: d };
+    } catch {
+        return { mtimeMs, aside, rev: null, parsed: null };
+    }
+}
+
 export class LayerEnvStore {
     private cache: { mtimeMs: number; cfg: LayerEnvConfigFile } | null = null;
     /** 写链串行（自挖 S2：load-modify-save 无锁——并发 upsert 后者以旧 cfg 覆盖
@@ -245,42 +263,17 @@ export class LayerEnvStore {
         // 旁路恢复（Sol 59 P2-1 link 舞步）：移开态/中止残留并入读取——data 缺席
         // 时旁路是唯一状态源（崩溃于移开与落位之间）；在场即绕过 mtime 缓存
         //（旁路增删不触 data mtime 变化，缓存键看不见）
-        const asides = await this.listAsides();
-        let mtimeMs = 0;
-        let hasData = false;
-        try {
-            mtimeMs = (await stat(this.path)).mtimeMs;
-            hasData = true;
-        } catch { /* 缺席——旁路承载 */ }
+        const { docs, asides, dataMtimeMs, hasData } = await this.collectDocs();
         if (asides.length === 0) {
             if (!hasData) {
                 this.cache = { mtimeMs: 0, cfg: { layers: {} } };
                 return { layers: {} };
             }
-            // 缓存命中也返回副本（Sol 61 P2-4）：缓存对象外泄别名曾被 upsert 的
-            // layers[key]=entry 就地污染——写失败后同实例读到未落盘条目
-            if (!force && this.cache?.mtimeMs === mtimeMs) return { layers: { ...this.cache.cfg.layers } };
+            if (!force && this.cache?.mtimeMs === dataMtimeMs) return LayerEnvStore.snapshot(this.cache.cfg);
         }
-        // mtime 升序逐档并入（Sol 60 P1）：陈锁穿透后 data（A 陈值）与旁路（B
-        // 新值）同键冲突——「data 恒胜」选错赢家。link/rename 都保 mtime：档位
-        // mtime=其 tmp 写入时间=提交新旧的可靠序（正常序旁路旧 data 新——正常
-        // 提交仍胜出；穿透序 B 的 tmp 写于 A 暂停之后——B 胜出）。
-        // 平局旁路胜（Sol 61 P2-3）：mtime 相同时 data 后入曾覆盖旁路新值——
-        // 排序键补 aside 位使 data 在平局时排前（并入序后者覆盖→旁路胜）。
-        // 粗钟/同毫秒平局两难（崩溃于落位后的 data 反被旁路旧值盖）选护已提交
-        // 值——错误侧靠指纹 stale 重探自愈
-        const docs: Array<{ mtimeMs: number; aside: boolean; text: string }> = [];
-        for (const a of asides) {
-            try { docs.push({ mtimeMs: a.mtimeMs, aside: true, text: await readFile(a.p, "utf-8") }); } catch { /* 竞态消失 */ }
-        }
-        if (hasData) {
-            try { docs.push({ mtimeMs: mtimeMs, aside: false, text: await readFile(this.path, "utf-8") }); } catch { /* data 缺席竞态 */ }
-        }
-        docs.sort((x, y) => x.mtimeMs - y.mtimeMs || (x.aside ? 1 : 0) - (y.aside ? 1 : 0));
+        docs.sort(LayerEnvStore.docOrder);
         const cfg: LayerEnvConfigFile = { layers: {} };
-        for (const d of docs) {
-            try { mergeLayers(cfg, JSON.parse(d.text)); } catch { /* 坏档跳过（原「坏文件不崩」语义放宽为旁路仍并入） */ }
-        }
+        for (const d of docs) mergeLayers(cfg, d.parsed);
         // 老化旁路压实（Sol 60 P2-3）：先持久后清理——只删不写曾使恢复出的条目
         // 读一次即蒸发。锁内重读再写（本快照可能落后他方新提交）。data 缺席时
         // 旁路是唯一状态源不清（等下次成功提交带出 data 再压）
@@ -289,10 +282,67 @@ export class LayerEnvStore {
             try {
                 await this.compact(aged);
             } catch { /* 锁竞争等——留待下次 load */ }
-            return { layers: { ...cfg.layers } };
+            return LayerEnvStore.snapshot(cfg);
         }
-        this.cache = { mtimeMs, cfg };
-        return { layers: { ...cfg.layers } };
+        this.cache = { mtimeMs: dataMtimeMs, cfg };
+        return LayerEnvStore.snapshot(cfg);
+    }
+
+    /** 深副本（Sol 62 P2-1）：浅副本曾漏嵌套——改 environment.os 就地污染缓存
+     *  条目并随后续 upsert 落盘。条目为 JSON 纯数据，structuredClone 深隔离 */
+    private static snapshot(cfg: LayerEnvConfigFile): LayerEnvConfigFile {
+        const layers: Record<string, LayerEnvEntry> = {};
+        for (const [k, v] of Object.entries(cfg.layers)) layers[k] = structuredClone(v);
+        return { layers };
+    }
+
+    /** 档位排序（Sol 60 P1 → Sol 62 P2-4）：内嵌序戳 _fx_rev（提交时刻 ms-pid-nonce）
+     *  优先——真提交新旧的可靠序：穿透序（A 陈 data vs B 新旁路）与崩溃清理前序
+     *  （新 data vs 旧旁路）双解，mtime 同刻平局不再靠猜。无戳（手造/遗老档）
+     *  回落 mtime；双无戳同刻=结构上不可判定，选护已落位提交（data 胜） */
+    private static docOrder(x: FxDoc, y: FxDoc): number {
+        const kx = x.rev ? parseInt(x.rev, 10) : x.mtimeMs;
+        const ky = y.rev ? parseInt(y.rev, 10) : y.mtimeMs;
+        if (kx !== ky) return kx - ky;
+        if (x.rev && y.rev) return x.rev < y.rev ? -1 : x.rev > y.rev ? 1 : 0;
+        if (x.rev) return 1; // 同刻：带戳后入（胜）——新协议档
+        if (y.rev) return -1;
+        return (y.aside ? 1 : 0) - (x.aside ? 1 : 0); // 双无戳同刻：data 后入（胜）
+    }
+
+    /** 档位收集：stat 先于列旁路（Sol 62 P2-3）——stat 失败=现行态在 stat 前已被
+     *  移开→rename 已落地→随后的列旁路必见移开态；stat 成功而读失败=stat 与读
+     *  之间被移开→重列旁路捞回。两个舞步窗口都不再读成空档 */
+    private async collectDocs(): Promise<{
+        docs: FxDoc[];
+        asides: Array<{ p: string; mtimeMs: number }>;
+        dataMtimeMs: number;
+        hasData: boolean;
+    }> {
+        let dataMtimeMs = 0;
+        let hasData = false;
+        try {
+            dataMtimeMs = (await stat(this.path)).mtimeMs;
+            hasData = true;
+        } catch { /* 缺席——旁路承载 */ }
+        const asides = await this.listAsides();
+        const docs: FxDoc[] = [];
+        for (const a of asides) {
+            try { docs.push(makeDoc(a.mtimeMs, true, await readFile(a.p, "utf-8"))); } catch { /* 竞态消失 */ }
+        }
+        if (hasData) {
+            try {
+                docs.push(makeDoc(dataMtimeMs, false, await readFile(this.path, "utf-8")));
+            } catch {
+                // stat 与读之间现行态被移开——重列旁路（rename 先于读失败，必见）
+                const known = new Set(asides.map((x) => x.p));
+                for (const a of await this.listAsides()) {
+                    if (known.has(a.p)) continue;
+                    try { docs.push(makeDoc(a.mtimeMs, true, await readFile(a.p, "utf-8"))); } catch { /* 竞态消失 */ }
+                }
+            }
+        }
+        return { docs, asides, dataMtimeMs, hasData };
     }
 
     /** 压实：锁内重读合并态 → 舞步落位（成功即自消其旁路）→ 清 aged。
@@ -309,19 +359,12 @@ export class LayerEnvStore {
         }
     }
 
-    /** 盘面全量读（旁路+data 按 mtime 升序并（平局旁路胜）——load 的纯读核，无缓存/无压实副作用） */
+    /** 盘面全量读（旁路+data 按序戳/mtime 排序并——load 的纯读核，无缓存/无压实副作用） */
     private async readMergedRaw(): Promise<LayerEnvConfigFile> {
-        const asides = await this.listAsides();
-        const docs: Array<{ mtimeMs: number; aside: boolean; text: string }> = [];
-        for (const a of asides) {
-            try { docs.push({ mtimeMs: a.mtimeMs, aside: true, text: await readFile(a.p, "utf-8") }); } catch { /* 竞态消失 */ }
-        }
-        try { docs.push({ mtimeMs: (await stat(this.path)).mtimeMs, aside: false, text: await readFile(this.path, "utf-8") }); } catch { /* 缺席 */ }
-        docs.sort((x, y) => x.mtimeMs - y.mtimeMs || (x.aside ? 1 : 0) - (y.aside ? 1 : 0));
+        const { docs } = await this.collectDocs();
+        docs.sort(LayerEnvStore.docOrder);
         const cfg: LayerEnvConfigFile = { layers: {} };
-        for (const d of docs) {
-            try { mergeLayers(cfg, JSON.parse(d.text)); } catch { /* 坏档跳过 */ }
-        }
+        for (const d of docs) mergeLayers(cfg, d.parsed);
         return cfg;
     }
 
@@ -363,7 +406,10 @@ export class LayerEnvStore {
         // 舞步开场旁路快照（Sol 61 P2-2）：成功收尾时一并消费——上轮只消自己的
         // 旁路，崩溃遗留的历史旁路仍会把整档替换已删的层复活
         const preAsides = (await this.listAsides()).map((a) => a.p);
-        await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
+        // 内嵌序戳（Sol 62 P2-4）：文档自带提交时刻——rename/link 迁移不损，
+        // 同刻 mtime 平局由戳裁决（mergeLayers 只读 layers，戳不外泄）
+        const rev = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        await writeFile(tmp, JSON.stringify({ ...cfg, _fx_rev: rev }, null, 2), "utf-8");
         if (verifyHeld && !(await verifyHeld())) {
             await unlink(tmp).catch(() => undefined);
             throw new Error("__FX_LOCK_LOST__"); // 哨兵：落位未尝试，盘上数据未动

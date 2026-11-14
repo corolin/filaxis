@@ -478,3 +478,25 @@ describe("Sol 61：读往返内戳-正文互核", () => {
         rmSync(d, { recursive: true, force: true });
     }, 30_000);
 });
+
+// GPT Sol 六十二期 P1：CAS 写回命令 exit 1 + stdout "FX_OK …" 曾被报成
+// atomic-replace/flock——成功分支只看输出前缀。修：退出码入闸（FX_LOCK_FAIL
+// 特判外非零一律不作成功凭证）。
+describe("Sol 62：写回退出码入闸", () => {
+    test("exit 1 + FX_OK 输出 → 拒绝（不报 atomic-replace）", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-ec62-")).replace(/\\/g, "/");
+        const p = `${d}/ec.env`;
+        writeFileSync(p, "X=1\n");
+        const realExec = drv.exec.bind(drv);
+        (drv as unknown as { exec: unknown }).exec = async (cmd: string, o?: unknown) => {
+            // FX_CAS_FAIL 标记只在 CAS 写回命令里（读命令无此串）
+            if (cmd.includes("FX_CAS_FAIL")) {
+                return { stdout: "FX_OK 1794630000 4\n", exitCode: 1 }; // 异常退出+成功标记
+            }
+            return await realExec(cmd, o as never);
+        };
+        await expect(editFile(drv, p, "X=1", "X=2")).rejects.toThrow(/异常退出|exit 1/);
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});

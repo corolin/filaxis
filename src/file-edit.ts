@@ -347,10 +347,19 @@ async function casWrite(
         );
     }
     if (payload.startsWith("FX_INPLACE")) {
+        // 成功回报退出码入闸（Sol 62 P1）：exit 1 + stdout "FX_OK …" 曾被报成
+        // atomic-replace/flock——成功分支只看输出前缀。失败标记走各自专错（上方），
+        // 成功标记必须伴 exit 0 才作数
+        if (cas.exitCode !== 0) {
+            throw new Error(`远端 CAS 写回命令异常退出（exit ${cas.exitCode}——成功标记不作数）: ${path}（${out.slice(0, 80)}）`);
+        }
         return { bytesAfter: Buffer.byteLength(edited, "utf-8"), mutex: degraded ? ("degraded" as const) : ("flock" as const), writeMode: "inplace-write" as const };
     }
     if (!payload.startsWith("FX_OK")) {
         throw new Error(`远端 CAS 写回异常: ${path}（输出 ${out.slice(0, 80)}）`);
+    }
+    if (cas.exitCode !== 0) { // 同上（Sol 62 P1）：FX_OK 亦须伴 exit 0
+        throw new Error(`远端 CAS 写回命令异常退出（exit ${cas.exitCode}——成功标记不作数）: ${path}（${out.slice(0, 80)}）`);
     }
     return { bytesAfter: Buffer.byteLength(edited, "utf-8"), mutex: degraded ? ("degraded" as const) : ("flock" as const), writeMode: "atomic-replace" as const };
 }

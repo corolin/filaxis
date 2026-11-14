@@ -2,7 +2,7 @@
  * 层环境规格单测（AC-17：解析纯函数/身份键/漂移/匹配/持久化）
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, renameSync, utimesSync, readdirSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, renameSync, utimesSync, readdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -330,18 +330,19 @@ describe("Sol 61：协议三缝", () => {
         }
     }, 15_000);
 
-    test("P2 mtime 平局旁路胜（旧 data 不再压住新旁路）", async () => {
+    test("P2 平局序戳裁决：旁路带新戳胜（旧 data 不再压住新旁路）", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-env61b-"));
         try {
             const p = join(dir, "env.json");
-            writeFileSync(p, JSON.stringify({ layers: { k: mk61("old") } }));
+            // 带戳形态（store 自写档恒带 _fx_rev——真实旁路/data 皆如此）
+            writeFileSync(p, JSON.stringify({ layers: { k: mk61("old") }, _fx_rev: "1000000000000-1-aa" }));
             const aside = `${p}.888-tie.fx-old`;
-            writeFileSync(aside, JSON.stringify({ layers: { k: mk61("new") } }));
-            const t = new Date(Date.now() - 60_000); // 同一时刻（新鲜——不触压实）
+            writeFileSync(aside, JSON.stringify({ layers: { k: mk61("new") }, _fx_rev: "2000000000000-1-bb" }));
+            const t = new Date(Date.now() - 60_000); // 同刻 mtime——戳裁决
             utimesSync(p, t, t);
             utimesSync(aside, t, t);
             const cfg = await new LayerEnvStore(p).load();
-            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（data 平局压住）
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 旁路戳新胜
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -361,6 +362,96 @@ describe("Sol 61：协议三缝", () => {
             expect(Object.keys(same.layers)).toEqual(["real"]);
             const fresh = await new LayerEnvStore(p).load();
             expect(Object.keys(fresh.layers)).toEqual(["real"]); // 盘上对照（本就无 ghost）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 六十二期 P2 三件：嵌套改缓存条目随后续 upsert 落盘（浅副本漏嵌套）；
+// 舞步窗口读成空档（列旁路先于 stat——两步之间现行态被移开）；同刻平局反转
+// （崩溃于落位后清理前：新 data+旧旁路同刻，固定选旁路回退成旧值）。
+describe("Sol 62：读隔离/舞步窗口/序戳裁决", () => {
+    const mk62 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("P2 嵌套改不污染缓存不落盘（load 深副本）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env62a-"));
+        try {
+            const p = join(dir, "env.json");
+            const s = new LayerEnvStore(p);
+            await s.upsert("real", mk62("real"));
+            const c = await s.load();
+            c.layers.real!.environment.os = "MUTATED"; // 嵌套字段就地改
+            expect(readFileSync(p, "utf-8")).not.toContain("MUTATED"); // 当时盘上仍原值
+            await s.upsert("other", mk62("other")); // 后续写——修前：MUTATED 随缓存落盘
+            const fresh = await new LayerEnvStore(p).load();
+            expect(fresh.layers.real!.environment.os).toBe("os-real");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2 舞步窗口不读成空档（列旁路后、读 data 前现行态被移开——重列捞回）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env62b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { live: mk62("live") } }));
+            const s = new LayerEnvStore(p);
+            // 注入：首列旁路（此刻无旁路）返回后、data 读取前——现行态被移开
+            //（模拟提交方舞步落在我们 collectDocs 的列旁路与读之间）
+            const origList = (s as unknown as { listAsides: () => Promise<Array<{ p: string }>> }).listAsides.bind(s);
+            let moved = false;
+            (s as unknown as { listAsides: unknown }).listAsides = async () => {
+                const r = await origList();
+                if (!moved) {
+                    moved = true;
+                    renameSync(p, `${p}.win62.fx-old`);
+                }
+                return r;
+            };
+            const cfg = await s.load();
+            expect(Object.keys(cfg.layers)).toContain("live"); // 修前：{}（空档）
+            expect(cfg.layers.live!.connection.target).toBe("live");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2 平局序戳裁决：崩溃清理前态（新 data 带新戳胜旧旁路）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env62c-"));
+        try {
+            const p = join(dir, "env.json");
+            // 崩溃于「落位后、旁路清理前」：data=新提交（戳新），旁路=被移开的旧态（戳旧）
+            writeFileSync(p, JSON.stringify({ layers: { k: mk62("new") }, _fx_rev: "2000000000000-1-cc" }));
+            const aside = `${p}.777-pre.fx-old`;
+            writeFileSync(aside, JSON.stringify({ layers: { k: mk62("old") }, _fx_rev: "1000000000000-1-dd" }));
+            const t = new Date(Date.now() - 60_000); // 同刻——戳裁决
+            utimesSync(p, t, t);
+            utimesSync(aside, t, t);
+            const cfg = await new LayerEnvStore(p).load();
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（平局固定选旁路回退）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2 双无戳同刻平局：data 胜（护已落位提交——手造/遗老档的结构性不可判定选边）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env62d-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { k: mk62("landed") } })); // 无戳（遗老形态）
+            const aside = `${p}.666-legacy.fx-old`;
+            writeFileSync(aside, JSON.stringify({ layers: { k: mk62("aside") } }));
+            const t = new Date(Date.now() - 60_000);
+            utimesSync(p, t, t);
+            utimesSync(aside, t, t);
+            const cfg = await new LayerEnvStore(p).load();
+            expect(cfg.layers.k!.connection.target).toBe("landed"); // 已落位者胜
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
