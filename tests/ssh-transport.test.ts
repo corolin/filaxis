@@ -994,3 +994,19 @@ describe("Sol 67：直接读取凭证纪律", () => {
         await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 "PARTIAL"
     }, 15_000);
 });
+
+// GPT Sol 六十八期 #5：tailLines()（双流行对象读取入口）补凭证纪律——
+// exit≠0 的输出不作日志凭证（tail/readLog 上轮已查、此处漏查）。
+describe("Sol 68：tailLines 凭证", () => {
+    test("读命令 exit 1+partial → 拒绝（不作日志凭证）", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("tail -n ")) return { stdout: "partial", exitCode: 1 };
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100));
+        await expect(m.tailLines(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 partial 行
+    }, 15_000);
+});

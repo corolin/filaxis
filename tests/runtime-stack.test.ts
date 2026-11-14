@@ -932,3 +932,47 @@ describe("Sol 67：restore 预留/共享销毁", () => {
         RuntimeStack.evictDriver({ driver: "mockssh", target: "shared-t" } as RuntimeDescriptor);
     }, 15_000);
 });
+
+// GPT Sol 六十八期 P1/P2：删除默认层的销毁暂停期，缺省命令曾落初始 driver
+//（默认层回落在异步销毁之后）；跨 stack 共享 driver 曾被单 stack 引用检查
+// 提前销毁（全局引用计数收口）。
+describe("Sol 68：默认层切换序/跨 stack 引用计数", () => {
+    test("P1 默认层销毁暂停期：缺省解析已切到存活层（不落初始 driver）", async () => {
+        const stack = new RuntimeStack();
+        let releaseDestroy!: () => void;
+        const gate = new Promise<void>((res) => { releaseDestroy = res; });
+        const mkDriver = (d: RuntimeDescriptor) => {
+            const drv = new MockLayerDriver(d) as unknown as RuntimeDriver & { destroy: () => Promise<void> };
+            drv.destroy = () => gate.then(() => { (drv as unknown as MockLayerDriver).destroyed = true; });
+            return drv;
+        };
+        stack.registerDriver("mockssh", (d) => mkDriver(d));
+        await stack.addLayer("a", { driver: "mockssh", target: "ta68" }); // 默认层
+        const b = await stack.addLayer("b", { driver: "mockssh", target: "tb68" });
+        stack.setActive("a"); // a 为默认层
+        const removing = stack.removeLayer("a", { destroy: true }); // 暂停在 destroy
+        await new Promise((r) => setTimeout(r, 30));
+        // 销毁暂停期：默认层已回落到 b（修前：activeName 仍指已删的 a——缺省解析落初始 driver）
+        expect(stack.active).toBe(b.handle.driver);
+        releaseDestroy();
+        await removing;
+        expect((stack.layer("b").driver as unknown as MockLayerDriver).destroyed).toBe(false);
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "ta68" } as RuntimeDescriptor);
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "tb68" } as RuntimeDescriptor);
+    }, 15_000);
+
+    test("P2 跨 stack 共享 driver：一 stack 销毁不连坐另一 stack", async () => {
+        // registerDriver 会配随机 cacheNs（实例隔离）——跨 stack 共享只发生在
+        // 缺省工厂路径（全局缓存键）：local driver 两 stack 同键复用同一实例
+        const s1 = new RuntimeStack();
+        const s2 = new RuntimeStack();
+        await s1.addLayer("a", { driver: "local" });
+        await s2.addLayer("b", { driver: "local" });
+        expect(s2.layer("b").driver).toBe(s1.layer("a").driver); // 跨 stack 共享实证（全局缓存）
+        await s1.removeLayer("a", { destroy: true }); // 修前：单 stack 检查通过→销毁共享 driver
+        const out = await s2.layer("b").driver.exec("echo ok");
+        expect(out.exitCode).toBe(0); // 修前：local driver 已被销毁、exec 失败
+        expect((out as { stdout?: string }).stdout?.trim()).toBe("ok");
+        RuntimeStack.evictDriver({ driver: "local" });
+    }, 20_000);
+});

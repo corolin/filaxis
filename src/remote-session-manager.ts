@@ -234,6 +234,11 @@ export class RemoteSessionManager {
         // 命令 echo 该字面量即令后续行全部错归 stderr）——nonce 后不可预测
         const sep = `__FX_TL_${crypto.randomBytes(4).toString("hex")}__`;
         const r = await this.exec(`tail -n ${n} ${q(e.base)}.out 2>/dev/null; echo ${sep}; tail -n ${n} ${q(e.base)}.err 2>/dev/null`);
+        // 凭证纪律（Sol 68 #5）：双流读取入口同权——exit≠0 的输出不作日志凭证
+        //（tail/readLog 上轮已查、tailLines 漏查）
+        if (r.exitCode !== 0) {
+            throw new Error(`会话日志读取失败（tailLines exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
+        }
         const parts = (r.stdout || "").split(sep);
         const out: Array<{ stream: "stdout" | "stderr"; text: string }> = [];
         for (const l of (parts[0] ?? "").split("\n")) {

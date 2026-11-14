@@ -288,6 +288,9 @@ export class RuntimeStack {
     private namedLayers = new Map<string, LayerHandle>();
     /** 建链中的名称预留（二十七期 #2：并发同名 addLayer 的覆盖防线） */
     private pendingNames = new Set<string>();
+    /** driver 全局引用计数（Sol 68 #2）：身份缓存跨 stack 共享——销毁决策须看
+     *  全局在册数而非单 stack 引用。每个命名层注册 +1 / removeLayer -1 */
+    private static readonly driverRefs = new Map<RuntimeDriver, number>();
     private activeName?: string;
 
     /** 层注册表只读视图 */
@@ -316,6 +319,7 @@ export class RuntimeStack {
         if (this.isDriver(descriptorOrDriver)) {
             const driver = descriptorOrDriver;
             const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
+            this.trackDriver(handle);
             this.namedLayers.set(name, handle);
             this.activeName = name;
             return { handle, reused: false };
@@ -349,6 +353,7 @@ export class RuntimeStack {
         }
         const driver = await this.connect(descriptor);
         const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
+        this.trackDriver(handle);
         this.namedLayers.set(name, handle);
         this.activeName = name;
         return { handle, reused: false };
@@ -378,6 +383,7 @@ export class RuntimeStack {
             }
             const driver = await pushInto.call(src.driver, enterCmd, opts.label ?? enterCmd.slice(0, 30));
             const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
+            this.trackDriver(handle);
             this.namedLayers.set(name, handle);
             this.activeName = name;
             return handle;
@@ -415,6 +421,7 @@ export class RuntimeStack {
             }
             const driver = await pushChild.call(src.driver, hop);
             const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
+            this.trackDriver(handle);
             this.namedLayers.set(name, handle);
             this.activeName = name;
             return { handle, reused: false };
@@ -437,18 +444,19 @@ export class RuntimeStack {
     async removeLayer(name: string, opts: { destroy?: boolean } = {}): Promise<void> {
         const h = this.requireLayer(name);
         this.namedLayers.delete(name);
-        if (opts.destroy) {
-            // 共享连接不销毁（Sol 67 #5）：同名落点复用=多命名层共享同一 driver——
-            // destroy 曾连坐杀死仍在用的另一层（按名可查、执行即死 driver）。
-            // 仅当无其他层引用时才销毁
-            const shared = [...this.namedLayers.values()].some((x) => x.driver === h.driver);
-            if (!shared) {
-                RuntimeStack.evictDriver(h.descriptor, this.cacheNs);
-                await h.driver.destroy().catch(() => undefined);
-            }
-        }
+        // 默认层回落在异步销毁**之前**（Sol 68 P1）：destroy 暂停期间缺省命令
+        //（未显式指定层的 run_command）曾落到初始 driver——销毁完才切到存活层
         if (this.activeName === name) {
             this.activeName = [...this.namedLayers.keys()].at(-1); // 回落最后注册层
+        }
+        // 全局引用计数（Sol 67 #5 → Sol 68 #2）：driver 缓存跨 stack 共享——
+        // 只看本 stack 引用曾提前销毁他 stack 仍持有的 driver。计数归零才销毁
+        const refs = Math.max(0, (RuntimeStack.driverRefs.get(h.driver) ?? 0) - 1);
+        if (refs === 0) RuntimeStack.driverRefs.delete(h.driver);
+        else RuntimeStack.driverRefs.set(h.driver, refs);
+        if (opts.destroy && refs === 0) {
+            RuntimeStack.evictDriver(h.descriptor, this.cacheNs);
+            await h.driver.destroy().catch(() => undefined);
         }
     }
 
@@ -500,7 +508,9 @@ export class RuntimeStack {
             this.pendingNames.add(name);
             try {
                 const driver = await this.connect(descriptor);
-                this.namedLayers.set(name, { name, descriptor: driver.descriptor, driver });
+                const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
+                this.trackDriver(handle);
+                this.namedLayers.set(name, handle);
             } finally {
                 this.pendingNames.delete(name);
             }
@@ -509,6 +519,11 @@ export class RuntimeStack {
     }
 
     // ── 注册表内部 ──
+
+    /** 层注册计数（Sol 68 #2：跨 stack 共享 driver 的销毁门） */
+    private trackDriver(handle: LayerHandle): void {
+        RuntimeStack.driverRefs.set(handle.driver, (RuntimeStack.driverRefs.get(handle.driver) ?? 0) + 1);
+    }
 
     private assertNotDupName(name: string): void {
         if (this.namedLayers.has(name) || this.pendingNames.has(name)) {

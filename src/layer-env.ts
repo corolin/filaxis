@@ -301,37 +301,51 @@ export class LayerEnvStore {
         return LayerEnvStore.snapshot(cfg);
     }
 
-    /** 并入（Sol 64 门控 → Sol 66 血统 → Sol 67 集合血统）：**带戳主档**在场时，
-     *  旁路去留按血统集合 _fx_seen（写入时盘面全部 rev——作者确切见过什么）：
-     *  见过（∈seen）=知悉后删除（不并入）；没见过=踩踏者崩溃残留（救回——
-     *  集合成员判定免疫时钟回拨，首写见空盘/旁路戳超上界两端都不再误判）。
-     *  旧档回落链：无 seen 有 _fx_base（上界）→ 超上界救；两者皆无=首写见空盘
-     *  →全救。新于主档的旁路恒救（踩踏恢复）。救回的旁路在主档**之后**并入
-     *  （并入序兜住回拨倒挂的戳序）；无戳主档保持全并入+docOrder（恢复偏置） */
+    /** 并入（Sol 64 门控 → Sol 66/67 血统 → Sol 68 锚点化）：血统集合 _fx_seen
+     *  （写入时盘面全部 rev）成员判定——见过=知悉后删除（不并入）、没见过=踩踏
+     *  残留（救回，免疫时钟回拨）。**锚点**：主档在场用它；缺席（舞步移开窗口/
+     *  崩溃残留）取「统摄」旁路——其 seen 收录其余带戳旁路 rev（回拨下墙钟序
+     *  会说谎，seen 收录关系是因果的不会；主档移开时曾绕过血统直并全部旁路、
+     *  多旁路墙钟排序曾让旧值覆盖新值）。无统摄者退回 docOrder 末位；无戳锚点
+     *  保持全并入+docOrder（恢复偏置）。救回的旁路在锚点之后并入 */
     private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
         const dataDoc = docs.find((d) => !d.aside);
+        // 选锚：主档 → 统摄旁路（seen 收录其余全部带戳档）→ docOrder 末位
+        let anchor: FxDoc | null = dataDoc ?? null;
+        if (!anchor) {
+            const stamped = docs.filter((d) => d.rev != null);
+            for (const cand of stamped) {
+                if (stamped.every((x) => x === cand || !x.rev || (cand.seen?.includes(x.rev) ?? false))) {
+                    anchor = cand;
+                    break;
+                }
+            }
+            if (!anchor && stamped.length > 0) {
+                const sorted = [...stamped].sort(LayerEnvStore.docOrder);
+                anchor = sorted[sorted.length - 1]!;
+            }
+        }
         const cfg: LayerEnvConfigFile = { layers: {} };
-        if (dataDoc?.rev) {
-            const dataRev = dataDoc.rev; // 闭包内窄化保留
-            const dataBase = dataDoc.base;
-            const seen = dataDoc.seen;
+        if (anchor?.rev) {
+            const anchorRev = anchor.rev; // 闭包内窄化保留
+            const anchorBase = anchor.base;
+            const seen = anchor.seen;
             const kept = docs.filter((d) => {
-                if (d === dataDoc) return false;
-                if (!d.rev) return false; // 带戳主档+无戳旁路：作者 load 过全盘（Sol 65 #5）
-                // 集合血统优先（Sol 67 #2）：见过=删/没见过=救——成员判定不受回拨
-                // 影响（须先于「新于主档」查：回拨下已见过的旧档戳可 numeric 上
-                // 大于主档戳，先查戳序会误判踩踏恢复）
+                if (d === anchor) return false;
+                if (!d.rev) return false; // 带戳锚点+无戳旁路：作者 load 过全盘（Sol 65 #5）
+                // 集合血统（Sol 67 #2）：见过=删/没见过=救——先于戳序（回拨下已见
+                // 旧档的戳可 numeric 上大于锚点戳）
                 if (seen) return !seen.includes(d.rev);
-                if (d.rev > dataRev) return true; // 新于主档=踩踏恢复（无集合时的回落）
-                if (dataBase != null) return d.rev > dataBase; // 旧档回落：超上界=没见过
+                if (d.rev > anchorRev) return true; // 新于锚点=踩踏恢复（无集合回落）
+                if (anchorBase != null) return d.rev > anchorBase; // 旧档回落：超上界=没见过
                 return true; // 无血统=首写见空盘——全救（Sol 67 #1）
             });
             kept.sort(LayerEnvStore.docOrder);
-            mergeLayers(cfg, dataDoc.parsed); // 主档先并入
+            mergeLayers(cfg, anchor.parsed); // 锚点先并入
             for (const d of kept) mergeLayers(cfg, d.parsed); // 救回的旁路随后覆盖其键
             return cfg;
         }
-        // 无戳主档（遗老/手造）或主档缺席：全并入按 docOrder（平局 data 胜）
+        // 无戳锚点（遗老/手造）或无档：全并入按 docOrder（平局 data 胜）
         const ordered = [...docs];
         ordered.sort(LayerEnvStore.docOrder);
         for (const d of ordered) mergeLayers(cfg, d.parsed);
