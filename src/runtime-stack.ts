@@ -222,6 +222,11 @@ export class RuntimeStack {
                 throw new Error(`连接已在建链期间被逐出（evict/removeLayer）：${descriptor.driver}/${descriptor.target ?? "local"}——请重连`);
             }
             RuntimeStack.driverCache.set(key, drv);
+            // homeKey 登记（Sol 73 #3）：tmux 初始化会补写 terminalId——descriptor
+            // 建后即变；removeLayer 按描述符算键逐出=键不匹配旧缓存残留，重连
+            // 拿回已销毁实例。不重挂键（descriptor 可能丢 config 信息、砸键控
+            // 缓存）——逐出按「本 driver 实际挂在哪个键」实例核对（evictDriverHome）
+            RuntimeStack.driverHomeKeys.set(drv, key);
             this.log.info(`[Filaxis] 新建连接: ${descriptor.driver}/${descriptor.target ?? "local"}`);
             return drv;
         })();
@@ -253,10 +258,23 @@ export class RuntimeStack {
 
     /** 逐出缓存（销毁归调用方——先 evict 再 destroy，避免销毁竞态复用）。
      *  ns：命名空间（默认共享缓存传 ""；自定义工厂的 stack 内部逐出走自身 ns） */
+    /** 实例逐出（Sol 73 #3）：按 homeKey 找到本 driver 实际挂载键——缓存里
+     *  就是它才清（同键别代/同 driver 键不匹配都不误伤） */
+    static evictDriverHome(drv: RuntimeDriver): RuntimeDriver | undefined {
+        const key = RuntimeStack.driverHomeKeys.get(drv);
+        if (key == null) return undefined;
+        return RuntimeStack.evictByKey(key);
+    }
+
     static evictDriver(d: RuntimeDescriptor, ns = ""): RuntimeDriver | undefined {
         const key = ns ? `${ns}|${RuntimeStack.driverKey(d)}` : RuntimeStack.driverKey(d);
+        return RuntimeStack.evictByKey(key);
+    }
+
+    private static evictByKey(key: string): RuntimeDriver | undefined {
         const drv = RuntimeStack.driverCache.get(key);
         RuntimeStack.driverCache.delete(key);
+        if (drv) RuntimeStack.driverHomeKeys.delete(drv);
         // in-flight 一并清（自挖 S3）：建链中的同指纹并发不再搭已逐出连接的
         // 车。注：已在途的建链 Promise 完成时仍会 set 回缓存（毫秒级窗口，
         // removeLayer/destroy 实路径在连接建成后才会 evict——接受并声明）
@@ -303,6 +321,10 @@ export class RuntimeStack {
     /** 已调度延迟销毁的 driver（Sol 71 #2 去重）：定时器触发前的重复移除不再
      *  二次调度 destroy */
     private static readonly destroyScheduled = new WeakSet<RuntimeDriver>();
+    /** driver 实际挂载的缓存键（Sol 73 #3）：建链时 descriptor 可能被 init 补写
+     *  （tmux terminalId）——事后按描述符算键与实际键不一致；按实例记键，
+     *  逐出实例核对（不重挂——descriptor 可能丢 config、砸键控缓存） */
+    private static readonly driverHomeKeys = new Map<RuntimeDriver, string>();
     private activeName?: string;
 
     /** 层注册表只读视图 */
@@ -472,10 +494,10 @@ export class RuntimeStack {
         if (refs === 0) RuntimeStack.driverRefs.delete(h.driver);
         else RuntimeStack.driverRefs.set(h.driver, refs);
         if (opts.destroy && refs === 0) {
-            // 缓存同步逐出（Sol 71 #2）+ 实例核对（Sol 72 #2）：缓存里就是本代
-            // 才清——按描述符无条件清曾把同描述符的新一代连坐逐出/中断建链；
-            // 定时器只复核+销毁本代 driver（不逐出）
-            RuntimeStack.evictDriverIfIs(h.driver, h.descriptor, this.cacheNs);
+            // 缓存同步逐出（Sol 71 #2 → Sol 73 #3 homeKey）：按本 driver 实际
+            // 挂载键实例核对清——按描述符算键曾因 init 补写 terminalId 键不匹配
+            // （旧缓存残留、重连拿回已销毁实例）；定时器只复核+销毁本代（不逐出）
+            RuntimeStack.evictDriverHome(h.driver);
             // 销毁去重（Sol 71 #2）：定时器触发前同 driver 重新登记又移除曾触发
             // 两次 destroy()
             if (RuntimeStack.destroyScheduled.has(h.driver)) return;

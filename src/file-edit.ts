@@ -197,14 +197,19 @@ async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRea
     // 会 ENAMETOOLONG——接近上限截前段+短 hash（文件本体走目标原路径不受影响）。
     // hash 取名内容确定性摘要（Sol 60 P2-4）：随机后缀曾使同一长文件名的两次
     // 编辑各持各的 fx-lock——flock 互斥对同目标失效；确定性基底=同目标必同锁
-    //（tmp/lock 同名碰撞由 flock 覆盖——与短名路径行为一致）
+    //（tmp/lock 同名碰撞由 flock 覆盖——与短名路径行为一致）。
+    // 字节口径（Sol 73 #5）：码元判定曾让 252B 中文文件名（84 码元）基底不缩
+    //——伴生锁文件名追后缀即超限、CAS 编辑整体失败
     const fxBase = (() => {
         const slash = path.lastIndexOf("/");
         const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
         const name = slash >= 0 ? path.slice(slash + 1) : path;
-        if (name.length + ".filaxis-lock-xxxxxxxx".length <= 255) return path;
+        if (Buffer.byteLength(name, "utf-8") + Buffer.byteLength(".filaxis-lock-xxxxxxxx", "utf-8") <= 255) return path;
         const h = crypto.createHash("sha256").update(name).digest("hex").slice(0, 8);
-        return dir + name.slice(0, Math.max(1, 255 - 32)) + "~" + h;
+        let cut = name.slice(0, Math.max(1, 255 - 32));
+        while (Buffer.byteLength(cut, "utf-8") > Math.max(1, 255 - 32) && cut.length > 0) cut = cut.slice(0, -1);
+        if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+        return dir + cut + "~" + h;
     })();
     // 读原文件用**原路径**（Sol 57 P2-5）：fxBase 是缩短名——曾拿缩短路径去读/戳
     // 原文件（240 字符合法文件名报不存在）。fxBase 只服务 .fx-tmp/.fx-lock 同目录

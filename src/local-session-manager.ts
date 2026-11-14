@@ -212,6 +212,13 @@ export class LocalSessionManager {
                 } finally {
                     await fh.close();
                 }
+                // 长行回退（Sol 73 #4）：尾块（lines*512B）装不下单行 2.5KB 时——
+                // 块内完整行数不足且文件比块大，曾静默截断（取 1 行得 1023B 半行、
+                // 取 2 行只剩同段）。退全量读再取尾窗
+                const probe = content.split("\n");
+                if (st.size > want && probe.length - 1 < opts.lines + 1) { // 需 lines+1 条完整行——块首行可能被截断（恰 lines 条时首行半截检不出）
+                    content = await fs.readFile(file, "utf-8");
+                }
                 const linesArr = content.split("\n");
                 // 尾换行不是行（Sol 72 #4）：first\nsecond\n 取 1 行曾得 ""、取 2 行
                 // 曾得 "second\n"——split 尾部空串先剥再取尾窗（与下方全量路径同纪律）

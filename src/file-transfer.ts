@@ -198,14 +198,9 @@ export async function getFile(
     // 本地临时 + rename 原子落位（写中途失败/磁盘满不留半截；并发本地写互不干扰）
     // 本地临时名 NAME_MAX 安全（Sol 58 P2-5）：240 字符目标名+后缀曾超 255B——
     // 创建失败下载不落盘。超限时截 basename 前段+短 hash 保唯一
-    const localTmp = (() => {
-        const suffix = `.filaxis-get-${randomBytes(6).toString("hex")}`;
-        const sep = Math.max(localPath.lastIndexOf("/"), localPath.lastIndexOf("\\"));
-        const dir = sep >= 0 ? localPath.slice(0, sep + 1) : "";
-        const name = sep >= 0 ? localPath.slice(sep + 1) : localPath;
-        if (name.length + suffix.length <= 255) return localPath + suffix;
-        return dir + name.slice(0, 255 - suffix.length - 9) + "~" + randomBytes(4).toString("hex") + suffix;
-    })();
+    // 本地临时名走 localTmpFor（Sol 73 #5）：内联旧版按码元计——252B 中文名
+    // 追后缀 ENAMETOOLONG（上传/sftp 已修、此处漏）
+    const localTmp = localTmpFor(localPath, `.filaxis-get-${randomBytes(6).toString("hex")}`);
     try {
         await fs.writeFile(localTmp, content);
         await fs.rename(localTmp, localPath);
@@ -348,8 +343,10 @@ export async function sftpPutFile(
 }
 
 /** 本地下载临时名（Sol 63 P2-5）：basename+后缀超 255B 截前段+短 hash（NAME_MAX 安全） */
-function localTmpFor(localPath: string, nonce: string): string {
-    const suffix = `.fx-dl-${process.pid}-${nonce}`;
+/** 本地临时名（字节口径 NAME_MAX 安全）：suffix 由调用方给（fx-dl/filaxis-get
+ *  两条下载路径共用——Sol 73 #5：getFile 内联旧版仍按码元计，252B 中文名
+ *  追后缀 ENAMETOOLONG） */
+function localTmpFor(localPath: string, suffix: string): string {
     const name = basename(localPath);
     const suffixBytes = Buffer.byteLength(suffix, "utf-8");
     // 字节口径（Sol 72 #5 同 withSuffix）：多字节长名按 UTF-8 字节预算截断
@@ -360,7 +357,7 @@ function localTmpFor(localPath: string, nonce: string): string {
     let cut = name.slice(0, keep);
     while (Buffer.byteLength(cut, "utf-8") > keep && cut.length > 0) cut = cut.slice(0, -1);
     if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
-    return join(dirname(localPath), cut + "~" + nonce + suffix);
+    return join(dirname(localPath), cut + "~" + randomBytes(4).toString("hex") + suffix);
 }
 
 /** sftp 快路径 get（batch `get`；校验同 put）。
@@ -377,7 +374,7 @@ export async function sftpGetFile(
     const doSpawn = opts.spawnImpl ?? defaultSftpSpawn;
     assertSftpPath(localPath, "本地");
     assertSftpPath(remotePath, "远端");
-    const tmpLocal = localTmpFor(localPath, randomBytes(4).toString("hex"));
+    const tmpLocal = localTmpFor(localPath, `.fx-dl-${process.pid}-${randomBytes(4).toString("hex")}`);
     const batch = `get ${q(remotePath)} ${q(tmpLocal)}\n`;
     let r: Awaited<ReturnType<typeof doSpawn>>;
     try {

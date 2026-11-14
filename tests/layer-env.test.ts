@@ -1001,3 +1001,52 @@ describe("Sol 72：结构无效主档不作锚", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十三期 P1：`{"layers":[]}` 数组曾通过对象检查——压成错版；缺 layers
+// 的带版本旁路曾压过有效旁路返回空配置。无效档全流程惰化（不作锚/不竞选/不门控）。
+describe("Sol 73：数组层表与空版本旁路", () => {
+    const mk73 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("主档 {\"layers\":[]}：B 胜出、压实落盘正果、retired 不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env73a-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: [] })); // 数组层表——结构无效
+            const asideA = `${p}.111-222-vvvv.fx-old`;
+            const asideB = `${p}.111-222-wwww.fx-old`;
+            writeFileSync(asideA, JSON.stringify({ layers: { k: mk73("old"), retired: mk73("retired") }, _fx_rev: "9000000000000-1-a73" }));
+            writeFileSync(asideB, JSON.stringify({ layers: { k: mk73("new") }, _fx_rev: "3000000000000-1-b73", _fx_seen: ["9000000000000-1-a73"] }));
+            const old = new Date(Date.now() - 11 * 60_000);
+            utimesSync(asideA, old, old);
+            utimesSync(asideB, old, old);
+            const cfg = await new LayerEnvStore(p).load();
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old
+            expect(cfg.layers.retired).toBeUndefined();
+            expect(existsSync(asideA)).toBe(false);
+            expect(existsSync(asideB)).toBe(false);
+            const onDisk = JSON.parse(readFileSync(p, "utf-8")) as LayerEnvConfigFile;
+            expect(onDisk.layers.k!.connection.target).toBe("new");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("缺 layers 的带版本旁路不压有效旁路（不竞选统摄）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env73b-"));
+        try {
+            const p = join(dir, "env.json");
+            // badAside：有版本号但无 layers（结构无效）——修前曾当选统摄锚返回空配置
+            writeFileSync(`${p}.111-222-xxxx.fx-old`, JSON.stringify({ _fx_rev: "9000000000000-1-bad" }));
+            writeFileSync(`${p}.111-222-yyyy.fx-old`, JSON.stringify({ layers: { k: mk73("good") }, _fx_rev: "1000000000000-1-good" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.k!.connection.target).toBe("good"); // 修前：{}（无效旁路当锚）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

@@ -309,12 +309,13 @@ export class LayerEnvStore {
      *  锚点经 seen 链继承对更早各代的知悉（C 直接只记 B，但 B 见过 A ⇒ C 对
      *  A 的删除同样成立）。并发多锚（互相没见过）退回 docOrder 末位；无戳锚点
      *  保持全并入+docOrder（恢复偏置）。救回的旁路在锚点之后并入 */
-    private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
-        // 坏档不作主（Sol 71 P1 → Sol 72 P1 扩面）：截断 JSON（parsed=null）与
-        // 结构无效的合法 JSON（如 `[]`——解析成功但无 layers）都视同坏档——
-        // 曾锚定它按墙钟并旁路（回拨下旧 A 覆盖见过它的 B、复活已删条目），
-        // 老化压实再把错果写进主档连删两份旁路=B 永久丢失。锚点落统摄旁路
-        const dataDoc = docs.find((d) => !d.aside && LayerEnvStore.docHasLayers(d));
+    private static mergeDocs(allDocs: FxDoc[]): LayerEnvConfigFile {
+        // 无效档全流程惰化（Sol 71 P1 → Sol 72 P1 → Sol 73 P1）：截断 JSON、
+        // `[]`、`{"layers":[]}`（数组层表）都视同坏档——不作锚、不参与统摄
+        // 竞选与辈分门控（缺 layers 的带版本旁路曾压过有效旁路返回空配置），
+        // 锚点落统摄旁路（回拨下旧 A 不再覆盖见过它的 B）
+        const docs = allDocs.filter((d) => LayerEnvStore.docHasLayers(d));
+        const dataDoc = docs.find((d) => !d.aside);
         let anchor: FxDoc | null = dataDoc ?? null;
         if (!anchor) {
             const stamped = docs.filter((d) => d.rev != null);
@@ -367,7 +368,9 @@ export class LayerEnvStore {
      *  无 layers 结构，与截断 JSON 同罪（视同坏档不作锚） */
     private static docHasLayers(d: FxDoc): boolean {
         const layers = (d.parsed as LayerEnvConfigFile | null | undefined)?.layers;
-        return layers != null && typeof layers === "object";
+        // 数组非档（Sol 73 P1）：`{"layers":[]}` 曾通过 typeof object 检查——
+        // Object.entries 语义上会把 [] 当空层表，锚点误判同坏 JSON
+        return layers != null && typeof layers === "object" && !Array.isArray(layers);
     }
 
     /** seen 传递闭包：锚点的有效知悉=自身 seen ∪ 各被收录档的 seen（链式回收） */

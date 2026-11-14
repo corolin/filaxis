@@ -500,3 +500,22 @@ describe("Sol 62：写回退出码入闸", () => {
         rmSync(d, { recursive: true, force: true });
     }, 30_000);
 });
+
+// GPT Sol 七十三期 #5：CAS 编辑的伴生锁基底（fxBase）曾按码元判定——250B 中文
+// 文件名不触发缩短、.filaxis-lock 后缀追上即超限（Linux ENAMETOOLONG 编辑整体
+// 失败）。字节口径（Windows 长路径下验证编辑成功+基底缩短生效）。
+describe("Sol 73：长中文名编辑", () => {
+    test("250B 中文文件名 CAS 编辑成功（fxBase 字节口径缩短）", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-cjk73-")).replace(/\\/g, "/");
+        const p = `${d}/${"中".repeat(82)}.txt`; // 246B+4B=250B——裸名合法
+        writeFileSync(p, "OLD=1\n");
+        const r = await editFile(drv, p, "OLD=1", "NEW=2");
+        expect(r.writeMode).toBe("atomic-replace");
+        expect(readFileSync(p, "utf-8")).toBe("NEW=2\n");
+        // 伴生锁文件名（fxBase+后缀）字节不超限
+        const lockFiles = readdirSync(d).filter((f) => f.endsWith(".fx-lock"));
+        for (const f of lockFiles) expect(Buffer.byteLength(f, "utf-8")).toBeLessThanOrEqual(255);
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});

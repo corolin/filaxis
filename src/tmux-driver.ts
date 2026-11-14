@@ -47,10 +47,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 // \s+ 归一解码——折行免疫）；大文件 b64 落远端临时 + 字节分页读（每页
                 // 8K b64 折 ~40 行稳居窗口内，与滚动窗口彻底解耦）
                 const st = await self.exec(`wc -c < ${q(p)} 2>/dev/null`);
+                // 凭证纪律（Sol 73 P1-2）：编码/wc 命令失败（exit≠0）不作内容凭证
+                //——故障注入时 base64 失败曾静默返回空串
+                if (st.exitCode !== 0) throw new Error(`readFile 失败（wc 退出码 ${st.exitCode}）: ${p}`);
                 const size = parseInt((st.stdout || "").trim(), 10);
                 if (!Number.isFinite(size)) throw new Error(`readFile 失败（文件不存在或不可读）: ${p}`);
                 if (size * 2 <= 12_000) {
                     const r = await self.exec(`base64 ${q(p)}`);
+                    if (r.exitCode !== 0) throw new Error(`readFile 失败（base64 退出码 ${r.exitCode}）: ${p}`);
                     return Buffer.from((r.stdout || "").replace(/\s+/g, ""), "base64").toString("utf-8");
                 }
                 const tmp = `/tmp/filaxis-read-${Math.random().toString(36).slice(2, 10)}.b64`;
@@ -80,7 +84,10 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 // 阈值与分块尺寸按真机实证收紧：tmux server 单条命令 ~16-24K 即
                 // "command too long"（远端实测 16K OK / 24K FAIL）——12K 安全边距
                 if (b64.length <= 12_000) {
-                    await self.exec(`printf %s ${q(b64)} | base64 -d > ${q(p)}`);
+                    const w = await self.exec(`printf %s ${q(b64)} | base64 -d > ${q(p)}`);
+                    // 凭证纪律（Sol 73 P1-2）：重定向失败（目标为目录等）曾静默
+                    // 返回成功——退出码入闸
+                    if (w.exitCode !== 0) throw new Error(`writeFile 失败（重定向退出码 ${w.exitCode}）: ${p}`);
                     return;
                 }
                 const { putContent } = await import("./file-transfer.js");

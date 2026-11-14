@@ -561,3 +561,35 @@ describe("Sol 72：多字节长名字节口径", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十三期 #5：长中文名修复漏了普通下载（getFile 内联临时名仍按码元
+// 计）与 CAS 编辑伴生锁（fxBase 码元判定）。两入口字节口径补齐。
+describe("Sol 73：长名漏网入口", () => {
+    test("getFile（普通下载）：250B 中文名归位成功", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-get73-"));
+        try {
+            const localPath = join(dir, "中".repeat(82) + ".bin"); // 250B 裸名合法
+            const remote = mockRemoteForGet();
+            remote.files.set("/remote/cjk.bin", Buffer.from("content-73"));
+            const dialect = { family: "gnu", base64Encode: ["base64", "-w", "0"], base64Decode: ["base64", "-d"], sha256: ["sha256sum"] } as never;
+            const r = await getFile(remote.exec, dialect, "/remote/cjk.bin", localPath);
+            expect(r.verified).toBe(true);
+            expect(readFileSync(localPath, "utf-8")).toBe("content-73"); // 修前：临时名 ENAMETOOLONG
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    function mockRemoteForGet() {
+        const files = new Map<string, Buffer>();
+        const exec: TransferExec = async (cmd) => {
+            const m = cmd.match(/^(?:base64 -w 0|wc -c|sha256sum) < '([^']+)'$/);
+            if (!m) return { stdout: "", exitCode: 0 };
+            const buf = files.get(m[1]!) ?? Buffer.alloc(0);
+            if (cmd.startsWith("wc")) return { stdout: String(buf.length), exitCode: 0 };
+            if (cmd.startsWith("sha256")) return { stdout: createHash("sha256").update(buf).digest("hex"), exitCode: 0 };
+            return { stdout: buf.toString("base64"), exitCode: 0 };
+        };
+        return { files, exec };
+    }
+});

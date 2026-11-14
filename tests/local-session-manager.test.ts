@@ -295,3 +295,20 @@ describe("Sol 72：本地尾行纪律", () => {
         expect(await m.readLog(h.sessionId, { lines: 2 })).toBe("first\nsecond"); // 修前："second\n"
     }, 20_000);
 });
+
+// GPT Sol 七十三期 #4：本地 readLog 尾窗（lines*512B）装不下 2.5KB 长行时曾静默
+// 截断——取 1 行得 1023B 半行、取 2 行只剩同段。块内完整行不足且文件比块大→退全量。
+describe("Sol 73：长行回退", () => {
+    test("末行 2500B：取 1 行得完整长行、取 2 行两行齐全", async () => {
+        const m = new LocalSessionManager();
+        const longTail = "L".repeat(2500);
+        const h = await m.start(`echo first; printf %s ${JSON.stringify(longTail)}; echo`);
+        await waitFor(() => m.list().find((s) => s.sessionId === h.sessionId)?.running === false);
+        const l1 = await m.readLog(h.sessionId, { lines: 1 });
+        expect(l1.length).toBe(2500); // 修前：1023（半行）
+        expect(l1).toBe(longTail);
+        const l2 = await m.readLog(h.sessionId, { lines: 2 });
+        expect(l2.startsWith("first")).toBe(true); // 修前：前一行完全丢失
+        expect(l2.endsWith(longTail)).toBe(true);
+    }, 20_000);
+});

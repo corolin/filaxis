@@ -210,7 +210,10 @@ export class RemoteSessionManager {
             const nonce = crypto.randomBytes(3).toString("hex");
             const readCmd = opts.offsetLines ? `tail -n +${opts.offsetLines + 1} ${rd}` : `cat ${rd}`;
             cmd = `test -r ${rd} || exit 9; ` +
-                `__fx_t="\${TMPDIR:-/tmp}/fx-rl-$$-${nonce}"; ` +
+                // TMPDIR 失效回落（Sol 73 #6）：指向不存在/不可写目录时 lines 读曾
+                // exit 9（全量读正常）——校验在场且可写，否则回落 /tmp
+                `__fx_d="\${TMPDIR:-/tmp}"; [ -d "$__fx_d" ] && [ -w "$__fx_d" ] || __fx_d=/tmp; ` +
+                `__fx_t="$__fx_d/fx-rl-$$-${nonce}"; ` +
                 `{ ${readCmd} > "$__fx_t" 2>/dev/null || { rm -f "$__fx_t"; exit 9; }; }; ` +
                 `{ tail -n ${opts.lines} "$__fx_t"; }; __fx_rc=$?; rm -f "$__fx_t"; exit $__fx_rc`;
         } else {

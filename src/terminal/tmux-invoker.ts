@@ -21,11 +21,14 @@ export class TmuxInvoker {
             const eDec = new StringDecoder("utf-8");
             p.stdout.on("data", (d: Buffer) => { stdout += oDec.write(d); });
             p.stderr.on("data", (d: Buffer) => { stderr += eDec.write(d); });
-            const settle = (exitCode: number | null) => {
+            const settle = (exitCode: number | null, signal?: NodeJS.Signals | null) => {
                 if (settled) return;
                 settled = true;
-                const code = exitCode ?? 0;
-                if (code === 0) {
+                // 信号终止=失败（Sol 73 #7）：被 SIGTERM/SIGKILL 杀死时 exit 为
+                // null——曾 `?? 0` 映射成成功（has-session 把未完成的探测当
+                // 存活凭证）。mock 无参 emit 兼容保留成功（signal 与 code 皆空）
+                const code = signal != null ? 128 + 15 : (exitCode ?? 0);
+                if (signal == null && exitCode == null ? true : code === 0) {
                     resolve({ stdout, stderr, exitCode: 0 });
                 } else {
                     reject(new TmuxError(
@@ -35,8 +38,8 @@ export class TmuxInvoker {
                     ));
                 }
             };
-            p.once("exit", (code) => settle(code));
-            p.once("close", (code) => settle(code));
+            p.once("exit", (code, signal) => settle(code, signal));
+            p.once("close", (code, signal) => settle(code, signal));
             p.once("error", (err) => {
                 if (settled) return;
                 settled = true;

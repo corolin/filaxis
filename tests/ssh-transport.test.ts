@@ -1132,11 +1132,43 @@ describe("Sol 72：lines 临时副本落 TMPDIR", () => {
             const h = await m.start("x");
             writeFileSync(`${h.logBase}.out`, "first\nsecond\n"); // 真文件（真 shell）
             expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("second");
-            expect(sawCmd).toContain("${TMPDIR:-/tmp}/fx-rl-"); // 临时副本在 TMPDIR（修前：日志目录）
+            expect(sawCmd).toContain('__fx_d="${TMPDIR:-/tmp}"'); // 临时副本根在 TMPDIR（Sol 73 #6 起带失效回落）
+            expect(sawCmd).toContain('$__fx_d/fx-rl-');
             expect(sawCmd).not.toContain(`${logDir}/fx-rl-`); // 不落日志目录（只读目录也可读）
             // 副本清场：TMPDIR 下无残留
             const clean = Bun.spawnSync([shPath, "-c", 'ls "${TMPDIR:-/tmp}" | grep -c "fx-rl-" || true']);
             expect(clean.stdout.toString().trim()).toBe("0");
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
+    }, 20_000);
+});
+
+// GPT Sol 七十三期 #6：TMPDIR 指向不存在目录时，readLog({lines}) 曾 exit 9
+//（全量读正常）——临时盘依赖。TMPDIR 失效回落 /tmp（真 shell 实证）。
+describe("Sol 73：TMPDIR 失效回落", () => {
+    test.skipIf(!Bun.which("sh"))("TMPDIR=/nonexistent-fx-73 下 lines 读正常", async () => {
+        const remote = fakeRemote();
+        const shPath = Bun.which("sh")!;
+        const realSh = async (cmd: string, env?: Record<string, string>): Promise<{ stdout: string; exitCode: number }> => {
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, ...env } });
+            p.stdin.write(cmd);
+            await p.stdin.end();
+            const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            return { stdout, exitCode: code };
+        };
+        const d = mkdtempSync(join(tmpdir(), "fx-td73-"));
+        try {
+            const logDir = d.replace(/\\/g, "/");
+            const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+                if (cmd.startsWith("test -r ")) return realSh(cmd, { TMPDIR: "/nonexistent-fx-73" }); // TMPDIR 失效注入
+                return remote.exec(cmd);
+            };
+            const m = new RemoteSessionManager({ exec, pollMs: 10_000, logDir });
+            const h = await m.start("x");
+            writeFileSync(`${h.logBase}.out`, "first\nsecond\n");
+            expect(await m.readLog(h.sessionId)).toBe("first\nsecond"); // 全量（对照）
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("second"); // 修前：抛 exit 9
         } finally {
             rmSync(d, { recursive: true, force: true });
         }
