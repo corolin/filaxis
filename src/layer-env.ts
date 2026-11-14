@@ -211,21 +211,29 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     for (const [k, v] of Object.entries(layers)) dst.layers[k] = v;
 }
 
-/** 盘面档位（Sol 62 P2-4 序戳）：rev=文档内嵌 _fx_rev（提交时刻——比 mtime 更
- *  可靠的新旧序，rename/link 迁移不损），坏档 parsed=null（mergeLayers 自验证跳过） */
+/** 盘面档位（Sol 62 P2-4 序戳 + Sol 66 #3 血统）：rev=文档内嵌 _fx_rev（提交
+ *  时刻），base=写入时盘面最大 rev（作者见过的状态——因果链，不受时钟回拨
+ *  影响）。坏档 parsed=null（mergeLayers 自验证跳过） */
 interface FxDoc {
     mtimeMs: number;
     aside: boolean;
     rev: string | null;
+    base: string | null;
     parsed: unknown;
 }
 
 function makeDoc(mtimeMs: number, aside: boolean, text: string): FxDoc {
     try {
-        const d = JSON.parse(text) as { _fx_rev?: unknown };
-        return { mtimeMs, aside, rev: typeof d._fx_rev === "string" ? d._fx_rev : null, parsed: d };
+        const d = JSON.parse(text) as { _fx_rev?: unknown; _fx_base?: unknown };
+        return {
+            mtimeMs,
+            aside,
+            rev: typeof d._fx_rev === "string" ? d._fx_rev : null,
+            base: typeof d._fx_base === "string" ? d._fx_base : null,
+            parsed: d,
+        };
     } catch {
-        return { mtimeMs, aside, rev: null, parsed: null };
+        return { mtimeMs, aside, rev: null, base: null, parsed: null };
     }
 }
 
@@ -243,18 +251,24 @@ export class LayerEnvStore {
      *  的原写时间非移开时间，清理阈值按此保守理解）。
      *  归属按 uniq 形态全匹配（Sol 63 P1-1）：前后缀判定曾把同目录他档
      *  （env.json.other.<uniq>.fx-old）误认自家旁路——合并错档+舞步收尾连删
-     *  他档恢复锚。剥前缀后必须恰为 <pid>-<ms>-<rand> 形态才算自己的 */
+     *  他档恢复锚。剥前缀后必须恰为 <pid>-<ms>-<rand> 形态才算自己的。
+     *  大小写随平台（Sol 66 #4）：Windows/macOS 文件系统大小写不敏感——
+     *  case.json 移开旁路后 CASE.JSON 实例曾认不到自己的恢复锚（前缀匹配
+     *  大小写敏感）。此类平台前缀与 uniq 段按小写比对（返回路径仍用盘面实名） */
     private async listAsides(): Promise<Array<{ p: string; mtimeMs: number }>> {
         try {
             const { readdir } = await import("node:fs/promises");
             const dir = dirname(this.path);
+            const ci = process.platform === "win32" || process.platform === "darwin";
             const pre = `${basename(this.path)}.`;
+            const preCmp = ci ? pre.toLowerCase() : pre;
             const uniqTail = new RegExp(`^\\d+-\\d+-[a-z0-9]{1,12}\\${ASIDE_SUFFIX}$`);
             const out: Array<{ p: string; mtimeMs: number }> = [];
             for (const n of await readdir(dir)) {
-                if (!n.startsWith(pre)) continue;
-                if (!uniqTail.test(n.slice(pre.length))) continue;
-                const p = join(dir, n);
+                const nCmp = ci ? n.toLowerCase() : n;
+                if (!nCmp.startsWith(preCmp)) continue;
+                if (!uniqTail.test(nCmp.slice(preCmp.length))) continue;
+                const p = join(dir, n); // 盘面实名（大小写不敏感平台按实名开档最稳）
                 try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs }); } catch { /* 竞态消失 */ }
             }
             return out.sort((a, b) => a.mtimeMs - b.mtimeMs);
@@ -284,20 +298,32 @@ export class LayerEnvStore {
         return LayerEnvStore.snapshot(cfg);
     }
 
-    /** 并入（Sol 64 #3 门控 → Sol 65 #5 扩面）：**带戳主档**在场时，旧于主档的
-     *  旁路不并入——它是被新档作者知悉后删除的状态（整档替换已删条目不再经
-     *  恢复复活）；无戳旁路同样视作被知悉（带戳主档的作者 load 过全盘——遗老
-     *  档升级首次替换中断曾复活已删条目）。**新于主档**的带戳旁路=踩踏恢复
-     *  （并入）。无戳主档（遗老/手造）保持全并入（恢复偏置） */
+    /** 并入（Sol 64 #3 门控 → Sol 65 #5 扩面 → Sol 66 #3 血统判据）：**带戳主档**
+     *  在场时，旁路默认不并入（被作者知悉后删除），两类除外：①新于主档（踩踏
+     *  恢复）②血统外——旁路 rev 超出主档 _fx_base（写入时盘面最大 rev，因果链
+     *  不受时钟回拨影响）=作者从未见过的提交（踩踏者崩溃残留——救回，回拨下
+     *  戳序倒挂也救得回）。救回的旁路在主档**之后**并入（其键胜出——并入序兜
+     *  住倒挂的戳序）。主档无血统字段（手造/遗老）退回戳序判定；无戳主档保持
+     *  全并入+docOrder（恢复偏置，平局 data 胜） */
     private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
         const dataDoc = docs.find((d) => !d.aside);
-        const ordered = docs.filter((d) => {
-            if (d === dataDoc || !dataDoc) return true;
-            if (!dataDoc.rev) return true; // 主档无戳——恢复偏置
-            return d.rev ? d.rev > dataDoc.rev : false; // 带戳主档：仅新于它的旁路（踩踏恢复）并入
-        });
-        ordered.sort(LayerEnvStore.docOrder);
         const cfg: LayerEnvConfigFile = { layers: {} };
+        if (dataDoc?.rev) {
+            const dataRev = dataDoc.rev; // 闭包内窄化保留
+            const dataBase = dataDoc.base;
+            const kept = docs.filter((d) => {
+                if (d === dataDoc) return false;
+                if (!d.rev) return false; // 带戳主档+无戳旁路：作者 load 过全盘（Sol 65 #5）
+                return d.rev > dataRev || (dataBase != null && d.rev > dataBase);
+            });
+            kept.sort(LayerEnvStore.docOrder);
+            mergeLayers(cfg, dataDoc.parsed); // 主档先并入
+            for (const d of kept) mergeLayers(cfg, d.parsed); // 救回的旁路随后覆盖其键
+            return cfg;
+        }
+        // 无戳主档（遗老/手造）或主档缺席：全并入按 docOrder（平局 data 胜）
+        const ordered = [...docs];
+        ordered.sort(LayerEnvStore.docOrder);
         for (const d of ordered) mergeLayers(cfg, d.parsed);
         return cfg;
     }
@@ -433,11 +459,19 @@ export class LayerEnvStore {
         // 舞步开场旁路快照（Sol 61 P2-2）：成功收尾时一并消费——上轮只消自己的
         // 旁路，崩溃遗留的历史旁路仍会把整档替换已删的层复活
         const preAsides = (await this.listAsides()).map((a) => a.p);
+        // 血统快照（Sol 66 #3）：锁内盘面当前最大 rev=本轮作者「确曾见过」的状态
+        // 上界——比墙钟戳更可靠的因果链（时钟回拨下序戳倒挂、血统不倒）。写入
+        // _fx_base 供 mergeDocs 判「知悉后删除 vs 从未见过该救」
+        const diskDocs = (await this.collectDocs()).docs;
+        const baseRev = diskDocs.reduce<string | null>(
+            (m, d) => (d.rev && (!m || d.rev > m) ? d.rev : m), null);
         // 内嵌序戳（Sol 62 P2-4）：文档自带提交时刻——rename/link 迁移不损，
         // 同刻 mtime 平局由戳裁决（mergeLayers 只读 layers，戳不外泄）。
         // payloadText 单源（Sol 63 P2-4）：落位后锁失的还原比对须与写入逐字节同串
         const rev = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-        const payloadText = JSON.stringify({ ...cfg, _fx_rev: rev }, null, 2);
+        const payloadText = JSON.stringify(
+            baseRev != null ? { ...cfg, _fx_rev: rev, _fx_base: baseRev } : { ...cfg, _fx_rev: rev },
+            null, 2);
         await writeFile(tmp, payloadText, "utf-8");
         if (verifyHeld && !(await verifyHeld())) {
             await unlink(tmp).catch(() => undefined);

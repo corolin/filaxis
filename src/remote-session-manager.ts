@@ -442,6 +442,9 @@ export class RemoteSessionManager {
                     const r = await this.exec(
                         `tail -c +${bytes + 1} ${q(entry.base)}${suffix} 2>/dev/null || true`,
                     );
+                    // 凭证纪律（Sol 66 #1）：读命令失败（exit≠0）的输出不作行凭证
+                    // ——曾据错误输出发 match 还推进游标（终态冲刷已查、轮询漏查）
+                    if (r.exitCode !== 0) return;
                     const text = r.stdout || "";
                     const lastNl = text.lastIndexOf("\n");
                     if (lastNl === -1) return;
@@ -452,8 +455,13 @@ export class RemoteSessionManager {
                     else entry.errBytes += Buffer.byteLength(complete, "utf-8");
                     for (const line of asm.feed(complete)) this.onLine(entry, line, stream);
                 };
-                await readStream(".out");
-                await readStream(".err");
+                // 分流独立 try（Sol 66 #2）：stdout 读持续抛错曾连坐跳过 stderr
+                //（终态冲刷已分路、轮询仍共用）——单流失败不堵另一流
+                for (const suffix of [".out", ".err"] as const) {
+                    try {
+                        await readStream(suffix);
+                    } catch { /* 单流读失败——下轮再试 */ }
+                }
             });
             // 终态：.code 文件在场 = 进程已退出（nohup 包装的 echo 已落盘）
             const code = await this.exec(`cat ${entry.base}.code 2>/dev/null || true`);

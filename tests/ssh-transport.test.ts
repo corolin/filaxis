@@ -941,3 +941,39 @@ describe("Sol 65：冲刷凭证与事件流", () => {
         expect(events.some((e) => e.type === "match")).toBe(false); // 修前：match 照发
     }, 15_000);
 });
+
+// GPT Sol 六十六期：#1 常规轮询读命令失败（exit≠0）输出不作行凭证（终态冲刷
+// 已查、轮询漏查——曾据错误输出发 match 还推进游标）；#2 轮询单流抛错不连坐
+// 另一流（stdout 持续抛错曾堵死 stderr 读取）。
+describe("Sol 66：轮询凭证与分流隔离", () => {
+    test("#1 poll stderr 读 exit 1+MATCH 输出 → 无 match", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.err/.test(cmd)) return { stdout: "MATCH\n", exitCode: 1 }; // 失败命令的输出含匹配文本
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 30 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "MATCH", once: true });
+        await new Promise((r) => setTimeout(r, 400));
+        expect(events.some((e) => e.type === "match")).toBe(false); // 修前：poll 照喂
+    }, 15_000);
+
+    test("#2 poll stdout 读持续抛错——stderr 完整行照喂 watcher", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.out/.test(cmd)) throw new Error("out channel gone");
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 30 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "ERRLINE", once: true });
+        setTimeout(() => { remote.files.set(`${h.logBase}.err`, "ERRLINE\n"); }, 25);
+        await new Promise((r) => setTimeout(r, 400));
+        expect(events.some((e) => e.type === "match" && e.matchedLine.includes("ERRLINE"))).toBe(true); // 修前：out 抛错连坐
+    }, 15_000);
+});

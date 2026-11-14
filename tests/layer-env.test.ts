@@ -712,3 +712,61 @@ describe("Sol 65：重探扩面/门控扩面", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 六十六期：#3 时钟回拨+陈锁踩踏者崩溃于还原前——序戳倒挂把已提交
+// 新值判过期；血统 _fx_base（写入时盘面最大 rev，因果链不受回拨影响）裁决。
+// #4 Windows/macOS 大小写不敏感文件系统：仅改路径大小写曾认不到自己的旁路。
+describe("Sol 66：血统裁决/大小写归属", () => {
+    const mk66 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("#3 回拨踩踏崩溃残留：旁路 rev 在主档血统外——已提交新值救回", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env66a-"));
+        try {
+            const p = join(dir, "env.json");
+            // 踩踏者 A 崩溃于落位后还原前：主档=A 的旧值（戳 5000=正常钟；血统只含
+            // 1000——A 从未见过 B 的提交）；旁路=B 的已提交新值（戳 3000=回拨钟，
+            // 序戳倒挂但血统外）
+            writeFileSync(p, JSON.stringify({ layers: { k: mk66("old") }, _fx_rev: "5000000000000-1-aa", _fx_base: "1000000000000-1-pp" }));
+            writeFileSync(`${p}.111-222-qqqq.fx-old`, JSON.stringify({ layers: { k: mk66("new") }, _fx_rev: "3000000000000-1-bb" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（戳序把 B 判过期）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    // 血统内对照：旁路 rev 在主档血统内=作者确曾见过（整档替换删除成立）
+    test("#3b 血统内旁路（作者见过）：整档替换删除仍成立", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env66b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: {}, _fx_rev: "2000000000000-1-cc", _fx_base: "1500000000000-1-rr" }));
+            writeFileSync(`${p}.111-222-rrrr.fx-old`, JSON.stringify({ layers: { retired: mk66("retired") }, _fx_rev: "1500000000000-1-rr" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(Object.keys(cfg.layers)).toEqual([]); // retired 不复活（血统内=知悉后删）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    // 大小写敏感平台（Linux）不认领他名旁路才是正确行为——仅不敏感平台跑
+    test.skipIf(process.platform !== "win32" && process.platform !== "darwin")
+    ("#4 大小写不敏感平台：CASE.JSON 认得 case.json 的旁路", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env66c-"));
+        try {
+            const p = join(dir, "case.json");
+            writeFileSync(p, JSON.stringify({ layers: { live: mk66("live") } }));
+            renameSync(p, `${p}.111-222-ssss.fx-old`); // 移开（恢复锚）
+            const s = new LayerEnvStore(join(dir, "CASE.JSON")); // 仅大小写不同
+            const cfg = await s.load();
+            expect(cfg.layers.live).toBeTruthy(); // 修前：{}（前缀匹配大小写敏感认不到）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
