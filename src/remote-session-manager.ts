@@ -398,19 +398,26 @@ export class RemoteSessionManager {
         return p;
     }
 
-    /** 终态冲刷：消费 .out 里游标之后的残余（Astra 二十三期 #2——无尾换行的最后
-     *  一行此前被字节游标跳过：.code 出现即 finalize，watcher 对尾行零命中）。进程
-     *  已死，残余是终值——补一个换行让末行成行，全量喂 watcher。 */
+    /** 终态冲刷：消费 .out/.err 里游标之后的残余（Astra 二十三期 #2——无尾换行
+     *  的最后一行此前被字节游标跳过：.code 出现即 finalize，watcher 对尾行零命中；
+     *  Sol 64 #6：曾只冲 .out——stderr 的无换行尾行同样漏 watcher）。进程已死，
+     *  残余是终值——补一个换行让末行成行，全量喂 watcher。 */
     private async flushTail(entry: RemoteEntry): Promise<void> {
         return this.consume(entry, async () => {
             try {
-                const r = await this.exec(
-                    `tail -c +${entry.outBytes + 1} ${q(entry.base)}.out 2>/dev/null || true`,
-                );
-                const text = (r.stdout || "").replace(/\n$/, "");
-                if (text) {
-                    entry.outBytes += Buffer.byteLength(text + "\n", "utf-8");
-                    for (const line of entry.assembler.feed(text + "\n")) this.onLine(entry, line);
+                for (const suffix of [".out", ".err"] as const) {
+                    const bytes = suffix === ".out" ? entry.outBytes : entry.errBytes;
+                    const r = await this.exec(
+                        `tail -c +${bytes + 1} ${q(entry.base)}${suffix} 2>/dev/null || true`,
+                    );
+                    const text = (r.stdout || "").replace(/\n$/, "");
+                    if (text) {
+                        if (suffix === ".out") entry.outBytes += Buffer.byteLength(text + "\n", "utf-8");
+                        else entry.errBytes += Buffer.byteLength(text + "\n", "utf-8");
+                        const asm = suffix === ".out" ? entry.assembler : entry.errAssembler;
+                        const stream = suffix === ".out" ? ("stdout" as const) : ("stderr" as const);
+                        for (const line of asm.feed(text + "\n")) this.onLine(entry, line, stream);
+                    }
                 }
             } catch { /* 冲刷 best-effort——终态本身已确认 */ }
         });

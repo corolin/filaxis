@@ -230,7 +230,6 @@ function makeDoc(mtimeMs: number, aside: boolean, text: string): FxDoc {
 }
 
 export class LayerEnvStore {
-    private cache: { mtimeMs: number; cfg: LayerEnvConfigFile } | null = null;
     /** 写链串行（自挖 S2：load-modify-save 无锁——并发 upsert 后者以旧 cfg 覆盖
      *  前者写入，丢更新；实例级 promise 链保证读-改-写原子序） */
     private writeChain: Promise<unknown> = Promise.resolve();
@@ -264,21 +263,14 @@ export class LayerEnvStore {
         }
     }
 
-    async load(force = false): Promise<LayerEnvConfigFile> {
+    async load(_force = false): Promise<LayerEnvConfigFile> {
         // 旁路恢复（Sol 59 P2-1 link 舞步）：移开态/中止残留并入读取——data 缺席
-        // 时旁路是唯一状态源（崩溃于移开与落位之间）；在场即绕过 mtime 缓存
-        //（旁路增删不触 data mtime 变化，缓存键看不见）
-        const { docs, asides, dataMtimeMs, hasData } = await this.collectDocs();
-        if (asides.length === 0) {
-            if (!hasData) {
-                this.cache = { mtimeMs: 0, cfg: { layers: {} } };
-                return { layers: {} };
-            }
-            if (!force && this.cache?.mtimeMs === dataMtimeMs) return LayerEnvStore.snapshot(this.cache.cfg);
-        }
-        docs.sort(LayerEnvStore.docOrder);
-        const cfg: LayerEnvConfigFile = { layers: {} };
-        for (const d of docs) mergeLayers(cfg, d.parsed);
+        // 时旁路是唯一状态源（崩溃于移开与落位之间）。
+        // mtime 缓存已退役（Sol 64 #4）：同刻写入下缓存失明（A 预热+B 同刻保存
+        // →A 的 load 仍旧值）——env 档案小、读取廉，正确性优先于省一次读
+        const { docs, asides, hasData } = await this.collectDocs();
+        if (!hasData && docs.length === 0) return { layers: {} };
+        const cfg = LayerEnvStore.mergeDocs(docs);
         // 老化旁路压实（Sol 60 P2-3）：先持久后清理——只删不写曾使恢复出的条目
         // 读一次即蒸发。锁内重读再写（本快照可能落后他方新提交）。data 缺席时
         // 旁路是唯一状态源不清（等下次成功提交带出 data 再压）
@@ -289,8 +281,22 @@ export class LayerEnvStore {
             } catch { /* 锁竞争等——留待下次 load */ }
             return LayerEnvStore.snapshot(cfg);
         }
-        this.cache = { mtimeMs: dataMtimeMs, cfg };
         return LayerEnvStore.snapshot(cfg);
+    }
+
+    /** 并入（Sol 64 #3 门控）：主档在场且双方带戳时，**旧于主档**的旁路不并入
+     *  ——它是被新档作者知悉后删除的状态（整档替换已删条目不再经恢复复活）；
+     *  **新于主档**的旁路=踩踏恢复（并入）。无戳（遗老/手造）保持并入（恢复偏置） */
+    private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
+        const dataDoc = docs.find((d) => !d.aside);
+        const ordered = docs.filter((d) => {
+            if (d === dataDoc || !dataDoc) return true;
+            return !(dataDoc.rev && d.rev && d.rev < dataDoc.rev);
+        });
+        ordered.sort(LayerEnvStore.docOrder);
+        const cfg: LayerEnvConfigFile = { layers: {} };
+        for (const d of ordered) mergeLayers(cfg, d.parsed);
+        return cfg;
     }
 
     /** 深副本（Sol 62 P2-1）：浅副本曾漏嵌套——改 environment.os 就地污染缓存
@@ -352,6 +358,17 @@ export class LayerEnvStore {
                 } catch { /* 仍缺席——旁路已并入 */ }
             }
         }
+        if (!hasData && docs.length === 0) {
+            // 主档重探（Sol 64 #1）：读取自「主档已移开」起步（stat 即失败）、列
+            // 旁路前写入方已完整收尾（归位+清旁路）——两皆空时重探主档一次，
+            // 新落位档不漏读成空配置
+            try {
+                const st = await stat(this.path);
+                docs.push(makeDoc(st.mtimeMs, false, await readFile(this.path, "utf-8")));
+                dataMtimeMs = st.mtimeMs;
+                hasData = true;
+            } catch { /* 确无档 */ }
+        }
         return { docs, asides, dataMtimeMs, hasData };
     }
 
@@ -369,13 +386,10 @@ export class LayerEnvStore {
         }
     }
 
-    /** 盘面全量读（旁路+data 按序戳/mtime 排序并——load 的纯读核，无缓存/无压实副作用） */
+    /** 盘面全量读（旁路+data 按序戳/mtime 排序并+新旧门控——load 的纯读核） */
     private async readMergedRaw(): Promise<LayerEnvConfigFile> {
         const { docs } = await this.collectDocs();
-        docs.sort(LayerEnvStore.docOrder);
-        const cfg: LayerEnvConfigFile = { layers: {} };
-        for (const d of docs) mergeLayers(cfg, d.parsed);
-        return cfg;
+        return LayerEnvStore.mergeDocs(docs);
     }
 
     /** 原子写（公共）：抢跨实例文件锁后走 saveLocked（含锁属复核——Sol 59 P2-1：
@@ -444,16 +458,18 @@ export class LayerEnvStore {
             throw e;
         }
         await unlink(tmp).catch(() => undefined);
-        this.cache = null; // 失效缓存（下次 load 重 stat）
         // 落位后锁属复核：EEXIST 未触发只证明落位瞬间无并发提交——暂停窗口跨越
         // 整个舞步时持有权早失。还原优先（Sol 63 P2-4）：盘上仍是本舞步产物
         //（无人再动过）时把移开态搬回主位——陈值不留主位；时钟回拨/同刻下
-        // 序戳不可靠，物理还原是活检测路径上最诚实的序。盘面已变则留给合并序
+        // 序戳不可靠，物理还原是活检测路径上最诚实的序。盘面已变则留给合并序。
+        // 首次写无移开态可还原（Sol 64 #2）：搬回失败即撤下自己的产物——
+        // 报冲突的写入不留盘（盘面回到无档原态）
         if (verifyHeld && !(await verifyHeld())) {
             try {
                 const cur = await readFile(this.path, "utf-8");
                 if (cur === payloadText) {
-                    await rename(aside, this.path).catch(() => undefined);
+                    const moved = await rename(aside, this.path).then(() => true, () => false);
+                    if (!moved) await unlink(this.path).catch(() => undefined);
                     await unlink(aside).catch(() => undefined); // rename 未遂时兜底（aside 可能已被收）
                 }
             } catch { /* 盘面已变——旁路留恢复锚 */}

@@ -367,7 +367,15 @@ export async function sftpGetFile(
     assertSftpPath(remotePath, "远端");
     const tmpLocal = localTmpFor(localPath, randomBytes(4).toString("hex"));
     const batch = `get ${q(remotePath)} ${q(tmpLocal)}\n`;
-    const r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
+    let r: Awaited<ReturnType<typeof doSpawn>>;
+    try {
+        r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
+    } catch (e) {
+        // 执行器抛错也清临时（Sol 64 #5）：spawn 调用曾在清理 try 之外——
+        // 半途抛错（已写部分内容）留下 .fx-dl-* 残件
+        await fs.unlink(tmpLocal).catch(() => undefined);
+        throw e;
+    }
     if (r.exitCode !== 0) {
         await fs.unlink(tmpLocal).catch(() => undefined);
         throw new Error(`sftp get 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);

@@ -502,3 +502,27 @@ describe("Sol 63：sftpGetFile 校验失败不覆盖目标", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 六十四期 P2-5：sftp 执行器半途抛错——spawn 调用曾在清理 try 之外，
+// .fx-dl-* 半截临时残留在盘。
+describe("Sol 64：sftpGetFile 执行器抛错清临时", () => {
+    test("spawn 写入部分内容后抛错 → 透传异常 + 目标保持 + 无临时残留", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-get64-"));
+        try {
+            const localPath = join(dir, "target.bin");
+            writeFileSync(localPath, "original");
+            const spawnImpl: SftpSpawnImpl = async (_args: string[], batch: string) => {
+                const m = batch.trim().match(/^get '([^']+)' '([^']+)'$/);
+                if (m) writeFileSync(m[2]!, "partial"); // 半途已写
+                throw new Error("channel died");
+            };
+            const exec: TransferExec = async () => ({ stdout: "", exitCode: 0 });
+            await expect(sftpGetFile(exec, GNU, "/remote/x.bin", localPath, { connArgs: [], spawnImpl }))
+                .rejects.toThrow(/channel died/);
+            expect(readFileSync(localPath, "utf-8")).toBe("original");
+            expect(readdirSync(dir).filter((f) => f.includes("fx-dl"))).toEqual([]); // 修前：半截临时残留
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

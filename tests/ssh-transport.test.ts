@@ -879,3 +879,20 @@ describe("Sol 60：verify 探针精确匹配", () => {
         expect((await m.verify(h.sessionId)).status).toBe("running");
     }, 15_000);
 });
+
+// GPT Sol 六十四期 P2-6：stderr 无换行尾行漏 watcher——终态冲刷曾只读 .out。
+describe("Sol 64：stderr 尾行冲刷", () => {
+    test("stderr 最后输出无换行尾行 → exit 前冲刷喂 watcher 命中", async () => {
+        const remote = fakeRemote();
+        const m = new RemoteSessionManager({ exec: remote.exec, pollMs: 30 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("err tail");
+        m.watch(h.sessionId, { pattern: "STDERR_TAIL", once: true });
+        // 自动完成（60ms 落 .code）前注入 stderr 尾行（无换行——轮询只交付完整行）
+        setTimeout(() => { remote.files.set(`${h.logBase}.err`, "STDERR_TAIL"); }, 25);
+        await new Promise((r) => setTimeout(r, 400));
+        expect(events.some((e) => e.type === "exit")).toBe(true);
+        expect(events.some((e) => e.type === "match" && e.matchedLine.includes("STDERR_TAIL"))).toBe(true); // 修前：只有 exit
+    }, 15_000);
+});
