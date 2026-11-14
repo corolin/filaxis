@@ -199,12 +199,15 @@ export class RemoteSessionManager {
     async readLog(sessionId: string, opts: ReadLogOptions = {}): Promise<string> {
         const e = this.require(sessionId);
         const file = opts.stream === "stderr" ? `${e.base}.err` : `${e.base}.out`;
-        // 可读性门（Sol 69 #3）：`|| true` 曾吞错 + `cat | tail` 管道以末命令 rc
-        // 掩盖读失败——test -r 前置，读不了整体非零退出（管道掩码也一并封死）
+        // 可读性门（Sol 69 #3）：`|| true` 曾吞错——test -r 前置，读不了整体非零。
+        // lines 截断走命令替换中转（Sol 70 #3）：`cat f | tail -n N` 管道整体 rc
+        // 只反映末命令——test -r 通过（如路径是可读目录）而 cat 失败时曾当空
+        // 日志返回；$(cat) 的失败经 || exit 9 直达整体退出码
         const rd = q(file);
-        let cmd = `test -r ${rd} || exit 9; cat ${rd}`;
-        if (opts.offsetLines) cmd = `test -r ${rd} || exit 9; tail -n +${opts.offsetLines + 1} ${rd}`;
-        if (opts.lines) cmd += ` | tail -n ${opts.lines}`;
+        const readCmd = opts.offsetLines ? `tail -n +${opts.offsetLines + 1} ${rd}` : `cat ${rd}`;
+        const cmd = opts.lines != null
+            ? `test -r ${rd} || exit 9; __fx_l=$(${readCmd} 2>/dev/null) || exit 9; printf %s "$__fx_l" | tail -n ${opts.lines}`
+            : `test -r ${rd} || exit 9; ${readCmd}`;
         const r = await this.exec(cmd);
         // 凭证纪律（Sol 67 #3）：失败输出不作日志凭证
         if (r.exitCode !== 0) {

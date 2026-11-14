@@ -900,3 +900,32 @@ test("锁句柄零泄漏（强制 GC 不报 FileHandle 错误）", async () => {
         rmSync(dir, { recursive: true, force: true });
     }
 }, 15_000);
+
+// GPT Sol 七十期 #2：主档在场时 kept 旁路间曾按墙钟序合并——回拨下后继
+//（seen 已录前代、戳反小）被前代覆盖，已删条目复活。kept 内部辈分门控：被
+// 另一 kept 档见过=后继承继（整档不并入），按辈分深度定并入序。
+describe("Sol 70：kept 辈分门控", () => {
+    test("主档独立 + A/B 旁路（B 见过 A、回拨戳反小）——B 胜出且 retired 不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env70-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk70 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            // 主档独立（血统不含 A/B——两者皆救回）；A=旧代（retired+k:old）；
+            // B=A 的后继（seen 录 A、删 retired、改 k:new；回拨钟戳 3000 < A 的 9000）
+            writeFileSync(p, JSON.stringify({ layers: { base: mk70("base") }, _fx_rev: "5000000000000-1-mm" }));
+            writeFileSync(`${p}.111-222-pppp.fx-old`, JSON.stringify({ layers: { k: mk70("old"), retired: mk70("retired") }, _fx_rev: "9000000000000-1-nn" }));
+            writeFileSync(`${p}.111-222-qqqq.fx-old`, JSON.stringify({ layers: { k: mk70("new") }, _fx_rev: "3000000000000-1-oo", _fx_seen: ["9000000000000-1-nn"] }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（kept 按墙钟序、A 后并入）
+            expect(cfg.layers.retired).toBeUndefined(); // 修前：retired 经 A 复活（B 的删除被无视）
+            expect(cfg.layers.base).toBeTruthy(); // 主档键如常
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

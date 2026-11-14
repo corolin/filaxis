@@ -1004,3 +1004,19 @@ describe("Sol 69：connect 归还点 claim", () => {
         RuntimeStack.evictDriver({ driver: "mockssh", target: "race69" } as RuntimeDescriptor);
     }, 15_000);
 });
+
+// GPT Sol 七十期 #1：connect 的 claim 计数无释放出口——裸 connect 永久占用，
+// 唯一命名层 removeLayer(destroy) 后 destroy 从未调用。登记计数复归 + 宏任务
+// 级延迟复核（在途登记先行落地、复核见 0 才真销毁）。
+describe("Sol 70：销毁两难正解", () => {
+    test("#1 两次 connect（一裸一成层）：最后一层 destroy 释放连接", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        await stack.connect({ driver: "mockssh", target: "rel70" } as RuntimeDescriptor); // 裸 connect
+        await stack.addLayer("a", { driver: "mockssh", target: "rel70" }); // 同落点复用 + 唯一命名层
+        const drv = stack.layer("a").driver as unknown as MockLayerDriver;
+        await stack.removeLayer("a", { destroy: true });
+        await new Promise((r) => setTimeout(r, 30)); // 延迟复核宏任务落地
+        expect(drv.destroyed).toBe(true); // 修前：claim 计数永不归零、destroy 不发
+    }, 15_000);
+});

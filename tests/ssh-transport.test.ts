@@ -1051,3 +1051,21 @@ describe("Sol 69：读取失败不被掩盖", () => {
         await expect(m.tailLines(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：stderr 行照常返回
     }, 15_000);
 });
+
+// GPT Sol 七十期 #3：readLog({lines}) 的 `cat f | tail -n N` 管道整体 rc 只反映
+// 末命令——日志路径是可读目录时 test -r 通过而 cat 失败，曾当空日志返回。
+// lines 截断改命令替换中转（cat 失败经 || exit 9 直达整体退出码）。
+describe("Sol 70：readLog lines 管道掩码", () => {
+    test("日志路径为可读目录：lines 截断与全量读取都拒绝", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("test -r ")) return { stdout: "", exitCode: 9 }; // 门过后读取即败（目录态）
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100));
+        await expect(m.readLog(h.sessionId, { lines: 5 })).rejects.toThrow(/不作日志凭证/); // 修前：""（管道尾 tail rc=0）
+        await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 对照（Sol 69 已修）
+    }, 15_000);
+});

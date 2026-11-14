@@ -340,9 +340,16 @@ export class LayerEnvStore {
                 if (anchorBase != null) return d.rev > anchorBase; // 旧档回落：超上界=没见过
                 return true; // 无血统=首写见空盘——全救（Sol 67 #1）
             });
-            kept.sort(LayerEnvStore.docOrder);
+            // kept 内部辈分门控（Sol 70 #2）：被另一 kept 档**见过**（∈其闭包）=
+            // 后继作者已知悉并做出取舍（含删除）——整档由后继承继，不再并入
+            //（主档在场时曾只按墙钟序合并 kept——回拨下后继戳反小，旧值覆盖
+            // 新值+已删条目复活）。后继闭包经 seen 链传递覆盖全部前代
+            const keptMeta = kept.map((d) => ({ d, closure: LayerEnvStore.seenClosure(d, docs) }));
+            const heirs = keptMeta.filter(({ d }) =>
+                !keptMeta.some(({ d: k, closure: kc }) => k !== d && (kc?.has(d.rev!) ?? false)));
+            heirs.sort((a, b) => (a.closure?.size ?? 0) - (b.closure?.size ?? 0) || LayerEnvStore.docOrder(a.d, b.d));
             mergeLayers(cfg, anchor.parsed); // 锚点先并入
-            for (const d of kept) mergeLayers(cfg, d.parsed); // 救回的旁路随后覆盖其键
+            for (const { d } of heirs) mergeLayers(cfg, d.parsed); // 救回的旁路随后覆盖其键（辈分深者后并入）
             return cfg;
         }
         // 无戳锚点（遗老/手造）或无档：全并入按 docOrder（平局 data 胜）
