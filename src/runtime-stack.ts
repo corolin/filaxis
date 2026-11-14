@@ -190,14 +190,15 @@ export class RuntimeStack {
             this.log.debug(`[Filaxis] 指纹命中复用连接: ${descriptor.driver}/${descriptor.target ?? "local"}`);
             this.bridgeSessionEvents(cached); // 命中即订阅（二十八期 #2：每个共享
             // 该连接的 stack 登记自己的转发——修前只在首建时桥接，第二个 stack 永远收不到）
-            return cached;
+            return this.claim(cached); // 归还即计数（Sol 69 #1）：引用登记在 connect
+            // 内原子完成——登记与获取之间隔着任意代码，事后计数追不上并发销毁
         }
         const inflight = RuntimeStack.connectInflight.get(key);
         if (inflight) {
             // in-flight 共享同一次建链——返回后同样登记订阅（与缓存命中同权）
             const drv = await inflight;
             this.bridgeSessionEvents(drv);
-            return drv;
+            return this.claim(drv); // 归还即计数（Sol 69 #1 同缓存命中）
         }
         let p!: Promise<RuntimeDriver>; // 自引用（回填前复检 in-flight 身份）——回调执行时已赋值
         p = (async () => {
@@ -229,7 +230,7 @@ export class RuntimeStack {
         try {
             const drv = await p;
             this.bridgeSessionEvents(drv); // 首建者订阅（建链成功后）
-            return drv;
+            return this.claim(drv); // 归还即计数（Sol 69 #1）
         } finally {
             // 只清自己的登记（Hydrogen R3 #3 追修）：失败在途 promise 的 finally 曾
             // 无条件 delete——同 key 新一代建链的登记被前代尸体清掉，复检误判再逐出
@@ -351,9 +352,8 @@ export class RuntimeStack {
                 `（宁重连不错主机）：请检查连接参数后重试`,
             );
         }
-        const driver = await this.connect(descriptor);
+        const driver = await this.connect(descriptor); // connect 内已 claim（Sol 69 #1）
         const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
-        this.trackDriver(handle);
         this.namedLayers.set(name, handle);
         this.activeName = name;
         return { handle, reused: false };
@@ -507,9 +507,8 @@ export class RuntimeStack {
             }
             this.pendingNames.add(name);
             try {
-                const driver = await this.connect(descriptor);
+                const driver = await this.connect(descriptor); // connect 内已 claim（Sol 69 #1）
                 const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
-                this.trackDriver(handle);
                 this.namedLayers.set(name, handle);
             } finally {
                 this.pendingNames.delete(name);
@@ -520,9 +519,19 @@ export class RuntimeStack {
 
     // ── 注册表内部 ──
 
-    /** 层注册计数（Sol 68 #2：跨 stack 共享 driver 的销毁门） */
+    /** 层注册计数（Sol 68 #2：跨 stack 共享 driver 的销毁门——pushInto/pushChild
+     *  新建 driver 与 driver 直传形态；connect 路径在归还点已 claim） */
     private trackDriver(handle: LayerHandle): void {
         RuntimeStack.driverRefs.set(handle.driver, (RuntimeStack.driverRefs.get(handle.driver) ?? 0) + 1);
+    }
+
+    /** 引用认领（Sol 69 #1）：connect 归还 driver 即同步计数——获取与登记之间
+     *  隔任意代码（含调用方 await），事后登记曾与并发销毁竞态（缓存拿到 driver
+     *  →旧层减到 0 销毁→新层登记已死连接）。claim 后的连接若未成层（调用方
+     *  失败），计数泄漏 +1=偏安全方向（永不提前销毁） */
+    private claim(drv: RuntimeDriver): RuntimeDriver {
+        RuntimeStack.driverRefs.set(drv, (RuntimeStack.driverRefs.get(drv) ?? 0) + 1);
+        return drv;
     }
 
     private assertNotDupName(name: string): void {

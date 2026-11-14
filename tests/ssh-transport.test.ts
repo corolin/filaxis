@@ -382,9 +382,34 @@ function fakeRemote() {
         }
         if (cmd.startsWith("tail -n ")) {
             const n = parseInt(cmd.match(/tail -n (\d+)/)![1]!, 10);
+            // tailLines 双 rc 复合形态（Sol 69 #3）：两流各自缺席=非零
+            if (cmd.includes("__fx_r1")) {
+                const sep = cmd.match(/echo (__FX_TL_\w+__)/)![1]!;
+                const base = unq(cmd.match(/tail -n \d+ (\S+)\.out/)?.[1] ?? "");
+                const o = files.get(`${base}.out`);
+                const er = files.get(`${base}.err`);
+                if (o == null || er == null) return { stdout: "", exitCode: 9 };
+                const t = (b: string) => b.split("\n").filter(Boolean).slice(-n).join("\n");
+                return { stdout: `${t(o)}\n${sep}\n${t(er)}`, exitCode: 0 };
+            }
             const f = unq(cmd.match(/(\S+)\.out/)?.[1] ?? "");
+            if (!files.has(`${f}.out`)) return { stdout: "", exitCode: 1 }; // 无 || true（Sol 69 #3）
             const all = (files.get(`${f}.out`) ?? "").split("\n").filter(Boolean);
             return { stdout: all.slice(-n).join("\n"), exitCode: 0 };
+        }
+        // readLog 可读性门形态（Sol 69 #3）：test -r 'X' || exit 9; cat/tail 'X'
+        if (cmd.startsWith("test -r ")) {
+            const m = cmd.match(/test -r (\S+) \|\| exit 9; (cat|tail -n \+\d+) (\S+)/);
+            if (m) {
+                const f = unq(m[1]!);
+                if (!files.has(f)) return { stdout: "", exitCode: 9 }; // 不可读——整体失败
+                let text = files.get(f) ?? "";
+                if (m[2]!.startsWith("tail")) {
+                    const from = parseInt(m[2]!.match(/\+(\d+)/)![1]!, 10) - 1;
+                    text = text.split("\n").slice(from).join("\n");
+                }
+                return { stdout: text, exitCode: 0 };
+            }
         }
         if (cmd.startsWith("cat ")) {
             const f = unq(cmd.match(/cat (\S+)/)![1]!);
@@ -984,7 +1009,7 @@ describe("Sol 67：直接读取凭证纪律", () => {
     test("tail/readLog 读命令 exit 1+PARTIAL → 拒绝（不作日志凭证）", async () => {
         const remote = fakeRemote();
         const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            if (cmd.startsWith("tail -n ") || cmd.startsWith("cat ")) return { stdout: "PARTIAL", exitCode: 1 };
+            if (cmd.startsWith("tail -n ") || cmd.startsWith("test -r ") || cmd.startsWith("cat ")) return { stdout: "PARTIAL", exitCode: 1 };
             return remote.exec(cmd);
         };
         const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
@@ -1008,5 +1033,21 @@ describe("Sol 68：tailLines 凭证", () => {
         const h = await m.start("x");
         await new Promise((r) => setTimeout(r, 100));
         await expect(m.tailLines(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 partial 行
+    }, 15_000);
+});
+
+// GPT Sol 六十九期 #3：真实 shell 语义——readLog 的 || true 吞错、tailLines
+// 只拿末个 tail 的退出码（stdout 缺失+stderr 正常曾当正常返回）。
+describe("Sol 69：读取失败不被掩盖", () => {
+    test("stdout 日志缺失（stderr 仍在）→ tail/readLog/tailLines 全拒绝", async () => {
+        const remote = fakeRemote();
+        const m = new RemoteSessionManager({ exec: remote.exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100)); // 自动完成（.out/.code 落盘）
+        remote.files.set(`${h.logBase}.err`, "OK\n");
+        remote.files.delete(`${h.logBase}.out`); // stdout 日志缺失
+        await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：""（|| true 吞错）
+        await expect(m.tail(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：[]（|| true 吞错）
+        await expect(m.tailLines(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：stderr 行照常返回
     }, 15_000);
 });

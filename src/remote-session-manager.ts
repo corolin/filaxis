@@ -185,9 +185,10 @@ export class RemoteSessionManager {
     async tail(sessionId: string, n = 50): Promise<string[]> {
         const e = this.require(sessionId);
         e.lastAttentionAt = Date.now();
-        const r = await this.exec(`tail -n ${n} ${q(e.base)}.out 2>/dev/null || true`);
-        // 凭证纪律（Sol 67 #3）：读命令失败（exit≠0）的输出不作日志凭证——轮询/
-        // 冲刷已查，直接读取入口曾把失败输出当正常日志返回
+        // 无 || true（Sol 69 #3）：曾以 `2>/dev/null || true` 吞错——文件缺失/读失败
+        // exit 恒 0，空串当正常日志返回
+        const r = await this.exec(`tail -n ${n} ${q(e.base)}.out 2>/dev/null`);
+        // 凭证纪律（Sol 67 #3）：读命令失败（exit≠0）的输出不作日志凭证
         if (r.exitCode !== 0) {
             throw new Error(`会话日志读取失败（tail exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
         }
@@ -198,11 +199,14 @@ export class RemoteSessionManager {
     async readLog(sessionId: string, opts: ReadLogOptions = {}): Promise<string> {
         const e = this.require(sessionId);
         const file = opts.stream === "stderr" ? `${e.base}.err` : `${e.base}.out`;
-        let cmd = `cat ${q(file)} 2>/dev/null || true`;
-        if (opts.offsetLines) cmd = `tail -n +${opts.offsetLines + 1} ${q(file)} 2>/dev/null || true`;
+        // 可读性门（Sol 69 #3）：`|| true` 曾吞错 + `cat | tail` 管道以末命令 rc
+        // 掩盖读失败——test -r 前置，读不了整体非零退出（管道掩码也一并封死）
+        const rd = q(file);
+        let cmd = `test -r ${rd} || exit 9; cat ${rd}`;
+        if (opts.offsetLines) cmd = `test -r ${rd} || exit 9; tail -n +${opts.offsetLines + 1} ${rd}`;
         if (opts.lines) cmd += ` | tail -n ${opts.lines}`;
         const r = await this.exec(cmd);
-        // 凭证纪律（Sol 67 #3）：同 tail——失败输出不作日志凭证
+        // 凭证纪律（Sol 67 #3）：失败输出不作日志凭证
         if (r.exitCode !== 0) {
             throw new Error(`会话日志读取失败（readLog exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
         }
@@ -231,11 +235,16 @@ export class RemoteSessionManager {
         const e = this.require(sessionId);
         e.lastAttentionAt = Date.now();
         // 分隔符带随机 nonce（自排查 R4）：静态 __FX_TL__ 可被输出内容伪造（用户
-        // 命令 echo 该字面量即令后续行全部错归 stderr）——nonce 后不可预测
+        // 命令 echo 该字面量即令后续行全部错归 stderr）——nonce 后不可预测。
+        // 双 rc 捕获（Sol 69 #3）：复合命令整体 exit 只反映**末个** tail——首流
+        // 读失败曾被末流成功掩盖（stdout 缺失+stderr 正常曾当正常返回）
         const sep = `__FX_TL_${crypto.randomBytes(4).toString("hex")}__`;
-        const r = await this.exec(`tail -n ${n} ${q(e.base)}.out 2>/dev/null; echo ${sep}; tail -n ${n} ${q(e.base)}.err 2>/dev/null`);
+        const r = await this.exec(
+            `tail -n ${n} ${q(e.base)}.out 2>/dev/null; __fx_r1=$?; echo ${sep}; ` +
+            `tail -n ${n} ${q(e.base)}.err 2>/dev/null; __fx_r2=$?; ` +
+            `[ "$__fx_r1" = 0 ] && [ "$__fx_r2" = 0 ] || exit 9`,
+        );
         // 凭证纪律（Sol 68 #5）：双流读取入口同权——exit≠0 的输出不作日志凭证
-        //（tail/readLog 上轮已查、tailLines 漏查）
         if (r.exitCode !== 0) {
             throw new Error(`会话日志读取失败（tailLines exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
         }

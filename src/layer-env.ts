@@ -301,27 +301,26 @@ export class LayerEnvStore {
         return LayerEnvStore.snapshot(cfg);
     }
 
-    /** 并入（Sol 64 门控 → Sol 66/67 血统 → Sol 68 锚点化）：血统集合 _fx_seen
-     *  （写入时盘面全部 rev）成员判定——见过=知悉后删除（不并入）、没见过=踩踏
-     *  残留（救回，免疫时钟回拨）。**锚点**：主档在场用它；缺席（舞步移开窗口/
-     *  崩溃残留）取「统摄」旁路——其 seen 收录其余带戳旁路 rev（回拨下墙钟序
-     *  会说谎，seen 收录关系是因果的不会；主档移开时曾绕过血统直并全部旁路、
-     *  多旁路墙钟排序曾让旧值覆盖新值）。无统摄者退回 docOrder 末位；无戳锚点
+    /** 并入（Sol 64 门控 → Sol 66/67 血统 → Sol 68 锚点 → Sol 69 传递闭包）：
+     *  血统集合 _fx_seen 成员判定——见过=知悉后删除、没见过=踩踏残留（救回，
+     *  免疫时钟回拨）。**锚点**：主档在场用它；缺席取「无人见过者」（其 rev 不
+     *  出现在任何档的 seen=因果最新——seen 收录链传递：A∈B.seen、B∈C.seen ⇒
+     *  C 最新，回拨下墙钟序会说谎、收录关系不会）。**血统按传递闭包**判定：
+     *  锚点经 seen 链继承对更早各代的知悉（C 直接只记 B，但 B 见过 A ⇒ C 对
+     *  A 的删除同样成立）。并发多锚（互相没见过）退回 docOrder 末位；无戳锚点
      *  保持全并入+docOrder（恢复偏置）。救回的旁路在锚点之后并入 */
     private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
         const dataDoc = docs.find((d) => !d.aside);
-        // 选锚：主档 → 统摄旁路（seen 收录其余全部带戳档）→ docOrder 末位
         let anchor: FxDoc | null = dataDoc ?? null;
         if (!anchor) {
             const stamped = docs.filter((d) => d.rev != null);
-            for (const cand of stamped) {
-                if (stamped.every((x) => x === cand || !x.rev || (cand.seen?.includes(x.rev) ?? false))) {
-                    anchor = cand;
-                    break;
-                }
-            }
-            if (!anchor && stamped.length > 0) {
-                const sorted = [...stamped].sort(LayerEnvStore.docOrder);
+            if (stamped.length > 0) {
+                // 无人见过者（被任何档 seen 收录的都不是最新）——传递成立：中间代
+                // 必被其后代收录（A∈B、B∈C ⇒ A 被 B 见过）✓
+                const unseen = stamped.filter(
+                    (cand) => !stamped.some((x) => x !== cand && (x.seen?.includes(cand.rev!) ?? false)));
+                const pool = unseen.length > 0 ? unseen : stamped; // 并发互未见/环——墙钟兜底
+                const sorted = [...pool].sort(LayerEnvStore.docOrder);
                 anchor = sorted[sorted.length - 1]!;
             }
         }
@@ -329,13 +328,14 @@ export class LayerEnvStore {
         if (anchor?.rev) {
             const anchorRev = anchor.rev; // 闭包内窄化保留
             const anchorBase = anchor.base;
-            const seen = anchor.seen;
+            // 锚点有效 seen = 自身 ∪ seen 链上各代的并（传递闭包——Sol 69 #2）
+            const seen = LayerEnvStore.seenClosure(anchor, docs);
             const kept = docs.filter((d) => {
                 if (d === anchor) return false;
                 if (!d.rev) return false; // 带戳锚点+无戳旁路：作者 load 过全盘（Sol 65 #5）
-                // 集合血统（Sol 67 #2）：见过=删/没见过=救——先于戳序（回拨下已见
-                // 旧档的戳可 numeric 上大于锚点戳）
-                if (seen) return !seen.includes(d.rev);
+                // 集合血统（Sol 67 #2）：见过（含传递）=删/没见过=救——先于戳序
+                //（回拨下已见旧档的戳可 numeric 上大于锚点戳）
+                if (seen) return !seen.has(d.rev);
                 if (d.rev > anchorRev) return true; // 新于锚点=踩踏恢复（无集合回落）
                 if (anchorBase != null) return d.rev > anchorBase; // 旧档回落：超上界=没见过
                 return true; // 无血统=首写见空盘——全救（Sol 67 #1）
@@ -350,6 +350,27 @@ export class LayerEnvStore {
         ordered.sort(LayerEnvStore.docOrder);
         for (const d of ordered) mergeLayers(cfg, d.parsed);
         return cfg;
+    }
+
+    /** seen 传递闭包：锚点的有效知悉=自身 seen ∪ 各被收录档的 seen（链式回收） */
+    private static seenClosure(anchor: FxDoc, docs: FxDoc[]): Set<string> | null {
+        if (!anchor.seen) return null;
+        const byRev = new Map<string, FxDoc>();
+        for (const d of docs) if (d.rev) byRev.set(d.rev, d);
+        const out = new Set<string>(anchor.seen);
+        const visited = new Set<string>(); // 走查去重按**档**（rev）——out 预置
+        // anchor.seen 后按 rev 查重曾把首层递归整个短路（首层 r 必已在 out）
+        const walk = (d: FxDoc): void => {
+            if (d.rev && visited.has(d.rev)) return;
+            if (d.rev) visited.add(d.rev);
+            for (const r of d.seen ?? []) {
+                out.add(r);
+                const next = byRev.get(r);
+                if (next) walk(next);
+            }
+        };
+        walk(anchor);
+        return out;
     }
 
     /** 深副本（Sol 62 P2-1）：浅副本曾漏嵌套——改 environment.os 就地污染缓存

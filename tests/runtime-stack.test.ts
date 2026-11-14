@@ -976,3 +976,31 @@ describe("Sol 68：默认层切换序/跨 stack 引用计数", () => {
         RuntimeStack.evictDriver({ driver: "local" });
     }, 20_000);
 });
+
+// GPT Sol 六十九期 #1：并发建层/销毁——新层从缓存拿到 driver 后、登记引用前，
+// 旧层删除曾把引用减到 0 销毁共享 driver（新层注册到已死连接）。claim 前移到
+// connect 归还点（原子）。
+describe("Sol 69：connect 归还点 claim", () => {
+    test("获取与登记之间的窗口：旧层销毁不追杀已认领连接", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        await stack.addLayer("a", { driver: "mockssh", target: "race69" });
+        const realConnect = (stack as unknown as { connect: (d: RuntimeDescriptor) => Promise<RuntimeDriver> }).connect.bind(stack);
+        let release!: () => void;
+        const gate = new Promise<void>((r) => { release = r; });
+        (stack as unknown as { connect: unknown }).connect = async (d: RuntimeDescriptor) => {
+            const drv = await realConnect(d); // claim 已在此原子发生（修前：拿到后未计数）
+            await gate; // 模拟获取与登记之间的任意代码
+            return drv;
+        };
+        const adding = stack.addLayer("b", { driver: "mockssh", target: "race69" }); // 缓存命中后挂起
+        await new Promise((r) => setTimeout(r, 30));
+        await stack.removeLayer("a", { destroy: true }); // 修前：引用数只见 a=1→0 销毁
+        release();
+        const r2 = await adding;
+        const out = await r2.handle.driver.exec("echo hi"); // 修前：driver 已销毁
+        expect(out.exitCode).toBe(0);
+        await stack.removeLayer("b", { destroy: true });
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "race69" } as RuntimeDescriptor);
+    }, 15_000);
+});

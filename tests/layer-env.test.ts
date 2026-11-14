@@ -853,3 +853,31 @@ describe("Sol 68：锚点化恢复", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 六十九期 #2：三代旁路（A→B→C，seen 链式、回拨下墙钟戳逐代减小）——
+// 统摄判据只查直接收录曾漏 C 经 B 对 A 的继承（旧值+已删条目齐回）。锚点改选
+// 「无人见过者」+ 血统传递闭包。
+describe("Sol 69：传递闭包", () => {
+    const mk69 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("三代旁路：C（seen 只记 B、墙钟戳最小）作锚——新值胜出且 retired 不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env69-"));
+        try {
+            const p = join(dir, "env.json");
+            // 墙钟逐代回拨：A(9000) → B(5000) → C(1000)；seen 链：B 记 A、C 只记 B
+            writeFileSync(`${p}.111-222-zzzz.fx-old`, JSON.stringify({ layers: { k: mk69("a"), retired: mk69("retired") }, _fx_rev: "9000000000000-1-a69" }));
+            writeFileSync(`${p}.111-222-aaaa.fx-old`, JSON.stringify({ layers: { k: mk69("b") }, _fx_rev: "5000000000000-1-b69", _fx_seen: ["9000000000000-1-a69"] }));
+            writeFileSync(`${p}.111-222-bbbb.fx-old`, JSON.stringify({ layers: { k: mk69("c") }, _fx_rev: "1000000000000-1-c69", _fx_seen: ["5000000000000-1-b69"] }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.k!.connection.target).toBe("c"); // 修前：b（墙钟序）
+            expect(cfg.layers.retired).toBeUndefined(); // 修前：retired 经 A 复活（直接收录漏 A）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
