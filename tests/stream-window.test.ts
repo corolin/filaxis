@@ -425,3 +425,32 @@ describe("五十六期", () => {
         expect(t.endsWith("…[truncated]")).toBe(false); // 放不进即放弃后缀
     });
 });
+
+// GPT Sol 五十九期 P2-2：封顶保留段末尾正文 CR 随分块消失——上限 4B 时
+// "abc\rXYZ\n" 整行送达得 "abc\r"（硬切含 CR），"abc\rXYZ"+"\n" 分块送达却得
+// "abc"（emitCapped 一律剥尾 \r）。修：封顶切留段以 \r 收尾且被丢首字节非 \n
+// → 判定正文保留（capKeepCr）；恰为 \n 才按真 CRLF 剥（与整行送达同辙）。
+describe("五十九期：封顶末尾 CR 分治", () => {
+    test("P2 上限 4B——整行/分块同为 abc<CR>；真 CRLF 封顶后仍剥", async () => {
+        // 封顶/CRLF 语义住在 LineSplitter——经 FakeChild→registry 正径驱动
+        let seq = 0;
+        const run = async (chunks: string[]): Promise<string[]> => {
+            const procs: FakeChild[] = [];
+            const reg = new StreamWindowRegistry({
+                shell: BASH,
+                spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+            });
+            const win = await reg.open({ name: `t:59-${seq++}`, command: "x", maxLineBytes: 4 });
+            for (const ch of chunks) procs[0]!.emitOut(ch);
+            await new Promise((r) => setTimeout(r, 30));
+            const texts = win.peekLast(5).frames.map((f) => f.text);
+            reg.dispose();
+            return texts;
+        };
+        expect(await run(["abc\rXYZ\n"])).toEqual(["abc\r"]); // 整行一次：硬切 4B（后缀 14B 放不进）
+        expect(await run(["abc\rXYZ", "\n"])).toEqual(["abc\r"]); // 修前 "abc"（emitCapped 剥正文 CR）
+        // 对照：真 CRLF 整对到达走正常分辙（无封顶）——仍剥。封顶尾 \r 则必是正文：
+        // 封顶只在无换行尾段触发，被丢字节里不可能是 \n（\n 在块内即走正常路径）
+        expect(await run(["abc\r\n"])).toEqual(["abc"]);
+    }, 15_000);
+});

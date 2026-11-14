@@ -253,8 +253,10 @@ async function casWrite(
         // 覆盖他人——内容指纹封死该盲区）；写后回验 sha 自证写入正确。
         // 残余窗口（核验→写入之间）fs 层无原子 CAS 可用，如实声明：>90KB 文件的受控编辑
         // 存在毫秒级核验-写入窗口，并发写场景请消费方自管锁。
+        // 核验/回验走**原路径**（Sol 59 P1-1 与 58 P2-4 同根）：sr.qp 是 NAME_MAX
+        // 缩短名——大文件回退路径三处 stat/sha 曾仍指缩短路径（不存在 → 假冲突）
         const verify = await drv.exec(
-            `${statCmdOf(sr.qp)}; ${shaCmdOf(sr.qp)}`, { timeoutMs: 30_000 },
+            `${statCmdOf(q(path))}; ${shaCmdOf(q(path))}`, { timeoutMs: 30_000 },
         );
         const vLines = (verify.stdout || "").trim().split(/\n/);
         if ((vLines[0] ?? "").trim() !== sr.statStamp || (vLines[1] ?? "").trim() !== sr.shaStamp) {
@@ -265,7 +267,7 @@ async function casWrite(
         }
         await editFileViaFs(drv, path, edited, 1);
         // 写后回验：内容指纹确认写入结果（被并发覆盖或写坏立即暴露）
-        const post = await drv.exec(shaCmdOf(sr.qp), { timeoutMs: 30_000 });
+        const post = await drv.exec(shaCmdOf(q(path)), { timeoutMs: 30_000 });
         const expectSha = shaCmdOfContent(edited);
         if ((post.stdout || "").trim() !== expectSha) {
             throw new EditConflictError(
@@ -291,7 +293,10 @@ async function casWrite(
     // mv 不因属性同步失败而中止）。
     // 失败三态（Astra 十八轮 #2 同款）：inplace 中断=目标可能已被部分改写（绝谎称
     // 未动），tmp 载荷保留供核实/重试
-    const tgtSetup = `__fx_tgt=$(readlink -f ${sr.qp} 2>/dev/null || echo ${sr.qp}); ` +
+    // 落位目标解析走**原路径**（Sol 59 P1-1）：__fx_tgt 曾由缩短名 fxBase 解析
+    // ——240 字符长名编辑报 atomic-replace 成功，实际写进同目录缩短名旁路文件
+    // （原文件分毫未动）。fxBase 只准锚 tmp/lock 伴生文件，目标本体永远是原路径
+    const tgtSetup = `__fx_tgt=$(readlink -f ${q(path)} 2>/dev/null || echo ${q(path)}); ` +
         // 数字模式权限保持（Hydrogen R8 #2）：chmod/chown --reference 仅 GNU——macOS/
         // FreeBSD/busybox 不认，mv 后目标静默回退 umask 默认（0600 私钥→0644 可读）。
         // stat -c 读八进制权限（GNU）→ chmod NNN 数字模式全平台通吃；stat 缺席 best-effort

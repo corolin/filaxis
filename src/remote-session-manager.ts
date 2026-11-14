@@ -456,7 +456,12 @@ export class RemoteSessionManager {
                     `if [ -n "$g" ] && [ "$g" = "${entry.pid}" ]; then /bin/kill -0 -- "-$g" 2>/dev/null && echo Y || echo N; ` +
                     `else kill -0 ${entry.pid} 2>/dev/null && echo Y || echo N; fi`,
                 );
-                if (alive.stdout.includes("N")) {
+                // 探针凭证纪律（Sol 59 P1-2）：includes("N") 子串匹配曾把两类脏
+                // 结果当死讯——①探针命令自身失败（exitCode≠0+stdout "N"：通道
+                // 失灵的输出不是死亡凭证，与 .code 读同一纪律）②输出非精确单标记
+                //（"NOT DEAD" 含 N）。改为 exitCode=0 且 trim 后恰为 "N" 才判死
+                //（与 stop/verify 的 ALIVE/DEAD 精确匹配同口径）
+                if (alive.exitCode === 0 && (alive.stdout || "").trim() === "N") {
                     await this.flushTail(entry);
                     this.finalize(entry, null);
                 }

@@ -1,6 +1,6 @@
 /** editFile 受控编辑测试（local driver 真跑 + toolkit 新工具真跑 + CLI 冒烟） */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
@@ -399,4 +399,25 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         expect(out3).toContain("无已保存层");
         rmSync(d6, { recursive: true, force: true });
     }, 60_000);
+});
+
+// GPT Sol 五十九期 P1-1：240 字符长文件名编辑——CAS 核验已改原路径（58 P2-4），
+// 但落位目标 __fx_tgt 仍由缩短名 fxBase 解析：编辑报 atomic-replace 成功，实际
+// 写进同目录缩短名旁路文件（原文件分毫未动）。修：fxBase 只锚 tmp/lock 伴生件。
+describe("Sol 59：长文件名编辑落位原路径", () => {
+    test("240 字符 ASCII 文件名：原文件被改写 + 无旁路缩短名文件", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-long-")).replace(/\\/g, "/");
+        const name = "L".repeat(240) + ".env"; // >231 触发 fxBase 缩短（NAME_MAX 基底）
+        const p = `${d}/${name}`;
+        writeFileSync(p, "OLD=1\n");
+        const r = await editFile(drv, p, "OLD=1", "NEW=2");
+        expect(r.writeMode).toBe("atomic-replace");
+        expect(readFileSync(p, "utf-8")).toBe("NEW=2\n"); // 修前：原文件仍是 OLD=1
+        // 修前实锤形态：同目录出现「LLL…~xxxxxxxx」缩短名文件装着 NEW=2
+        //（fx-lock 残留是 fd 9 重定向的既有行为，不算旁路）
+        const lSiblings = readdirSync(d).filter((f) => f.startsWith("L") && f !== name && !f.endsWith(".fx-lock") && !f.endsWith(".fx-tmp"));
+        expect(lSiblings).toEqual([]);
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
 });

@@ -33,6 +33,9 @@ export interface AgentToolHandlers {
     }>;
     observe_stream(args: { command: string; duration_ms?: number; stream?: "stdout" | "stderr" | "both"; name?: string; layer?: string }): Promise<{
         session_id: string; lines: Array<{ stream: string; text: string }>;
+        /** 终态信息（Sol 59 P2-4：运行时 stop unknown 时已返回——类型声明补齐，
+         *  TypeScript 调用方可直接分支；stop_status 只在停止结果 unknown 时在场 */
+        stop_status?: string; verify_status?: string;
     }>;
     spawn_and_observe(args: { command: string; ready_marker?: string; error_pattern?: string; name?: string; layer?: string }): Promise<{
         session_id: string; log_base: string; note?: string;

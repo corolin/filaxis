@@ -395,12 +395,17 @@ async function main() {
                 const filtered = (o.stream && o.stream !== "both") ? lines.filter((l) => l.stream === o.stream) : lines;
                 for (const l of filtered) console.log(`[${l.stream}] ${l.text}`);
                 const stopR = await drv.stopSession(h.sessionId).catch(() => ({ status: "unknown" }) as { status: "unknown" }); // 异常归 unknown（Sol 58 P2-6）
-                // stop unknown 接核实（Sol 57 P2-7 同 toolkit——吞掉改带终态警示）
+                // stop unknown 接核实（Sol 57 P2-7 同 toolkit——吞掉改带终态警示）。
+                // 双未知不静默（Sol 59 P2-3）：修前仅核实 running 时提示——verify
+                // 也 unknown/抛错时 CLI 零输出收场，调用者拿不到会话与日志线索
                 if (stopR && stopR.status === "unknown") {
                     let vStatus = "unknown";
-                    try { vStatus = (await drv.verifySession(h.sessionId)).status; } catch { /* 核实失败保 unknown */ }
+                    let vErr = "";
+                    try { vStatus = (await drv.verifySession(h.sessionId)).status; } catch (e) { vErr = (e as Error).message; }
                     if (vStatus === "running") {
                         console.error(`[filaxis] 停止结果未知且核实显示**任务仍在运行**——会话 ${h.sessionId} 日志 ${h.logBase}，勿盲目重试`);
+                    } else if (vStatus === "unknown") {
+                        console.error(`[filaxis] 停止与核实均为未知（${vErr ? `核实失败: ${vErr}` : "通道异常或会话失联"}）——会话 ${h.sessionId} 日志 ${h.logBase}，任务可能仍在运行：核实终态后再重试`);
                     }
                 }
                 break;

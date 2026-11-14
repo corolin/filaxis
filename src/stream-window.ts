@@ -227,6 +227,8 @@ export class StreamWindow {
 class LineSplitter {
     private buf = "";
     private capped = false;
+    /** 封顶保留段末尾 CR 的内容性判定（Sol 59 P2-2）：true=已证正文（成行时保留） */
+    private capKeepCr = false;
     constructor(private readonly maxBytes: number) {}
     push(chunk: string, onLine: (line: string) => void): void {
         // 迭代扫描（Sol 五十二期 #1）：逐换行消费——递归处理剩余曾随块内换行
@@ -270,6 +272,12 @@ class LineSplitter {
                         if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
                         this.buf = cut + TRUNC_SUFFIX;
                     }
+                    // 封顶末尾 CR 分治（Sol 59 P2-2）：保留段恰以 \r 收尾且其后有
+                    // 被丢字节——该 \r 必是正文（abc\rXYZ 上限 4 → "abc\r"，成行时
+                    // 保留——修前 emitCapped 一律剥，同输入分块方式改变了截断结果）。
+                    // 真 CRLF 的 \n 若在本块内会走正常分辙（不封顶）——被丢首字节
+                    // 不可能是 \n，防御性比较保留作未来改动的护栏
+                    this.capKeepCr = this.buf.endsWith("\r") && raw.length > this.buf.length && raw[this.buf.length] !== "\n";
                     this.capped = true;
                 } else {
                     this.buf += data; // CR 保留（成行时按 CRLF/内容分治）
@@ -308,15 +316,19 @@ class LineSplitter {
 
     /** 封顶行输出（capped 等到换行——buf 终值直接成行并复位） */
     private emitCapped(onLine: (line: string) => void): void {
-        const clean = this.buf.replace(/\r$/, "");
+        // 正文 CR 保留（Sol 59 P2-2）：capKeepCr=封顶时已证末尾 \r 是正文——
+        // 修前一律剥尾（abc\rXYZ 上限 4 分块送达曾成 "abc"，整行送达是 "abc\r"）
+        const clean = this.capKeepCr ? this.buf : this.buf.replace(/\r$/, "");
         this.buf = "";
         this.capped = false;
+        this.capKeepCr = false;
         if (clean !== "") onLine(clean);
     }
     flush(onLine: (line: string) => void): void {
-        const rest = this.buf.replace(/\r$/, "");
+        const rest = this.capped && this.capKeepCr ? this.buf : this.buf.replace(/\r$/, "");
         this.buf = "";
         this.capped = false; // 行已终结——下一行重新计封顶
+        this.capKeepCr = false;
         if (rest !== "") onLine(rest);
     }
 }

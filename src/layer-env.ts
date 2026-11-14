@@ -13,7 +13,7 @@
  */
 import { createHash } from "node:crypto";
 import { rename, stat, mkdir, writeFile, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { RuntimeDescriptor } from "./driver.js";
 import { enterStepsOf, type SshConnParams } from "./ssh-helpers.js";
 
@@ -199,7 +199,17 @@ function looksLikeGpuModel(val: string): boolean {
     return /^[A-Za-z0-9 ()+.-]+$/.test(val);
 }
 
-// ════════════════ 持久化（JSON + 原子写 + mtime 缓存） ════════════════
+// ════════════════ 持久化（JSON + link-CAS 落位 + mtime 缓存） ════════════════
+
+/** 旁路文件后缀：<path>.<uniq>.fx-old（link 舞步的移开态/中止残留——load 并入恢复） */
+const ASIDE_SUFFIX = ".fx-old";
+
+/** 层条目并入（dst 被 src 覆盖同键——后并入者新） */
+function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
+    const layers = (src as LayerEnvConfigFile | null)?.layers;
+    if (!layers || typeof layers !== "object") return;
+    for (const [k, v] of Object.entries(layers)) dst.layers[k] = v;
+}
 
 export class LayerEnvStore {
     private cache: { mtimeMs: number; cfg: LayerEnvConfigFile } | null = null;
@@ -209,56 +219,134 @@ export class LayerEnvStore {
 
     constructor(public readonly path: string) {}
 
-    async load(force = false): Promise<LayerEnvConfigFile> {
-        let mtimeMs = 0;
+    /** 列旁路文件（mtime 升序——线性历史态，旧→新逐个并入；mtime 是被移开文件
+     *  的原写时间非移开时间，清理阈值按此保守理解） */
+    private async listAsides(): Promise<Array<{ p: string; mtimeMs: number }>> {
         try {
-            mtimeMs = (await stat(this.path)).mtimeMs;
+            const { readdir } = await import("node:fs/promises");
+            const dir = dirname(this.path);
+            const pre = `${basename(this.path)}.`;
+            const out: Array<{ p: string; mtimeMs: number }> = [];
+            for (const n of await readdir(dir)) {
+                if (!n.startsWith(pre) || !n.endsWith(ASIDE_SUFFIX)) continue;
+                const p = join(dir, n);
+                try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs }); } catch { /* 竞态消失 */ }
+            }
+            return out.sort((a, b) => a.mtimeMs - b.mtimeMs);
         } catch {
-            const cfg: LayerEnvConfigFile = { layers: {} };
-            this.cache = { mtimeMs: 0, cfg };
-            return cfg;
-        }
-        if (!force && this.cache?.mtimeMs === mtimeMs) return this.cache.cfg;
-        try {
-            const parsed = JSON.parse(await readFile(this.path, "utf-8")) as LayerEnvConfigFile;
-            const cfg: LayerEnvConfigFile = parsed?.layers && typeof parsed.layers === "object"
-                ? { layers: parsed.layers }
-                : { layers: {} };
-            this.cache = { mtimeMs, cfg };
-            return cfg;
-        } catch {
-            return this.cache?.cfg ?? { layers: {} }; // 坏文件：不崩，返回空
+            return [];
         }
     }
 
-    /** 原子写（公共）：抢跨实例文件锁后走 saveLocked */
+    async load(force = false): Promise<LayerEnvConfigFile> {
+        // 旁路恢复（Sol 59 P2-1 link 舞步）：移开态/中止残留并入读取——data 缺席
+        // 时旁路是唯一状态源（崩溃于移开与落位之间）；在场即绕过 mtime 缓存
+        //（旁路增删不触 data mtime 变化，缓存键看不见）
+        const asides = await this.listAsides();
+        let mtimeMs = 0;
+        let hasData = false;
+        try {
+            mtimeMs = (await stat(this.path)).mtimeMs;
+            hasData = true;
+        } catch { /* 缺席——旁路承载 */ }
+        if (asides.length === 0) {
+            if (!hasData) {
+                const cfg: LayerEnvConfigFile = { layers: {} };
+                this.cache = { mtimeMs: 0, cfg };
+                return cfg;
+            }
+            if (!force && this.cache?.mtimeMs === mtimeMs) return this.cache.cfg;
+        }
+        let cfg: LayerEnvConfigFile = { layers: {} };
+        for (const a of asides) {
+            try { mergeLayers(cfg, JSON.parse(await readFile(a.p, "utf-8"))); } catch { /* 残旁路坏文件跳过 */ }
+        }
+        if (hasData) {
+            try {
+                // data 最新（当前持有者提交，其 load 已并入当时旁路）——同键胜出
+                mergeLayers(cfg, JSON.parse(await readFile(this.path, "utf-8")));
+            } catch {
+                return this.cache?.cfg ?? cfg; // 坏文件：不崩（原语义）
+            }
+        }
+        this.cache = { mtimeMs, cfg };
+        // 陈旧旁路清理（10min）：内容已被历次 load 并入；data 缺席时旁路是唯一
+        // 状态源绝不清理。极端交叠（陈锁持有者崩溃于落位后复核前——盘上留陈
+        // 态+新旁路）靠指纹 stale 检测重探自愈（缓存语义，非账本）
+        if (hasData) {
+            const { unlink } = await import("node:fs/promises");
+            const now = Date.now();
+            for (const a of asides) {
+                if (now - a.mtimeMs > 600_000) await unlink(a.p).catch(() => undefined);
+            }
+        }
+        return cfg;
+    }
+
+    /** 原子写（公共）：抢跨实例文件锁后走 saveLocked（含锁属复核——Sol 59 P2-1：
+     *  此前未传复核，公开 save() 是无保护覆盖通道） */
     async save(cfg: LayerEnvConfigFile): Promise<void> {
         const release = await this.acquireLock();
         try {
-            await this.saveLocked(cfg);
+            await this.saveLocked(cfg, () => release.verifyHeld());
+        } catch (e) {
+            if (e instanceof Error && e.message === "__FX_LOCK_LOST__") {
+                // save 是整档快照语义（不自动合并重试——重放会盖掉并发写入方的键）：
+                // 报冲突交调用方 load() 重读合并后重写
+                throw new Error(`LayerEnvStore.save 并发冲突（写入期间锁被回收——盘上是他方新档或本轮已落位）。请 load() 重读、合并你的键后重写: ${this.path}`);
+            }
+            throw e;
         } finally {
             await release.finalize();
         }
     }
 
-    /** 无锁写（调用方持锁）：tmp+rename 原子落位。
-     *  rename 前锁属复核（Sol 58 P2-1）：写前复核后→写入期间锁被回收+新 holder
-     *  写入→旧 holder rename 覆盖新数据（retry 重读时新数据已被盖）。复核内联到
-     *  rename 紧前——窗口从「整个写入」收窄到 check→rename 的 syscall 间隙；复核
-     *  失败抛哨兵（rename 未发生，盘上新 holder 数据完好），上层重试重读合并 */
+    /** 无锁写（调用方持锁）：tmp + link-CAS 舞步落位。
+     *  link-CAS（Sol 59 P2-1）：rename 是「无条件替换」——上轮把锁属复核内联到
+     *  rename 紧前只收窄到 syscall 间隙，复核回调内可暂停的窗口仍会被陈锁回收
+     *  穿透（A 复核过→暂停→B 回收接管提交→A 恢复 rename 直接盖掉——两个
+     *  upsert 都报成功，B 的键蒸发）。link 是「不存在才落位」：EEXIST = 落位
+     *  点已有他人提交的铁证——中止且不动盘上数据。舞步：先把现行态移开
+     *  （rename→旁路）空出落位点，再 link；崩溃/中止时旁路残留由 load 并入
+     *  恢复（自愈）。落位后二次锁属复核兜底「暂停跨越整个舞步」的持有权早失 */
     private async saveLocked(
         cfg: LayerEnvConfigFile,
         verifyHeld?: () => Promise<boolean>,
     ): Promise<void> {
+        const { link, unlink } = await import("node:fs/promises");
         await mkdir(dirname(this.path), { recursive: true });
-        const tmp = `${this.path}.${process.pid}-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 6)}.tmp`;
+        const uniq = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const tmp = `${this.path}.${uniq}.tmp`;
+        const aside = `${this.path}.${uniq}${ASIDE_SUFFIX}`;
         await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
         if (verifyHeld && !(await verifyHeld())) {
-            await (await import("node:fs/promises")).unlink(tmp).catch(() => undefined);
-            throw new Error("__FX_LOCK_LOST__"); // 哨兵：rename 未发生
+            await unlink(tmp).catch(() => undefined);
+            throw new Error("__FX_LOCK_LOST__"); // 哨兵：落位未尝试，盘上数据未动
         }
-        await rename(tmp, this.path);
+        try {
+            await rename(this.path, aside);
+        } catch (e) {
+            if ((e as { code?: string }).code !== "ENOENT") {
+                await unlink(tmp).catch(() => undefined); // 移开失败：tmp 不留残
+                throw e;
+            } // 缺席容忍（首次写）
+        }
+        try {
+            await link(tmp, this.path);
+        } catch (e) {
+            await unlink(tmp).catch(() => undefined);
+            if ((e as { code?: string }).code === "EEXIST") {
+                throw new Error("__FX_LOCK_LOST__"); // 并发已提交铁证——移开态留旁路，load 并入恢复
+            }
+            throw e;
+        }
+        await unlink(tmp).catch(() => undefined);
         this.cache = null; // 失效缓存（下次 load 重 stat）
+        // 落位后锁属复核：EEXIST 未触发只证明落位瞬间无并发提交——暂停窗口跨越
+        // 整个舞步时持有权早失；哨兵交上层重试（重读并入旁路再提交，不丢他人键）
+        if (verifyHeld && !(await verifyHeld())) {
+            throw new Error("__FX_LOCK_LOST__");
+        }
     }
 
     /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */

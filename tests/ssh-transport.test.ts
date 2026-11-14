@@ -827,3 +827,35 @@ describe("Gemini 审查批回归", () => {
         expect(tokenizeArgv("a '' b")).toEqual(["a", "", "b"]); // 空串参数保留
     });
 });
+
+// GPT Sol 五十九期 P1-2：poll 探针凭证纪律——includes("N") 子串匹配曾把两类脏
+// 结果当死讯终结会话：①探针命令自身失败（exitCode 1 + stdout "N"——通道失灵
+// 的输出不是死亡凭证，与 .code 读同一纪律）②输出非精确标记（"NOT DEAD" 含 N）。
+// 修：exitCode=0 且 trim 后恰为 "N" 才判死（与 stop/verify 的精确匹配同口径）。
+describe("Sol 59：poll 探针脏结果不判死", () => {
+    test("exit 1+‘N’ 与 exit 0+‘NOT DEAD’ 均不终结；精确 ‘N’ 才判死（null 退出码）", async () => {
+        const remote = fakeRemote();
+        let probe: { stdout: string; exitCode: number } | null = null;
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("g=$(cat ") && cmd.includes("kill -0") && probe) return probe;
+            if (/^cat \S+\.code/.test(cmd)) return { stdout: "", exitCode: 0 }; // .code 恒缺席（走 pid 探针分支）
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 25 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("sleep 60");
+        remote.procs.delete(h.pid!); // 进程已死但无 .code——探针分支
+        probe = { stdout: "N", exitCode: 1 }; // 探针命令失败：输出不作死亡凭证
+        await new Promise((r) => setTimeout(r, 150));
+        expect(events.some((e) => e.type === "exit")).toBe(false); // 修前：includes("N") 判死
+        probe = { stdout: "NOT DEAD", exitCode: 0 }; // 输出非精确标记（含 N 子串）
+        await new Promise((r) => setTimeout(r, 150));
+        expect(events.some((e) => e.type === "exit")).toBe(false); // 修前：同判死
+        probe = { stdout: "N\n", exitCode: 0 }; // 精确 N（trim 后）→ 判死
+        await new Promise((r) => setTimeout(r, 150));
+        const exit = events.find((e) => e.type === "exit") as Extract<SessionEvent, { type: "exit" }>;
+        expect(exit).toBeTruthy();
+        expect(exit.exitCode).toBeNull(); // 无 .code 的外部死亡 → unknown 退出码
+    }, 15_000);
+});

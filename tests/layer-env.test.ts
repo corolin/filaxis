@@ -2,7 +2,7 @@
  * 层环境规格单测（AC-17：解析纯函数/身份键/漂移/匹配/持久化）
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -160,3 +160,66 @@ test("LayerEnvStore 并发 upsert 不丢更新（自挖 S2）", async () => {
         rmSync(dir, { recursive: true, force: true });
     }
 }, 15_000);
+
+// GPT Sol 五十九期 P2-1：link-CAS 舞步——A 复核过后暂停、B 陈锁回收接管提交、
+// A 恢复 rename 直接盖掉 B（两个 upsert 都报成功，B 的键蒸发）。rename 是「无条件
+// 替换」，link 是「不存在才落位」：EEXIST=并发已提交铁证，中止+移开态旁路留盘、
+// load 并入恢复，重试收敛双方都在。
+describe("Sol 59：跨实例并发提交不丢更新（link-CAS 舞步）", () => {
+    test("A 复核后暂停→B 接管提交→A 恢复：双方键共存", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env59-"));
+        try {
+            const p = join(dir, "env.json");
+            const a = new LayerEnvStore(p);
+            const b = new LayerEnvStore(p);
+            const mk = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            // 白盒驱动 A 的舞步（upsert 的复核钩子不可注入——「复核已过、落位前被
+            // 穿透」的暂停窗口经 saveLocked 直达）：钩子先复核（A 真持锁→true），
+            // 再睡过 5s 陈锁阈值让 B 完整提交，然后放行
+            const relA = await (a as unknown as { acquireLock: () => Promise<{ verifyHeld(): Promise<boolean>; finalize(): Promise<void> }> }).acquireLock();
+            const cfgA = await a.load();
+            cfgA.layers.alpha = mk("alpha");
+            let aErr: unknown = null;
+            try {
+                await (a as unknown as { saveLocked: (cfg: LayerEnvConfigFile, v?: () => Promise<boolean>) => Promise<void> })
+                    .saveLocked(cfgA, async () => {
+                        const held = await relA.verifyHeld(); // A 复核时真持锁
+                        await new Promise((r) => setTimeout(r, 5_300)); // 暂停：锁过陈阈
+                        await b.upsert("beta", mk("beta")); // B 回收接管完整提交
+                        return held; // 复核结论 true——A 不知道自己已被回收
+                    });
+            } catch (e) { aErr = e; } // link-CAS/落位后复核拦下（修前 rename 无声盖掉 B 且 saveLocked 成功）
+            expect(aErr).toBeInstanceOf(Error);
+            // A 走正门重提交：重读并入旁路（B 的移开态）→ 双方收敛
+            await a.upsert("alpha", mk("alpha"));
+            await relA.finalize();
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(Object.keys(cfg.layers).sort()).toEqual(["alpha", "beta"]); // 修前：只剩 alpha
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("旁路恢复：data 缺席时 load 从旁路救回（崩溃于移开与落位之间）+ 在场时并入", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env59b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { live: entry({ os: "live" }) } }));
+            // 模拟舞步崩溃残留：现行态被移开、落位未发生——旁路是唯一状态源
+            renameSync(p, `${p}.777-crash.fx-old`);
+            const cfg = await new LayerEnvStore(p).load();
+            expect(cfg.layers.live).toBeTruthy();
+            // data 回场后旁路并入（并集——data 同键胜出）
+            writeFileSync(p, JSON.stringify({ layers: { fresh: entry({ os: "fresh" }) } }));
+            const cfg2 = await new LayerEnvStore(p).load(true);
+            expect(Object.keys(cfg2.layers).sort()).toEqual(["fresh", "live"]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
