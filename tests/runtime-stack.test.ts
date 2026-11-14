@@ -1079,3 +1079,41 @@ describe("Sol 71：销毁窗口三缝", () => {
         await (gen2 as unknown as CountingDriver).destroy();
     }, 15_000);
 });
+
+// GPT Sol 七十二期 #2：removeLayer 的同步逐出曾按描述符无条件清——同描述符的
+// 下一代（先显式逐出旧代、connect 新建）被连坐逐出/中断建链；重新登记旧
+// driver 再移除同罪。实例核对：缓存里就是本代才清。
+describe("Sol 72：实例核对逐出", () => {
+    test("旧层移除不逐出新代（先 evict 旧、connect 建二代、再移除持旧代的层）", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        const desc = { driver: "mockssh", target: "inst72" } as RuntimeDescriptor;
+        await stack.addLayer("old", desc);
+        const gen1 = stack.layer("old").driver;
+        stack.evict(desc); // 显式逐出旧代
+        const gen2 = await stack.connect(desc); // 同描述符建二代（缓存）
+        await stack.removeLayer("old", { destroy: true }); // 移除持 gen1 的层——修前：连坐逐出 gen2
+        const gen3 = await stack.connect(desc);
+        expect(gen3).toBe(gen2); // 修前：gen2 被清、gen3 是三代（gen1 的销毁定时器还可能中断建链）
+        await new Promise((r) => setTimeout(r, 30)); // 延迟复核宏任务落地
+        expect((gen1 as unknown as MockLayerDriver).destroyed).toBe(true); // 销毁的只是 gen1
+        await (gen2 as unknown as MockLayerDriver).destroy();
+        RuntimeStack.evictDriver(desc);
+    }, 15_000);
+
+    test("重新登记旧 driver 再移除——已建好的二代不被逐出", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        const desc = { driver: "mockssh", target: "reg72" } as RuntimeDescriptor;
+        await stack.addLayer("a", desc);
+        const gen1 = stack.layer("a").driver;
+        stack.evict(desc);
+        const gen2 = await stack.connect(desc); // 二代已建好（在缓存）
+        await stack.addLayer("re", gen1); // 重新登记旧 driver（driver 直传）
+        await stack.removeLayer("re", { destroy: true }); // 修前：按描述符清缓存=逐出 gen2
+        const gen3 = await stack.connect(desc);
+        expect(gen3).toBe(gen2);
+        await (gen2 as unknown as MockLayerDriver).destroy();
+        RuntimeStack.evictDriver(desc);
+    }, 15_000);
+});

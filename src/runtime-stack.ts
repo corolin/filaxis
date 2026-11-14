@@ -242,6 +242,15 @@ export class RuntimeStack {
         return RuntimeStack.evictDriver(d, this.cacheNs);
     }
 
+    /** 实例核对的逐出（Sol 72 #2）：缓存里就是本代才清——removeLayer 曾按描述符
+     *  无条件清缓存，把同描述符的下一代（先显式逐出旧代、connect 新建后）连坐
+     *  逐出/中断其在途建链；重新登记旧 driver 再移除同罪 */
+    static evictDriverIfIs(drv: RuntimeDriver, d: RuntimeDescriptor, ns = ""): void {
+        const key = ns ? `${ns}|${RuntimeStack.driverKey(d)}` : RuntimeStack.driverKey(d);
+        if (RuntimeStack.driverCache.get(key) !== drv) return; // 缓存里已是别代——不动
+        RuntimeStack.evictDriver(d, ns);
+    }
+
     /** 逐出缓存（销毁归调用方——先 evict 再 destroy，避免销毁竞态复用）。
      *  ns：命名空间（默认共享缓存传 ""；自定义工厂的 stack 内部逐出走自身 ns） */
     static evictDriver(d: RuntimeDescriptor, ns = ""): RuntimeDriver | undefined {
@@ -463,11 +472,10 @@ export class RuntimeStack {
         if (refs === 0) RuntimeStack.driverRefs.delete(h.driver);
         else RuntimeStack.driverRefs.set(h.driver, refs);
         if (opts.destroy && refs === 0) {
-            // 缓存同步逐出（Sol 71 #2）：延迟销毁窗口内 connect 曾拿到注定被杀的
-            // 旧连接（逐出曾放在定时器里）。定时器只复核+销毁本代 driver——不再
-            // 按描述符逐出（曾把定时器落地前建立的**新一代**连接逐出=旧定时器
-            // 误杀新代，Sol 71 #3）
-            RuntimeStack.evictDriver(h.descriptor, this.cacheNs);
+            // 缓存同步逐出（Sol 71 #2）+ 实例核对（Sol 72 #2）：缓存里就是本代
+            // 才清——按描述符无条件清曾把同描述符的新一代连坐逐出/中断建链；
+            // 定时器只复核+销毁本代 driver（不逐出）
+            RuntimeStack.evictDriverIfIs(h.driver, h.descriptor, this.cacheNs);
             // 销毁去重（Sol 71 #2）：定时器触发前同 driver 重新登记又移除曾触发
             // 两次 destroy()
             if (RuntimeStack.destroyScheduled.has(h.driver)) return;

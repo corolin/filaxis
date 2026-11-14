@@ -526,3 +526,38 @@ describe("Sol 64：sftpGetFile 执行器抛错清临时", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十二期 #5：NAME_MAX 按字节计——250B 中文文件名（83 码元）+临时后缀
+// 曾按码元判定「放得进」→ 追后缀即超限（上传 tmp/普通下载 out/sftp 下载本地
+// 临时全中）。字节口径截断。
+describe("Sol 72：多字节长名字节口径", () => {
+    test("sftpGetFile 本地临时名：82 个「中」（250B）+ 后缀 ≤255B", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-cjk72-"));
+        try {
+            const name = "中".repeat(82) + ".bin"; // 246B + 4B=250B 裸名合法（<255B）、追后缀必超（>255B）
+            const localPath = join(dir, name);
+            writeFileSync(localPath, "original");
+            const files = new Map<string, Buffer>([["/remote/x.bin", Buffer.from("good")]]);
+            const exec: TransferExec = async (cmd) => {
+                const m = cmd.match(/^(?:wc -c|sha256sum) < '([^']+)'$/);
+                if (!m) return { stdout: "", exitCode: 0 };
+                const buf = files.get(m[1]!) ?? Buffer.alloc(0);
+                if (cmd.startsWith("wc")) return { stdout: String(buf.length), exitCode: 0 };
+                return { stdout: createHash("sha256").update(buf).digest("hex"), exitCode: 0 };
+            };
+            let tmpSeen = "";
+            const spawnImpl: SftpSpawnImpl = async (_args: string[], batch: string) => {
+                const m = batch.trim().match(/^get '([^']+)' '([^']+)'$/);
+                if (m) { tmpSeen = m[2]!; writeFileSync(m[2]!, "good"); } // 落真实文件（名字超限会当场 ENAMETOOLONG）
+                return { stdout: "", stderr: "", exitCode: 0 };
+            };
+            const r = await sftpGetFile(exec, GNU, "/remote/x.bin", localPath, { connArgs: [], spawnImpl });
+            expect(r.verified).toBe(true);
+            expect(readFileSync(localPath, "utf-8")).toBe("good"); // 归位成功（修前：临时名超限写不进）
+            const tmpBase = tmpSeen.split(/[\\/]/).pop()!;
+            expect(Buffer.byteLength(tmpBase, "utf-8")).toBeLessThanOrEqual(255); // 字节口径（修前码元口径必超）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

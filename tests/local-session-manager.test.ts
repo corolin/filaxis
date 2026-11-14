@@ -283,3 +283,15 @@ describe("local verify（Gemini #7）", () => {
         await m.stop(h.sessionId).catch(() => undefined);
     }, 15_000);
 });
+
+// GPT Sol 七十二期 #4：本地 readLog 尾窗快路径把末尾换行算成一条空行——
+// first\nsecond\n 取 1 行曾得 ""、取 2 行曾得 "second\n"。split 尾空串先剥。
+describe("Sol 72：本地尾行纪律", () => {
+    test("尾换行不算行：取 1 行=second、取 2 行=first+second", async () => {
+        const m = new LocalSessionManager();
+        const h = await m.start("echo first; echo second");
+        await waitFor(() => m.list().find((s) => s.sessionId === h.sessionId)?.running === false);
+        expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("second"); // 修前：""
+        expect(await m.readLog(h.sessionId, { lines: 2 })).toBe("first\nsecond"); // 修前："second\n"
+    }, 20_000);
+});

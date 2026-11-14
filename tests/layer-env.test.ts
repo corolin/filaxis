@@ -966,3 +966,38 @@ describe("Sol 71：坏主档不作锚", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十二期 P1：合法 JSON 但结构无效（`[]` 无 layers）仍作锚——上轮只
+// 堵了截断 JSON。同款两代旁路回拨复现（旧 A 覆盖见过它的 B、复活已删条目，
+// 老化压实把错果写回主档并清两份旁路）。
+describe("Sol 72：结构无效主档不作锚", () => {
+    test("主档为 []：B 胜出、压实落盘 B、旁路清、retired 不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env72-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk72 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            writeFileSync(p, "[]"); // 合法 JSON、无 layers——结构无效
+            const asideA = `${p}.111-222-tttt.fx-old`;
+            const asideB = `${p}.111-222-uuuu.fx-old`;
+            writeFileSync(asideA, JSON.stringify({ layers: { k: mk72("old"), retired: mk72("retired") }, _fx_rev: "9000000000000-1-a72" }));
+            writeFileSync(asideB, JSON.stringify({ layers: { k: mk72("new") }, _fx_rev: "3000000000000-1-b72", _fx_seen: ["9000000000000-1-a72"] }));
+            const old = new Date(Date.now() - 11 * 60_000);
+            utimesSync(asideA, old, old);
+            utimesSync(asideB, old, old);
+            const cfg = await new LayerEnvStore(p).load();
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（[] 作锚按墙钟并旁路）
+            expect(cfg.layers.retired).toBeUndefined();
+            const onDisk = JSON.parse(readFileSync(p, "utf-8")) as LayerEnvConfigFile;
+            expect(onDisk.layers.k!.connection.target).toBe("new"); // 压实落盘正果
+            expect(existsSync(asideA)).toBe(false);
+            expect(existsSync(asideB)).toBe(false);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

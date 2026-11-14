@@ -310,11 +310,11 @@ export class LayerEnvStore {
      *  A 的删除同样成立）。并发多锚（互相没见过）退回 docOrder 末位；无戳锚点
      *  保持全并入+docOrder（恢复偏置）。救回的旁路在锚点之后并入 */
     private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
-        // 坏档不作主（Sol 71 P1）：截断 JSON 的主档（parsed=null）仍占主位——
-        // 恢复曾锚定它按墙钟并旁路（回拨下旧 A 覆盖见过它的 B、复活已删条目，
-        // 老化压实再把错果写进主档连删两份旁路=B 永久丢失）。坏主档视同缺席，
-        // 锚点落统摄旁路；其自身无 layers 可并（自然零贡献）
-        const dataDoc = docs.find((d) => !d.aside && d.parsed != null);
+        // 坏档不作主（Sol 71 P1 → Sol 72 P1 扩面）：截断 JSON（parsed=null）与
+        // 结构无效的合法 JSON（如 `[]`——解析成功但无 layers）都视同坏档——
+        // 曾锚定它按墙钟并旁路（回拨下旧 A 覆盖见过它的 B、复活已删条目），
+        // 老化压实再把错果写进主档连删两份旁路=B 永久丢失。锚点落统摄旁路
+        const dataDoc = docs.find((d) => !d.aside && LayerEnvStore.docHasLayers(d));
         let anchor: FxDoc | null = dataDoc ?? null;
         if (!anchor) {
             const stamped = docs.filter((d) => d.rev != null);
@@ -361,6 +361,13 @@ export class LayerEnvStore {
         ordered.sort(LayerEnvStore.docOrder);
         for (const d of ordered) mergeLayers(cfg, d.parsed);
         return cfg;
+    }
+
+    /** 档位有效性（Sol 72 P1）：layers 为对象才算可作主档——`[]` 类合法 JSON
+     *  无 layers 结构，与截断 JSON 同罪（视同坏档不作锚） */
+    private static docHasLayers(d: FxDoc): boolean {
+        const layers = (d.parsed as LayerEnvConfigFile | null | undefined)?.layers;
+        return layers != null && typeof layers === "object";
     }
 
     /** seen 传递闭包：锚点的有效知悉=自身 seen ∪ 各被收录档的 seen（链式回收） */

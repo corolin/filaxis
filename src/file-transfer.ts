@@ -284,19 +284,25 @@ export interface SftpOptions {
 /** SFTP batch 路径防线（审计 M5）：batch 按行分割——路径含换行即命令注入面
  *  （q() 单引号对 sftp batch 解析器无效）；前导 - 会被当选项（用 ./ 相对形态）。 */
 
-/** NAME_MAX 安全后缀路径（Hydrogen R5 #5）：basename+suffix 超 255B 触发
- *  ENAMETOOLONG——接近上限时截 basename 前段并以短 hash 保唯一性 */
+/** NAME_MAX 安全后缀路径（Hydrogen R5 #5）：basename+suffix 超文件系统字节上限
+ *  触发 ENAMETOOLONG——接近上限时截 basename 前段并以短 hash 保唯一性。
+ *  字节口径（Sol 72 #5）：码元计数曾让 252B 中文文件名（84 码元）+后缀
+ *  「看似放得进」——Linux NAME_MAX 按 UTF-8 字节计，追后缀即超限 */
 function withSuffix(p: string, suffix: string): string {
     const slash = p.lastIndexOf("/");
     const dir = slash >= 0 ? p.slice(0, slash + 1) : "";
     const name = slash >= 0 ? p.slice(slash + 1) : p;
-    if (name.length + suffix.length <= 255) return p + suffix;
+    const suffixBytes = Buffer.byteLength(suffix, "utf-8");
+    if (Buffer.byteLength(name, "utf-8") + suffixBytes <= 255) return p + suffix;
     const crypto = globalThis.crypto;
     const h = crypto && "randomUUID" in crypto
         ? crypto.randomUUID().slice(0, 8)
         : Math.random().toString(16).slice(2, 10);
-    const keep = Math.max(1, 255 - suffix.length - 9);
-    return dir + name.slice(0, keep) + "~" + h + suffix;
+    const keep = Math.max(1, 255 - suffixBytes - 9);
+    let cut = name.slice(0, keep);
+    while (Buffer.byteLength(cut, "utf-8") > keep && cut.length > 0) cut = cut.slice(0, -1);
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1); // 代理对不拆（多字节名截断）
+    return dir + cut + "~" + h + suffix;
 }
 
 function assertSftpPath(p: string, what: string): void {
@@ -345,10 +351,16 @@ export async function sftpPutFile(
 function localTmpFor(localPath: string, nonce: string): string {
     const suffix = `.fx-dl-${process.pid}-${nonce}`;
     const name = basename(localPath);
-    const n = name.length + suffix.length <= 255
-        ? name
-        : name.slice(0, Math.max(1, 255 - suffix.length - 9)) + "~" + nonce;
-    return join(dirname(localPath), n + suffix);
+    const suffixBytes = Buffer.byteLength(suffix, "utf-8");
+    // 字节口径（Sol 72 #5 同 withSuffix）：多字节长名按 UTF-8 字节预算截断
+    if (Buffer.byteLength(name, "utf-8") + suffixBytes <= 255) {
+        return join(dirname(localPath), name + suffix);
+    }
+    const keep = Math.max(1, 255 - suffixBytes - 9);
+    let cut = name.slice(0, keep);
+    while (Buffer.byteLength(cut, "utf-8") > keep && cut.length > 0) cut = cut.slice(0, -1);
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+    return join(dirname(localPath), cut + "~" + nonce + suffix);
 }
 
 /** sftp 快路径 get（batch `get`；校验同 put）。

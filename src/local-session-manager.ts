@@ -213,6 +213,9 @@ export class LocalSessionManager {
                     await fh.close();
                 }
                 const linesArr = content.split("\n");
+                // 尾换行不是行（Sol 72 #4）：first\nsecond\n 取 1 行曾得 ""、取 2 行
+                // 曾得 "second\n"——split 尾部空串先剥再取尾窗（与下方全量路径同纪律）
+                if (linesArr.length > 0 && linesArr[linesArr.length - 1] === "") linesArr.pop();
                 if (linesArr.length > opts.lines) linesArr.splice(0, linesArr.length - opts.lines);
                 return linesArr.join("\n");
             }

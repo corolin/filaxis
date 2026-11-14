@@ -200,15 +200,17 @@ export class RemoteSessionManager {
         const e = this.require(sessionId);
         const file = opts.stream === "stderr" ? `${e.base}.err` : `${e.base}.out`;
         // 可读性门（Sol 69 #3）：`|| true` 曾吞错——test -r 前置，读不了整体非零。
-        // lines 截断走临时文件中转（Sol 70 #3 → Sol 71 #4）：管道尾 rc 掩码曾当
-        // 空日志返回；上轮命令替换（$(cat)）虽通 rc 却吞尾换行+剥 NUL（first\n\n
-        // 取末行曾得 first 而非空行）。临时文件保字节保真，cat 失败经 || 清场退出
+        // lines 截断走临时文件中转（Sol 70 #3 → Sol 71 #4 → Sol 72 #3）：管道尾 rc
+        // 掩码曾当空日志；命令替换（$(cat)）吞尾换行+剥 NUL；临时文件曾落日志
+        // 目录——只读目录下 lines 读曾报错（全量读正常）。临时文件改落远端
+        // $TMPDIR（$$+nonce 保唯一），cat 失败经 || 清场退出、字节全程保真
         const rd = q(file);
         let cmd: string;
         if (opts.lines != null) {
-            const tmp = q(`${e.base}.fx-rl-${crypto.randomBytes(3).toString("hex")}`);
+            const nonce = crypto.randomBytes(3).toString("hex");
             const readCmd = opts.offsetLines ? `tail -n +${opts.offsetLines + 1} ${rd}` : `cat ${rd}`;
-            cmd = `test -r ${rd} || exit 9; __fx_t=${tmp}; ` +
+            cmd = `test -r ${rd} || exit 9; ` +
+                `__fx_t="\${TMPDIR:-/tmp}/fx-rl-$$-${nonce}"; ` +
                 `{ ${readCmd} > "$__fx_t" 2>/dev/null || { rm -f "$__fx_t"; exit 9; }; }; ` +
                 `{ tail -n ${opts.lines} "$__fx_t"; }; __fx_rc=$?; rm -f "$__fx_t"; exit $__fx_rc`;
         } else {

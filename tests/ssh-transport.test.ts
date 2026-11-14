@@ -1105,3 +1105,40 @@ describe("Sol 71：readLog lines 字节保真", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十二期 #3：readLog({lines}) 的临时副本曾落日志目录——只读目录下
+// lines 读报错而全量读正常。临时文件改落远端 $TMPDIR（命令形态断言 + 真 shell
+// 落点断言双验）。
+describe("Sol 72：lines 临时副本落 TMPDIR", () => {
+    test("命令的临时路径在 ${TMPDIR:-/tmp} 下（真 shell 可执行且不在日志目录）", async () => {
+        const remote = fakeRemote();
+        const shPath = Bun.which("sh")!;
+        let sawCmd = "";
+        const realSh = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            p.stdin.write(cmd);
+            await p.stdin.end();
+            const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            return { stdout, exitCode: code };
+        };
+        const d = mkdtempSync(join(tmpdir(), "fx-tmp72-"));
+        try {
+            const logDir = d.replace(/\\/g, "/");
+            const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+                if (cmd.startsWith("test -r ")) { sawCmd = cmd; return realSh(cmd); }
+                return remote.exec(cmd);
+            };
+            const m = new RemoteSessionManager({ exec, pollMs: 10_000, logDir });
+            const h = await m.start("x");
+            writeFileSync(`${h.logBase}.out`, "first\nsecond\n"); // 真文件（真 shell）
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("second");
+            expect(sawCmd).toContain("${TMPDIR:-/tmp}/fx-rl-"); // 临时副本在 TMPDIR（修前：日志目录）
+            expect(sawCmd).not.toContain(`${logDir}/fx-rl-`); // 不落日志目录（只读目录也可读）
+            // 副本清场：TMPDIR 下无残留
+            const clean = Bun.spawnSync([shPath, "-c", 'ls "${TMPDIR:-/tmp}" | grep -c "fx-rl-" || true']);
+            expect(clean.stdout.toString().trim()).toBe("0");
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
+    }, 20_000);
+});
