@@ -427,7 +427,7 @@ describe("Sol 62：读隔离/舞步窗口/序戳裁决", () => {
         try {
             const p = join(dir, "env.json");
             // 崩溃于「落位后、旁路清理前」：data=新提交（戳新），旁路=被移开的旧态（戳旧）
-            writeFileSync(p, JSON.stringify({ layers: { k: mk62("new") }, _fx_rev: "2000000000000-1-cc" }));
+            writeFileSync(p, JSON.stringify({ layers: { k: mk62("new") }, _fx_rev: "2000000000000-1-cc", _fx_seen: ["1000000000000-1-dd"] }));
             const aside = `${p}.111-222-ffff.fx-old`;
             writeFileSync(aside, JSON.stringify({ layers: { k: mk62("old") }, _fx_rev: "1000000000000-1-dd" }));
             const t = new Date(Date.now() - 60_000); // 同刻——戳裁决
@@ -633,7 +633,7 @@ describe("Sol 64：读穿/首写撤产/门控/缓存退役", () => {
         try {
             const p = join(dir, "env.json");
             // 崩溃于「落位后、清旁路前」：主档=整档清空（新戳），旁路=被移开旧态（旧戳）
-            writeFileSync(p, JSON.stringify({ layers: {}, _fx_rev: "2000000000000-1-kk" }));
+            writeFileSync(p, JSON.stringify({ layers: {}, _fx_rev: "2000000000000-1-kk", _fx_seen: ["1000000000000-1-ll"] }));
             writeFileSync(`${p}.111-222-jjjj.fx-old`, JSON.stringify({ layers: { retired: mk64("retired") }, _fx_rev: "1000000000000-1-ll" }));
             const cfg = await new LayerEnvStore(p).load();
             expect(Object.keys(cfg.layers)).toEqual([]); // 修前：retired 经旧旁路复活
@@ -765,6 +765,48 @@ describe("Sol 66：血统裁决/大小写归属", () => {
             const s = new LayerEnvStore(join(dir, "CASE.JSON")); // 仅大小写不同
             const cfg = await s.load();
             expect(cfg.layers.live).toBeTruthy(); // 修前：{}（前缀匹配大小写敏感认不到）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 六十七期：#1 首写者（盘面为空→无血统字段）落位后中断——上界判据
+// 把 B 的已提交旁路判过期；#2 已知旧档（∈集合血统）仅因墙钟戳超上界复活已删
+// 条目。集合血统 _fx_seen（写入时盘面全部 rev）成员判定免疫回拨。
+describe("Sol 67：集合血统", () => {
+    const mk67 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("#1 首写见空盘（无血统字段）踩踏残留——B 的已提交新值救回", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env67a-"));
+        try {
+            const p = join(dir, "env.json");
+            // A 首写：准备时盘面为空（无 _fx_seen/_fx_base）——落位后中断；
+            // B 已提交的新值在旁路（回拨钟：戳 3000 低于 A 的 5000）
+            writeFileSync(p, JSON.stringify({ layers: { k: mk67("old") }, _fx_rev: "5000000000000-1-aa" }));
+            writeFileSync(`${p}.111-222-tttt.fx-old`, JSON.stringify({ layers: { k: mk67("new") }, _fx_rev: "3000000000000-1-bb" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（无血统按墙钟比较跳过 B）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("#2 集合内旧档（作者见过）墙钟戳超上界——已删条目不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env67b-"));
+        try {
+            const p = join(dir, "env.json");
+            // 删除者带集合血统见过旧档（rev 9000）；其 _fx_base 上界（8000）低于
+            // 旧档戳——上界判据曾误判「没见过」而复活 retired
+            writeFileSync(p, JSON.stringify({ layers: {}, _fx_rev: "1000000000000-1-cc", _fx_base: "8000000000000-1-qq", _fx_seen: ["9000000000000-1-rr"] }));
+            writeFileSync(`${p}.111-222-uuuu.fx-old`, JSON.stringify({ layers: { retired: mk67("retired") }, _fx_rev: "9000000000000-1-rr" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(Object.keys(cfg.layers)).toEqual([]); // 集合判据：见过=知悉后删
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

@@ -186,6 +186,11 @@ export class RemoteSessionManager {
         const e = this.require(sessionId);
         e.lastAttentionAt = Date.now();
         const r = await this.exec(`tail -n ${n} ${q(e.base)}.out 2>/dev/null || true`);
+        // 凭证纪律（Sol 67 #3）：读命令失败（exit≠0）的输出不作日志凭证——轮询/
+        // 冲刷已查，直接读取入口曾把失败输出当正常日志返回
+        if (r.exitCode !== 0) {
+            throw new Error(`会话日志读取失败（tail exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
+        }
         return (r.stdout || "").split("\n").filter((l, i, arr) => l !== "" || i < arr.length - 1).filter((l) => l !== "");
     }
 
@@ -197,6 +202,10 @@ export class RemoteSessionManager {
         if (opts.offsetLines) cmd = `tail -n +${opts.offsetLines + 1} ${q(file)} 2>/dev/null || true`;
         if (opts.lines) cmd += ` | tail -n ${opts.lines}`;
         const r = await this.exec(cmd);
+        // 凭证纪律（Sol 67 #3）：同 tail——失败输出不作日志凭证
+        if (r.exitCode !== 0) {
+            throw new Error(`会话日志读取失败（readLog exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
+        }
         return (r.stdout || "").replace(/\n$/, "");
     }
 

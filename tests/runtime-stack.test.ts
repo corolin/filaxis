@@ -889,3 +889,46 @@ describe("三十八期", () => {
         // 修前：instanceof 漏网 → 外来 rejection 无人接 → unhandledRejection 崩宿主（bun test 直接 fail）
     });
 });
+
+// GPT Sol 六十七期：#4 restore 绕过同名建层预留——addLayer 暂停在初始化时并发
+// restore 同名层，先成者被覆盖；#5 两命名层共享同一 driver（同落点复用）——
+// removeLayer(destroy) 连坐销毁仍在用的另一层。
+describe("Sol 67：restore 预留/共享销毁", () => {
+    const mockStack67 = () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        return stack;
+    };
+
+    test("#4 addLayer 建链中 restore 同名 → 拒绝（不竞争不覆盖）", async () => {
+        const stack = new RuntimeStack();
+        let releaseInit!: () => void;
+        const gate = new Promise<void>((res) => { releaseInit = res; });
+        stack.registerDriver("slowssh", (d: RuntimeDescriptor) => {
+            const drv = new MockLayerDriver(d) as unknown as RuntimeDriver & { init: () => Promise<void> };
+            drv.init = () => gate; // init 挂起——addLayer 停在建链（预留持有中）
+            return drv;
+        });
+        const adding = stack.addLayer("same", { driver: "slowssh", target: "t67" });
+        await new Promise((r) => setTimeout(r, 30)); // 预留生效
+        await expect(stack.restore({ layers: [{ name: "same", descriptor: { driver: "mockssh", target: "other" } }] }))
+            .rejects.toThrow(/建链中/); // 修前：绕过预留直接覆盖注册项
+        releaseInit();
+        const r = await adding;
+        expect(r.handle.name).toBe("same");
+        expect(stack.layer("same").descriptor.driver).toBe("slowssh"); // addLayer 的注册不被 restore 劫走
+    }, 15_000);
+
+    test("#5 共享 driver 层 destroy 不连坐——另一层照常执行", async () => {
+        const stack = mockStack67();
+        await stack.addLayer("a", { driver: "mockssh", target: "shared-t" });
+        await stack.addLayer("b", { driver: "mockssh", target: "shared-t" }); // 同落点=复用同一 driver
+        const aDriver = stack.layer("a").driver;
+        expect(stack.layer("b").driver).toBe(aDriver); // 共享实证（指纹缓存复用）
+        await stack.removeLayer("a", { destroy: true }); // 修前：连坐销毁共享 driver
+        expect((aDriver as unknown as MockLayerDriver).destroyed).toBe(false);
+        const out = await stack.layer("b").driver.exec("hostname");
+        expect(out.exitCode).toBe(0); // b 层照常干活
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "shared-t" } as RuntimeDescriptor);
+    }, 15_000);
+});

@@ -438,8 +438,14 @@ export class RuntimeStack {
         const h = this.requireLayer(name);
         this.namedLayers.delete(name);
         if (opts.destroy) {
-            RuntimeStack.evictDriver(h.descriptor, this.cacheNs);
-            await h.driver.destroy().catch(() => undefined);
+            // 共享连接不销毁（Sol 67 #5）：同名落点复用=多命名层共享同一 driver——
+            // destroy 曾连坐杀死仍在用的另一层（按名可查、执行即死 driver）。
+            // 仅当无其他层引用时才销毁
+            const shared = [...this.namedLayers.values()].some((x) => x.driver === h.driver);
+            if (!shared) {
+                RuntimeStack.evictDriver(h.descriptor, this.cacheNs);
+                await h.driver.destroy().catch(() => undefined);
+            }
         }
         if (this.activeName === name) {
             this.activeName = [...this.namedLayers.keys()].at(-1); // 回落最后注册层
@@ -486,8 +492,18 @@ export class RuntimeStack {
     async restore(snap: LayerSnapshot): Promise<void> {
         for (const { name, descriptor } of snap.layers) {
             if (this.namedLayers.has(name)) continue;
-            const driver = await this.connect(descriptor);
-            this.namedLayers.set(name, { name, descriptor: driver.descriptor, driver });
+            // 同名建层预留同权（Sol 67 #4）：restore 曾绕过 pendingNames——addLayer
+            // 暂停在初始化时并发 restore 同名层，双方都成功、先成者被覆盖
+            if (this.pendingNames.has(name)) {
+                throw new Error(`层名 '${name}' 建链中（addLayer 进行时）——restore 不与其竞争，稍后重试或换名`);
+            }
+            this.pendingNames.add(name);
+            try {
+                const driver = await this.connect(descriptor);
+                this.namedLayers.set(name, { name, descriptor: driver.descriptor, driver });
+            } finally {
+                this.pendingNames.delete(name);
+            }
         }
         if (snap.active && this.namedLayers.has(snap.active)) this.activeName = snap.active;
     }

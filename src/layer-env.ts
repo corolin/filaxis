@@ -211,29 +211,32 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     for (const [k, v] of Object.entries(layers)) dst.layers[k] = v;
 }
 
-/** 盘面档位（Sol 62 P2-4 序戳 + Sol 66 #3 血统）：rev=文档内嵌 _fx_rev（提交
- *  时刻），base=写入时盘面最大 rev（作者见过的状态——因果链，不受时钟回拨
- *  影响）。坏档 parsed=null（mergeLayers 自验证跳过） */
+/** 盘面档位（Sol 62 P2-4 序戳 + Sol 66 #3 血统 → Sol 67 集合血统）：rev=文档
+ *  内嵌 _fx_rev（提交时刻），seen=写入时盘面全部 rev 的集合（作者确切见过的
+ *  状态——集合成员判定免疫时钟回拨；上界 base 保留作旧档回落）。坏档
+ *  parsed=null（mergeLayers 自验证跳过） */
 interface FxDoc {
     mtimeMs: number;
     aside: boolean;
     rev: string | null;
     base: string | null;
+    seen: string[] | null;
     parsed: unknown;
 }
 
 function makeDoc(mtimeMs: number, aside: boolean, text: string): FxDoc {
     try {
-        const d = JSON.parse(text) as { _fx_rev?: unknown; _fx_base?: unknown };
+        const d = JSON.parse(text) as { _fx_rev?: unknown; _fx_base?: unknown; _fx_seen?: unknown };
         return {
             mtimeMs,
             aside,
             rev: typeof d._fx_rev === "string" ? d._fx_rev : null,
             base: typeof d._fx_base === "string" ? d._fx_base : null,
+            seen: Array.isArray(d._fx_seen) ? d._fx_seen.filter((x): x is string => typeof x === "string") : null,
             parsed: d,
         };
     } catch {
-        return { mtimeMs, aside, rev: null, base: null, parsed: null };
+        return { mtimeMs, aside, rev: null, base: null, seen: null, parsed: null };
     }
 }
 
@@ -298,23 +301,30 @@ export class LayerEnvStore {
         return LayerEnvStore.snapshot(cfg);
     }
 
-    /** 并入（Sol 64 #3 门控 → Sol 65 #5 扩面 → Sol 66 #3 血统判据）：**带戳主档**
-     *  在场时，旁路默认不并入（被作者知悉后删除），两类除外：①新于主档（踩踏
-     *  恢复）②血统外——旁路 rev 超出主档 _fx_base（写入时盘面最大 rev，因果链
-     *  不受时钟回拨影响）=作者从未见过的提交（踩踏者崩溃残留——救回，回拨下
-     *  戳序倒挂也救得回）。救回的旁路在主档**之后**并入（其键胜出——并入序兜
-     *  住倒挂的戳序）。主档无血统字段（手造/遗老）退回戳序判定；无戳主档保持
-     *  全并入+docOrder（恢复偏置，平局 data 胜） */
+    /** 并入（Sol 64 门控 → Sol 66 血统 → Sol 67 集合血统）：**带戳主档**在场时，
+     *  旁路去留按血统集合 _fx_seen（写入时盘面全部 rev——作者确切见过什么）：
+     *  见过（∈seen）=知悉后删除（不并入）；没见过=踩踏者崩溃残留（救回——
+     *  集合成员判定免疫时钟回拨，首写见空盘/旁路戳超上界两端都不再误判）。
+     *  旧档回落链：无 seen 有 _fx_base（上界）→ 超上界救；两者皆无=首写见空盘
+     *  →全救。新于主档的旁路恒救（踩踏恢复）。救回的旁路在主档**之后**并入
+     *  （并入序兜住回拨倒挂的戳序）；无戳主档保持全并入+docOrder（恢复偏置） */
     private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
         const dataDoc = docs.find((d) => !d.aside);
         const cfg: LayerEnvConfigFile = { layers: {} };
         if (dataDoc?.rev) {
             const dataRev = dataDoc.rev; // 闭包内窄化保留
             const dataBase = dataDoc.base;
+            const seen = dataDoc.seen;
             const kept = docs.filter((d) => {
                 if (d === dataDoc) return false;
                 if (!d.rev) return false; // 带戳主档+无戳旁路：作者 load 过全盘（Sol 65 #5）
-                return d.rev > dataRev || (dataBase != null && d.rev > dataBase);
+                // 集合血统优先（Sol 67 #2）：见过=删/没见过=救——成员判定不受回拨
+                // 影响（须先于「新于主档」查：回拨下已见过的旧档戳可 numeric 上
+                // 大于主档戳，先查戳序会误判踩踏恢复）
+                if (seen) return !seen.includes(d.rev);
+                if (d.rev > dataRev) return true; // 新于主档=踩踏恢复（无集合时的回落）
+                if (dataBase != null) return d.rev > dataBase; // 旧档回落：超上界=没见过
+                return true; // 无血统=首写见空盘——全救（Sol 67 #1）
             });
             kept.sort(LayerEnvStore.docOrder);
             mergeLayers(cfg, dataDoc.parsed); // 主档先并入
@@ -459,18 +469,20 @@ export class LayerEnvStore {
         // 舞步开场旁路快照（Sol 61 P2-2）：成功收尾时一并消费——上轮只消自己的
         // 旁路，崩溃遗留的历史旁路仍会把整档替换已删的层复活
         const preAsides = (await this.listAsides()).map((a) => a.p);
-        // 血统快照（Sol 66 #3）：锁内盘面当前最大 rev=本轮作者「确曾见过」的状态
-        // 上界——比墙钟戳更可靠的因果链（时钟回拨下序戳倒挂、血统不倒）。写入
-        // _fx_base 供 mergeDocs 判「知悉后删除 vs 从未见过该救」
+        // 血统快照（Sol 66 #3 → Sol 67 集合化）：锁内盘面全部 rev=本轮作者「确切
+        // 见过」的状态集——集合成员判定免疫时钟回拨（上界 base 在首写见空盘与
+        // 旁路戳超上界两端都误判）。写入 _fx_seen（_fx_base 保留作旧档回落）
         const diskDocs = (await this.collectDocs()).docs;
-        const baseRev = diskDocs.reduce<string | null>(
-            (m, d) => (d.rev && (!m || d.rev > m) ? d.rev : m), null);
+        const seenRevs = diskDocs.map((d) => d.rev).filter((r): r is string => r != null);
+        const baseRev = seenRevs.reduce<string | null>((m, r) => (!m || r > m ? r : m), null);
         // 内嵌序戳（Sol 62 P2-4）：文档自带提交时刻——rename/link 迁移不损，
         // 同刻 mtime 平局由戳裁决（mergeLayers 只读 layers，戳不外泄）。
         // payloadText 单源（Sol 63 P2-4）：落位后锁失的还原比对须与写入逐字节同串
         const rev = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
         const payloadText = JSON.stringify(
-            baseRev != null ? { ...cfg, _fx_rev: rev, _fx_base: baseRev } : { ...cfg, _fx_rev: rev },
+            seenRevs.length > 0
+                ? { ...cfg, _fx_rev: rev, _fx_base: baseRev, _fx_seen: seenRevs }
+                : { ...cfg, _fx_rev: rev },
             null, 2);
         await writeFile(tmp, payloadText, "utf-8");
         if (verifyHeld && !(await verifyHeld())) {

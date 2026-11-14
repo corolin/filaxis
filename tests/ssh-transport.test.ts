@@ -977,3 +977,20 @@ describe("Sol 66：轮询凭证与分流隔离", () => {
         expect(events.some((e) => e.type === "match" && e.matchedLine.includes("ERRLINE"))).toBe(true); // 修前：out 抛错连坐
     }, 15_000);
 });
+
+// GPT Sol 六十七期 P2-3：tail()/readLog() 直接读取入口缺退出码检查——失败
+// 命令（exit 1）的输出曾当正常日志返回（轮询/冲刷已查、此处漏查）。
+describe("Sol 67：直接读取凭证纪律", () => {
+    test("tail/readLog 读命令 exit 1+PARTIAL → 拒绝（不作日志凭证）", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("tail -n ") || cmd.startsWith("cat ")) return { stdout: "PARTIAL", exitCode: 1 };
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100)); // 自动完成落 .code/.out
+        await expect(m.tail(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 ["PARTIAL"]
+        await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 "PARTIAL"
+    }, 15_000);
+});
