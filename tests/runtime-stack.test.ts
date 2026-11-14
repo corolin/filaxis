@@ -1020,3 +1020,62 @@ describe("Sol 70：销毁两难正解", () => {
         expect(drv.destroyed).toBe(true); // 修前：claim 计数永不归零、destroy 不发
     }, 15_000);
 });
+
+// GPT Sol 七十一期 #2/#3：destroy 同步逐出缓存（延迟窗口内 connect 曾拿到注定
+// 被杀的旧连接）+ 销毁去重（定时器前重复登记移除曾双 destroy）+ 旧定时器不再
+// 按描述符逐出（曾误杀定时器落地前建立的新一代连接）。
+describe("Sol 71：销毁窗口三缝", () => {
+    class CountingDriver extends MockLayerDriver {
+        destroyCount = 0;
+        async destroy(): Promise<void> { this.destroyCount++; this.destroyed = true; }
+    }
+    const mkStack = () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new CountingDriver(d) as unknown as RuntimeDriver);
+        return stack;
+    };
+
+    test("#2a destroy 返回后立即 connect——拿到新代（非注定被杀的旧代）", async () => {
+        const stack = mkStack();
+        await stack.addLayer("a", { driver: "mockssh", target: "doom71" });
+        const oldDrv = stack.layer("a").driver;
+        const removing = stack.removeLayer("a", { destroy: true }); // 返回时 destroy 未跑
+        const d2 = await stack.connect({ driver: "mockssh", target: "doom71" }); // 窗口内
+        await removing;
+        await new Promise((r) => setTimeout(r, 30));
+        expect(d2).not.toBe(oldDrv); // 修前：同实例（随后被定时器销毁）
+        expect((d2 as unknown as CountingDriver).destroyed).toBe(false); // 新代未被波及
+        const out = await d2.exec("echo ok");
+        expect(out.exitCode).toBe(0);
+        expect((oldDrv as unknown as CountingDriver).destroyCount).toBe(1); // 旧代恰好销毁一次
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "doom71" } as RuntimeDescriptor);
+        await (d2 as unknown as CountingDriver).destroy();
+    }, 15_000);
+
+    test("#2b 定时器前重新登记又移除——destroy 恰好一次", async () => {
+        const stack = mkStack();
+        await stack.addLayer("a", { driver: "mockssh", target: "dedup71" });
+        const drv = stack.layer("a").driver as unknown as CountingDriver;
+        await stack.removeLayer("a", { destroy: true }); // 调度 T1（未触发）
+        await stack.addLayer("re", drv as unknown as RuntimeDriver); // driver 直传：同实例重新登记
+        await stack.removeLayer("re", { destroy: true }); // 再移除（refs 0 → 重新调度）
+        await new Promise((r) => setTimeout(r, 30));
+        expect(drv.destroyCount).toBe(1); // 修前：两次
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "dedup71" } as RuntimeDescriptor);
+    }, 15_000);
+
+    test("#3 旧定时器不逐出新代：移除→显式 evict→connect 建二代——旧定时器落地后 connect 仍命中二代", async () => {
+        const stack = mkStack();
+        await stack.addLayer("a", { driver: "mockssh", target: "gen71" });
+        const gen1 = stack.layer("a").driver;
+        await stack.removeLayer("a", { destroy: true }); // 同步逐出+调度旧定时器
+        stack.evict({ driver: "mockssh", target: "gen71" }); // 显式再逐（幂等）
+        const gen2 = await stack.connect({ driver: "mockssh", target: "gen71" }); // 建二代
+        await new Promise((r) => setTimeout(r, 30)); // 旧定时器落地
+        const gen3 = await stack.connect({ driver: "mockssh", target: "gen71" });
+        expect(gen3).toBe(gen2); // 修前：旧定时器按描述符逐出——gen2 被清、gen3 是三代
+        expect((gen1 as unknown as CountingDriver).destroyCount).toBe(1); // 旧代销毁的是自己
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "gen71" } as RuntimeDescriptor);
+        await (gen2 as unknown as CountingDriver).destroy();
+    }, 15_000);
+});

@@ -929,3 +929,40 @@ describe("Sol 70：kept 辈分门控", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十一期 P1：主档截断（坏 JSON）仍占主位——恢复锚定坏档按墙钟并
+// 旁路（回拨下旧 A 覆盖见过它的 B、复活已删条目）；旁路超 10min 时单次 load
+// 的压实把错果写进主档并连删两份旁路=B 永久丢失。坏主档视同缺席（不作锚）。
+describe("Sol 71：坏主档不作锚", () => {
+    test("截断主档 + 老化旁路：B 胜出、压实落盘 B、旁路清、retired 不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env71-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk71 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            writeFileSync(p, '{"layers":{"k":{"connection":{"driver":"ssh","tar'); // 截断 JSON（坏主档）
+            const asideA = `${p}.111-222-rrrr.fx-old`;
+            const asideB = `${p}.111-222-ssss.fx-old`;
+            writeFileSync(asideA, JSON.stringify({ layers: { k: mk71("old"), retired: mk71("retired") }, _fx_rev: "9000000000000-1-a71" }));
+            writeFileSync(asideB, JSON.stringify({ layers: { k: mk71("new") }, _fx_rev: "3000000000000-1-b71", _fx_seen: ["9000000000000-1-a71"] }));
+            const old = new Date(Date.now() - 11 * 60_000); // 超过 10min——触发压实
+            utimesSync(asideA, old, old);
+            utimesSync(asideB, old, old);
+            const cfg = await new LayerEnvStore(p).load(); // 单次 load（读+压实）
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（坏主档作锚、墙钟序）
+            expect(cfg.layers.retired).toBeUndefined(); // 修前：retired 复活
+            // 压实落盘的是 B 的正果（主档可解析、旁路双双消费）
+            expect(existsSync(asideA)).toBe(false);
+            expect(existsSync(asideB)).toBe(false);
+            const onDisk = JSON.parse(readFileSync(p, "utf-8")) as LayerEnvConfigFile;
+            expect(onDisk.layers.k!.connection.target).toBe("new"); // 修前：错果（old+retired）写进主档
+            expect(onDisk.layers.retired).toBeUndefined();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

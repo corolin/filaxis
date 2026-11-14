@@ -200,14 +200,22 @@ export class RemoteSessionManager {
         const e = this.require(sessionId);
         const file = opts.stream === "stderr" ? `${e.base}.err` : `${e.base}.out`;
         // 可读性门（Sol 69 #3）：`|| true` 曾吞错——test -r 前置，读不了整体非零。
-        // lines 截断走命令替换中转（Sol 70 #3）：`cat f | tail -n N` 管道整体 rc
-        // 只反映末命令——test -r 通过（如路径是可读目录）而 cat 失败时曾当空
-        // 日志返回；$(cat) 的失败经 || exit 9 直达整体退出码
+        // lines 截断走临时文件中转（Sol 70 #3 → Sol 71 #4）：管道尾 rc 掩码曾当
+        // 空日志返回；上轮命令替换（$(cat)）虽通 rc 却吞尾换行+剥 NUL（first\n\n
+        // 取末行曾得 first 而非空行）。临时文件保字节保真，cat 失败经 || 清场退出
         const rd = q(file);
-        const readCmd = opts.offsetLines ? `tail -n +${opts.offsetLines + 1} ${rd}` : `cat ${rd}`;
-        const cmd = opts.lines != null
-            ? `test -r ${rd} || exit 9; __fx_l=$(${readCmd} 2>/dev/null) || exit 9; printf %s "$__fx_l" | tail -n ${opts.lines}`
-            : `test -r ${rd} || exit 9; ${readCmd}`;
+        let cmd: string;
+        if (opts.lines != null) {
+            const tmp = q(`${e.base}.fx-rl-${crypto.randomBytes(3).toString("hex")}`);
+            const readCmd = opts.offsetLines ? `tail -n +${opts.offsetLines + 1} ${rd}` : `cat ${rd}`;
+            cmd = `test -r ${rd} || exit 9; __fx_t=${tmp}; ` +
+                `{ ${readCmd} > "$__fx_t" 2>/dev/null || { rm -f "$__fx_t"; exit 9; }; }; ` +
+                `{ tail -n ${opts.lines} "$__fx_t"; }; __fx_rc=$?; rm -f "$__fx_t"; exit $__fx_rc`;
+        } else {
+            cmd = opts.offsetLines
+                ? `test -r ${rd} || exit 9; tail -n +${opts.offsetLines + 1} ${rd}`
+                : `test -r ${rd} || exit 9; cat ${rd}`;
+        }
         const r = await this.exec(cmd);
         // 凭证纪律（Sol 67 #3）：失败输出不作日志凭证
         if (r.exitCode !== 0) {

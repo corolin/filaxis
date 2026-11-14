@@ -291,6 +291,9 @@ export class RuntimeStack {
     /** driver 全局引用计数（Sol 68 #2）：身份缓存跨 stack 共享——销毁决策须看
      *  全局在册数而非单 stack 引用。每个命名层注册 +1 / removeLayer -1 */
     private static readonly driverRefs = new Map<RuntimeDriver, number>();
+    /** 已调度延迟销毁的 driver（Sol 71 #2 去重）：定时器触发前的重复移除不再
+     *  二次调度 destroy */
+    private static readonly destroyScheduled = new WeakSet<RuntimeDriver>();
     private activeName?: string;
 
     /** 层注册表只读视图 */
@@ -460,10 +463,22 @@ export class RuntimeStack {
         if (refs === 0) RuntimeStack.driverRefs.delete(h.driver);
         else RuntimeStack.driverRefs.set(h.driver, refs);
         if (opts.destroy && refs === 0) {
+            // 缓存同步逐出（Sol 71 #2）：延迟销毁窗口内 connect 曾拿到注定被杀的
+            // 旧连接（逐出曾放在定时器里）。定时器只复核+销毁本代 driver——不再
+            // 按描述符逐出（曾把定时器落地前建立的**新一代**连接逐出=旧定时器
+            // 误杀新代，Sol 71 #3）
+            RuntimeStack.evictDriver(h.descriptor, this.cacheNs);
+            // 销毁去重（Sol 71 #2）：定时器触发前同 driver 重新登记又移除曾触发
+            // 两次 destroy()
+            if (RuntimeStack.destroyScheduled.has(h.driver)) return;
+            RuntimeStack.destroyScheduled.add(h.driver);
             setTimeout(() => {
                 void (async () => {
-                    if ((RuntimeStack.driverRefs.get(h.driver) ?? 0) > 0) return; // 在途登记已落地——不追杀
-                    RuntimeStack.evictDriver(h.descriptor, this.cacheNs);
+                    if ((RuntimeStack.driverRefs.get(h.driver) ?? 0) > 0) {
+                        RuntimeStack.destroyScheduled.delete(h.driver); // 在途登记已落地——不追杀（标记释放供后续移除再调度）
+                        return;
+                    }
+                    RuntimeStack.destroyScheduled.delete(h.driver);
                     await h.driver.destroy().catch(() => undefined);
                 })();
             }, 0);

@@ -310,7 +310,11 @@ export class LayerEnvStore {
      *  A 的删除同样成立）。并发多锚（互相没见过）退回 docOrder 末位；无戳锚点
      *  保持全并入+docOrder（恢复偏置）。救回的旁路在锚点之后并入 */
     private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
-        const dataDoc = docs.find((d) => !d.aside);
+        // 坏档不作主（Sol 71 P1）：截断 JSON 的主档（parsed=null）仍占主位——
+        // 恢复曾锚定它按墙钟并旁路（回拨下旧 A 覆盖见过它的 B、复活已删条目，
+        // 老化压实再把错果写进主档连删两份旁路=B 永久丢失）。坏主档视同缺席，
+        // 锚点落统摄旁路；其自身无 layers 可并（自然零贡献）
+        const dataDoc = docs.find((d) => !d.aside && d.parsed != null);
         let anchor: FxDoc | null = dataDoc ?? null;
         if (!anchor) {
             const stamped = docs.filter((d) => d.rev != null);

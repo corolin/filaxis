@@ -782,9 +782,11 @@ describe("reapIdle 事件单发（自审）", () => {
         const events: Array<{ type?: string; exitCode?: number | null }> = [];
         m.onEvent = (e) => events.push(e as never);
         const h = await m.start("echo done");
-        await new Promise((r) => setTimeout(r, 900)); // 自然退出 + 轮询发现
+        // flake 治理补漏（Sol 71 环境实锤）：固定 900ms 在慢环境（sh 冷启/杀软
+        // 扫描拖慢每次 exec 的 spawn）内 poll 发现不了 .code → 0 exit——改谓词
+        // 等待（waitFor 已有），慢环境给足余量
+        await waitFor(() => events.some((e) => e.type === "exit"), 15_000);
         m.reapIdle(Date.now() + 60_000, 1); // 强制回收（已 running=false → 跳过 ✓ 无声）
-        await new Promise((r) => setTimeout(r, 300));
         const exits = events.filter((e) => e.type === "exit");
         expect(exits.length).toBe(1); // 修前风险：预发 null + finalize 真实码=双发
         expect(exits[0]!.exitCode).toBe(0); // 真实码（非 null 错值）
@@ -1067,5 +1069,39 @@ describe("Sol 70：readLog lines 管道掩码", () => {
         await new Promise((r) => setTimeout(r, 100));
         await expect(m.readLog(h.sessionId, { lines: 5 })).rejects.toThrow(/不作日志凭证/); // 修前：""（管道尾 tail rc=0）
         await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 对照（Sol 69 已修）
+    }, 15_000);
+});
+
+// GPT Sol 七十一期 #4：readLog({lines}) 的命令替换中转曾吞尾换行+剥 NUL
+//（first\n\n 取末行得 first 而非空行）。临时文件中转保字节保真——真 shell 验证。
+describe("Sol 71：readLog lines 字节保真", () => {
+    test.skipIf(!Bun.which("sh"))("尾空行保留 + NUL 不丢", async () => {
+        const remote = fakeRemote();
+        const shPath = Bun.which("sh")!;
+        const realSh = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            p.stdin.write(cmd);
+            await p.stdin.end();
+            const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            return { stdout, exitCode: code };
+        };
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("test -r ")) return realSh(cmd); // readLog 形态走真 shell
+            return remote.exec(cmd);
+        };
+        const d = mkdtempSync(join(tmpdir(), "fx-rl71-"));
+        try {
+            const m = new RemoteSessionManager({ exec, pollMs: 10_000, logDir: d.replace(/\\/g, "/") });
+            const h = await m.start("x");
+            // 尾空行：last line of "first\n\n" 是空行（readLog 返回剥一个尾换行 → ""）
+            writeFileSync(`${h.logBase}.out`, "first\n\n"); // 真文件（真 shell 读真盘）
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe(""); // 修前："first"（$() 吞尾换行）
+            expect(await m.readLog(h.sessionId, { lines: 2 })).toBe("first\n"); // 两行=first+空行（尾剥一个换行后留 first\n）
+            // NUL 字节不丢
+            writeFileSync(`${h.logBase}.out`, "a\0b\n");
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("a\0b"); // 修前：NUL 被 $() 剥
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
     }, 15_000);
 });
