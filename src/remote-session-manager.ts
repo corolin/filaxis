@@ -404,12 +404,17 @@ export class RemoteSessionManager {
      *  残余是终值——补一个换行让末行成行，全量喂 watcher。 */
     private async flushTail(entry: RemoteEntry): Promise<void> {
         return this.consume(entry, async () => {
-            try {
-                for (const suffix of [".out", ".err"] as const) {
+            // 分路独立 try（Sol 65 #2）：曾两路共用一个 try——stdout 末读抛错连坐
+            // 跳过仍可读的 stderr 尾行。每路各自 best-effort
+            for (const suffix of [".out", ".err"] as const) {
+                try {
                     const bytes = suffix === ".out" ? entry.outBytes : entry.errBytes;
                     const r = await this.exec(
                         `tail -c +${bytes + 1} ${q(entry.base)}${suffix} 2>/dev/null || true`,
                     );
+                    // 凭证纪律（Sol 65 #3）：读命令失败（exit≠0）的输出不作行凭证
+                    // ——曾据错误输出发 match（thenStop 配置还会误触停止）
+                    if (r.exitCode !== 0) continue;
                     const text = (r.stdout || "").replace(/\n$/, "");
                     if (text) {
                         if (suffix === ".out") entry.outBytes += Buffer.byteLength(text + "\n", "utf-8");
@@ -418,8 +423,8 @@ export class RemoteSessionManager {
                         const stream = suffix === ".out" ? ("stdout" as const) : ("stderr" as const);
                         for (const line of asm.feed(text + "\n")) this.onLine(entry, line, stream);
                     }
-                }
-            } catch { /* 冲刷 best-effort——终态本身已确认 */ }
+                } catch { /* 冲刷 best-effort——终态本身已确认 */ }
+            }
         });
     }
 
@@ -492,7 +497,7 @@ export class RemoteSessionManager {
                     watcherId: id,
                     pattern: String(w.pattern),
                     matchedLine: line,
-                    stream: "stdout",
+                    stream, // 事件流随实参（Sol 65 #1）：曾写死 stdout——stderr 行命中的事件流标错（thenStop/过滤按流分流的消费方全被误导）
                     context: [line],
                 });
                 entry.lastAttentionAt = Date.now();

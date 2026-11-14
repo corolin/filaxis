@@ -896,3 +896,48 @@ describe("Sol 64：stderr 尾行冲刷", () => {
         expect(events.some((e) => e.type === "match" && e.matchedLine.includes("STDERR_TAIL"))).toBe(true); // 修前：只有 exit
     }, 15_000);
 });
+
+// GPT Sol 六十五期：#1 match 事件 stream 写死 stdout（stderr 行命中的事件流标错）；
+// #2 flushTail 两路共用 try（stdout 读抛错连坐跳过 stderr 尾行）；#3 读命令失败
+//（exit≠0）的输出不作行凭证（曾据错误输出发 match、thenStop 还误触停止）。
+describe("Sol 65：冲刷凭证与事件流", () => {
+    test("#1+#2 stdout 读抛错不断 stderr 冲刷——match 事件 stream 如实标 stderr", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.out/.test(cmd)) throw new Error("out channel gone"); // stdout 末读抛错
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "STDERR_TAIL", once: true });
+        setTimeout(() => { remote.files.set(`${h.logBase}.err`, "STDERR_TAIL"); }, 25);
+        await new Promise((r) => setTimeout(r, 100)); // 自动完成（60ms 落 .code）
+        const v = await m.verify(h.sessionId); // verify 路径触终态冲刷（poll 长周期免干扰）
+        expect(v.status).toBe("exited");
+        await new Promise((r) => setTimeout(r, 50));
+        const match = events.find((e) => e.type === "match") as Extract<SessionEvent, { type: "match" }> | undefined;
+        expect(match?.matchedLine).toContain("STDERR_TAIL"); // 修前 #2：out 抛错连坐、无 match
+        expect(match?.stream).toBe("stderr"); // 修前 #1：写死 stdout
+    }, 15_000);
+
+    test("#3 读命令失败（exit 1+匹配文本在输出里）不作行凭证——无 match", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.err/.test(cmd)) {
+                return { stdout: "STDERR_TAIL", exitCode: 1 }; // 失败命令的输出含匹配文本
+            }
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "STDERR_TAIL", once: true });
+        await new Promise((r) => setTimeout(r, 100));
+        await m.verify(h.sessionId);
+        await new Promise((r) => setTimeout(r, 50));
+        expect(events.some((e) => e.type === "match")).toBe(false); // 修前：match 照发
+    }, 15_000);
+});

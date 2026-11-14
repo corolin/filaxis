@@ -660,3 +660,55 @@ describe("Sol 64：读穿/首写撤产/门控/缓存退役", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 六十五期：#4 主档重探曾只在零旁路时执行——捞到旧旁路+新主档落位→
+// 返回旧值；#5 带戳主档对无戳旧旁路（遗老档升级首次替换中断）曾绕过门控复活
+// 已删条目。
+describe("Sol 65：重探扩面/门控扩面", () => {
+    const mk65 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("#4 捞到旧旁路后新主档落位——重探读新值", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env65a-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { k: mk65("old") } }));
+            const asidePath = `${p}.111-222-mmmm.fx-old`;
+            renameSync(p, asidePath); // 移开窗口（load 的 stat 将失败）
+            const s = new LayerEnvStore(p);
+            const orig = (s as unknown as { listAsides: () => Promise<Array<{ p: string }>> }).listAsides.bind(s);
+            let done = false;
+            (s as unknown as { listAsides: unknown }).listAsides = async () => {
+                const r = await orig(); // 先列——捞到旧旁路（非零）
+                if (!done) {
+                    done = true;
+                    writeFileSync(p, JSON.stringify({ layers: { k: mk65("new") } })); // 新主档落位
+                }
+                return r;
+            };
+            const cfg = await s.load();
+            expect(cfg.layers.k!.connection.target).toBe("new"); // 修前：old（旁路非零不重探）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("#5 带戳主档+无戳旧旁路（升级首次替换中断）——已删条目不复活", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env65b-"));
+        try {
+            const p = join(dir, "env.json");
+            // 升级路径：主档=带戳空档（首次 post-升级整档替换落位），旁路=被移开的
+            // 遗老旧档（无戳）且未及清理
+            writeFileSync(p, JSON.stringify({ layers: {}, _fx_rev: "2000000000000-1-nn" }));
+            writeFileSync(`${p}.111-222-nnnn.fx-old`, JSON.stringify({ layers: { retired: mk65("retired") } }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(Object.keys(cfg.layers)).toEqual([]); // 修前：retired 经无戳旁路复活
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

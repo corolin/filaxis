@@ -284,14 +284,17 @@ export class LayerEnvStore {
         return LayerEnvStore.snapshot(cfg);
     }
 
-    /** 并入（Sol 64 #3 门控）：主档在场且双方带戳时，**旧于主档**的旁路不并入
-     *  ——它是被新档作者知悉后删除的状态（整档替换已删条目不再经恢复复活）；
-     *  **新于主档**的旁路=踩踏恢复（并入）。无戳（遗老/手造）保持并入（恢复偏置） */
+    /** 并入（Sol 64 #3 门控 → Sol 65 #5 扩面）：**带戳主档**在场时，旧于主档的
+     *  旁路不并入——它是被新档作者知悉后删除的状态（整档替换已删条目不再经
+     *  恢复复活）；无戳旁路同样视作被知悉（带戳主档的作者 load 过全盘——遗老
+     *  档升级首次替换中断曾复活已删条目）。**新于主档**的带戳旁路=踩踏恢复
+     *  （并入）。无戳主档（遗老/手造）保持全并入（恢复偏置） */
     private static mergeDocs(docs: FxDoc[]): LayerEnvConfigFile {
         const dataDoc = docs.find((d) => !d.aside);
         const ordered = docs.filter((d) => {
             if (d === dataDoc || !dataDoc) return true;
-            return !(dataDoc.rev && d.rev && d.rev < dataDoc.rev);
+            if (!dataDoc.rev) return true; // 主档无戳——恢复偏置
+            return d.rev ? d.rev > dataDoc.rev : false; // 带戳主档：仅新于它的旁路（踩踏恢复）并入
         });
         ordered.sort(LayerEnvStore.docOrder);
         const cfg: LayerEnvConfigFile = { layers: {} };
@@ -358,10 +361,10 @@ export class LayerEnvStore {
                 } catch { /* 仍缺席——旁路已并入 */ }
             }
         }
-        if (!hasData && docs.length === 0) {
-            // 主档重探（Sol 64 #1）：读取自「主档已移开」起步（stat 即失败）、列
-            // 旁路前写入方已完整收尾（归位+清旁路）——两皆空时重探主档一次，
-            // 新落位档不漏读成空配置
+        if (!hasData) {
+            // 主档重探（Sol 64 #1 → Sol 65 #4）：读取自「主档已移开」起步（stat 即
+            // 失败）后，写入方可能在任何时刻归位新档——不论旁路扫描是否已捞到旧
+            // 态（曾只在零旁路时重探：捞到旧旁路+新档落位→返回旧值）。缺席即重探
             try {
                 const st = await stat(this.path);
                 docs.push(makeDoc(st.mtimeMs, false, await readFile(this.path, "utf-8")));
