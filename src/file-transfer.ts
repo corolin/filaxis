@@ -15,6 +15,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import type { RemoteDialect } from "./dialect.js";
 
 /** 远端执行回调（通常是 driver 的 exec 通道） */
@@ -340,7 +341,20 @@ export async function sftpPutFile(
     return { bytes: content.length, sha256: localSha, verified: true, verification: v.level, writeMode: "inplace-write" as const };
 }
 
-/** sftp 快路径 get（batch `get`；校验同 put） */
+/** 本地下载临时名（Sol 63 P2-5）：basename+后缀超 255B 截前段+短 hash（NAME_MAX 安全） */
+function localTmpFor(localPath: string, nonce: string): string {
+    const suffix = `.fx-dl-${process.pid}-${nonce}`;
+    const name = basename(localPath);
+    const n = name.length + suffix.length <= 255
+        ? name
+        : name.slice(0, Math.max(1, 255 - suffix.length - 9)) + "~" + nonce;
+    return join(dirname(localPath), n + suffix);
+}
+
+/** sftp 快路径 get（batch `get`；校验同 put）。
+ *  先落临时再校验后归位（Sol 63 P2-5）：get 直写目标+事后校验——校验失败时
+ *  目标已被坏内容覆盖（original→bad 无从恢复）。临时落位→双校验通过才
+ *  rename 归位；任何失败清临时，目标分毫未动 */
 export async function sftpGetFile(
     exec: TransferExec,
     dialect: RemoteDialect,
@@ -351,14 +365,22 @@ export async function sftpGetFile(
     const doSpawn = opts.spawnImpl ?? defaultSftpSpawn;
     assertSftpPath(localPath, "本地");
     assertSftpPath(remotePath, "远端");
-    const batch = `get ${q(remotePath)} ${q(localPath)}\n`;
+    const tmpLocal = localTmpFor(localPath, randomBytes(4).toString("hex"));
+    const batch = `get ${q(remotePath)} ${q(tmpLocal)}\n`;
     const r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
     if (r.exitCode !== 0) {
+        await fs.unlink(tmpLocal).catch(() => undefined);
         throw new Error(`sftp get 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);
     }
-    const content = await fs.readFile(localPath);
-    const localSha = createHash("sha256").update(content).digest("hex");
-    const v = await verify(exec, dialect, remotePath, content.length, localSha);
-    if (!v.verified) throw new TransferVerificationError("get", v.detail);
-    return { bytes: content.length, sha256: localSha, verified: true, verification: v.level, writeMode: "inplace-write" as const };
+    try {
+        const content = await fs.readFile(tmpLocal);
+        const localSha = createHash("sha256").update(content).digest("hex");
+        const v = await verify(exec, dialect, remotePath, content.length, localSha);
+        if (!v.verified) throw new TransferVerificationError("get", v.detail);
+        await fs.rename(tmpLocal, localPath);
+        return { bytes: content.length, sha256: localSha, verified: true, verification: v.level, writeMode: "atomic-replace" as const };
+    } catch (e) {
+        await fs.unlink(tmpLocal).catch(() => undefined);
+        throw e;
+    }
 }

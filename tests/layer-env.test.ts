@@ -2,7 +2,7 @@
  * 层环境规格单测（AC-17：解析纯函数/身份键/漂移/匹配/持久化）
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, renameSync, utimesSync, readdirSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, renameSync, utimesSync, readdirSync, existsSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -211,7 +211,7 @@ describe("Sol 59：跨实例并发提交不丢更新（link-CAS 舞步）", () =
             const p = join(dir, "env.json");
             writeFileSync(p, JSON.stringify({ layers: { live: entry({ os: "live" }) } }));
             // 模拟舞步崩溃残留：现行态被移开、落位未发生——旁路是唯一状态源
-            renameSync(p, `${p}.777-crash.fx-old`);
+            renameSync(p, `${p}.111-222-aaaa.fx-old`);
             const cfg = await new LayerEnvStore(p).load();
             expect(cfg.layers.live).toBeTruthy();
             // data 回场后旁路并入（并集——data 同键胜出）
@@ -287,7 +287,7 @@ describe("Sol 60：link-CAS 协议收口", () => {
         try {
             const p = join(dir, "env.json");
             writeFileSync(p, JSON.stringify({ layers: { current: mk("current") } }));
-            const aside = `${p}.777-aged.fx-old`;
+            const aside = `${p}.111-222-bbbb.fx-old`;
             writeFileSync(aside, JSON.stringify({ layers: { onlyAside: mk("onlyAside") } }));
             const old = new Date(Date.now() - 11 * 60_000);
             utimesSync(aside, old, old); // 超过 10min 压实阈值
@@ -321,7 +321,7 @@ describe("Sol 61：协议三缝", () => {
             const s = new LayerEnvStore(p);
             await s.save({ layers: { live: mk61("live") } });
             // 预置崩溃遗留旁路（非本次舞步产物）
-            writeFileSync(`${p}.999-crash.fx-old`, JSON.stringify({ layers: { retired: mk61("retired") } }));
+            writeFileSync(`${p}.111-222-cccc.fx-old`, JSON.stringify({ layers: { retired: mk61("retired") } }));
             await s.save({ layers: {} }); // 整档替换=显式清空
             const cfg = await new LayerEnvStore(p).load(true);
             expect(Object.keys(cfg.layers)).toEqual([]); // 修前：retired 经历史旁路复活
@@ -336,7 +336,7 @@ describe("Sol 61：协议三缝", () => {
             const p = join(dir, "env.json");
             // 带戳形态（store 自写档恒带 _fx_rev——真实旁路/data 皆如此）
             writeFileSync(p, JSON.stringify({ layers: { k: mk61("old") }, _fx_rev: "1000000000000-1-aa" }));
-            const aside = `${p}.888-tie.fx-old`;
+            const aside = `${p}.111-222-dddd.fx-old`;
             writeFileSync(aside, JSON.stringify({ layers: { k: mk61("new") }, _fx_rev: "2000000000000-1-bb" }));
             const t = new Date(Date.now() - 60_000); // 同刻 mtime——戳裁决
             utimesSync(p, t, t);
@@ -410,7 +410,7 @@ describe("Sol 62：读隔离/舞步窗口/序戳裁决", () => {
                 const r = await origList();
                 if (!moved) {
                     moved = true;
-                    renameSync(p, `${p}.win62.fx-old`);
+                    renameSync(p, `${p}.111-222-eeee.fx-old`);
                 }
                 return r;
             };
@@ -428,7 +428,7 @@ describe("Sol 62：读隔离/舞步窗口/序戳裁决", () => {
             const p = join(dir, "env.json");
             // 崩溃于「落位后、旁路清理前」：data=新提交（戳新），旁路=被移开的旧态（戳旧）
             writeFileSync(p, JSON.stringify({ layers: { k: mk62("new") }, _fx_rev: "2000000000000-1-cc" }));
-            const aside = `${p}.777-pre.fx-old`;
+            const aside = `${p}.111-222-ffff.fx-old`;
             writeFileSync(aside, JSON.stringify({ layers: { k: mk62("old") }, _fx_rev: "1000000000000-1-dd" }));
             const t = new Date(Date.now() - 60_000); // 同刻——戳裁决
             utimesSync(p, t, t);
@@ -445,7 +445,7 @@ describe("Sol 62：读隔离/舞步窗口/序戳裁决", () => {
         try {
             const p = join(dir, "env.json");
             writeFileSync(p, JSON.stringify({ layers: { k: mk62("landed") } })); // 无戳（遗老形态）
-            const aside = `${p}.666-legacy.fx-old`;
+            const aside = `${p}.111-222-gggg.fx-old`;
             writeFileSync(aside, JSON.stringify({ layers: { k: mk62("aside") } }));
             const t = new Date(Date.now() - 60_000);
             utimesSync(p, t, t);
@@ -456,4 +456,110 @@ describe("Sol 62：读隔离/舞步窗口/序戳裁决", () => {
             rmSync(dir, { recursive: true, force: true });
         }
     }, 15_000);
+});
+
+// GPT Sol 六十三期：P1×2——旁路归属前后缀判定把同目录他档（env.json.other）
+// 的恢复锚误认自家并连删；同刻 mtime 下持锁 upsert 从旧缓存取基线丢 B 的更新。
+// P2×2——读跨完整提交（move→link→清旁路全毕）重扫只看旁路曾读成空档；时钟
+// 回拨颠倒序戳（陈锁穿透后陈值反胜）。
+describe("Sol 63：归属隔离/锁内重读/读穿完整提交/回拨还原", () => {
+    const mk63 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("P1 旁路归属 uniq 形态全匹配：env.json 不吃 env.json.other 的恢复锚", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env63a-"));
+        try {
+            const p = join(dir, "env.json");
+            const other = join(dir, "env.json.other");
+            // 他档崩溃遗留旁路（uniq 形态——前缀含 "env.json." 曾被误认领）
+            writeFileSync(`${other}.4242-1794000000-zzzz.fx-old`, JSON.stringify({ layers: { sole: mk63("sole") } }));
+            await new LayerEnvStore(p).save({ layers: { mine: mk63("mine") } }); // 舞步+收尾清理
+            // 修前：他档旁路被当自家 preAsides 连删——env.json.other 唯一恢复锚蒸发
+            expect(existsSync(`${other}.4242-1794000000-zzzz.fx-old`)).toBe(true);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P1 锁内强制重读：同刻 mtime 不丢 B 的更新", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env63b-"));
+        try {
+            const p = join(dir, "env.json");
+            const a = new LayerEnvStore(p);
+            const b = new LayerEnvStore(p);
+            await a.upsert("a", mk63("a"));
+            await a.load(); // A 预热缓存（mtime M）
+            const m = statSync(p).mtimeMs;
+            await b.upsert("b", mk63("b")); // B 写入
+            utimesSync(p, new Date(m), new Date(m)); // 文件系统把两次写入记成同一 mtime
+            await a.upsert("c", mk63("c")); // A 持锁写——修前：旧缓存基线 {a} → {a,c}，b 蒸发
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(Object.keys(cfg.layers).sort()).toEqual(["a", "b", "c"]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2 读跨完整提交不返回空档（重扫旁路外主档也重读）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env63c-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { v1: mk63("v1") } }));
+            const s = new LayerEnvStore(p);
+            // 注入两相：①列旁路后现行态被移开（随后的主档读必失败）②重扫时
+            // 完整提交已毕（新主档落位+旁路清理）——修前只重扫旁路→{}
+            const asidePath = `${p}.31337-1794000001-wwww.fx-old`;
+            const orig = (s as unknown as { listAsides: () => Promise<Array<{ p: string }>> }).listAsides.bind(s);
+            let phase = 0;
+            (s as unknown as { listAsides: unknown }).listAsides = async () => {
+                const r = await orig();
+                if (phase === 0) { phase = 1; renameSync(p, asidePath); } // 移开窗口开
+                else if (phase === 1) { phase = 2; writeFileSync(p, JSON.stringify({ layers: { v2: mk63("v2") } })); rmSync(asidePath); } // 提交收尾
+                return r;
+            };
+            const cfg = await s.load();
+            expect(Object.keys(cfg.layers)).toEqual(["v2"]); // 修前：{}（空档）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P2 时钟回拨：落位后锁失即物理还原——B 新值胜出、A 得 stale", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env63d-"));
+        try {
+            const p = join(dir, "env.json");
+            const a = new LayerEnvStore(p);
+            const b = new LayerEnvStore(p);
+            const relA = await (a as unknown as { acquireLock: () => Promise<{ verifyHeld(): Promise<boolean>; finalize(): Promise<void> }> }).acquireLock();
+            const cfgA = await a.load();
+            cfgA.layers.k = mk63("old");
+            let aErr: unknown = null;
+            let hookRan = false; // verifyHeld 被调两次（写前+落位后）——暂停注入只走一次
+            try {
+                await (a as unknown as { saveLocked: (cfg: LayerEnvConfigFile, v?: () => Promise<boolean>) => Promise<void> })
+                    .saveLocked(cfgA, async () => {
+                        if (hookRan) return relA.verifyHeld(); // 落位后复核：真值（锁已失→false）
+                        hookRan = true;
+                        const held = await relA.verifyHeld();
+                        await new Promise((r) => setTimeout(r, 5_300)); // 暂停过陈锁阈
+                        rmSync(`${p}.lock`); // 手动模拟陈锁回收（时钟回拨下 mtime 判龄不可用）
+                        const realNow = Date.now;
+                        Date.now = () => realNow() - 10_000; // 回拨 10s——B 的序戳取到比 A 的 tmp 更早的墙钟
+                        try { await b.upsert("k", mk63("new")); } finally { Date.now = realNow; }
+                        return held;
+                    });
+            } catch (e) { aErr = e; }
+            expect(aErr).toBeInstanceOf(Error); // 落位后锁失拦下
+            const retry = await a.upsert("k", mk63("old")); // A 正门重试
+            expect(retry).toEqual({ stale: true }); // 修前：stale:false（回拨序戳让陈值看起来更新）
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.k!.connection.target).toBe("new"); // B 的已提交新值胜出
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
 });

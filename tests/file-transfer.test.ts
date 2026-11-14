@@ -6,7 +6,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { putFile, getFile, sftpPutFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
+import { putFile, getFile, sftpPutFile, sftpGetFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
 import { probeDialect, NULL_DIALECT, type RemoteDialect } from "../src/dialect.js";
 
 const GNU: RemoteDialect = {
@@ -470,4 +470,35 @@ describe("方言探测通道崩溃（审计 M6）", () => {
         await expect(cache.get("k1", flaky)).rejects.toThrow(/channel reset/);
         expect((cache as unknown as { cache: Map<string, unknown> }).cache.size).toBe(0); // 未固化
     });
+});
+
+// GPT Sol 六十三期 P2-5：sftp get 直写目标+事后校验——校验失败时目标已被坏
+// 内容覆盖。修：临时落位→双校验→rename 归位；失败清临时，目标分毫未动。
+describe("Sol 63：sftpGetFile 校验失败不覆盖目标", () => {
+    test("下载内容损坏（size 不符）→ 抛校验错 + 目标保持 original + 无临时残留", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-get63-"));
+        try {
+            const localPath = join(dir, "target.bin");
+            writeFileSync(localPath, "original");
+            const files = new Map<string, Buffer>([["/remote/src.bin", Buffer.from("good")]]);
+            const exec: TransferExec = async (cmd) => {
+                const m = cmd.match(/^(?:wc -c|sha256sum) < '([^']+)'$/);
+                if (!m) return { stdout: "", exitCode: 0 };
+                const buf = files.get(m[1]!) ?? Buffer.alloc(0);
+                if (cmd.startsWith("wc")) return { stdout: String(buf.length), exitCode: 0 };
+                return { stdout: createHash("sha256").update(buf).digest("hex"), exitCode: 0 };
+            };
+            const spawnImpl: SftpSpawnImpl = async (_args: string[], batch: string) => {
+                const m = batch.trim().match(/^get '([^']+)' '([^']+)'$/);
+                if (m) writeFileSync(m[2]!, "bad"); // 模拟损坏下载（远端是 good）
+                return { stdout: "", stderr: "", exitCode: 0 };
+            };
+            await expect(sftpGetFile(exec, GNU, "/remote/src.bin", localPath, { connArgs: [], spawnImpl }))
+                .rejects.toBeInstanceOf(TransferVerificationError);
+            expect(readFileSync(localPath, "utf-8")).toBe("original"); // 修前：bad 已覆盖
+            expect(readdirSync(dir).filter((f) => f.includes("fx-dl"))).toEqual([]); // 临时已清
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
 });

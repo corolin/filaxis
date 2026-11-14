@@ -241,15 +241,20 @@ export class LayerEnvStore {
     constructor(public readonly path: string) {}
 
     /** 列旁路文件（mtime 升序——线性历史态，旧→新逐个并入；mtime 是被移开文件
-     *  的原写时间非移开时间，清理阈值按此保守理解） */
+     *  的原写时间非移开时间，清理阈值按此保守理解）。
+     *  归属按 uniq 形态全匹配（Sol 63 P1-1）：前后缀判定曾把同目录他档
+     *  （env.json.other.<uniq>.fx-old）误认自家旁路——合并错档+舞步收尾连删
+     *  他档恢复锚。剥前缀后必须恰为 <pid>-<ms>-<rand> 形态才算自己的 */
     private async listAsides(): Promise<Array<{ p: string; mtimeMs: number }>> {
         try {
             const { readdir } = await import("node:fs/promises");
             const dir = dirname(this.path);
             const pre = `${basename(this.path)}.`;
+            const uniqTail = new RegExp(`^\\d+-\\d+-[a-z0-9]{1,12}\\${ASIDE_SUFFIX}$`);
             const out: Array<{ p: string; mtimeMs: number }> = [];
             for (const n of await readdir(dir)) {
-                if (!n.startsWith(pre) || !n.endsWith(ASIDE_SUFFIX)) continue;
+                if (!n.startsWith(pre)) continue;
+                if (!uniqTail.test(n.slice(pre.length))) continue;
                 const p = join(dir, n);
                 try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs }); } catch { /* 竞态消失 */ }
             }
@@ -334,12 +339,17 @@ export class LayerEnvStore {
             try {
                 docs.push(makeDoc(dataMtimeMs, false, await readFile(this.path, "utf-8")));
             } catch {
-                // stat 与读之间现行态被移开——重列旁路（rename 先于读失败，必见）
+                // stat 与读之间现行态被移开——重列旁路（rename 先于读失败，必见）；
+                // 主档也重读（Sol 63 P2-3）：完整提交可能已跨过我们的读
+                //（move→link→清旁路全毕）——只重扫旁路曾读成空档
                 const known = new Set(asides.map((x) => x.p));
                 for (const a of await this.listAsides()) {
                     if (known.has(a.p)) continue;
                     try { docs.push(makeDoc(a.mtimeMs, true, await readFile(a.p, "utf-8"))); } catch { /* 竞态消失 */ }
                 }
+                try {
+                    docs.push(makeDoc((await stat(this.path)).mtimeMs, false, await readFile(this.path, "utf-8")));
+                } catch { /* 仍缺席——旁路已并入 */ }
             }
         }
         return { docs, asides, dataMtimeMs, hasData };
@@ -407,9 +417,11 @@ export class LayerEnvStore {
         // 旁路，崩溃遗留的历史旁路仍会把整档替换已删的层复活
         const preAsides = (await this.listAsides()).map((a) => a.p);
         // 内嵌序戳（Sol 62 P2-4）：文档自带提交时刻——rename/link 迁移不损，
-        // 同刻 mtime 平局由戳裁决（mergeLayers 只读 layers，戳不外泄）
+        // 同刻 mtime 平局由戳裁决（mergeLayers 只读 layers，戳不外泄）。
+        // payloadText 单源（Sol 63 P2-4）：落位后锁失的还原比对须与写入逐字节同串
         const rev = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-        await writeFile(tmp, JSON.stringify({ ...cfg, _fx_rev: rev }, null, 2), "utf-8");
+        const payloadText = JSON.stringify({ ...cfg, _fx_rev: rev }, null, 2);
+        await writeFile(tmp, payloadText, "utf-8");
         if (verifyHeld && !(await verifyHeld())) {
             await unlink(tmp).catch(() => undefined);
             throw new Error("__FX_LOCK_LOST__"); // 哨兵：落位未尝试，盘上数据未动
@@ -434,8 +446,17 @@ export class LayerEnvStore {
         await unlink(tmp).catch(() => undefined);
         this.cache = null; // 失效缓存（下次 load 重 stat）
         // 落位后锁属复核：EEXIST 未触发只证明落位瞬间无并发提交——暂停窗口跨越
-        // 整个舞步时持有权早失；哨兵交上层重试（重读并入旁路再提交，不丢他人键）
+        // 整个舞步时持有权早失。还原优先（Sol 63 P2-4）：盘上仍是本舞步产物
+        //（无人再动过）时把移开态搬回主位——陈值不留主位；时钟回拨/同刻下
+        // 序戳不可靠，物理还原是活检测路径上最诚实的序。盘面已变则留给合并序
         if (verifyHeld && !(await verifyHeld())) {
+            try {
+                const cur = await readFile(this.path, "utf-8");
+                if (cur === payloadText) {
+                    await rename(aside, this.path).catch(() => undefined);
+                    await unlink(aside).catch(() => undefined); // rename 未遂时兜底（aside 可能已被收）
+                }
+            } catch { /* 盘面已变——旁路留恢复锚 */}
             throw new Error("__FX_LOCK_LOST__");
         }
         // 成功收尾：消费自己移开的旁路 + 舞步开场在场的历史旁路（Sol 60 P2-2 +
@@ -512,7 +533,10 @@ export class LayerEnvStore {
             for (let round = 0; round < 3; round++) {
                 const release = await this.acquireLock();
                 try {
-                    const cfg = await this.load();
+                    // 锁内强制重读（Sol 63 P1-2）：mtime 缓存在同刻写入下失明——
+                    // A 缓存{a}+B 同刻写 b 后，A 持锁 upsert 曾从旧缓存取基线写
+                    // {a,c}，b 蒸发。写者不信缓存，锁内永远读盘面新鲜态
+                    const cfg = await this.load(true);
                     const existing = cfg.layers[key];
                     if (existing && !force && existing.fingerprint !== entry.fingerprint) {
                         return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
