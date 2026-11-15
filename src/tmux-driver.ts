@@ -32,8 +32,13 @@ export interface TmuxDriverOptions {
  *  driver 实例但**共指同一 tmux 会话**——任一 destroy 曾直接杀会话连坐其余层。
  *  模块级计数：归零才真 destroySession（driver 实例各自独立，会话是共享物） */
 const sessionAttachRefs = new Map<string, number>();
-/** 同 tid 各在册实例声明的 cwd（Sol 77 P1-1）：重挂不同 cwd 的冲突守卫依据 */
-const sessionCwds = new Map<string, Set<string>>();
+/** 同 tid 各在册实例声明的 cwd 计数（Sol 77 P1-1 → Sol 78 P1-4 计数化）：
+ *  重挂不同 cwd 的冲突守卫依据。Set 形态曾在一个同 cwd 驱动销毁时把条目删光
+ *  ——另一驱动还在用，守卫失效（不同 cwd 重挂被放行，共享 shell 的 pwd 被改） */
+const sessionCwds = new Map<string, Map<string, number>>();
+/** 正在执行 destroySession 的 tid（Sol 78 #5）：销毁在途时重挂曾拿到
+ *  has-session 尚可通过的将死会话——恢复清理后新句柄随即失效 */
+const sessionDestroying = new Set<string>();
 
 export class TmuxSessionDriver implements RuntimeDriver {
     descriptor: RuntimeDescriptor;
@@ -163,10 +168,13 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 全落错目录）。他实例已在册且 cwd 不同 → 拒绝（改目录请新层或
             // per-exec cwd）；相同 cwd 幂等无害放行
             const tid0 = this.descriptor.terminalId!;
+            if (sessionDestroying.has(tid0)) {
+                throw new Error(`tmux 会话 '${tid0}' 销毁进行中——稍后重试重挂或新建层（Sol 78 #5：在途销毁的会话 has-session 尚可通过，重挂拿到的将是将死句柄）`);
+            }
             const wanted = this.descriptor.cwd;
             if (wanted != null) {
-                for (const cwd of sessionCwds.get(tid0) ?? []) {
-                    if (cwd !== wanted) {
+                for (const [cwd, n] of sessionCwds.get(tid0) ?? []) {
+                    if (n > 0 && cwd !== wanted) {
                         throw new Error(
                             `tmux 会话 '${tid0}' 已以 cwd='${cwd}' 在用——重挂不同 cwd（'${wanted}'）会改掉共享持久 shell 的工作目录（原层相对路径将落错位置）。` +
                             `请新建层（不带 terminalId）或用 exec 的 cwd 选项（按命令前缀）`,
@@ -187,7 +195,12 @@ export class TmuxSessionDriver implements RuntimeDriver {
           // destroy 的引用扣减曾照扣（?? 1 把缺席当 1），原层会话被连带销毁
             const tid = this.descriptor.terminalId!;
             sessionAttachRefs.set(tid, (sessionAttachRefs.get(tid) ?? 0) + 1);
-            { const cwds = sessionCwds.get(tid) ?? new Set<string>(); if (this.descriptor.cwd != null) cwds.add(this.descriptor.cwd); sessionCwds.set(tid, cwds); }
+            { // cwd 计数登记（Sol 78 P1-4）
+              if (this.descriptor.cwd != null) {
+                  const cwds = sessionCwds.get(tid) ?? new Map<string, number>();
+                  cwds.set(this.descriptor.cwd, (cwds.get(this.descriptor.cwd) ?? 0) + 1);
+                  sessionCwds.set(tid, cwds);
+              } }
             this.attached = true;
         }
         if (this.descriptor.cwd && this.descriptor.terminalId && !isAttach) {
@@ -234,14 +247,24 @@ export class TmuxSessionDriver implements RuntimeDriver {
             this.ownedSessions.clear();
             const tid = this.descriptor.terminalId;
             const refs = Math.max(0, (sessionAttachRefs.get(tid) ?? 1) - 1);
-            { // cwd 注册表同步摘除本实例声明
-                const cwds = sessionCwds.get(tid);
-                cwds?.delete(this.descriptor.cwd ?? "");
-                if (cwds && cwds.size === 0) sessionCwds.delete(tid);
-            }
+            { // cwd 计数递减（Sol 78 P1-4）：同 cwd 他实例仍在（n>0）条目保留
+              if (this.descriptor.cwd != null) {
+                  const cwds = sessionCwds.get(tid);
+                  const n = (cwds?.get(this.descriptor.cwd) ?? 1) - 1;
+                  if (n > 0) cwds!.set(this.descriptor.cwd, n);
+                  else {
+                      cwds?.delete(this.descriptor.cwd);
+                      if (cwds && cwds.size === 0) sessionCwds.delete(tid);
+                  }
+              } }
             if (refs === 0) {
                 sessionAttachRefs.delete(tid);
-                await this.terminal.destroySession(tid);
+                sessionDestroying.add(tid); // 销毁在途（Sol 78 #5）：重挂守卫依据
+                try {
+                    await this.terminal.destroySession(tid);
+                } finally {
+                    sessionDestroying.delete(tid);
+                }
             } else {
                 sessionAttachRefs.set(tid, refs); // 他实例仍持有——会话留命
             }

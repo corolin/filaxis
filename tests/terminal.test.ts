@@ -782,3 +782,62 @@ describe("Sol 77：重挂守卫/引用纪律", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十八期 P1-4/#5：同 cwd 双驱动一个销毁曾把 cwd 条目删光（守卫失效
+// ——不同 cwd 重挂被放行改掉共享 shell 目录）；销毁在途重挂曾拿到将死会话。
+describe("Sol 78：cwd 计数/销毁在途守卫", () => {
+    test("P1-4 同 cwd 双驱动：销毁一个后守卫仍拦截不同 cwd 重挂", async () => {
+        const real78 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const mk = (cwd?: string, tid?: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: tid, cwd, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH78",
+                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            const d1 = mk("/tmp"); // spawn：登记 cwd /tmp（计数 1）
+            await d1.init();
+            const d2 = mk("/tmp", "SH78"); // 同 cwd 重挂（计数 2）
+            await d2.init();
+            await d1.destroy(); // 一个销毁——/tmp 计数 2→1（条目保留）
+            const d3 = mk("/", "SH78"); // 不同 cwd 重挂：仍须拒绝（d2 还在用 /tmp）
+            await expect(d3.init()).rejects.toThrow(/已以 cwd/); // 修前：条目被删光→放行→pwd 被改
+            await d2.destroy(); // 最后一个：条目清、会话销毁
+            const d4 = mk("/", "SH78"); // 现在无冲突——放行
+            await d4.init();
+            await d4.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real78;
+        }
+    }, 15_000);
+
+    test("#5 销毁在途重挂被拒（destroySession 暂停窗口）", async () => {
+        const real78 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        let releaseDestroy!: () => void;
+        const destroyGate = new Promise<void>((r) => { releaseDestroy = r; });
+        const mk = (tid?: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH78b",
+                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                destroySession: async () => { await destroyGate; }, // 暂停清理
+            } as never },
+        );
+        try {
+            const d1 = mk();
+            await d1.init();
+            const dying = d1.destroy(); // refs→0：destroySession 挂起（destroying 在册）
+            await new Promise((r) => setTimeout(r, 30));
+            const d2 = mk("SH78b"); // 销毁在途重挂——修前：has-session 尚通过→将死句柄
+            await expect(d2.init()).rejects.toThrow(/销毁进行中/);
+            releaseDestroy();
+            await dying;
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real78;
+        }
+    }, 15_000);
+});

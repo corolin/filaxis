@@ -1221,3 +1221,30 @@ describe("Sol 77：空 connection/无效提名回救", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十八期 P1-3：回救序曾按墙钟（docOrder）——回拨下后代戳反小，
+// 旧值被回救写回主档。改因果序（闭包深度定新旧）。
+describe("Sol 78：回救因果序", () => {
+    test("回拨后代（戳小）的 null 提名——回救取后代线有效值非墙钟最大者", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env78-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk78 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            // 主档（当前代）：one 无效提名（null）——回救触发点
+            writeFileSync(p, JSON.stringify({ layers: { one: null }, _fx_rev: "5000000000000-1-cur78" }));
+            // 前代 A（墙钟戳大——回拨前的旧档）：one=old（曾按墙钟被回救）
+            writeFileSync(`${p}.111-222-ssss.fx-old`, JSON.stringify({ layers: { one: mk78("old") }, _fx_rev: "9000000000000-1-oldA78", _fx_seen: [] }));
+            // 前代 B（墙钟戳小、闭包深——真后代）：one=new（因果上更新）
+            writeFileSync(`${p}.111-222-tttt.fx-old`, JSON.stringify({ layers: { one: mk78("new") }, _fx_rev: "1000000000000-1-newB78", _fx_seen: ["9000000000000-1-oldA78"] }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one!.connection.target).toBe("new"); // 修前：old（墙钟序回救）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

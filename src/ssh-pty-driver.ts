@@ -674,7 +674,7 @@ export class SshPtyDriver implements RuntimeDriver {
             // 显式 stdio 模式覆盖（DeepSeek Harness 反馈）：FILAXIS_SSH_STDIO_MODE=inherit
             // 直接走文件中转（管道句柄在受限沙箱里被拦截——ssh 秒退 255 零输出）
             if (process.env.FILAXIS_SSH_STDIO_MODE === "inherit") {
-                void spawnWithFileRedirect(argv, render.stdinCmd, options?.timeoutMs).then((r) => {
+                void spawnWithFileRedirect(argv, render.stdinCmd, { timeoutMs: options?.timeoutMs, signal: options?.signal }).then((r) => {
                     const mIdx = r.stdout.lastIndexOf(`\n${marker}:`);
                     const m = mIdx !== -1 ? r.stdout.slice(mIdx + 1).split("\n", 1)[0]?.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`)) : null;
                     if (!m) {
@@ -768,25 +768,18 @@ export class SshPtyDriver implements RuntimeDriver {
                     // 零输出=管道句柄被拦截的指纹——一次文件中转重试（cmd/sh 的 >
                     // 是文件句柄非管道句柄，沙箱放行）；重试仍败才报错附双模式现场
                     if (isBrokenStdioExit(code, out, stderr, Date.now() - spawnAt)) {
+                        // 沙箱 stdio 管道损坏指纹（DeepSeek Harness 反馈）。**不自动重放**
+                        //（Sol 78 P1-2）：首轮结果未知=远端可能已执行副作用——非幂等命令
+                        // 重试违宪（tmux spawn 错误同款纪律「勿盲目重试非幂等命令」）。
+                        // 报明确指纹+出路，由调用方显式设 FILAXIS_SSH_STDIO_MODE=inherit 重发
                         finish(() => {
-                            void spawnWithFileRedirect(argv, render.stdinCmd, options?.timeoutMs).then((r) => {
-                                const mIdx2 = r.stdout.lastIndexOf(`\n${marker}:`);
-                                const m2 = mIdx2 !== -1 ? r.stdout.slice(mIdx2 + 1).split("\n", 1)[0]?.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`)) : null;
-                                if (!m2) {
-                                    const e = new Error(
-                                        `命令未完成（管道模式秒退 255 零输出——已自动降级文件中转仍无哨兵，exit=${r.exitCode}）。stdout 尾:\n${r.stdout.slice(-500)}\nstderr 尾:\n${r.stderr.slice(-300)}${BROKEN_STDIO_HINT}`,
-                                    ) as Error & { outcome: "unknown" };
-                                    e.outcome = "unknown";
-                                    reject(e);
-                                    return;
-                                }
-                                resolve({
-                                    stdout: r.stdout.slice(0, mIdx2),
-                                    stderr: r.stderr,
-                                    exitCode: parseInt(m2[1]!, 10),
-                                    effectiveUser: m2[2] === "" ? undefined : m2[2],
-                                });
-                            }, (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))));
+                            const e = new Error(
+                                `命令未完成（ssh 秒退 code=255、零输出——沙箱 stdio 管道损坏指纹）。` +
+                                `注意：首轮结果未知（远端可能已执行——非幂等命令请先核实再重发）。` +
+                                `重发方式：环境变量 FILAXIS_SSH_STDIO_MODE=inherit（文件中转，绕开管道句柄）${BROKEN_STDIO_HINT}`,
+                            ) as Error & { outcome: "unknown" };
+                            e.outcome = "unknown";
+                            reject(e);
                         });
                         return;
                     }
@@ -851,26 +844,44 @@ const BROKEN_STDIO_HINT =
     "\n  ③真实终端执行。详见 docs/known-environments.md";
 
 /** 文件中转包装（inherit 降级）：经 shell 重定向到临时文件绕开损坏的管道——
- *  cmd/sh 的 > 是文件句柄非管道句柄，沙箱放行。产物读回拼 ExecResult。 */
-async function spawnWithFileRedirect(argv: string[], stdinCmd: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+ *  cmd/sh 的 > 是文件句柄非管道句柄，沙箱放行。产物读回拼 ExecResult。
+ *  abort（Sol 78 #6）：signal 已取消即 AbortError；在途取消杀本地 shell。
+ *  0600（Sol 78 #7）：中转文件含原始命令/env 值——umask 022 下 0644 曾可被
+ *  同机其他用户读取 */
+export const __testFileRedirect = spawnWithFileRedirect; // 测试导出面（中转命令形态验证）
+async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
     const os = await import("node:os");
     const fsp = await import("node:fs/promises");
     const nonce = crypto.randomBytes(6).toString("hex");
     const outFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.out`;
     const errFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.err`;
     const inFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.in`;
-    await fsp.writeFile(inFile, stdinCmd, "utf-8");
+    if (opts.signal?.aborted) {
+        throw new DOMException("exec aborted by AbortSignal（文件中转未启动）", "AbortError");
+    }
+    await fsp.writeFile(inFile, stdinCmd, { encoding: "utf-8", mode: 0o600 });
+    // 输出文件预创建 0600（> 重定向沿用 umask 创建——shell 无法传 mode）
+    await fsp.writeFile(outFile, "", { mode: 0o600 });
+    await fsp.writeFile(errFile, "", { mode: 0o600 });
     const shell = process.platform === "win32" ? "cmd" : "/bin/sh";
     const shellArg = process.platform === "win32" ? "/c" : "-c";
-    const quoted = argv.map((a) => (process.platform === "win32" ? `"${a.replace(/"/g, '\\"')}"` : q(a))).join(" ");
+    // argv 首位是 ssh 本体（Sol 78 P1-1：曾漏——选项列表直交 shell 变 `/bin/sh: -o: not found`）
+    const quoted = ["ssh", ...argv].map((a) => (process.platform === "win32" ? `"${a.replace(/"/g, '\\"')}"` : q(a))).join(" ");
     const redirect = process.platform === "win32"
         ? `${quoted} < "${inFile}" > "${outFile}" 2> "${errFile}"`
         : `${quoted} < ${q(inFile)} > ${q(outFile)} 2> ${q(errFile)}`;
     const p = spawn(shell, [shellArg, redirect], { stdio: ["ignore", "ignore", "ignore"] });
     const exitCode = await new Promise<number | null>((resolve) => {
-        const t = timeoutMs ? setTimeout(() => { p.kill("SIGTERM"); resolve(null); }, timeoutMs) : null;
-        p.once("exit", (c) => { if (t) clearTimeout(t); resolve(c); });
-        p.once("error", () => { if (t) clearTimeout(t); resolve(null); });
+        const onAbort = () => { p.kill("SIGTERM"); resolve(null); };
+        const t = opts.timeoutMs ? setTimeout(() => { p.kill("SIGTERM"); resolve(null); }, opts.timeoutMs) : null;
+        opts.signal?.addEventListener("abort", onAbort, { once: true });
+        const done = (c: number | null) => {
+            if (t) clearTimeout(t);
+            opts.signal?.removeEventListener("abort", onAbort);
+            resolve(c);
+        };
+        p.once("exit", (c) => done(c));
+        p.once("error", () => done(null));
     });
     const [out, err] = await Promise.all([
         fsp.readFile(outFile, "utf-8").catch(() => ""),

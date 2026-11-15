@@ -2,6 +2,7 @@
  * ssh-helpers / 层状态机 / 远端会话引擎 单测（纯逻辑 + mock 远端，真机面属 CI sshd 矩阵）
  */
 import { describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1189,4 +1190,17 @@ describe("DS 反馈：沙箱 stdio 管道损坏", () => {
         expect(probe.__testBrokenStdioExit(255, "", "", 2000)).toBe(false); // 慢退=网络/认证
         expect(probe.__testBrokenStdioExit(null, "", "", 100)).toBe(false); // 信号杀
     }, 10_000);
+});
+
+// GPT Sol 七十八期：P1-1 文件中转曾漏 ssh 本体（选项直交 shell）；P1-2 自动
+// 重放撤除（首轮结果未知=可能已执行副作用——非幂等命令重试违宪）；#6 abort
+// 信号贯通；#7 中转文件 0600。
+describe("Sol 78：文件中转三缝", () => {
+    test.skipIf(!Bun.which("sh"))("P1-1 中转命令含 ssh 本体：ssh -V 真跑通（修前 /bin/sh: -o not found）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
+        if (!run) return; // 导出面缺席
+        const r = await run(["-V"], ""); // ssh -V：版本打到 stderr
+        expect(r.stderr).toMatch(/OpenSSH|OpenSSH_for_Windows/i); // 修前：'-o/-V: not found'（无 ssh 本体）
+    }, 15_000);
 });
