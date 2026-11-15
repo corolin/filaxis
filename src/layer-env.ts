@@ -215,10 +215,11 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
         //+environment+fingerprint 四要素——缺任一跳过）
         if (v != null && typeof v === "object" && !Array.isArray(v)) {
             const conn = (v as LayerEnvEntry).connection as { driver?: unknown; target?: unknown } | null | undefined;
-            const env = (v as LayerEnvEntry).environment;
+            const env = (v as LayerEnvEntry).environment as { packages?: unknown } | null | undefined;
+            const envOk = env != null && typeof env === "object" && !Array.isArray(env)
+                && (env.packages == null || Array.isArray(env.packages));
             if (conn != null && typeof conn === "object" && typeof conn.driver === "string"
-                && (conn.driver === "local" || conn.driver === "tmux" || typeof conn.target === "string")
-                && env != null && typeof env === "object" && !Array.isArray(env)
+                && envOk
                 && typeof (v as LayerEnvEntry).fingerprint === "string") {
                 dst.layers[k] = v as LayerEnvEntry;
             }
@@ -300,7 +301,13 @@ export class LayerEnvStore {
         // 时旁路是唯一状态源（崩溃于移开与落位之间）。
         // mtime 缓存已退役（Sol 64 #4）：同刻写入下缓存失明（A 预热+B 同刻保存
         // →A 的 load 仍旧值）——env 档案小、读取廉，正确性优先于省一次读
-        const { docs, asides, hasData } = await this.collectDocs();
+        const { docs, asides, hasData, readFailures } = await this.collectDocs();
+        if (readFailures.length > 0) {
+            // 读故障在场（Sol 84 P1-2）：跳过压实与旁路清理——EIO 挡住的旁路
+            // 曾被照常压实删除（唯一恢复数据永久丢失）。返回已读到的部分，
+            // 故障旁路留盘待解除后重试
+            return LayerEnvStore.snapshot(LayerEnvStore.mergeDocs(docs));
+        }
         if (!hasData && docs.length === 0) return { layers: {} };
         const cfg = LayerEnvStore.mergeDocs(docs);
         // 老化旁路压实（Sol 60 P2-3）：先持久后清理——只删不写曾使恢复出的条目
@@ -383,10 +390,11 @@ export class LayerEnvStore {
                     if (v == null || typeof v !== "object" || Array.isArray(v)) return true;
                     const e = v as LayerEnvEntry;
                     const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
-                    const envR = e.environment;
+                    const envR = e.environment as { packages?: unknown } | null | undefined;
+                    const envOk = envR != null && typeof envR === "object" && !Array.isArray(envR)
+                        && (envR.packages == null || Array.isArray(envR.packages));
                     return !(conn != null && typeof conn === "object" && typeof conn.driver === "string"
-                        && (conn.driver === "local" || conn.driver === "tmux" || typeof conn.target === "string")
-                        && envR != null && typeof envR === "object" && !Array.isArray(envR)
+                        && envOk
                         && typeof e.fingerprint === "string");
                 };
                 for (const src of [anchor.parsed, ...heirs.map(({ d }) => d.parsed)]) {
@@ -455,13 +463,14 @@ export class LayerEnvStore {
             if (v == null || typeof v !== "object" || Array.isArray(v)) return false;
             const e = v as LayerEnvEntry;
             const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
-            // 最小完整契约（Sol 77→83 逐轮收紧的定版）：driver 字符串 + 非
-            // local/tmux 须 target（local/tmux 默认层无落点合法——Sol 83 P1-3：
-            // tmux:default 探测记录曾因四要素被判残缺过滤丢弃）+ environment
-            // 非空对象且非数组（Sol 83 P1-4：[] 曾通过 typeof object）+ fingerprint
-            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment);
+            // 最小完整契约（Sol 77→84）：driver 字符串 + environment 非空对象
+            // 且非数组（Sol 83 P1-4）+ environment.packages 在场须数组（Sol 84
+            // P1-4：字符串 packages 曾覆盖备份并让 matchLayers 崩）+ fingerprint
+            // 字符串。target **不作要求**（Sol 84 P1-3：embedded 等自定义驱动的
+            // 默认层无落点合法——白名单豁免曾漏掉第三方驱动，探测记录被过滤删除）
+            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment)
+                && ((e.environment as { packages?: unknown }).packages == null || Array.isArray((e.environment as { packages?: unknown }).packages));
             return conn != null && typeof conn === "object" && typeof conn.driver === "string"
-                && (conn.driver === "local" || conn.driver === "tmux" || typeof conn.target === "string")
                 && envOk
                 && typeof e.fingerprint === "string";
         };
@@ -520,17 +529,29 @@ export class LayerEnvStore {
         asides: Array<{ p: string; mtimeMs: number }>;
         dataMtimeMs: number;
         hasData: boolean;
+        /** 读失败（EIO 等非缺席类）——在场时 load 跳过压实（Sol 84 P1-2：
+         *  曾照常压实删除唯一含恢复数据的旁路=故障窗口内永久丢失） */
+        readFailures: string[];
     }> {
         let dataMtimeMs = 0;
         let hasData = false;
+        const readFailures: string[] = [];
+        const docs: FxDoc[] = [];
+        const readDoc = async (p: string, mtimeMs: number, aside: boolean): Promise<void> => {
+            try {
+                docs.push(makeDoc(mtimeMs, aside, await readFile(p, "utf-8")));
+            } catch (e) {
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") readFailures.push(`${p}: ${code ?? (e as Error).message}`); // EIO 等真故障（ENOENT=舞步竞态归缺席）
+            }
+        };
         try {
             dataMtimeMs = (await stat(this.path)).mtimeMs;
             hasData = true;
         } catch { /* 缺席——旁路承载 */ }
-        const asides = await this.listAsides();
-        const docs: FxDoc[] = [];
+        const asides = await this.listAsides(); // stat 先于列旁路（Sol 62 P2-3）——次序是读穿舞步窗口的依据，勿动
         for (const a of asides) {
-            try { docs.push(makeDoc(a.mtimeMs, true, await readFile(a.p, "utf-8"))); } catch { /* 竞态消失 */ }
+            await readDoc(a.p, a.mtimeMs, true);
         }
         if (hasData) {
             try {
@@ -560,7 +581,7 @@ export class LayerEnvStore {
                 hasData = true;
             } catch { /* 确无档 */ }
         }
-        return { docs, asides, dataMtimeMs, hasData };
+        return { docs, asides, dataMtimeMs, hasData, readFailures };
     }
 
     /** 压实：锁内重读合并态 → 舞步落位（成功即自消其旁路）→ 清 aged。
@@ -835,7 +856,8 @@ export function matchLayers(cfg: LayerEnvConfigFile, needs: string[]): LayerMatc
                 return compareVersion(extractVersion(have) ?? "0", want, op);
             }
             // 包名匹配（matchNames 别名 + @ 版本）
-            const pkg = (spec.packages ?? []).find((p) => {
+            const pkgList = Array.isArray(spec.packages) ? spec.packages : []; // 防御（Sol 84 P1-4）：损坏 packages 不再崩查询
+            const pkg = pkgList.find((p) => {
                 const base = p.split("@")[0]!;
                 const def = PROBE_PACKAGES.find((d) => base === d.key || d.matchNames.includes(base));
                 return base === name || def?.matchNames.includes(name);

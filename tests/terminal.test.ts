@@ -761,7 +761,7 @@ describe("Sol 77：重挂守卫/引用纪律", () => {
             { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH77b",
-                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                runCommand: async (_id: unknown, cmd: string) => { const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "", stderr: "", exitCode: 0 }; },
                 destroySession: async (id: string) => { destroyed.push(id); },
             } as never },
         );
@@ -793,7 +793,7 @@ describe("Sol 78：cwd 计数/销毁在途守卫", () => {
             { driver: "tmux", terminalId: tid, cwd, config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH78",
-                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                runCommand: async (_id: unknown, cmd: string) => { const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -823,7 +823,7 @@ describe("Sol 78：cwd 计数/销毁在途守卫", () => {
             { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH78b",
-                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                runCommand: async (_id: unknown, cmd: string) => { const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "", stderr: "", exitCode: 0 }; },
                 destroySession: async () => { await destroyGate; }, // 暂停清理
             } as never },
         );
@@ -853,7 +853,7 @@ describe("Sol 79：restore cwd/探活竞态", () => {
             { driver: "tmux", terminalId: "SH79", cwd: "/", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH79",
-                runCommand: async (_id: string, cmd: string) => { if (cmd.startsWith("cd ")) cds.push(cmd); return { stdout: "", stderr: "", exitCode: 0 }; },
+                runCommand: async (_id: string, cmd: string) => { if (cmd.startsWith("cd ")) cds.push(cmd); const m = cmd.match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -875,7 +875,7 @@ describe("Sol 79：restore cwd/探活竞态", () => {
             { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH79b",
-                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                runCommand: async (_id: unknown, cmd: string) => { const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -905,7 +905,7 @@ describe("Sol 80：未声明 cwd 守卫/竞态归零", () => {
             { driver: "tmux", terminalId: tid, cwd, config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH80",
-                runCommand: async (_id: string, cmd: string) => { if (cmd.startsWith("cd ")) cds.push(cmd); return { stdout: "", stderr: "", exitCode: 0 }; },
+                runCommand: async (_id: string, cmd: string) => { if (cmd.startsWith("cd ")) cds.push(cmd); const m = cmd.match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -928,7 +928,7 @@ describe("Sol 80：未声明 cwd 守卫/竞态归零", () => {
             { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH80b",
-                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                runCommand: async (_id: unknown, cmd: string) => { const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -961,7 +961,7 @@ describe("Sol 81：并发首挂/restore 严验证", () => {
             { driver: "tmux", terminalId: "SH81", cwd, config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH81",
-                runCommand: async (_id: string, cmd: string) => { if (cmd.includes("cd ")) cds.push(cmd); return { stdout: "ok", stderr: "", exitCode: 0 }; },
+                runCommand: async (_id: string, cmd: string) => { if (cmd.includes("cd ")) cds.push(cmd); const m = cmd.match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -1018,8 +1018,9 @@ describe("Sol 82：验证互斥/幽灵占位/nonce 标记", () => {
             { terminalManager: {
                 spawnSession: async () => "SH82",
                 runCommand: async (_id: string, cmd: string) => {
-                    if (cmd.includes("cd ") && cmd.includes("pwd")) { cdCount++; await cdGate; return { stdout: "ok", stderr: "", exitCode: 0 }; }
-                    return { stdout: "ok", stderr: "", exitCode: 0 };
+                    const m = cmd.match(/echo (__FX_CDOk_\w+__)/);
+                    if (cmd.includes("cd ") && cmd.includes("pwd")) { cdCount++; await cdGate; return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 }; }
+                    return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 };
                 },
                 destroySession: async () => undefined,
             } as never },
@@ -1047,7 +1048,7 @@ describe("Sol 82：验证互斥/幽灵占位/nonce 标记", () => {
             { driver: "tmux", terminalId: "SH82b", cwd: "/x", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH82b",
-                runCommand: async () => ({ stdout: "ok", stderr: "", exitCode: 0 }),
+                runCommand: async (_id: unknown, cmd: string) => { const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -1071,7 +1072,11 @@ describe("Sol 82：验证互斥/幽灵占位/nonce 标记", () => {
             { driver: "tmux", terminalId: "SH82c", cwd: "/opt/__FX_CD_FAIL_dir", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH82c",
-                runCommand: async () => ({ stdout: "/opt/__FX_CD_FAIL_dir", stderr: "", exitCode: 0 }), // pwd 输出含静态字样
+                runCommand: async (_id: unknown, cmd: string) => {
+                    const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/);
+                    const nl = "\n";
+                    return { stdout: "/opt/__FX_CD_FAIL_dir" + nl + (m ? m[1]! + nl : ""), stderr: "", exitCode: 0 }; // pwd 输出含静态字样 + ok 标记行
+                },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -1096,7 +1101,11 @@ describe("Sol 83：回显行判定/互斥提前", () => {
             { driver: "tmux", terminalId: "SH83", cwd: "/tmp", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH83",
-                runCommand: async (_id: string, cmd: string) => ({ stdout: `${cmd}\r\n/tmp\r\n`, stderr: "", exitCode: 0 }),
+                runCommand: async (_id: string, cmd: string) => {
+                    const m = cmd.match(/echo (__FX_CDOk_\w+__)/);
+                    const cr = "\r\n";
+                    return { stdout: cmd + cr + "/tmp" + cr + (m ? m[1]! + cr : ""), stderr: "", exitCode: 0 };
+                },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -1118,7 +1127,7 @@ describe("Sol 83：回显行判定/互斥提前", () => {
             { driver: "tmux", terminalId: "SH83b", cwd: "/bad-fx83", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH83b",
-                runCommand: async () => ({ stdout: "ok", stderr: "", exitCode: 0 }),
+                runCommand: async (_id: unknown, cmd: string) => { const m = String(cmd).match(/echo (__FX_CDOk_\w+__)/); return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 }; },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -1134,6 +1143,34 @@ describe("Sol 83：回显行判定/互斥提前", () => {
         } finally {
             releaseProbe();
             (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real83;
+        }
+    }, 15_000);
+});
+
+// GPT Sol 八十四期 P1-1：真机 tmux 上失败标记 echo 未被输出窗口捕获——标记
+// 缺席曾当成功。正向确认：成功必出 OK 行，缺席/FAIL 行都判失败。
+describe("Sol 84：cd 正向确认", () => {
+    test("成功标记缺席（输出只有回显）→ 拒绝；OK 行在场 → 通过", async () => {
+        const real84 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const mk = (echoOk: boolean) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: echoOk ? "SH84ok" : "SH84no", cwd: "/tmp", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => echoOk ? "SH84ok" : "SH84no",
+                runCommand: async (_id: string, cmd: string) => {
+                    const m = cmd.match(/echo (__FX_CDOk_\w+__)/);
+                    // 模拟真机病态：只有命令回显、标记 echo 未被捕获（echoOk=false）；
+                    // 健态：pwd + OK 行都在
+                    return { stdout: cmd + "\n" + (echoOk && m ? "/tmp\n" + m[1]! + "\n" : ""), stderr: "", exitCode: 0 };
+                },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await expect(mk(false).init()).rejects.toThrow(/未确认生效/); // 修前：标记缺席=成功
+            await mk(true).init(); // OK 行在场——通过
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real84;
         }
     }, 15_000);
 });

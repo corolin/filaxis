@@ -2,7 +2,7 @@
  * 层环境规格单测（AC-17：解析纯函数/身份键/漂移/匹配/持久化）
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, renameSync, utimesSync, readdirSync, existsSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, renameSync, utimesSync, readdirSync, existsSync, readFileSync, statSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1395,6 +1395,81 @@ describe("Sol 83：tmux 默认层/环境数组", () => {
             const cfg = await new LayerEnvStore(p).load(true);
             expect(cfg.layers.one!.connection.target).toBe("full"); // 修前：数组条目覆盖完整备份
             expect(cfg.layers.one!.environment.os).toBe("os-full");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 八十四期：P1-2 旁路 EIO 曾被照常压实删除（唯一恢复数据永久丢失）
+// ——读故障在场跳过压实；P1-3 无 target 的自定义驱动（embedded）记录曾被告
+// 白名单漏掉过滤删除；P1-4 environment.packages 字符串曾覆盖备份并崩查询。
+describe("Sol 84：读故障/无 target 自定义驱动/packages 形状", () => {
+    const mk84 = (k: string, driver = "ssh"): LayerEnvEntry => ({
+        connection: { driver, target: driver === "ssh" ? k : undefined },
+        environment: { os: `os-${k}`, packages: ["torch@2.4"] },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("P1-2 旁路读故障：跳过压实——旁路留盘、故障解除后读回", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env84-"));
+        try {
+            const p = join(dir, "env.json");
+            const aside = `${p}.111-222-eeee.fx-old`;
+            writeFileSync(p, JSON.stringify({ layers: {}, _fx_rev: "5000000000000-1-mm84" })); // 主档空
+            // 故障注入：旁路路径放**目录**——readFile 抛 EISDIR（非 ENOENT 的真故障，
+            // 不 monkey-patch fs/promises（Bun 命名空间只读）
+            mkdirSync(aside);
+            const old = new Date(Date.now() - 11 * 60_000);
+            utimesSync(aside, old, old); // 超时触发压实
+            const cfg = await new LayerEnvStore(p).load();
+            expect(cfg.layers.live).toBeUndefined(); // 已读到的部分（主档空）
+            expect(existsSync(aside)).toBe(true); // 修前：压实删除——永久丢失
+            // 故障解除（换回真文件）后可读回
+            rmSync(aside, { recursive: true, force: true });
+            writeFileSync(aside, JSON.stringify({ layers: { live: mk84("live") }, _fx_rev: "9000000000000-1-a84" }));
+            utimesSync(aside, old, old);
+            const cfg2 = await new LayerEnvStore(p).load(true);
+            expect(cfg2.layers.live?.connection.target).toBe("live");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("P1-3 无 target 的自定义驱动（embedded）记录合法读回", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env84b-"));
+        try {
+            const p = join(dir, "env.json");
+            const entry: LayerEnvEntry = {
+                connection: { driver: "embedded" }, // 公开 API 注册的默认驱动——无落点
+                environment: { os: "Linux" },
+                discovered_at: new Date().toISOString(),
+                fingerprint: "fp-embedded-default",
+            };
+            const s = new LayerEnvStore(p);
+            await s.upsert("embedded:default", entry);
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers["embedded:default"]?.fingerprint).toBe("fp-embedded-default"); // 修前：target 白名单漏 embedded——被过滤
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P1-4 packages 字符串：残缺提名不作有效——数组前代胜出 + matchLayers 不崩", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env84c-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { one: mk84("full") }, _fx_rev: "5000000000000-1-m84" }));
+            writeFileSync(`${p}.111-222-ffff.fx-old`, JSON.stringify({
+                layers: { one: { connection: { driver: "ssh", target: "x" }, environment: { packages: "torch@2.4" }, discovered_at: "t", fingerprint: "fp-bad" } }, // packages 字符串
+                _fx_rev: "9000000000000-1-b84", _fx_seen: ["5000000000000-1-m84"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(Array.isArray(cfg.layers.one?.environment.packages)).toBe(true); // 修前：字符串覆盖 + matchLayers TypeError
+            const { matchLayers } = await import("../src/layer-env.js");
+            expect(() => matchLayers(cfg, ["torch"])).not.toThrow();
+            expect(matchLayers(cfg, ["torch"]).length).toBe(1);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
