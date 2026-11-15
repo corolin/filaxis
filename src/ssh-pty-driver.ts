@@ -856,23 +856,44 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
     const outFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.out`;
     const errFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.err`;
     const inFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.in`;
+    const cleanup = () => Promise.all([
+        fsp.unlink(outFile).catch(() => undefined),
+        fsp.unlink(errFile).catch(() => undefined),
+        fsp.unlink(inFile).catch(() => undefined),
+    ]);
     if (opts.signal?.aborted) {
-        throw new DOMException("exec aborted by AbortSignal（文件中转未启动）", "AbortError");
+        throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转未启动）", "AbortError"), { outcome: "unknown" });
     }
-    await fsp.writeFile(inFile, stdinCmd, { encoding: "utf-8", mode: 0o600 });
-    // 输出文件预创建 0600（> 重定向沿用 umask 创建——shell 无法传 mode）
-    await fsp.writeFile(outFile, "", { mode: 0o600 });
-    await fsp.writeFile(errFile, "", { mode: 0o600 });
+    try {
+        await fsp.writeFile(inFile, stdinCmd, { encoding: "utf-8", mode: 0o600 });
+        // 输出文件预创建 0600（> 重定向沿用 umask 创建——shell 无法传 mode）
+        await fsp.writeFile(outFile, "", { mode: 0o600 });
+        await fsp.writeFile(errFile, "", { mode: 0o600 });
+    } catch (e) {
+        await cleanup(); // 准备失败不留残（Sol 79 #6）：.in 含原始命令/env 值
+        throw e;
+    }
+    // 备妥后再核一次取消（Sol 79 #4）：建文件窗口内 abort 曾照跑 ssh
+    if (opts.signal?.aborted) {
+        await cleanup();
+        throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转准备完成前取消）", "AbortError"), { outcome: "unknown" });
+    }
     const shell = process.platform === "win32" ? "cmd" : "/bin/sh";
-    const shellArg = process.platform === "win32" ? "/c" : "-c";
     // argv 首位是 ssh 本体（Sol 78 P1-1：曾漏——选项列表直交 shell 变 `/bin/sh: -o: not found`）
     const quoted = ["ssh", ...argv].map((a) => (process.platform === "win32" ? `"${a.replace(/"/g, '\\"')}"` : q(a))).join(" ");
-    const redirect = process.platform === "win32"
-        ? `${quoted} < "${inFile}" > "${outFile}" 2> "${errFile}"`
-        : `${quoted} < ${q(inFile)} > ${q(outFile)} 2> ${q(errFile)}`;
-    const p = spawn(shell, [shellArg, redirect], { stdio: ["ignore", "ignore", "ignore"] });
+    let p: ReturnType<typeof spawn>;
+    let aborted = false;
+    if (process.platform === "win32") {
+        // cmd 单串直交（Sol 79 P1-1）：spawn("cmd", ["/c", str]) 会被 Node 再包一层
+        // 引号→「文件名语法错误」且错误被中转吞掉。windowsVerbatimArguments 原样直传
+        const line = `/d /s /c "${quoted} < "${inFile}" > "${outFile}" 2> "${errFile}""`;
+        p = spawn(shell, [line], { stdio: ["ignore", "ignore", "ignore"], windowsVerbatimArguments: true } as never);
+    } else {
+        const shCmd = `${quoted} < ${q(inFile)} > ${q(outFile)} 2> ${q(errFile)}`;
+        p = spawn(shell, ["-c", shCmd], { stdio: ["ignore", "ignore", "ignore"] });
+    }
     const exitCode = await new Promise<number | null>((resolve) => {
-        const onAbort = () => { p.kill("SIGTERM"); resolve(null); };
+        const onAbort = () => { aborted = true; p.kill("SIGTERM"); resolve(null); };
         const t = opts.timeoutMs ? setTimeout(() => { p.kill("SIGTERM"); resolve(null); }, opts.timeoutMs) : null;
         opts.signal?.addEventListener("abort", onAbort, { once: true });
         const done = (c: number | null) => {
@@ -887,6 +908,10 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
         fsp.readFile(outFile, "utf-8").catch(() => ""),
         fsp.readFile(errFile, "utf-8").catch(() => ""),
     ]);
-    await Promise.all([fsp.unlink(outFile).catch(() => undefined), fsp.unlink(errFile).catch(() => undefined), fsp.unlink(inFile).catch(() => undefined)]);
+    await cleanup();
+    if (aborted) {
+        // AbortError+outcome（Sol 79 #4）：修前返回普通错误且替身照跑到底
+        throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转已终止本地 shell，远端进程状态未核实）", "AbortError"), { outcome: "unknown" });
+    }
     return { stdout: out, stderr: err, exitCode };
 }

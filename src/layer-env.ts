@@ -388,15 +388,35 @@ export class LayerEnvStore {
                         .filter((d) => d !== anchor && !heirs.some(({ d: h }) => h === d) && d.parsed != null)
                         .map((d) => ({ d, depth: LayerEnvStore.seenClosure(d, docs)?.size ?? 0 }))
                         .sort((a, b) => b.depth - a.depth || LayerEnvStore.docOrder(b.d, a.d)); // 深（新）优先
+                    // byRev 快查（删除判定的 seen 溯源用）
+                    const byRev = new Map(docs.filter((d) => d.rev).map((d) => [d.rev!, d]));
                     for (const { d } of skipped) {
+                        let changed = false;
                         for (const k of [...mentionedInvalid]) {
                             const v = layerEntries(d.parsed)[k];
-                            if (!invalidEntry(v)) {
-                                cfg.layers[k] = v as LayerEnvEntry;
-                                mentionedInvalid.delete(k);
+                            if (v !== undefined) {
+                                if (!invalidEntry(v)) {
+                                    cfg.layers[k] = v as LayerEnvEntry;
+                                    mentionedInvalid.delete(k);
+                                    changed = true;
+                                }
+                                // 无效提名（null/空壳）：状态不明——继续向更早回溯
+                                continue;
                             }
+                            // 未提名删除界（Sol 79 P1-2）：本档**没提**该键——若它见过的
+                            // 各代里有人有效持有该键，此未提名=明知而删（Sol 64 语义），
+                            // 回救不得越界向更早取值（曾越过中间删除档复活旧值）
+                            const closure = LayerEnvStore.seenClosure(d, docs);
+                            const sawValid = closure != null && [...closure].some((r) => {
+                                const sd = byRev.get(r);
+                                const sv = sd ? layerEntries(sd.parsed)[k] : undefined;
+                                return sv !== undefined && !invalidEntry(sv);
+                            });
+                            if (sawValid) mentionedInvalid.delete(k); // 删除成立——停止回救（保持缺席）
+                            changed = true;
                         }
                         if (mentionedInvalid.size === 0) break;
+                        void changed;
                     }
                 }
             }

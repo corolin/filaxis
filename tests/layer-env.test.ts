@@ -1248,3 +1248,29 @@ describe("Sol 78：回救因果序", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十九期 P1-2：回救越过中间删除档复活旧值——A(one=v1) → B(seen A，
+// 未提名 one=明知而删) → C(seen B, one=null 损坏提名)。回救曾直取 A 的 v1；
+// 修：B 的未提名+闭包内见过有效 one=删除成立，回救止步（保持缺席）。
+describe("Sol 79：回救删除界", () => {
+    test("中间档明知而删：null 提名不复活被删键", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env79-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk79 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            writeFileSync(p, JSON.stringify({ layers: { one: null, two: mk79("t2") }, _fx_rev: "5000000000000-1-c79", _fx_seen: ["1000000000000-1-b79"] }));
+            writeFileSync(`${p}.111-222-uuuu.fx-old`, JSON.stringify({ layers: { two: mk79("t2") }, _fx_rev: "1000000000000-1-b79", _fx_seen: ["9000000000000-1-a79"] })); // B：未提名 one（见过 A 的 one——删除）
+            writeFileSync(`${p}.111-222-vvvv.fx-old`, JSON.stringify({ layers: { one: mk79("old-v1") }, _fx_rev: "9000000000000-1-a79" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one).toBeUndefined(); // 修前：old-v1 复活（回救越过 B 的删除）
+            expect(cfg.layers.two).toBeTruthy();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

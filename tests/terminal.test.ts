@@ -841,3 +841,55 @@ describe("Sol 78：cwd 计数/销毁在途守卫", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十九期：P1-3 restore attach 曾忽略显式 cwd（pwd 留旧目录）；
+// #5 探活-登记竞态（探活 await 期间旧层销毁走完——新层拿到已死会话）。
+describe("Sol 79：restore cwd/探活竞态", () => {
+    test("P1-3 首挂 attach（cwd 注册表空）：显式 cwd 生效（cd 执行）", async () => {
+        const real79 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const cds: string[] = [];
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH79", cwd: "/", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH79",
+                runCommand: async (_id: string, cmd: string) => { if (cmd.startsWith("cd ")) cds.push(cmd); return { stdout: "", stderr: "", exitCode: 0 }; },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await drv.init(); // attach 首挂（本进程无在册实例）——cd / 应执行
+            expect(cds.some((c) => c.startsWith("cd '/'") || c.includes("cd /"))).toBe(true); // 修前：pwd 留旧目录
+            await drv.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real79;
+        }
+    }, 15_000);
+
+    test("#5 探活期间旧层销毁走完：新 attach 拒绝（竞态检出）", async () => {
+        let releaseProbe!: () => void;
+        const probeGate = new Promise<void>((r) => { releaseProbe = r; });
+        const real79 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => { await probeGate; return { stdout: "", stderr: "", exitCode: 0 }; };
+        const mk = (tid?: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH79b",
+                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            const d1 = mk();
+            await d1.init(); // refs=1
+            const d2 = mk("SH79b"); // 重挂：探活挂起
+            const attaching = d2.init();
+            await new Promise((r) => setTimeout(r, 20));
+            await d1.destroy(); // 探活期间销毁走完（refs 删光）——修前：d2 照登记（已死会话）
+            releaseProbe();
+            await expect(attaching).rejects.toThrow(/竞态检出|销毁/);
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real79;
+        }
+    }, 15_000);
+});

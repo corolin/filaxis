@@ -172,6 +172,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 throw new Error(`tmux 会话 '${tid0}' 销毁进行中——稍后重试重挂或新建层（Sol 78 #5：在途销毁的会话 has-session 尚可通过，重挂拿到的将是将死句柄）`);
             }
             const wanted = this.descriptor.cwd;
+            const cwdsBefore = sessionCwds.get(tid0);
             if (wanted != null) {
                 for (const [cwd, n] of sessionCwds.get(tid0) ?? []) {
                     if (n > 0 && cwd !== wanted) {
@@ -185,9 +186,24 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 重连探活（Hydrogen R9 #3）：restore(snap) 携 terminalId 时曾静默成功——
             // 宿主重启/tmux server 已退要到首次 exec 才报错。显式 has-session 探测，
             // 死会话立即抛错（快失败优于延迟失败），不自动重建（消费方决定重建或换层）
+            const refsBefore = sessionAttachRefs.get(tid0) ?? 0;
             const alive = await TmuxInvoker.tryInvoke(["has-session", "-t", tid0]);
             if (alive.exitCode !== 0) {
                 throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
+            }
+            // 探活-登记竞态守卫（Sol 79 #5）：探活 await 期间旧层 destroy 可走完
+            //（refs 掉到 0/destroying 走完）——登记的将是已死会话。refs 降量或
+            // destroying 在册即拒（首次 restore 场景 refsBefore=0 合法放行）
+            if ((sessionAttachRefs.get(tid0) ?? 0) < refsBefore || sessionDestroying.has(tid0)) {
+                throw new Error(`tmux 会话 '${tid0}' 在重挂探活期间被销毁（竞态检出）——请重试重挂或新建层`);
+            }
+            // 首挂 cd（Sol 79 P1-3）：attach 时 cwd 只在本进程无在册实例（cwd 注册表
+            // 空）才执行——快照 restore 的会话本进程没人用过，pwd 是旧目录；
+            // 他实例在册=共享会话状态不动的纪律保持
+            if (wanted != null && !cwdsBefore) {
+                try {
+                    await this.terminal.runCommand(tid0, `cd ${q(wanted)} 2>/dev/null || true`, 10_000);
+                } catch { /* cwd 恢复失败不阻断初始化 */ }
             }
         }
         { // 在册登记（Sol 76 P2-1）：spawn 与重挂 attach 同权计数。
