@@ -893,3 +893,55 @@ describe("Sol 79：restore cwd/探活竞态", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十期：P1-3 未声明 cwd 的在用层——不同 cwd 重挂曾放行（其实际目录
+// 不可证一致，pwd 被改）；#4 竞态误拒绝（多引用销毁其一 2→1 曾被当成销毁竞态）。
+describe("Sol 80：未声明 cwd 守卫/竞态归零", () => {
+    test("P1-3 原层未声明 cwd：重挂显式 cwd 被拒（目录不可证一致）", async () => {
+        const real80 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const cds: string[] = [];
+        const mk = (cwd?: string, tid?: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: tid, cwd, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH80",
+                runCommand: async (_id: string, cmd: string) => { if (cmd.startsWith("cd ")) cds.push(cmd); return { stdout: "", stderr: "", exitCode: 0 }; },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            const d1 = mk(); // spawn 无 cwd（"" 键登记）
+            await d1.init();
+            const d2 = mk("/tmp", "SH80"); // 重挂显式 cwd——修前：放行并 cd（原层 pwd 被改）
+            await expect(d2.init()).rejects.toThrow(/已以 cwd/); // 冲突守卫拦下（未声明层登记为空串键——冲突信息即拒绝）
+            expect(cds.filter((c) => c.includes("tmp")).length).toBe(0); // cd 未执行
+            await d1.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real80;
+        }
+    }, 15_000);
+
+    test("#4 多引用销毁其一（2→1）：重挂不被误拒", async () => {
+        const real80 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const mk = (tid?: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH80b",
+                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            const d1 = mk(); await d1.init();
+            const d2 = mk("SH80b"); await d2.init(); // refs=2
+            await d1.destroy(); // 2→1（d2 仍在用）——修前：refs 降量触发误拒
+            const d3 = mk("SH80b");
+            await d3.init(); // 不抛（合法：另一层仍在用）
+            await d2.destroy();
+            await d3.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real80;
+        }
+    }, 15_000);
+});

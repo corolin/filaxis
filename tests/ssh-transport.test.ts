@@ -1227,3 +1227,18 @@ describe("Sol 79：中转 Windows 形态/取消纪律", () => {
         await expect(run(["-V"], "", { signal: ac.signal })).rejects.toMatchObject({ name: "AbortError", outcome: "unknown" });
     }, 10_000);
 });
+
+// GPT Sol 八十期：P1-1 Windows 中转 %VAR% 展开改写参数字面量（ssh -G -i 对比
+// 实测）；P2-5 取消只杀外层 shell、ssh 替身照跑。直 spawn 文件 fd 两症同根同治
+//（无 shell=无展开、kill 直达 ssh 本体）。
+describe("Sol 80：中转直 spawn", () => {
+    test.skipIf(!Bun.which("ssh"))("P1-1 %FX80% 字面量经中转原样保留（ssh -G 实测）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
+        if (!run) return;
+        const literal = "%FX80_LITERAL%";
+        const r = await run(["-G", `-i ${literal}`], "");
+        expect(r.exitCode).toBe(0);
+        expect(r.stdout).toContain(literal); // 修前（win）：被 cmd 展开成环境变量值
+    }, 15_000);
+});

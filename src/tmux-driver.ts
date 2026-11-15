@@ -163,22 +163,31 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 双实例共指同一 tmux 会话，destroy 一个连坐杀掉另一层在用的会话
             this.descriptor = { ...this.descriptor, terminalId };
         } else {
-            // 重挂 cwd 冲突守卫（Sol 77 P1-1）：会话工作目录是**会话级状态**——
-            // 重挂曾对共享持久 shell 执行 cd，原层的 pwd 被悄悄改掉（相对路径
-            // 全落错目录）。他实例已在册且 cwd 不同 → 拒绝（改目录请新层或
-            // per-exec cwd）；相同 cwd 幂等无害放行
             const tid0 = this.descriptor.terminalId!;
             if (sessionDestroying.has(tid0)) {
                 throw new Error(`tmux 会话 '${tid0}' 销毁进行中——稍后重试重挂或新建层（Sol 78 #5：在途销毁的会话 has-session 尚可通过，重挂拿到的将是将死句柄）`);
             }
             const wanted = this.descriptor.cwd;
-            const cwdsBefore = sessionCwds.get(tid0);
+            // 重挂 cwd 冲突守卫（Sol 77 P1-1 → Sol 80 P1-3 扩面）：会话工作目录是
+            // **会话级状态**。在册实例（**含未声明 cwd 的**——其实际目录不可知，
+            // 曾被跳过检查）与重挂声明的 cwd 冲突/不可证一致 → 拒绝
             if (wanted != null) {
-                for (const [cwd, n] of sessionCwds.get(tid0) ?? []) {
-                    if (n > 0 && cwd !== wanted) {
+                const cwds = sessionCwds.get(tid0);
+                if (cwds) {
+                    for (const [cwd, n] of cwds) {
+                        if (n > 0 && cwd !== wanted) {
+                            throw new Error(
+                                `tmux 会话 '${tid0}' 已以 cwd='${cwd}' 在用——重挂不同 cwd（'${wanted}'）会改掉共享持久 shell 的工作目录（原层相对路径将落错位置）。` +
+                                `请新建层（不带 terminalId）或用 exec 的 cwd 选项（按命令前缀）`,
+                            );
+                        }
+                    }
+                    // 未声明 cwd 的在册实例（cwd 计数键为 ""）：其实际目录不可证与
+                    // wanted 一致——拒绝（曾放行致原层 pwd 被改）
+                    if ((cwds.get("") ?? 0) > 0) {
                         throw new Error(
-                            `tmux 会话 '${tid0}' 已以 cwd='${cwd}' 在用——重挂不同 cwd（'${wanted}'）会改掉共享持久 shell 的工作目录（原层相对路径将落错位置）。` +
-                            `请新建层（不带 terminalId）或用 exec 的 cwd 选项（按命令前缀）`,
+                            `tmux 会话 '${tid0}' 有未声明 cwd 的在用层（其实际目录不可证与 '${wanted}' 一致）——重挂显式 cwd 可能改掉共享目录。` +
+                            `请新建层或先显式声明各层 cwd`,
                         );
                     }
                 }
@@ -191,19 +200,20 @@ export class TmuxSessionDriver implements RuntimeDriver {
             if (alive.exitCode !== 0) {
                 throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
             }
-            // 探活-登记竞态守卫（Sol 79 #5）：探活 await 期间旧层 destroy 可走完
-            //（refs 掉到 0/destroying 走完）——登记的将是已死会话。refs 降量或
-            // destroying 在册即拒（首次 restore 场景 refsBefore=0 合法放行）
-            if ((sessionAttachRefs.get(tid0) ?? 0) < refsBefore || sessionDestroying.has(tid0)) {
-                throw new Error(`tmux 会话 '${tid0}' 在重挂探活期间被销毁（竞态检出）——请重试重挂或新建层`);
-            }
-            // 首挂 cd（Sol 79 P1-3）：attach 时 cwd 只在本进程无在册实例（cwd 注册表
-            // 空）才执行——快照 restore 的会话本进程没人用过，pwd 是旧目录；
-            // 他实例在册=共享会话状态不动的纪律保持
-            if (wanted != null && !cwdsBefore) {
+            // 首挂 cd（Sol 79 P1-3）：attach 时 cwd 只在本进程**无任何在册实例**
+            //（cwd 注册表整表缺席）才执行——快照 restore 的会话本进程没人用过、
+            // pwd 是旧目录；他实例在册（无论声明与否）=共享会话状态不动的纪律保持
+            if (wanted != null && !sessionCwds.has(tid0)) {
                 try {
                     await this.terminal.runCommand(tid0, `cd ${q(wanted)} 2>/dev/null || true`, 10_000);
                 } catch { /* cwd 恢复失败不阻断初始化 */ }
+            }
+            // 探活-登记竞态守卫（Sol 79 #5 → Sol 80 #4 双向校准）：**登记紧前**终检
+            //（探活/cd 两个 await 窗口内的销毁全兜住）。**归零判据**：仅当此前有
+            // 在册（refsBefore>0）而现在归零——多引用销毁其一（2→1）另一层仍在用
+            // 是合法场景（曾因降量被误拒）；首次 restore（refsBefore=0）放行
+            if ((refsBefore > 0 && (sessionAttachRefs.get(tid0) ?? 0) === 0) || sessionDestroying.has(tid0)) {
+                throw new Error(`tmux 会话 '${tid0}' 在重挂探活期间被销毁（竞态检出）——请重试重挂或新建层`);
             }
         }
         { // 在册登记（Sol 76 P2-1）：spawn 与重挂 attach 同权计数。
@@ -211,12 +221,12 @@ export class TmuxSessionDriver implements RuntimeDriver {
           // destroy 的引用扣减曾照扣（?? 1 把缺席当 1），原层会话被连带销毁
             const tid = this.descriptor.terminalId!;
             sessionAttachRefs.set(tid, (sessionAttachRefs.get(tid) ?? 0) + 1);
-            { // cwd 计数登记（Sol 78 P1-4）
-              if (this.descriptor.cwd != null) {
-                  const cwds = sessionCwds.get(tid) ?? new Map<string, number>();
-                  cwds.set(this.descriptor.cwd, (cwds.get(this.descriptor.cwd) ?? 0) + 1);
-                  sessionCwds.set(tid, cwds);
-              } }
+            { // cwd 计数登记（Sol 78 P1-4 → Sol 80 P1-3）：未声明 cwd 以 "" 键登记
+              //（在册事实本身是守卫依据——实际目录不可知也要挡不同 cwd 的重挂）
+              const cwds = sessionCwds.get(tid) ?? new Map<string, number>();
+              const key = this.descriptor.cwd ?? "";
+              cwds.set(key, (cwds.get(key) ?? 0) + 1);
+              sessionCwds.set(tid, cwds); }
             this.attached = true;
         }
         if (this.descriptor.cwd && this.descriptor.terminalId && !isAttach) {
@@ -263,15 +273,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
             this.ownedSessions.clear();
             const tid = this.descriptor.terminalId;
             const refs = Math.max(0, (sessionAttachRefs.get(tid) ?? 1) - 1);
-            { // cwd 计数递减（Sol 78 P1-4）：同 cwd 他实例仍在（n>0）条目保留
-              if (this.descriptor.cwd != null) {
-                  const cwds = sessionCwds.get(tid);
-                  const n = (cwds?.get(this.descriptor.cwd) ?? 1) - 1;
-                  if (n > 0) cwds!.set(this.descriptor.cwd, n);
-                  else {
-                      cwds?.delete(this.descriptor.cwd);
-                      if (cwds && cwds.size === 0) sessionCwds.delete(tid);
-                  }
+            { // cwd 计数递减（Sol 78 P1-4 → Sol 80 P1-3：未声明以 "" 键同登记同减）
+              const key = this.descriptor.cwd ?? "";
+              const cwds = sessionCwds.get(tid);
+              const n = (cwds?.get(key) ?? 1) - 1;
+              if (n > 0) cwds!.set(key, n);
+              else {
+                  cwds?.delete(key);
+                  if (cwds && cwds.size === 0) sessionCwds.delete(tid);
               } }
             if (refs === 0) {
                 sessionAttachRefs.delete(tid);

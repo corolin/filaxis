@@ -878,20 +878,23 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
         await cleanup();
         throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转准备完成前取消）", "AbortError"), { outcome: "unknown" });
     }
-    const shell = process.platform === "win32" ? "cmd" : "/bin/sh";
-    // argv 首位是 ssh 本体（Sol 78 P1-1：曾漏——选项列表直交 shell 变 `/bin/sh: -o: not found`）
-    const quoted = ["ssh", ...argv].map((a) => (process.platform === "win32" ? `"${a.replace(/"/g, '\\"')}"` : q(a))).join(" ");
-    let p: ReturnType<typeof spawn>;
-    let aborted = false;
-    if (process.platform === "win32") {
-        // cmd 单串直交（Sol 79 P1-1）：spawn("cmd", ["/c", str]) 会被 Node 再包一层
-        // 引号→「文件名语法错误」且错误被中转吞掉。windowsVerbatimArguments 原样直传
-        const line = `/d /s /c "${quoted} < "${inFile}" > "${outFile}" 2> "${errFile}""`;
-        p = spawn(shell, [line], { stdio: ["ignore", "ignore", "ignore"], windowsVerbatimArguments: true } as never);
-    } else {
-        const shCmd = `${quoted} < ${q(inFile)} > ${q(outFile)} 2> ${q(errFile)}`;
-        p = spawn(shell, ["-c", shCmd], { stdio: ["ignore", "ignore", "ignore"] });
+    // 直 spawn + 文件 fd（Sol 80 P1-1/P2-5）：无 shell——cmd 的 %VAR% 展开曾改写
+    // -i 密钥路径等参数字面量；shell 包装还使 kill 只杀到外层 shell（ssh 替身
+    // 照跑到底）。stdio 三路全部接文件句柄（沙箱拦的是**匿名管道**，文件句柄
+    // 放行）——无引用、无展开、kill 直达 ssh 本体
+    const fsSync = await import("node:fs");
+    let inFd = -1, outFd = -1, errFd = -1;
+    try {
+        inFd = fsSync.openSync(inFile, "r");
+        outFd = fsSync.openSync(outFile, "w");
+        errFd = fsSync.openSync(errFile, "w");
+    } catch (e) {
+        for (const fd of [inFd, outFd, errFd]) if (fd >= 0) fsSync.closeSync(fd);
+        await cleanup();
+        throw e;
     }
+    let aborted = false;
+    const p = spawn("ssh", argv, { stdio: [inFd, outFd, errFd] });
     const exitCode = await new Promise<number | null>((resolve) => {
         const onAbort = () => { aborted = true; p.kill("SIGTERM"); resolve(null); };
         const t = opts.timeoutMs ? setTimeout(() => { p.kill("SIGTERM"); resolve(null); }, opts.timeoutMs) : null;
@@ -904,6 +907,7 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
         p.once("exit", (c) => done(c));
         p.once("error", () => done(null));
     });
+    for (const fd of [inFd, outFd, errFd]) { try { fsSync.closeSync(fd); } catch { /* 已随进程关闭 */ } }
     const [out, err] = await Promise.all([
         fsp.readFile(outFile, "utf-8").catch(() => ""),
         fsp.readFile(errFile, "utf-8").catch(() => ""),

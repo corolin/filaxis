@@ -1274,3 +1274,28 @@ describe("Sol 79：回救删除界", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十期 P1-2：删除版落在 heirs（kept）时曾不被咨询——回救越过它复活
+// 旧值。回溯面扩为全部非锚档。
+describe("Sol 80：回救面全档", () => {
+    test("删除版在 kept 链：null 提名仍不复活被删键", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env80-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk80 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            // 主档（锚）：one 无效提名；删除版 B 与锚互不可见（同代 kept）——B 删了 one（它见过 A）
+            writeFileSync(p, JSON.stringify({ layers: { one: null }, _fx_rev: "5000000000000-1-anchor80" }));
+            writeFileSync(`${p}.111-222-wwww.fx-old`, JSON.stringify({ layers: { two: mk80("t") }, _fx_rev: "7000000000000-1-B80", _fx_seen: ["9000000000000-1-A80"] }));
+            writeFileSync(`${p}.111-222-xxxx.fx-old`, JSON.stringify({ layers: { one: mk80("old-v1") }, _fx_rev: "9000000000000-1-A80" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one).toBeUndefined(); // 修前：old-v1 复活（B 在 kept 链未被咨询）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

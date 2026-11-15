@@ -383,22 +383,22 @@ export class LayerEnvStore {
                 if (mentionedInvalid.size > 0) {
                     // 回救序按**因果**（Sol 78 P1-3）：闭包深度（seen 链长度）定新旧
                     // ——墙钟序戳在回拨下会倒挂（后代戳反小，曾把旧值写回主档）；
-                    // 并列以 docOrder 兜底
-                    const skipped = docs
-                        .filter((d) => d !== anchor && !heirs.some(({ d: h }) => h === d) && d.parsed != null)
+                    // 并列以 docOrder 兜底。
+                    // 回溯面=**全部非锚档**（Sol 80 P1-2）：删除界判定曾只扫被跳过
+                    // 的档——删除版落在 heirs（kept）时未被咨询，回救越过它复活旧值
+                    const chain = docs
+                        .filter((d) => d !== anchor && d.parsed != null)
                         .map((d) => ({ d, depth: LayerEnvStore.seenClosure(d, docs)?.size ?? 0 }))
                         .sort((a, b) => b.depth - a.depth || LayerEnvStore.docOrder(b.d, a.d)); // 深（新）优先
                     // byRev 快查（删除判定的 seen 溯源用）
                     const byRev = new Map(docs.filter((d) => d.rev).map((d) => [d.rev!, d]));
-                    for (const { d } of skipped) {
-                        let changed = false;
+                    for (const { d } of chain) {
                         for (const k of [...mentionedInvalid]) {
                             const v = layerEntries(d.parsed)[k];
                             if (v !== undefined) {
                                 if (!invalidEntry(v)) {
                                     cfg.layers[k] = v as LayerEnvEntry;
                                     mentionedInvalid.delete(k);
-                                    changed = true;
                                 }
                                 // 无效提名（null/空壳）：状态不明——继续向更早回溯
                                 continue;
@@ -413,10 +413,8 @@ export class LayerEnvStore {
                                 return sv !== undefined && !invalidEntry(sv);
                             });
                             if (sawValid) mentionedInvalid.delete(k); // 删除成立——停止回救（保持缺席）
-                            changed = true;
                         }
                         if (mentionedInvalid.size === 0) break;
-                        void changed;
                     }
                 }
             }
