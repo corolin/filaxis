@@ -488,13 +488,14 @@ describe("Sol 74：tmux 会话语义", () => {
 
     test.skipIf(!Bun.which("sh"))("P1-1 组长死孙进程活：verify=running、stop 组杀后收口", async () => {
         const sh = shPath();
-        // 造孤儿进程组：setsid 的 sh 立即退出、sleep 孙进程持组存活（全程
-        // stdio 重定向——管道被孙进程持有会拖住 spawn 语义）
+        // 造**自有**孤儿进程组（Sol 75 P1-3：曾 pgrep 系统 sleep——向他人进程组
+        // 发信号）：setsid 的 sh 立即退出、其 sleep 孙进程持组存活；pgid 从
+        // wrapper 的 /proc 自采（全程 stdio 重定向防管道拖挂）
         const g = Bun.spawnSync([sh, "-c",
-            "setsid sh -c 'sleep 4 >/dev/null 2>&1 </dev/null' >/dev/null 2>&1 </dev/null & " +
-            "sleep 0.3; p=$(pgrep -x sleep | head -1); [ -n \"$p\" ] && ps -o pgid= -p \"$p\" | tr -d ' '"]);
+            "setsid sh -c 'sleep 5 >/dev/null 2>&1 </dev/null' >/dev/null 2>&1 </dev/null & " +
+            "w=$!; sleep 0.3; awk '{print $5}' /proc/$w/stat 2>/dev/null"]);
         const pgid = g.stdout.toString().trim();
-        if (!/^\d+$/.test(pgid)) return; // 无 setsid/pgrep/ps——环境不适用（CI Linux 矩阵覆盖）
+        if (!/^\d+$/.test(pgid)) return; // 无 setsid//proc——环境不适用（CI Linux 矩阵覆盖）
         mkdirSync("/tmp/filaxis-sessions", { recursive: true });
         const sid = `fxgr74${Math.random().toString(36).slice(2, 6)}`;
         const base = `/tmp/filaxis-sessions/${sid}`;
@@ -514,13 +515,15 @@ describe("Sol 74：tmux 会话语义", () => {
         const d = mkdtempSync(join(tmpdir(), "fx-pg74-")).replace(/\\/g, "/");
         const src = `${d}/big.txt`;
         writeFileSync(src, "x".repeat(9_000));
-        let page = 0;
+        // 只删**本用例**的中转文件（Sol 75 P1-3：曾 rm /tmp 全部 filaxis-read-*
+        // ——同机其他任务的中转会被误删）：首页捕获本用例中转名，次页删它
+        let myTmp = "";
+        let hit = false;
         const drv = drvOf({ onPage: (cmd) => {
-            // 第二页读取前删掉中转 b64——上游 tail 失败
-            if (cmd.startsWith("tail -c +8001")) {
-                page++;
-                Bun.spawnSync([shPath(), "-c", `rm -f /tmp/filaxis-read-*.b64`]);
-            }
+            const m = cmd.match(/tail -c \+\d+ (\S+)/);
+            if (!m) return;
+            if (!myTmp) { myTmp = m[1]!; return; } // 首页：捕获中转名
+            if (!hit) { hit = true; Bun.spawnSync([shPath(), "-c", `rm -f ${myTmp}`]); } // 次页前删它
         } });
         await expect(drv.fs.readFile(src)).rejects.toThrow(/分页读失败|长度对账/); // 修前：~5922B 正常完成
     }, 20_000);
@@ -558,14 +561,82 @@ describe("Sol 74：tmux 会话语义", () => {
             const a = await mk();
             await a.reg.init();
             expect(existsSync(join(a.dir, "z74.json"))).toBe(true); // 修前：当会话已死亡删掉 profile
-            // tmux 语义码 1=会话不存在：删除
-            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 1 });
+            // tmux 语义码 1=会话不存在（且服务端健在——Sol 75 P2-6 二次甄别）：删除
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async (args: string[]) =>
+                ({ stdout: "", stderr: "", exitCode: args[0] === "list-sessions" ? 0 : 1 });
             const b = await mk();
             await b.reg.init();
             expect(existsSync(join(b.dir, "z74.json"))).toBe(false);
+            // 服务端不可用（list-sessions 也败）：保守保留（Sol 75 P2-6）
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 1 });
+            const c = await mk();
+            await c.reg.init();
+            expect(existsSync(join(c.dir, "z74.json"))).toBe(true);
             (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real;
         } finally {
             (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real;
         }
     }, 10_000);
+});
+
+// GPT Sol 七十五期：P1-1 tmux 的 exec 跑在持久 shell——日志读取的裸 exit 9/
+// exit $__fx_rc 曾直接退掉承载层（两次读取后 exec 全挂）。子 shell 包裹后 exit
+// 只出子 shell、退出码仍透传。P2-3 组模式组长优先：组长活着但 .st 不符=STALE
+//（复用组拦截），不再直信组存活。
+describe("Sol 75：持久 shell 语义/组长身份", () => {
+    test("P1-1 日志读取命令全以子 shell 包裹（无顶层裸 exit）", async () => {
+        const cmds: string[] = [];
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "fx75", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "fx75",
+                runCommand: async (_id: string, cmd: string, _t?: number) => {
+                    cmds.push(cmd);
+                    return { stdout: "", stderr: "", exitCode: 9 }; // 统一失败触发 throw 路径
+                },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        await expect(drv.tailSession("fxnope75")).rejects.toThrow(/不作日志凭证/);
+        await expect(drv.readSessionLog("fxnope75")).rejects.toThrow(/不作日志凭证/);
+        await expect(drv.readSessionLog("fxnope75", { lines: 3 })).rejects.toThrow(/不作日志凭证/);
+        for (const c of cmds) {
+            expect(c.startsWith("( ")).toBe(true); // 修前：test -r ... || exit 9 顶层裸 exit
+            expect(c.endsWith(" )")).toBe(true);
+        }
+    }, 10_000);
+
+    test.skipIf(!Bun.which("sh"))("P2-3 组长活但 .st 不符 → unknown（复用组拦截；修前组存活直信 running）", async () => {
+        const sh = Bun.which("sh")!;
+        // 自有活组长：exec setsid sleep——pid==pgid 且活着（stdio 全重定向防拖挂）
+        const g = Bun.spawnSync([sh, "-c", "setsid sh -c 'exec sleep 5 >/dev/null 2>&1 </dev/null' >/dev/null 2>&1 </dev/null & w=$!; sleep 0.3; echo $w"]);
+        const pid = g.stdout.toString().trim();
+        if (!/^\d+$/.test(pid)) return; // 无 setsid——CI Linux 矩阵覆盖
+        mkdirSync("/tmp/filaxis-sessions", { recursive: true });
+        const sid = `fxst75${Math.random().toString(36).slice(2, 6)}`;
+        const base = `/tmp/filaxis-sessions/${sid}`;
+        writeFileSync(`${base}.pid`, pid);
+        writeFileSync(`${base}.pgid`, pid);
+        writeFileSync(`${base}.st`, "9999999999.99"); // 与真实 starttime 必不符
+        const stubTerminal = {
+            spawnSession: async () => "fx75",
+            runCommand: async (_id: string, cmd: string, _t?: number) => {
+                const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+                p.stdin.write(cmd);
+                await p.stdin.end();
+                const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+                return { stdout, stderr: "", exitCode: code };
+            },
+            destroySession: async () => undefined,
+        };
+        try {
+            const drv = new TmuxSessionDriver(
+                { driver: "tmux", terminalId: "fx75", config: { launchCmd: "bash" } } as never,
+                { terminalManager: stubTerminal as never },
+            );
+            expect((await drv.verifySession(sid)).status).toBe("unknown"); // 修前：running（组存活直信）
+        } finally {
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st; kill -TERM ${pid} 2>/dev/null; true`]);
+        }
+    }, 20_000);
 });

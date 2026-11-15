@@ -185,6 +185,19 @@ export class RuntimeStack {
         // B 却在 A 执行）。descriptor.cwd 显式给出时本就是指纹列，不受影响。
         if (!descriptor.cwd && fallbackCwd) descriptor = { ...descriptor, cwd: fallbackCwd };
         const key = this.cacheKeyOf(descriptor);
+        // terminalId 索引先查（Sol 75 P2-1）：带 terminalId 的 descriptor（快照/
+        // 重挂）按描述符算键与原始缓存键不匹配——曾新建第二实例共指同一 tmux
+        // 会话，移除其一 destroySession 连坐另一层。terminalId 全局唯一，直接
+        // 索引到既有 driver（复用=引用计数护住共享会话）
+        const tid = (descriptor as { terminalId?: string }).terminalId;
+        if (tid) {
+            const byTid = RuntimeStack.terminalIdIndex.get(tid);
+            if (byTid) {
+                this.log.debug(`[Filaxis] terminalId 命中复用连接: ${tid}`);
+                this.bridgeSessionEvents(byTid);
+                return byTid;
+            }
+        }
         const cached = RuntimeStack.driverCache.get(key);
         if (cached) {
             this.log.debug(`[Filaxis] 指纹命中复用连接: ${descriptor.driver}/${descriptor.target ?? "local"}`);
@@ -227,6 +240,7 @@ export class RuntimeStack {
             // 拿回已销毁实例。不重挂键（descriptor 可能丢 config 信息、砸键控
             // 缓存）——逐出按「本 driver 实际挂在哪个键」实例核对（evictDriverHome）
             { const keys = RuntimeStack.driverHomeKeys.get(drv) ?? new Set<string>(); keys.add(key); RuntimeStack.driverHomeKeys.set(drv, keys); }
+            { const t = (drv.descriptor as { terminalId?: string }).terminalId; if (t) RuntimeStack.terminalIdIndex.set(t, drv); }
             this.log.info(`[Filaxis] 新建连接: ${descriptor.driver}/${descriptor.target ?? "local"}`);
             return drv;
         })();
@@ -279,14 +293,28 @@ export class RuntimeStack {
     private static evictByKey(key: string): RuntimeDriver | undefined {
         const drv = RuntimeStack.driverCache.get(key);
         RuntimeStack.driverCache.delete(key);
-        if (drv) RuntimeStack.driverHomeKeys.get(drv)?.delete(key); // 集合化（Sol 74 #6）：摘本键，同 driver 他键保留
+        // 集合化（Sol 74 #6）：摘本键，同 driver 他键保留；集合空=该 driver 已无
+        // 任何挂载键——回收 Map 条目（Sol 75 P2-7：空 Set 曾滞留强引用，常驻
+        // 进程反复建销持续积累）+ terminalId 索引同收
+        let fullyEvicted = !drv;
+        if (drv) {
+            const keys = RuntimeStack.driverHomeKeys.get(drv);
+            keys?.delete(key);
+            if (!keys || keys.size === 0) {
+                RuntimeStack.driverHomeKeys.delete(drv);
+                const t = (drv.descriptor as { terminalId?: string }).terminalId;
+                if (t && RuntimeStack.terminalIdIndex.get(t) === drv) RuntimeStack.terminalIdIndex.delete(t);
+                fullyEvicted = true;
+            }
+        }
         // in-flight 一并清（自挖 S3）：建链中的同指纹并发不再搭已逐出连接的
         // 车。注：已在途的建链 Promise 完成时仍会 set 回缓存（毫秒级窗口，
         // removeLayer/destroy 实路径在连接建成后才会 evict——接受并声明）
         RuntimeStack.connectInflight.delete(key);
-        // 事件订阅登记清空（二十八期 #2 生命周期）：逐出=所有订阅 stack 失效——
-        // 恢复管理器原回调，防止悬空转发
-        if (drv) {
+        // 事件订阅登记清空（二十八期 #2 生命周期）——仅**全逐出**才拆桥
+        //（Sol 75 P2-8：同 driver 多键别名时，逐出一个别名曾把整个事件桥拆掉，
+        // 其余别名的 exit 事件从此丢失）
+        if (drv && fullyEvicted) {
             const sm = (drv as { sessions?: { __fxSubs?: Set<unknown>; onEvent?: (e: never) => void; __fxOrig?: (e: never) => void } }).sessions;
             if (sm?.__fxSubs) {
                 sm.__fxSubs.clear();
@@ -331,6 +359,9 @@ export class RuntimeStack {
      *  不一致；自定义工厂还可让**同一 driver 挂多键**（曾只记一个键——销毁后
      *  另一键仍能拿到已销毁实例）。按实例记全部键，逐出实例核对全清 */
     private static readonly driverHomeKeys = new Map<RuntimeDriver, Set<string>>();
+    /** terminalId → driver 索引（Sol 75 P2-1）：tmux 会话全局唯一——带 id 重挂
+     *  直接复用既有 driver，杜绝双实例共指一会话互杀 */
+    private static readonly terminalIdIndex = new Map<string, RuntimeDriver>();
     private activeName?: string;
 
     /** 层注册表只读视图 */

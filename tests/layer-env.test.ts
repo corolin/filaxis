@@ -1094,3 +1094,45 @@ describe("Sol 74：null 条目档", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十五期 P1-2：`{"layers":{"one":[]}}`（数组条目）曾通过条目检查——
+// 压过含有效 one 的前代旁路、空数组落进主档。数组条目与 null 同罪。
+describe("Sol 75：数组条目档", () => {
+    const mk75 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("全数组条目旁路不作锚——有效前代胜出", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env75-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { base: mk75("base") }, _fx_rev: "5000000000000-1-mm75" }));
+            writeFileSync(`${p}.111-222-oooo.fx-old`, JSON.stringify({ layers: { one: [] }, _fx_rev: "9000000000000-1-arr75" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.base).toBeTruthy();
+            expect(cfg.layers.one).toBeUndefined(); // 修前：[] 落进结果
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("混入数组条目的有效档：数组不落盘", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env75b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { good: mk75("good"), bad: ["x"] }, _fx_rev: "9000000000000-1-mix75" }));
+            const s = new LayerEnvStore(p);
+            const cfg = await s.load();
+            expect(cfg.layers.good).toBeTruthy();
+            expect(cfg.layers.bad).toBeUndefined();
+            await s.upsert("next", mk75("next"));
+            const onDisk = JSON.parse(readFileSync(p, "utf-8")) as LayerEnvConfigFile;
+            expect(onDisk.layers.bad).toBeUndefined(); // 压实不写数组
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

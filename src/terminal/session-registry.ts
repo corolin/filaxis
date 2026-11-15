@@ -84,12 +84,19 @@ export class SessionRegistry {
                     kept++;
                     this.log.info(`[reconcile] 会话 [${id}] 仍存活，保留（已重连）`);
                 } else if (r.exitCode === 1) {
-                    // tmux 自身语义码 1=会话不存在（Sol 74 #5）：唯一可安全删除的
-                    // 判据。其他码（客户端被信号终止/崩溃/环境异常）=探测未完成
-                    // ——曾当会话已死亡删掉持久 profile；保守保留待下轮
-                    await this.remove(id);
-                    removed++;
-                    this.log.warn(`[reconcile] 僵尸会话 [${id}] 已清理`);
+                    // exit 1 双义（Sol 74 #5 → Sol 75 P2-6）：会话不存在 **或** 服务端
+                    // 不可用（socket 目录建不起来等——TMUX_TMPDIR 指向坏路径时
+                    // has-session 同样返 1）。二次甄别：list-sessions 通=服务端健在
+                    // →会话真不存在，可删；不通=环境异常，保守保留
+                    const ls = await TmuxInvoker.tryInvoke(["list-sessions"]);
+                    if (ls.exitCode === 0) {
+                        await this.remove(id);
+                        removed++;
+                        this.log.warn(`[reconcile] 僵尸会话 [${id}] 已清理`);
+                    } else {
+                        kept++;
+                        this.log.warn(`[reconcile] 会话 [${id}] 探测 exit 1 但服务端不可用（list-sessions exit=${ls.exitCode}——保守保留）`);
+                    }
                 } else {
                     kept++;
                     this.log.warn(`[reconcile] 会话 [${id}] 探测异常（exit=${r.exitCode}——非「不存在」语义，保守保留）`);

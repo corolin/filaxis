@@ -1150,3 +1150,55 @@ describe("Sol 74：homeKeys 多键", () => {
         await (again as unknown as MockLayerDriver).destroy();
     }, 15_000);
 });
+
+// GPT Sol 七十五期 P2-1/P2-7/P2-8：terminalId 重挂曾双实例互杀（索引复用收口）；
+// homeKeys 空 Set 强引用滞留（常驻积累）；逐出一别名曾拆掉整个事件桥。
+describe("Sol 75：重挂复用/回收/事件桥", () => {
+    test("P2-1 带 terminalId 重挂：复用既有 driver（不建第二实例）", async () => {
+        let created = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("mocktmux", (d: RuntimeDescriptor) => {
+            created++;
+            const drv = new MockLayerDriver({ ...d, terminalId: "T75" }) as unknown as RuntimeDriver & { descriptor: RuntimeDescriptor };
+            return drv;
+        });
+        const a = await stack.connect({ driver: "mocktmux", target: "t75" } as RuntimeDescriptor);
+        expect(created).toBe(1);
+        // 重挂：descriptor 带 terminalId（快照形态）——修前键不匹配新建第二实例
+        const b = await stack.connect({ driver: "mocktmux", target: "t75", terminalId: "T75" } as RuntimeDescriptor);
+        expect(b).toBe(a); // 索引复用
+        expect(created).toBe(1);
+        RuntimeStack.evictDriverHome(a);
+        await (a as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+
+    test("P2-7/P2-8 别名逐出不拆桥、全逐出拆桥且无空集合滞留", async () => {
+        const shared = new MockLayerDriver({ driver: "alias75" } as RuntimeDescriptor) as unknown as RuntimeDriver;
+        const stack = new RuntimeStack();
+        let served = 0;
+        const factory = () => {
+            served++;
+            return (served <= 2 ? shared : new MockLayerDriver({ driver: "fresh75" } as RuntimeDescriptor)) as unknown as RuntimeDriver;
+        };
+        stack.registerDriver("kA", factory);
+        stack.registerDriver("kB", factory);
+        await stack.addLayer("a", { driver: "kA", target: "x" });
+        await stack.addLayer("b", { driver: "kB", target: "x" });
+        // 事件桥在场（白盒：mock 补 sessions 载体 + subs 非空）
+        const sm = (shared as unknown as { sessions: { __fxSubs?: Set<unknown> } }).sessions
+            ?? ((shared as unknown as { sessions: { __fxSubs?: Set<unknown> } }).sessions = {});
+        sm.__fxSubs = sm.__fxSubs ?? new Set();
+        sm.__fxSubs.add("fwd-75");
+        stack.evict({ driver: "kA", target: "x" } as RuntimeDescriptor); // 逐出一别名（实例方法带 cacheNs）
+        expect(sm.__fxSubs.size).toBe(1); // 修前：整桥被拆（剩余别名丢事件）
+        const still = await stack.connect({ driver: "kB", target: "x" } as RuntimeDescriptor);
+        expect(still).toBe(shared); // 另一别名仍可用
+        stack.evict({ driver: "kB", target: "x" } as RuntimeDescriptor); // 全逐出
+        expect(sm.__fxSubs.size).toBe(0); // 全逐出才拆桥
+        const homeKeys = (RuntimeStack as unknown as { driverHomeKeys: Map<unknown, Set<string>> }).driverHomeKeys;
+        expect(homeKeys.has(shared)).toBe(false); // 修前：空 Set 条目滞留（强引用积累）
+        await (shared as unknown as MockLayerDriver).destroy();
+        RuntimeStack.evictDriver({ driver: "kA", target: "x" } as RuntimeDescriptor);
+        RuntimeStack.evictDriver({ driver: "kB", target: "x" } as RuntimeDescriptor);
+    }, 15_000);
+});

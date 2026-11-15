@@ -311,9 +311,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
     }
     async tailSession(sessionId: string, lines = 50): Promise<string[]> {
         const base = this.sessionBase(sessionId);
-        // 存在性纪律（Sol 74 #7）：`|| true` 曾把缺失会话的日志当空数组——调用方
-        // 无法区分「没有输出」与「日志不存在」。test -r 门 + 退出码入闸
-        const r = await this.exec(`test -r ${q(`${base}.out`)} || exit 9; tail -n ${lines} ${q(`${base}.out`)} 2>/dev/null`);
+        // 存在性纪律（Sol 74 #7）：`|| true` 曾把缺失会话的日志当空数组。test -r 门
+        // + 退出码入闸——**子 shell 包裹**（Sol 75 P1-1）：tmux 的 exec 跑在**持久
+        // shell** 里（send-keys 到会话），裸 exit 会退掉承载层（remote 的每命令
+        // sh -s 语义不可照搬）——全部命令以 ( ... ) 收束，exit 只出子 shell、
+        // 退出码仍透传为整行状态
+        const r = await this.exec(
+            `( test -r ${q(`${base}.out`)} || exit 9; tail -n ${lines} ${q(`${base}.out`)} 2>/dev/null )`,
+        );
         if (r.exitCode !== 0) {
             throw new Error(`会话日志读取失败（tailSession exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
         }
@@ -322,23 +327,24 @@ export class TmuxSessionDriver implements RuntimeDriver {
     async readSessionLog(sessionId: string, opts?: ReadLogOptions): Promise<string> {
         const base = this.sessionBase(sessionId);
         const suffix = opts?.stream === "stderr" ? ".err" : ".out";
-        // 存在性纪律（Sol 74 #7 同 tailSession）：可读性门 + 退出码入闸；lines 截断
-        // 走临时文件中转（管道尾 rc 只反映末命令——与 remote readLog 同款）
+        // 存在性纪律（Sol 74 #7）+ 子 shell 包裹（Sol 75 P1-1 同 tailSession：
+        // 裸 exit 曾直接终止承载层）；lines 截断走临时文件中转（管道尾 rc 只
+        // 反映末命令——与 remote readLog 同款，但包在子 shell 内）
         const rd = q(base + suffix);
-        let cmd: string;
+        let body: string;
         if (opts?.lines != null) {
             const readCmd = opts?.offsetLines ? `tail -n +${opts.offsetLines + 1} ${rd}` : `cat ${rd}`;
-            cmd = `test -r ${rd} || exit 9; ` +
+            body = `test -r ${rd} || exit 9; ` +
                 `__fx_d="\${TMPDIR:-/tmp}"; [ -d "$__fx_d" ] && [ -w "$__fx_d" ] || __fx_d=/tmp; ` +
                 `__fx_t="$__fx_d/fx-rl-$$-${Math.random().toString(36).slice(2, 6)}"; ` +
                 `{ ${readCmd} > "$__fx_t" 2>/dev/null || { rm -f "$__fx_t"; exit 9; }; }; ` +
                 `{ tail -n ${opts.lines} "$__fx_t"; }; __fx_rc=$?; rm -f "$__fx_t"; exit $__fx_rc`;
         } else {
-            cmd = opts?.offsetLines
+            body = opts?.offsetLines
                 ? `test -r ${rd} || exit 9; tail -n +${opts.offsetLines + 1} ${rd}`
                 : `test -r ${rd} || exit 9; cat ${rd}`;
         }
-        const r = await this.exec(cmd);
+        const r = await this.exec(`( ${body} )`);
         if (r.exitCode !== 0) {
             throw new Error(`会话日志读取失败（readSessionLog exit=${r.exitCode}——输出不作日志凭证）: ${sessionId}`);
         }
@@ -361,7 +367,13 @@ export class TmuxSessionDriver implements RuntimeDriver {
             `elif [ -f ${q(base)}.pid ]; then p=$(cat ${q(base)}.pid); ` +
             `g=$(cat ${q(base)}.pgid 2>/dev/null); ` +
             `if [ -n "$g" ] && [ "$g" = "$p" ]; then ` +
-            `if /bin/kill -0 -- "-$g" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; ` +
+            // 组模式组长优先+.st（Sol 75 P2-3 同 verifySession）：组长活→戳比对
+            //（不符=STALE 不发信号——复用组防误杀）；组长死组活=我组孙进程当家
+            // →ALIVE；组全灭→DEAD
+            `if kill -0 "$p" 2>/dev/null; then ` +
+            `s=$(cat ${q(base)}.st 2>/dev/null); c=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); ` +
+            `if [ -z "$s" ] || [ "$s" = "$c" ]; then echo ALIVE; else echo STALE; fi; ` +
+            `elif /bin/kill -0 -- "-$g" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; ` +
             `else if kill -0 "$p" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; fi; ` +
             `else echo NOEV; fi`
         );
@@ -379,6 +391,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 if (m) return { status: "exited", exitCode: parseInt(m[1]!, 10) };
             }
             if (out.includes("DEAD")) return { status: "stopped" }; // pid 在场且已死（TERM 致死/迟到死亡）
+            if (out.includes("STALE")) return { status: "unknown" }; // 组长被复用（Sol 75 P2-3）——原会话状态不可知，绝不向复用组发信号
             if (out.includes("NOEV")) return { status: "unknown" }; // 证据全缺——无从证实死亡
             if (out.includes("ALIVE")) return undefined; // 明确存活——才允许进信号段
             return { status: "unknown" }; // 词不达意（空输出/截断混流）——探针失败同罪
@@ -444,7 +457,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
             `elif [ -f ${q(base)}.pid ]; then p=$(cat ${q(base)}.pid); ` +
             `g=$(cat ${q(base)}.pgid 2>/dev/null); ` +
             `if [ -n "$g" ] && [ "$g" = "$p" ]; then ` +
-            `if /bin/kill -0 -- "-$g" 2>/dev/null; then echo RUNNING; else echo DEAD; fi; ` +
+            // 组模式组长身份核验（Sol 75 P2-3）：先探组长——活着即做 .st 比对
+            //（原组全灭后 pgid 被新组复用时，新组长 pid==pgid 必活着、戳必不符
+            // → STALE 拦下）；组长死而组仍活=我组孙进程当家（pgid 被我成员持有
+            // 不可能被复用）→ RUNNING；组全灭 → DEAD
+            `if kill -0 "$p" 2>/dev/null; then ` +
+            `s=$(cat ${q(base)}.st 2>/dev/null); c=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); ` +
+            `if [ -z "$s" ] || [ "$s" = "$c" ]; then echo RUNNING; else echo STALE; fi; ` +
+            `elif /bin/kill -0 -- "-$g" 2>/dev/null; then echo RUNNING; else echo DEAD; fi; ` +
             `elif kill -0 "$p" 2>/dev/null; then ` +
             `s=$(cat ${q(base)}.st 2>/dev/null); c=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); ` +
             `if [ -z "$s" ] || [ "$s" = "$c" ]; then echo RUNNING; else echo STALE; fi; ` + // 复用：活着但身份不符
