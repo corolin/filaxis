@@ -32,6 +32,8 @@ export interface TmuxDriverOptions {
  *  driver 实例但**共指同一 tmux 会话**——任一 destroy 曾直接杀会话连坐其余层。
  *  模块级计数：归零才真 destroySession（driver 实例各自独立，会话是共享物） */
 const sessionAttachRefs = new Map<string, number>();
+/** 同 tid 各在册实例声明的 cwd（Sol 77 P1-1）：重挂不同 cwd 的冲突守卫依据 */
+const sessionCwds = new Map<string, Set<string>>();
 
 export class TmuxSessionDriver implements RuntimeDriver {
     descriptor: RuntimeDescriptor;
@@ -144,7 +146,8 @@ export class TmuxSessionDriver implements RuntimeDriver {
 
     /** init：无 terminalId 则 spawn；有则验证存活（跨进程重连语义）；cwd 恢复 */
     async init(): Promise<void> {
-        if (!this.descriptor.terminalId) {
+        const isAttach = Boolean(this.descriptor.terminalId);
+        if (!isAttach) {
             const terminalId = await this.terminal.spawnSession(
                 this.descriptor.driver,
                 this.descriptor.target,
@@ -155,19 +158,40 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 双实例共指同一 tmux 会话，destroy 一个连坐杀掉另一层在用的会话
             this.descriptor = { ...this.descriptor, terminalId };
         } else {
+            // 重挂 cwd 冲突守卫（Sol 77 P1-1）：会话工作目录是**会话级状态**——
+            // 重挂曾对共享持久 shell 执行 cd，原层的 pwd 被悄悄改掉（相对路径
+            // 全落错目录）。他实例已在册且 cwd 不同 → 拒绝（改目录请新层或
+            // per-exec cwd）；相同 cwd 幂等无害放行
+            const tid0 = this.descriptor.terminalId!;
+            const wanted = this.descriptor.cwd;
+            if (wanted != null) {
+                for (const cwd of sessionCwds.get(tid0) ?? []) {
+                    if (cwd !== wanted) {
+                        throw new Error(
+                            `tmux 会话 '${tid0}' 已以 cwd='${cwd}' 在用——重挂不同 cwd（'${wanted}'）会改掉共享持久 shell 的工作目录（原层相对路径将落错位置）。` +
+                            `请新建层（不带 terminalId）或用 exec 的 cwd 选项（按命令前缀）`,
+                        );
+                    }
+                }
+            }
             // 重连探活（Hydrogen R9 #3）：restore(snap) 携 terminalId 时曾静默成功——
             // 宿主重启/tmux server 已退要到首次 exec 才报错。显式 has-session 探测，
             // 死会话立即抛错（快失败优于延迟失败），不自动重建（消费方决定重建或换层）
-            const alive = await TmuxInvoker.tryInvoke(["has-session", "-t", this.descriptor.terminalId]);
+            const alive = await TmuxInvoker.tryInvoke(["has-session", "-t", tid0]);
             if (alive.exitCode !== 0) {
                 throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
             }
         }
-        { // 在册登记（Sol 76 P2-1）：spawn 与重挂 attach 同权计数
+        { // 在册登记（Sol 76 P2-1）：spawn 与重挂 attach 同权计数。
+          // **登记即置位**（Sol 77 P1-2）：attach 探活失败抛错时未曾登记——
+          // destroy 的引用扣减曾照扣（?? 1 把缺席当 1），原层会话被连带销毁
             const tid = this.descriptor.terminalId!;
             sessionAttachRefs.set(tid, (sessionAttachRefs.get(tid) ?? 0) + 1);
+            { const cwds = sessionCwds.get(tid) ?? new Set<string>(); if (this.descriptor.cwd != null) cwds.add(this.descriptor.cwd); sessionCwds.set(tid, cwds); }
+            this.attached = true;
         }
-        if (this.descriptor.cwd && this.descriptor.terminalId) {
+        if (this.descriptor.cwd && this.descriptor.terminalId && !isAttach) {
+            // cd 仅 spawn 路径（Sol 77 P1-1）：attach 路径的 cd 会改共享会话状态
             try {
                 await this.terminal.runCommand(
                     this.descriptor.terminalId,
@@ -181,12 +205,21 @@ export class TmuxSessionDriver implements RuntimeDriver {
 
     /** 本实例启动的后台会话（sessionId 集合——destroy 只清理自己的，绝不扫目录误杀他层） */
     private ownedSessions = new Set<string>();
+    /** init 登记成功才置位（Sol 77 P1-2）：attach 探活失败的实例从未持有引用
+     *  ——destroy 不得扣减/销毁（曾照扣致原层会话被连带杀） */
+    private attached = false;
+    /** destroy 幂等（Sol 77 P1-2）：同 driver 二次 destroy 曾再扣一次引用，
+     *  提前耗尽其他层 */
+    private destroyedOnce = false;
 
     /** destroy：只停**本实例**启动的后台进程（审查问题 1：全目录扫杀会误杀同机其他
      * Filaxis 实例/其他层的任务——/tmp/filaxis-sessions 是共享目录），再销毁会话——
      * **引用计数护会话**（Sol 76 P2-1）：同 terminalId 的其他 driver 实例仍在
      *用时（不同 cwd 重挂等）不杀会话，归零才真销毁 */
     async destroy(): Promise<void> {
+        if (this.destroyedOnce) return; // 幂等（Sol 77 P1-2）：二次调用不再扣减
+        this.destroyedOnce = true;
+        if (!this.attached) return; // 未登记=未持有引用（init 失败路径）——不动会话
         if (this.descriptor.terminalId) {
             for (const sid of this.ownedSessions) {
                 const base = this.sessionBase(sid);
@@ -201,6 +234,11 @@ export class TmuxSessionDriver implements RuntimeDriver {
             this.ownedSessions.clear();
             const tid = this.descriptor.terminalId;
             const refs = Math.max(0, (sessionAttachRefs.get(tid) ?? 1) - 1);
+            { // cwd 注册表同步摘除本实例声明
+                const cwds = sessionCwds.get(tid);
+                cwds?.delete(this.descriptor.cwd ?? "");
+                if (cwds && cwds.size === 0) sessionCwds.delete(tid);
+            }
             if (refs === 0) {
                 sessionAttachRefs.delete(tid);
                 await this.terminal.destroySession(tid);

@@ -1262,3 +1262,39 @@ describe("Sol 76：索引判别/会话引用计数/扇出重装", () => {
         await new Promise((r) => setTimeout(r, 20));
     }, 15_000);
 });
+
+// GPT Sol 七十七期 #4/#5：销毁排程中的 driver 曾被 terminalId 索引返还（新句柄
+// 随即失效）；同 tid 多工厂曾互相覆盖索引（被覆盖方重挂出第三实例）。
+describe("Sol 77：索引销毁中跳过/嵌套不互覆", () => {
+    test("#4 销毁排程中的索引命中被跳过——重挂拿新活实例", async () => {
+        let made = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("mt77", (d: RuntimeDescriptor) => { made++; return new MockLayerDriver({ ...d, terminalId: "T77" }) as unknown as RuntimeDriver; });
+        await stack.addLayer("a", { driver: "mt77", target: "t" });
+        const old = stack.layer("a").driver;
+        const rm = stack.removeLayer("a", { destroy: true }); // 排程销毁（destroyScheduled）
+        await rm;
+        const again = await stack.connect({ driver: "mt77", target: "t", terminalId: "T77" } as RuntimeDescriptor);
+        expect(again).not.toBe(old); // 修前：索引返还排程中的死句柄
+        expect((again as unknown as MockLayerDriver).destroyed).toBe(false);
+        RuntimeStack.evictDriverHome(again);
+        await (again as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+
+    test("#5 同 tid 两工厂各占索引槽——互不覆盖", async () => {
+        let mA = 0, mB = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("fa77", (d: RuntimeDescriptor) => { mA++; return new MockLayerDriver({ ...d, terminalId: "TZ" }) as unknown as RuntimeDriver; });
+        stack.registerDriver("fb77", (d: RuntimeDescriptor) => { mB++; return new MockLayerDriver({ ...d, terminalId: "TZ" }) as unknown as RuntimeDriver; });
+        const a = await stack.connect({ driver: "fa77", target: "t" } as RuntimeDescriptor);
+        const b = await stack.connect({ driver: "fb77", target: "t" } as RuntimeDescriptor);
+        expect(a).not.toBe(b);
+        // A 方重挂（同描述符+tid）：拿到 A 的实例——修前：被 B 覆盖 → miss 出第三实例
+        const a2 = await stack.connect({ driver: "fa77", target: "t", terminalId: "TZ" } as RuntimeDescriptor);
+        expect(a2).toBe(a);
+        expect(mA).toBe(1); expect(mB).toBe(1);
+        RuntimeStack.evictDriverHome(a); RuntimeStack.evictDriverHome(b);
+        await (a as unknown as MockLayerDriver).destroy();
+        await (b as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+});

@@ -212,7 +212,8 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     // connection 的空对象**——曾原样并入随压实写进主档
     for (const [k, v] of Object.entries(layers)) {
         if (v != null && typeof v === "object" && !Array.isArray(v)
-            && typeof v.connection === "object" && v.connection != null) {
+            && typeof v.connection === "object" && v.connection != null
+            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string") {
             dst.layers[k] = v as LayerEnvEntry;
         }
     }
@@ -362,6 +363,40 @@ export class LayerEnvStore {
             heirs.sort((a, b) => (a.closure?.size ?? 0) - (b.closure?.size ?? 0) || LayerEnvStore.docOrder(a.d, b.d));
             mergeLayers(cfg, anchor.parsed); // 锚点先并入
             for (const { d } of heirs) mergeLayers(cfg, d.parsed); // 救回的旁路随后覆盖其键（辈分深者后并入）
+            // 无效提名透传回救（Sol 77 P1-3b）：锚点/heirs 中被提名为**无效条目**
+            //（null/数组/空 connection）的键≠删除（删除=未提名，Sol 64 语义）——
+            // 键位状态不明，向被血统跳过的各代回溯取最新有效值（曾整档跳过致
+            // 前代有效条目永久丢失并压实删除旁路）
+            {
+                const mentionedInvalid = new Set<string>();
+                const layerEntries = (src: unknown): Record<string, unknown> =>
+                    ((src as LayerEnvConfigFile | null)?.layers ?? {}) as Record<string, unknown>;
+                const invalidEntry = (v: unknown): boolean =>
+                    !(v != null && typeof v === "object" && !Array.isArray(v)
+                        && typeof (v as LayerEnvEntry).connection === "object" && (v as LayerEnvEntry).connection != null
+                        && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string");
+                for (const src of [anchor.parsed, ...heirs.map(({ d }) => d.parsed)]) {
+                    for (const [k, v] of Object.entries(layerEntries(src))) {
+                        if (invalidEntry(v) && cfg.layers[k] == null) mentionedInvalid.add(k);
+                    }
+                }
+                if (mentionedInvalid.size > 0) {
+                    const skipped = docs
+                        .filter((d) => d !== anchor && !heirs.some(({ d: h }) => h === d) && d.parsed != null)
+                        .sort(LayerEnvStore.docOrder) // 旧→新排序后逆取=最新有效优先
+                        .reverse();
+                    for (const doc of skipped) {
+                        for (const k of [...mentionedInvalid]) {
+                            const v = layerEntries(doc.parsed)[k];
+                            if (!invalidEntry(v)) {
+                                cfg.layers[k] = v as LayerEnvEntry;
+                                mentionedInvalid.delete(k);
+                            }
+                        }
+                        if (mentionedInvalid.size === 0) break;
+                    }
+                }
+            }
             return cfg;
         }
         // 无戳锚点（遗老/手造）或无档：全并入按 docOrder（平局 data 胜）
@@ -383,7 +418,8 @@ export class LayerEnvStore {
         // 不在废档之列；混入无效条目的档有效，无效条目由 mergeLayers 跳过
         const validEntry = (v: unknown): boolean =>
             v != null && typeof v === "object" && !Array.isArray(v)
-            && typeof (v as LayerEnvEntry).connection === "object" && (v as LayerEnvEntry).connection != null;
+            && typeof (v as LayerEnvEntry).connection === "object" && (v as LayerEnvEntry).connection != null
+            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string"; // 必填 driver（Sol 77 P1-3）：{"connection":{}} 曾压过前代
         const vals = Object.values(layers);
         return vals.length === 0 || vals.some(validEntry);
     }

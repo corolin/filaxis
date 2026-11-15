@@ -195,13 +195,20 @@ export class RuntimeStack {
         // 索引到既有 driver（复用=引用计数护住共享会话）
         const tid = (descriptor as { terminalId?: string }).terminalId;
         if (tid) {
-            const byTid = RuntimeStack.terminalIdIndex.get(tid);
-            // finalKey 全等才复用（Sol 76 P1-1）：不同 driver/target/config/cwd 的
-            // 同 id 重挂不串线——走正常 miss 路径（新建/逐出后重连，互不冒认）
-            if (byTid && byTid.finalKey === key) {
-                this.log.debug(`[Filaxis] terminalId 命中复用连接: ${tid}`);
-                this.bridgeSessionEvents(byTid.drv);
-                return byTid.drv;
+            const inner = RuntimeStack.terminalIdIndex.get(tid);
+            const hit = inner?.get(key);
+            // finalKey 全等才复用（Sol 76 P1-1）；**销毁中跳过**（Sol 77 #4）：
+            // destroy 排程中的 driver 曾被索引命中返还——调用方拿到随即失效的
+            // 句柄（会话已被定时器收走）。跳过并摘除该槽
+            if (hit) {
+                if (RuntimeStack.destroyScheduled.has(hit)) {
+                    inner!.delete(key);
+                    if (inner!.size === 0) RuntimeStack.terminalIdIndex.delete(tid);
+                } else {
+                    this.log.debug(`[Filaxis] terminalId 命中复用连接: ${tid}`);
+                    this.bridgeSessionEvents(hit);
+                    return hit;
+                }
             }
         }
         const cached = RuntimeStack.driverCache.get(key);
@@ -246,7 +253,13 @@ export class RuntimeStack {
             // 拿回已销毁实例。不重挂键（descriptor 可能丢 config 信息、砸键控
             // 缓存）——逐出按「本 driver 实际挂在哪个键」实例核对（evictDriverHome）
             { const keys = RuntimeStack.driverHomeKeys.get(drv) ?? new Set<string>(); keys.add(key); RuntimeStack.driverHomeKeys.set(drv, keys); }
-            { const t = (drv.descriptor as { terminalId?: string }).terminalId; if (t) RuntimeStack.terminalIdIndex.set(t, { finalKey: this.cacheKeyOf(drv.descriptor), drv }); } // 终态键（含 init 补写的 terminalId）——与重挂方算键同口径
+            { // 终态键（含 init 补写的 terminalId）——与重挂方算键同口径；嵌套槽
+              const t = (drv.descriptor as { terminalId?: string }).terminalId;
+              if (t) {
+                  const inner = RuntimeStack.terminalIdIndex.get(t) ?? new Map<string, RuntimeDriver>();
+                  inner.set(this.cacheKeyOf(drv.descriptor), drv);
+                  RuntimeStack.terminalIdIndex.set(t, inner);
+              } }
             this.log.info(`[Filaxis] 新建连接: ${descriptor.driver}/${descriptor.target ?? "local"}`);
             return drv;
         })();
@@ -309,7 +322,13 @@ export class RuntimeStack {
             if (!keys || keys.size === 0) {
                 RuntimeStack.driverHomeKeys.delete(drv);
                 const t = (drv.descriptor as { terminalId?: string }).terminalId;
-                if (t && RuntimeStack.terminalIdIndex.get(t)?.drv === drv) RuntimeStack.terminalIdIndex.delete(t);
+                if (t) {
+                    const inner = RuntimeStack.terminalIdIndex.get(t);
+                    for (const [ik, iv] of [...inner ?? []]) {
+                        if (iv === drv) inner!.delete(ik);
+                    }
+                    if (inner && inner.size === 0) RuntimeStack.terminalIdIndex.delete(t);
+                }
                 fullyEvicted = true;
             }
         }
@@ -365,11 +384,12 @@ export class RuntimeStack {
      *  不一致；自定义工厂还可让**同一 driver 挂多键**（曾只记一个键——销毁后
      *  另一键仍能拿到已销毁实例）。按实例记全部键，逐出实例核对全清 */
     private static readonly driverHomeKeys = new Map<RuntimeDriver, Set<string>>();
-    /** terminalId → {finalKey, driver} 索引（Sol 75 P2-1 → Sol 76 P1-1 判别化）：
-     *  tmux 会话全局唯一——带 id 重挂复用既有 driver。**finalKey 判别**：命中
-     *  须缓存键全等（driver/target/config/cwd 一致）——裸 id 索引曾把不同工厂、
-     *  不同 cwd 的重挂串到第一个 driver（命令送错驱动/目录） */
-    private static readonly terminalIdIndex = new Map<string, { finalKey: string; drv: RuntimeDriver }>();
+    /** terminalId → {finalKey → driver} 索引（Sol 75 P2-1 → Sol 76 P1-1 判别化 →
+     *  Sol 77 #5 嵌套化）：tmux 会话全局唯一——带 id 重挂复用既有 driver。
+     *  **finalKey 判别**：命中须缓存键全等（driver/target/config/cwd 一致）。
+     *  **嵌套**：同 tid 多工厂各占自己的 finalKey 槽——单值索引曾互相覆盖，
+     *  被覆盖方重挂 miss 出第三实例 */
+    private static readonly terminalIdIndex = new Map<string, Map<string, RuntimeDriver>>();
     private activeName?: string;
 
     /** 层注册表只读视图 */

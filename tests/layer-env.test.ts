@@ -1177,3 +1177,47 @@ describe("Sol 76：空对象条目档", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十七期 P1-3：`{"connection":{}}`（缺 driver）曾压过前代有效条目；
+// 后继含 one:null+有效 two 曾致前代有效 one 永久丢失（null 提名≠删除——回救）。
+describe("Sol 77：空 connection/无效提名回救", () => {
+    const mk77 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("空 connection 后继不作有效提名——前代胜出", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env77-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { one: mk77("real") }, _fx_rev: "5000000000000-1-mm77" }));
+            writeFileSync(`${p}.111-222-qqqq.fx-old`, JSON.stringify({
+                layers: { one: { connection: {} } },
+                _fx_rev: "9000000000000-1-ec77", _fx_seen: ["5000000000000-1-mm77"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one!.connection.target).toBe("real"); // 修前：one={connection:{}} 压过前代
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("后继 one:null + 有效 two：one 自前代回救（null 提名=状态不明非删除）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env77b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { one: mk77("v1") }, _fx_rev: "5000000000000-1-p77" }));
+            writeFileSync(`${p}.111-222-rrrr.fx-old`, JSON.stringify({
+                layers: { one: null, two: mk77("v2") },
+                _fx_rev: "9000000000000-1-s77", _fx_seen: ["5000000000000-1-p77"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one!.connection.target).toBe("v1"); // 修前：one 永久丢失
+            expect(cfg.layers.two!.connection.target).toBe("v2"); // 有效提名照常
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

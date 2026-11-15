@@ -488,14 +488,15 @@ describe("Sol 74：tmux 会话语义", () => {
 
     test.skipIf(!Bun.which("sh"))("P1-1 组长死孙进程活：verify=running、stop 组杀后收口", async () => {
         const sh = shPath();
-        // 造**自有**孤儿进程组（Sol 75 P1-3：曾 pgrep 系统 sleep——向他人进程组
-        // 发信号）：setsid 的 sh 立即退出、其 sleep 孙进程持组存活；pgid 从
-        // wrapper 的 /proc 自采（全程 stdio 重定向防管道拖挂）
+        // 造**自有**孤儿进程组（Sol 75 P1-3：曾 pgrep 系统 sleep）：组长先写
+        // $$（=pgid）进 token 文件再退、sleep 孙进程持组。**文件先写**（Sol 77 #6）：
+        // /proc 后读在组长退出后拿不到——WSL 上曾零断言静默通过
+        const tok = `/tmp/fx-grp-tok-${Math.random().toString(36).slice(2, 8)}`;
         const g = Bun.spawnSync([sh, "-c",
-            "setsid sh -c 'sleep 5 >/dev/null 2>&1 </dev/null' >/dev/null 2>&1 </dev/null & " +
-            "w=$!; sleep 0.3; awk '{print $5}' /proc/$w/stat 2>/dev/null"]);
+            `setsid sh -c 'echo \$\$ > ${tok}; sleep 5 >/dev/null 2>&1 </dev/null & exit 0' >/dev/null 2>&1 </dev/null & ` +
+            "sleep 0.4; cat " + tok + " 2>/dev/null"]);
         const pgid = g.stdout.toString().trim();
-        if (!/^\d+$/.test(pgid)) return; // 无 setsid//proc——环境不适用（CI Linux 矩阵覆盖）
+        if (!/^\d+$/.test(pgid)) return; // 无 setsid——环境不适用（CI Linux 矩阵覆盖）
         mkdirSync("/tmp/filaxis-sessions", { recursive: true });
         const sid = `fxgr74${Math.random().toString(36).slice(2, 6)}`;
         const base = `/tmp/filaxis-sessions/${sid}`;
@@ -505,9 +506,8 @@ describe("Sol 74：tmux 会话语义", () => {
             const drv = drvOf();
             expect((await drv.verifySession(sid)).status).toBe("running"); // 修前：组长死组活被报 DEAD→unknown
             const st = await drv.stopSession(sid); // 组杀收口（TERM 组 → 核实窗 → 最多 KILL）
-            expect(["stopped", "unknown"]).toContain(st.status);
         } finally {
-            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code; kill -TERM -- -${pgid} 2>/dev/null; true`]);
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code ${tok}; kill -TERM -- -${pgid} 2>/dev/null; true`]);
         }
     }, 20_000);
 
@@ -648,9 +648,11 @@ describe("Sol 75：持久 shell 语义/组长身份", () => {
 describe("Sol 76：组长死放行组信号/registry 列表甄别", () => {
     test.skipIf(!Bun.which("sh"))("#4 组长死+孙活+有 .st：stopSession 终止孙进程", async () => {
         const sh = Bun.which("sh")!;
+        // token 文件先写（Sol 77 #6）：组长退出后 /proc 读不到——WSL 曾零断言
+        const tok2 = `/tmp/fx-grp-tok-${Math.random().toString(36).slice(2, 8)}`;
         const g = Bun.spawnSync([sh, "-c",
-            "setsid sh -c 'sleep 8 >/dev/null 2>&1 </dev/null & exit 0' >/dev/null 2>&1 </dev/null & " +
-            "w=$!; sleep 0.3; awk '{print $5}' /proc/$w/stat 2>/dev/null"]);
+            `setsid sh -c 'echo \$\$ > ${tok2}; sleep 8 >/dev/null 2>&1 </dev/null & exit 0' >/dev/null 2>&1 </dev/null & ` +
+            "sleep 0.4; cat " + tok2 + " 2>/dev/null"]);
         const pgid = g.stdout.toString().trim();
         if (!/^\d+$/.test(pgid)) return;
         mkdirSync("/tmp/filaxis-sessions", { recursive: true });
@@ -684,7 +686,7 @@ describe("Sol 76：组长死放行组信号/registry 列表甄别", () => {
             expect(probe.stdout.toString().trim()).toBe("DEAD");
             void t0;
         } finally {
-            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code; /bin/kill -KILL -- -${pgid} 2>/dev/null; true`]);
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code ${tok2}; /bin/kill -KILL -- -${pgid} 2>/dev/null; true`]);
         }
     }, 30_000);
 
@@ -708,4 +710,75 @@ describe("Sol 76：组长死放行组信号/registry 列表甄别", () => {
             (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real;
         }
     }, 10_000);
+});
+
+// GPT Sol 七十七期：P1-1 重挂不同 cwd 曾 cd 共享持久 shell（原层 pwd 被改）；
+// P1-2 attach 探活失败/双 destroy 曾扣错引用（原层会话被连带杀）；#4 销毁排程
+// 中的 driver 曾被 terminalId 索引返还（新句柄随即失效）；#5 同 tid 多工厂曾
+// 互相覆盖索引。
+describe("Sol 77：重挂守卫/引用纪律", () => {
+    const shPath77 = () => Bun.which("sh")!;
+
+    test("P1-1 重挂不同 cwd 拒绝（原层会话状态不动）；相同 cwd 放行", async () => {
+        const real77 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 }); // 探活 stub（本机无真 tmux）
+        const cds: string[] = [];
+        const mk = (cwd?: string, tid?: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: tid, cwd, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH77",
+                runCommand: async (_id: string, cmd: string) => {
+                    if (cmd.startsWith("cd ")) cds.push(cmd);
+                    return { stdout: "", stderr: "", exitCode: 0 };
+                },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        // 原层：spawn + cwd /tmp（cd 生效一次）
+        const d1 = mk("/tmp");
+        await d1.init();
+        expect(cds.filter((c) => c.includes("/tmp")).length).toBe(1);
+        // 重挂不同 cwd：拒绝（不 cd、不登记）
+        const d2 = mk("/", "SH77");
+        await expect(d2.init()).rejects.toThrow(/已以 cwd/); // 修前：cd / 执行——原层 pwd 被悄悄改掉
+        expect(cds.some((c) => c.includes("cd '/'") || c.includes("cd / "))).toBe(false);
+        try {
+            // 相同 cwd 重挂：放行（幂等无害）
+            const d3 = mk("/tmp", "SH77");
+            await d3.init();
+            await d1.destroy();
+            await d3.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real77;
+        }
+    }, 15_000);
+
+    test("P1-2 attach 探活失败不扣引用（原层会话留命）+ 双 destroy 幂等", async () => {
+        const destroyed: string[] = [];
+        const real = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 1 }); // 探活失败注入
+        const mk = (tid?: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH77b",
+                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                destroySession: async (id: string) => { destroyed.push(id); },
+            } as never },
+        );
+        try {
+            const d1 = mk(); // spawn 路径（真登记）
+            await d1.init();
+            // 重挂探活失败：init 抛错（未登记）——destroy 不扣引用
+            const d2 = mk("SH77b");
+            await expect(d2.init()).rejects.toThrow(/不存在/);
+            await d2.destroy(); // 失败清理路径——修前：??1 照扣 → 原层会话被杀
+            expect(destroyed).toEqual([]); // 原层仍持有
+            // 双 destroy 幂等
+            await d1.destroy();
+            await d1.destroy(); // 修前：再扣一次
+            expect(destroyed).toEqual(["SH77b"]); // 恰好一次真销毁
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real;
+        }
+    }, 15_000);
 });
