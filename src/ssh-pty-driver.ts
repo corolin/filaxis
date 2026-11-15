@@ -68,16 +68,24 @@ class PtyLink {
         this.fallbackNonce = crypto.randomBytes(16).toString("hex");
         this.fallbackSteps.clear();
         this.fallbackSeen = undefined;
+        const spawnAt = Date.now();
         this.proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
         // 双流各自解码器（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂——两管道交替喂
         // 同一 decoder 会混流撕字，必须 per-stream
         const outDec = new StringDecoder("utf-8");
         const errDec = new StringDecoder("utf-8");
-        this.proc.stdout.on("data", (d: Buffer) => this.onData(outDec.write(d)));
-        this.proc.stderr.on("data", (d: Buffer) => this.onData(errDec.write(d)));
+        let sawAnyOutput = false;
+        this.proc.stdout.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(outDec.write(d)); });
+        this.proc.stderr.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(errDec.write(d)); });
         this.proc.on("exit", (code) => {
             if (!this.ready) {
-                const err = new Error(this.egressError(`ssh 进程建链期间退出（code=${code}）: ${this.handshakeWhat}`));
+                // 沙箱 stdio 管道损坏快速诊断（DeepSeek Harness 反馈）：PTY 常驻通道
+                // 无法降级重试（attach 是长连接），但给明确错误而非「建链期间退出」
+                // 的笼统话——秒退 255+零输出=管道句柄被沙箱拦截的指纹
+                const base = isBrokenStdioExit(code, sawAnyOutput ? "x" : "", sawAnyOutput ? "x" : "", Date.now() - spawnAt)
+                    ? `ssh 秒退（code=${code}，零输出）——疑似沙箱 stdio 管道损坏${BROKEN_STDIO_HINT}`
+                    : this.egressError(`ssh 进程建链期间退出（code=${code}）: ${this.handshakeWhat}`);
+                const err = new Error(base);
                 if (this.readyRejecter) this.readyRejecter(err);
                 else this.pendingExitFailure = err;
             }
@@ -663,6 +671,28 @@ export class SshPtyDriver implements RuntimeDriver {
             // 与观察流同一 socket（exec/observe 同主机共享一条主连接）
             const destArgs = sshArgsFor(rootHop);
             const argv = [...autonomousSshOpts(connParams), ...muxFlagsFor(destArgs), ...destArgs, "--", ...render.remoteArgs];
+            // 显式 stdio 模式覆盖（DeepSeek Harness 反馈）：FILAXIS_SSH_STDIO_MODE=inherit
+            // 直接走文件中转（管道句柄在受限沙箱里被拦截——ssh 秒退 255 零输出）
+            if (process.env.FILAXIS_SSH_STDIO_MODE === "inherit") {
+                void spawnWithFileRedirect(argv, render.stdinCmd, options?.timeoutMs).then((r) => {
+                    const mIdx = r.stdout.lastIndexOf(`\n${marker}:`);
+                    const m = mIdx !== -1 ? r.stdout.slice(mIdx + 1).split("\n", 1)[0]?.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`)) : null;
+                    if (!m) {
+                        const e = new Error(`命令未完成（inherit 模式无完成哨兵，exit=${r.exitCode}）。stdout 尾:\n${r.stdout.slice(-500)}\nstderr 尾:\n${r.stderr.slice(-300)}`) as Error & { outcome: "unknown" };
+                        e.outcome = "unknown";
+                        reject(e);
+                        return;
+                    }
+                    resolve({
+                        stdout: r.stdout.slice(0, mIdx),
+                        stderr: r.stderr,
+                        exitCode: parseInt(m[1]!, 10),
+                        effectiveUser: m[2] === "" ? undefined : m[2],
+                    });
+                }, reject);
+                return;
+            }
+            const spawnAt = Date.now();
             const p = spawn("ssh", argv, {
                 env: { ...process.env },
                 // 本地 ssh 进程启动目录不用 options.cwd（GPT Astra 十轮 #1）：cwd 是
@@ -734,6 +764,32 @@ export class SshPtyDriver implements RuntimeDriver {
                 if (effectiveUser) this.effectiveUser = effectiveUser;
                 // 无哨兵=命令未跑完（「无法执行」语义）——reject 附半截现场（outcome=unknown）
                 if (sentinelCode === undefined) {
+                    // 沙箱 stdio 管道损坏自动降级（DeepSeek Harness 反馈）：秒退 255+
+                    // 零输出=管道句柄被拦截的指纹——一次文件中转重试（cmd/sh 的 >
+                    // 是文件句柄非管道句柄，沙箱放行）；重试仍败才报错附双模式现场
+                    if (isBrokenStdioExit(code, out, stderr, Date.now() - spawnAt)) {
+                        finish(() => {
+                            void spawnWithFileRedirect(argv, render.stdinCmd, options?.timeoutMs).then((r) => {
+                                const mIdx2 = r.stdout.lastIndexOf(`\n${marker}:`);
+                                const m2 = mIdx2 !== -1 ? r.stdout.slice(mIdx2 + 1).split("\n", 1)[0]?.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`)) : null;
+                                if (!m2) {
+                                    const e = new Error(
+                                        `命令未完成（管道模式秒退 255 零输出——已自动降级文件中转仍无哨兵，exit=${r.exitCode}）。stdout 尾:\n${r.stdout.slice(-500)}\nstderr 尾:\n${r.stderr.slice(-300)}${BROKEN_STDIO_HINT}`,
+                                    ) as Error & { outcome: "unknown" };
+                                    e.outcome = "unknown";
+                                    reject(e);
+                                    return;
+                                }
+                                resolve({
+                                    stdout: r.stdout.slice(0, mIdx2),
+                                    stderr: r.stderr,
+                                    exitCode: parseInt(m2[1]!, 10),
+                                    effectiveUser: m2[2] === "" ? undefined : m2[2],
+                                });
+                            }, (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))));
+                        });
+                        return;
+                    }
                     finish(() => {
                         // 连接层失败诊断（试用反馈 #29：-J/--host 传 ssh-config 别名在沙箱/
                         // 远端环境「不认」——别名解析依赖**运行环境**的 ~/.ssh/config，本机
@@ -776,4 +832,50 @@ export class SshPtyDriver implements RuntimeDriver {
 /** shell 单引号安全引用 */
 function q(s: string): string {
     return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** 沙箱 stdio 管道损坏快速判定（DeepSeek Harness 反馈）：
+ *  ssh.exe 在受限沙箱（Electron 沙箱壳的 run_code 等）里经 stdio:'pipe' spawn
+ *  时，匿名管道被拦截——ssh 检测到三个 stdio 句柄损坏后立即自杀：exit 255、
+ *  stdout/stderr 全空（连 -vv 调试日志都吐不出来）、<500ms。同一命令在
+ *  PowerShell（cmdlet 管道=进程内实现不走 Windows 管道句柄）或真终端正常。 */
+export const __testBrokenStdioExit = isBrokenStdioExit; // 测试导出面（指纹判定单测）
+function isBrokenStdioExit(code: number | null, stdout: string, stderr: string, elapsedMs: number): boolean {
+    return code === 255 && stdout === "" && stderr === "" && elapsedMs < 500;
+}
+
+const BROKEN_STDIO_HINT =
+    "\n[沙箱 stdio 管道损坏] 父进程的匿名管道被沙箱拦截（常见于 Electron 沙箱壳的 run_code/execSync 环境）——ssh 因 stdio 句柄不可用秒退。" +
+    "\n  出路：①环境变量 FILAXIS_SSH_STDIO_MODE=inherit（输出经文件中转带回，绕开管道句柄）；" +
+    "\n  ②换 PowerShell pwsh 工具跑同命令（cmdlet 管道不走 Windows 管道句柄）；" +
+    "\n  ③真实终端执行。详见 docs/known-environments.md";
+
+/** 文件中转包装（inherit 降级）：经 shell 重定向到临时文件绕开损坏的管道——
+ *  cmd/sh 的 > 是文件句柄非管道句柄，沙箱放行。产物读回拼 ExecResult。 */
+async function spawnWithFileRedirect(argv: string[], stdinCmd: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+    const nonce = crypto.randomBytes(6).toString("hex");
+    const outFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.out`;
+    const errFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.err`;
+    const inFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.in`;
+    await fsp.writeFile(inFile, stdinCmd, "utf-8");
+    const shell = process.platform === "win32" ? "cmd" : "/bin/sh";
+    const shellArg = process.platform === "win32" ? "/c" : "-c";
+    const quoted = argv.map((a) => (process.platform === "win32" ? `"${a.replace(/"/g, '\\"')}"` : q(a))).join(" ");
+    const redirect = process.platform === "win32"
+        ? `${quoted} < "${inFile}" > "${outFile}" 2> "${errFile}"`
+        : `${quoted} < ${q(inFile)} > ${q(outFile)} 2> ${q(errFile)}`;
+    const p = spawn(shell, [shellArg, redirect], { stdio: ["ignore", "ignore", "ignore"] });
+    const exitCode = await new Promise<number | null>((resolve) => {
+        const t = timeoutMs ? setTimeout(() => { p.kill("SIGTERM"); resolve(null); }, timeoutMs) : null;
+        p.once("exit", (c) => { if (t) clearTimeout(t); resolve(c); });
+        p.once("error", () => { if (t) clearTimeout(t); resolve(null); });
+    });
+    const [out, err] = await Promise.all([
+        fsp.readFile(outFile, "utf-8").catch(() => ""),
+        fsp.readFile(errFile, "utf-8").catch(() => ""),
+    ]);
+    await Promise.all([fsp.unlink(outFile).catch(() => undefined), fsp.unlink(errFile).catch(() => undefined), fsp.unlink(inFile).catch(() => undefined)]);
+    return { stdout: out, stderr: err, exitCode };
 }

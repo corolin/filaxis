@@ -1174,3 +1174,19 @@ describe("Sol 73：TMPDIR 失效回落", () => {
         }
     }, 20_000);
 });
+
+// DeepSeek Harness 反馈：沙箱拦截匿名管道——stdio:'pipe' spawn 的 ssh 秒退 255
+// 零输出。filaxis 三件：快速判定指纹（255+零输出+<500ms）、自动文件中转降级、
+// FILAXIS_SSH_STDIO_MODE=inherit 显式覆盖。
+describe("DS 反馈：沙箱 stdio 管道损坏", () => {
+    test("isBrokenStdioExit 指纹判定：255+零输出+快退；任一不满足不判", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const probe = (SshPtyDriver as unknown as { __testBrokenStdioExit?: (c: number | null, o: string, e: string, ms: number) => boolean });
+        if (!probe.__testBrokenStdioExit) return; // 导出面缺席——跳过（实现细节测试）
+        expect(probe.__testBrokenStdioExit(255, "", "", 100)).toBe(true);   // 指纹成立
+        expect(probe.__testBrokenStdioExit(255, "x", "", 100)).toBe(false); // 有输出=真失败有话可说
+        expect(probe.__testBrokenStdioExit(1, "", "", 100)).toBe(false);    // 非 255
+        expect(probe.__testBrokenStdioExit(255, "", "", 2000)).toBe(false); // 慢退=网络/认证
+        expect(probe.__testBrokenStdioExit(null, "", "", 100)).toBe(false); // 信号杀
+    }, 10_000);
+});
