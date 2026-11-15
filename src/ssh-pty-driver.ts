@@ -896,9 +896,15 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
     }
     let aborted = false;
     let p: ReturnType<typeof spawn>;
+    const closeFds = (): void => {
+        // fd 双关防线（Sol 82 P2-8）：启动前取消分支关过一次、catch 再关同编号
+        //——清理期间复用编号的他文件曾报 EBADF。关后置 -1，二次关闭自然跳过
+        for (const fd of [inFd, outFd, errFd]) if (fd >= 0) { try { fsSync.closeSync(fd); } catch { /* 已关 */ } }
+        inFd = outFd = errFd = -1;
+    };
     try {
         if (opts.signal?.aborted) { // spawn 前最后一核（fd 打开窗口内取消）
-            for (const fd of [inFd, outFd, errFd]) fsSync.closeSync(fd);
+            closeFds();
             await cleanup();
             throw Object.assign(new DOMException("exec aborted by AbortSignal（spawn 前检出）", "AbortError"), { outcome: "unknown" });
         }
@@ -906,7 +912,7 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
     } catch (e) {
         // spawn 同步抛错清场（Sol 81 P2-5）：argv 含 NUL 等被 Node 拒启——
         // fd 与三个中转文件曾全部滞留
-        for (const fd of [inFd, outFd, errFd]) if (fd >= 0) { try { fsSync.closeSync(fd); } catch { /* 双关 */ } }
+        closeFds();
         await cleanup();
         throw e;
     }

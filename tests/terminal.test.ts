@@ -987,7 +987,10 @@ describe("Sol 81：并发首挂/restore 严验证", () => {
             { driver: "tmux", terminalId: "SH81b", cwd: "/nonexistent-fx81", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH81b",
-                runCommand: async () => ({ stdout: "__FX_CD_FAIL", stderr: "", exitCode: 0 }), // cd 失败标记
+                runCommand: async (_id: string, cmd: string) => {
+                    const m = cmd.match(/echo (__FX_CDFX_\w+__)/); // nonce 标记回显（cd 失败模拟）
+                    return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 };
+                },
                 destroySession: async () => undefined,
             } as never },
         );
@@ -995,6 +998,88 @@ describe("Sol 81：并发首挂/restore 严验证", () => {
             await expect(drv.init()).rejects.toThrow(/恢复目录失败/); // 修前：静默成功（pwd 停在旧处）
         } finally {
             (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real81;
+        }
+    }, 15_000);
+});
+
+// GPT Sol 八十二期：P1-1 同 cwd 并发首挂——第一挂占位后暂停在 cd 验证，第二挂
+// 曾因「占位=已恢复」跳过验证直接成功（旧目录执行）。验证期互斥。P2-6 探活
+// 抛错（tmux 消失）曾留幽灵占位——全程 try 回滚。P2-7 静态失败标记曾被合法
+// 目录名误判——nonce 化。
+describe("Sol 82：验证互斥/幽灵占位/nonce 标记", () => {
+    test("P1-1 同 cwd 并发首挂：验证在途第二挂被拒（不再跳过验证）", async () => {
+        const real82 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        let releaseCd!: () => void;
+        const cdGate = new Promise<void>((r) => { releaseCd = r; });
+        let cdCount = 0;
+        const mk = (cwd: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH82", cwd, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH82",
+                runCommand: async (_id: string, cmd: string) => {
+                    if (cmd.includes("cd ") && cmd.includes("pwd")) { cdCount++; await cdGate; return { stdout: "ok", stderr: "", exitCode: 0 }; }
+                    return { stdout: "ok", stderr: "", exitCode: 0 };
+                },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            const d1 = mk("/bad-fx82");
+            const p1 = d1.init(); // 首挂：cd 验证挂起（验证在途）
+            await new Promise((r) => setTimeout(r, 20));
+            const d2 = mk("/bad-fx82"); // 同 cwd 第二挂——修前：占位在场→firstAttach=false→跳过验证直接成功
+            await expect(d2.init()).rejects.toThrow(/验证进行中/);
+            releaseCd();
+            await p1;
+            expect(cdCount).toBe(1); // 只有一轮 cd 验证
+            await d1.destroy();
+        } finally {
+            releaseCd();
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real82;
+        }
+    }, 15_000);
+
+    test("P2-6 探活抛错（tmux 消失）：占位回滚（不留幽灵）", async () => {
+        const real82 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => { throw new Error("spawn tmux ENOENT"); };
+        const mk = () => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH82b", cwd: "/x", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH82b",
+                runCommand: async () => ({ stdout: "ok", stderr: "", exitCode: 0 }),
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await expect(mk().init()).rejects.toThrow(/ENOENT/); // 探活抛错（非 exitCode 路径）
+            // 占位必须已回滚：恢复探活后同 cwd 重挂应走首挂路径（不再被幽灵占位挡）
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+            const d = mk();
+            await d.init(); // 修前：此挂被上次失败留下的占位拒绝
+            await d.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real82;
+        }
+    }, 15_000);
+
+    test("P2-7 目录名含标记字样不误判（nonce 标记）", async () => {
+        const real82 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        // 真实 cd 成功但 pwd 输出含旧静态标记字样（模拟目录名撞车）
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH82c", cwd: "/opt/__FX_CD_FAIL_dir", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH82c",
+                runCommand: async () => ({ stdout: "/opt/__FX_CD_FAIL_dir", stderr: "", exitCode: 0 }), // pwd 输出含静态字样
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await drv.init(); // 修前：includes("__FX_CD_FAIL") 误判失败；nonce 化后 pwd 原样不撞
+            await drv.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real82;
         }
     }, 15_000);
 });

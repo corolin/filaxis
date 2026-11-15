@@ -1326,3 +1326,29 @@ describe("Sol 81：残缺条目", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十二期 P1-2：保留指纹但缺目标/环境的残缺主档仍覆盖完整备份——
+// 四要素契约定版（driver+target-or-local+environment+fingerprint）。
+describe("Sol 82：四要素契约", () => {
+    test("缺 target/environment 的残缺条目不作有效提名——完整前代胜出", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env82-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk82 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            writeFileSync(p, JSON.stringify({ layers: { one: mk82("full") }, _fx_rev: "5000000000000-1-mm82" }));
+            writeFileSync(`${p}.111-222-zzzz.fx-old`, JSON.stringify({
+                layers: { one: { connection: { driver: "ssh" }, fingerprint: "fp-kept", discovered_at: "t" } }, // 有指纹缺 target/environment
+                _fx_rev: "9000000000000-1-frag82", _fx_seen: ["5000000000000-1-mm82"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one!.connection.target).toBe("full"); // 修前：残缺条目（保留指纹）覆盖完整备份
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

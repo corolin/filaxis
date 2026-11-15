@@ -211,11 +211,16 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     // 无效条目跳过（Sol 74 P1-3 → Sol 76 P1-2）：null/非对象/数组/**缺必填
     // connection 的空对象**——曾原样并入随压实写进主档
     for (const [k, v] of Object.entries(layers)) {
-        if (v != null && typeof v === "object" && !Array.isArray(v)
-            && typeof v.connection === "object" && v.connection != null
-            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string"
-            && typeof (v as LayerEnvEntry).fingerprint === "string") { // fingerprint 必填（Sol 81 P1-2）
-            dst.layers[k] = v as LayerEnvEntry;
+        // 最小完整契约（Sol 82 P1-2 定版）：残缺条目不并入（driver+target-or-local
+        //+environment+fingerprint 四要素——缺任一跳过）
+        if (v != null && typeof v === "object" && !Array.isArray(v)) {
+            const conn = (v as LayerEnvEntry).connection as { driver?: unknown; target?: unknown } | null | undefined;
+            if (conn != null && typeof conn === "object" && typeof conn.driver === "string"
+                && (conn.driver === "local" || typeof conn.target === "string")
+                && (v as LayerEnvEntry).environment != null && typeof (v as LayerEnvEntry).environment === "object"
+                && typeof (v as LayerEnvEntry).fingerprint === "string") {
+                dst.layers[k] = v as LayerEnvEntry;
+            }
         }
     }
 }
@@ -372,11 +377,16 @@ export class LayerEnvStore {
                 const mentionedInvalid = new Set<string>();
                 const layerEntries = (src: unknown): Record<string, unknown> =>
                     ((src as LayerEnvConfigFile | null)?.layers ?? {}) as Record<string, unknown>;
-                const invalidEntry = (v: unknown): boolean =>
-                    !(v != null && typeof v === "object" && !Array.isArray(v)
-                        && typeof (v as LayerEnvEntry).connection === "object" && (v as LayerEnvEntry).connection != null
-                        && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string"
-                        && typeof (v as LayerEnvEntry).fingerprint === "string"); // fingerprint 必填（Sol 81 P1-2）
+                // 最小完整契约同判（Sol 82 P1-2）：四要素缺任一=无效提名（回救触发）
+                const invalidEntry = (v: unknown): boolean => {
+                    if (v == null || typeof v !== "object" || Array.isArray(v)) return true;
+                    const e = v as LayerEnvEntry;
+                    const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
+                    return !(conn != null && typeof conn === "object" && typeof conn.driver === "string"
+                        && (conn.driver === "local" || typeof conn.target === "string")
+                        && e.environment != null && typeof e.environment === "object"
+                        && typeof e.fingerprint === "string");
+                };
                 for (const src of [anchor.parsed, ...heirs.map(({ d }) => d.parsed)]) {
                     for (const [k, v] of Object.entries(layerEntries(src))) {
                         if (invalidEntry(v) && cfg.layers[k] == null) mentionedInvalid.add(k);
@@ -439,11 +449,18 @@ export class LayerEnvStore {
         // 有效档身份压过可恢复前代。有效条目须含对象 connection（LayerEnvEntry
         // 最小必填）。注意空对象 `{}` 是整档替换的合法清空态（store 自写），
         // 不在废档之列；混入无效条目的档有效，无效条目由 mergeLayers 跳过
-        const validEntry = (v: unknown): boolean =>
-            v != null && typeof v === "object" && !Array.isArray(v)
-            && typeof (v as LayerEnvEntry).connection === "object" && (v as LayerEnvEntry).connection != null
-            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string" // 必填 driver（Sol 77 P1-3）：{"connection":{}} 曾压过前代
-            && typeof (v as LayerEnvEntry).fingerprint === "string"; // 必填 fingerprint（Sol 81 P1-2）：残缺条目 {connection:{driver}} 曾覆盖完整备份
+        const validEntry = (v: unknown): boolean => {
+            if (v == null || typeof v !== "object" || Array.isArray(v)) return false;
+            const e = v as LayerEnvEntry;
+            const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
+            // 最小完整契约（Sol 77→81→82 逐轮收紧的定版）：driver 字符串 + 非 local
+            // 须 target（local 无落点合法）+ environment 对象 + fingerprint 字符串
+            //——缺任一=残缺条目（保留指纹但缺目标/环境的主档曾覆盖完整备份）
+            return conn != null && typeof conn === "object" && typeof conn.driver === "string"
+                && (conn.driver === "local" || typeof conn.target === "string")
+                && e.environment != null && typeof e.environment === "object"
+                && typeof e.fingerprint === "string";
+        };
         const vals = Object.values(layers);
         return vals.length === 0 || vals.some(validEntry);
     }
