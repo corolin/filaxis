@@ -147,8 +147,16 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 }
                 return out;
             },
-            async rm(p, options) { await self.exec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}${q(p)}`); },
-            async mkdir(p, options) { await self.exec(`mkdir ${options?.recursive ? "-p " : ""}${q(p)}`); },
+            // 退出码入闸（Sol 87 P2-7）：rm/mkdir 曾丢 exitCode——对普通文件 mkdir、
+            // 无 force 删缺席路径都报正常完成。凭证纪律同 readFile/writeFile
+            async rm(p, options) {
+                const r = await self.exec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}${q(p)}`);
+                if (r.exitCode !== 0 && !options?.force) throw new Error(`rm 失败（exit=${r.exitCode}）: ${p}`);
+            },
+            async mkdir(p, options) {
+                const r = await self.exec(`mkdir ${options?.recursive ? "-p " : ""}${q(p)}`);
+                if (r.exitCode !== 0) throw new Error(`mkdir 失败（exit=${r.exitCode}）: ${p}`);
+            },
         };
     }
 
@@ -355,10 +363,12 @@ export class TmuxSessionDriver implements RuntimeDriver {
         if (options?.signal) {
             throw new Error("tmux 层 exec 不支持 AbortSignal（runCommand 无中断挂钩）；改用 execSession + stopSession（三态收口）");
         }
-        // cwd 支持（Hydrogen R4 #3）：曾静默丢弃——命令跑在原目录=误操作错误目录文件
-        // 的风险。cd 前缀引用安全 + 失败即整条失败（fail-closed，退出码是数据）
+        // cwd 支持（Hydrogen R4 #3 → Sol 87 P1-6 作用域隔离）：曾静默丢弃；后修
+        // cd 前缀**裸跑在父 shell**——单次 exec 的 cwd 覆盖永久改掉持久 shell 的
+        // 目录（下一条无 cwd 的 pwd 仍在新目录、相对路径全落错）。改子 shell
+        // 隔离：( cd X && cmd )——cd 只活在本条命令；退出码经子 shell 天然透传
         const cmd = options?.cwd
-            ? `cd ${q(options.cwd)} && { ${command}; }`
+            ? `( cd ${q(options.cwd)} && { ${command}; } )`
             : command;
         if (options?.channel === "pty") {
             // tmux 后端本身即 PTY 语义（send-keys/capture-pane）

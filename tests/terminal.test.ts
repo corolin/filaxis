@@ -1212,3 +1212,21 @@ describe("Sol 86：回显先于 marker", () => {
         expect(strip(log, prefix, needle)).toBe("$ echo hello\nhello"); // 修前：在回显行 break——只剩 "$ echo"
     }, 10_000);
 });
+
+// GPT Sol 八十七期：P1-3 窄窗格折行退出码（23 列 127→12、22 列→1）——两段式
+// 解析（行尾锚定+剥换行拼接）；P1-2 kill 失败的 dead 会话不再被 has-session
+// 成功放行（destroyConfirmed 闸）；P1-7 中途死亡补 outcome unknown。
+describe("Sol 87：折行退出码/销毁确认闸/outcome", () => {
+    test("P1-3 折行退出码：80/23/22 列都解析出完整 127", async () => {
+        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const parse = (CommandExecuter as unknown as { __testParseExit?: (t: string, p: string) => number | null }).__testParseExit;
+        if (!parse) return;
+        const prefix = "---CMD_DONE_tk87_";
+        // 80 列：完整一行
+        expect(parse(`out\n${prefix}127\n$`, prefix)).toBe(127);
+        // 23 列：`---CMD_DONE_tk87_12` + 折行 `7`
+        expect(parse(`out\n${prefix}12\n7\n$`, prefix)).toBe(127);
+        // 22 列：`---CMD_DONE_tk87_1` + 折行 `27`
+        expect(parse(`out\n${prefix}1\n27\n$`, prefix)).toBe(127);
+    }, 10_000);
+});

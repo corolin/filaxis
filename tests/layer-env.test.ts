@@ -1573,3 +1573,22 @@ describe("Sol 86：主档分诊/版本标量", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十七期 P1-1：stat/readdir 的 EIO 曾静默当缺席/空列表——upsert 部分
+// 视图落盘丢主档独有条目；压实重读旁路 stat 故障照删恢复文件。全探测面分诊。
+describe("Sol 87：探测面故障", () => {
+    test("主档 stat 故障（EISDIR 母目录）：upsert 抛错不落盘", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env87-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { base: { connection: { driver: "ssh", target: "b" }, environment: { os: "o" }, discovered_at: "t", fingerprint: "f" } }, _fx_rev: "5000000000000-1-m87" }));
+            // 故障注入：主档换目录（stat EISDIR）
+            rmSync(p);
+            mkdirSync(p);
+            const s = new LayerEnvStore(p);
+            await expect(s.upsert("next", { connection: { driver: "ssh", target: "n" }, environment: { os: "o" }, discovered_at: "t", fingerprint: "fn" })).rejects.toThrow(/读故障在场/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+});

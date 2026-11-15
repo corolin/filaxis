@@ -139,8 +139,13 @@ export async function putContent(
         `chown --reference="$__fx_tgt" ${q(out)} 2>/dev/null || true; `;
     const place = opts.forceInplace
         ? `if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi`
-        : `if mv ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
-          `else if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; fi`;
+        : `if mv -T ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
+          `else if mv ${q(out)} "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
+          `else if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; fi; fi`;
+    // 落位三防（Sol 87 P1-5）：①前置目录检查与 mv 之间的竞态——外部把目标换成
+    // 目录后 GNU mv 把临时文件**搬进目录**（mv tmp dir/ = tmp 移入）返回 0。
+    // mv -T（--no-target-directory）精确指目标；不支持 -T 的平台回落裸 mv
+    // 后**落位复验**（[ ! -d ]）堵目录搬入
     const mv = await exec(`test ! -d ${q(remotePath)} || { echo FX_IS_DIR; exit 1; }; { ${tgtSetup}${place}; }`);
     const mvOut = (mv.stdout || "").trim();
     if (mvOut.includes("FX_IS_DIR")) {

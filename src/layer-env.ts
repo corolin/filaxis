@@ -284,26 +284,34 @@ export class LayerEnvStore {
      *  大小写随平台（Sol 66 #4）：Windows/macOS 文件系统大小写不敏感——
      *  case.json 移开旁路后 CASE.JSON 实例曾认不到自己的恢复锚（前缀匹配
      *  大小写敏感）。此类平台前缀与 uniq 段按小写比对（返回路径仍用盘面实名） */
+    /** 列旁路（mtime 升序）。故障透传（Sol 87 P1-1）：readdir/单档 stat 的
+     *  EIO 等真故障曾静默吞成空列表——压实把本轮未成功读取的恢复文件照删。
+     *  非 ENOENT 故障直接抛（collectDocs 归入 readFailures） */
     private async listAsides(): Promise<Array<{ p: string; mtimeMs: number }>> {
-        try {
-            const { readdir } = await import("node:fs/promises");
-            const dir = dirname(this.path);
-            const ci = process.platform === "win32" || process.platform === "darwin";
-            const pre = `${basename(this.path)}.`;
-            const preCmp = ci ? pre.toLowerCase() : pre;
-            const uniqTail = new RegExp(`^\\d+-\\d+-[a-z0-9]{1,12}\\${ASIDE_SUFFIX}$`);
-            const out: Array<{ p: string; mtimeMs: number }> = [];
-            for (const n of await readdir(dir)) {
-                const nCmp = ci ? n.toLowerCase() : n;
-                if (!nCmp.startsWith(preCmp)) continue;
-                if (!uniqTail.test(nCmp.slice(preCmp.length))) continue;
-                const p = join(dir, n); // 盘面实名（大小写不敏感平台按实名开档最稳）
-                try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs }); } catch { /* 竞态消失 */ }
+        const { readdir } = await import("node:fs/promises");
+        const dir = dirname(this.path);
+        const ci = process.platform === "win32" || process.platform === "darwin";
+        const pre = `${basename(this.path)}.`;
+        const preCmp = ci ? pre.toLowerCase() : pre;
+        const uniqTail = new RegExp(`^\\d+-\\d+-[a-z0-9]{1,12}\\${ASIDE_SUFFIX}$`);
+        const out: Array<{ p: string; mtimeMs: number }> = [];
+        const names = await readdir(dir).catch((e: unknown) => {
+            const code = (e as { code?: string }).code;
+            if (code === "ENOENT" || code === "ENOTDIR") return []; // 目录缺席=无旁路
+            throw new Error(`listAsides readdir 故障（${code ?? (e as Error).message}）: ${dir}`);
+        });
+        for (const n of names) {
+            const nCmp = ci ? n.toLowerCase() : n;
+            if (!nCmp.startsWith(preCmp)) continue;
+            if (!uniqTail.test(nCmp.slice(preCmp.length))) continue;
+            const p = join(dir, n); // 盘面实名（大小写不敏感平台按实名开档最稳）
+            try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs }); } catch (e) {
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") throw new Error(`listAsides stat 故障（${code ?? (e as Error).message}）: ${p}`);
+                /* ENOENT=竞态消失（他方舞步收尾）——跳过 */
             }
-            return out.sort((a, b) => a.mtimeMs - b.mtimeMs);
-        } catch {
-            return [];
         }
+        return out.sort((a, b) => a.mtimeMs - b.mtimeMs);
     }
 
     async load(_force = false): Promise<LayerEnvConfigFile> {
@@ -579,8 +587,15 @@ export class LayerEnvStore {
         try {
             dataMtimeMs = (await stat(this.path)).mtimeMs;
             hasData = true;
-        } catch { /* 缺席——旁路承载 */ }
-        const asides = await this.listAsides(); // stat 先于列旁路（Sol 62 P2-3）——次序是读穿舞步窗口的依据，勿动
+        } catch (e) {
+            // stat 分诊（Sol 87 P1-1）：EIO 曾静默当缺席——upsert 部分视图落盘
+            const code = (e as { code?: string }).code;
+            if (code !== "ENOENT") readFailures.push(`${this.path}(stat): ${code ?? (e as Error).message}`);
+        }
+        const asides = await this.listAsides().catch((e: unknown): Array<{ p: string; mtimeMs: number }> => {
+            readFailures.push((e as Error).message); // readdir/stat 真故障（Sol 87 P1-1）——旁路清单不可信
+            return [];
+        }); // stat 先于列旁路（Sol 62 P2-3）——次序是读穿舞步窗口的依据，勿动
         for (const a of asides) {
             await readDoc(a.p, a.mtimeMs, true);
         }
@@ -609,13 +624,16 @@ export class LayerEnvStore {
         if (!hasData) {
             // 主档重探（Sol 64 #1 → Sol 65 #4）：读取自「主档已移开」起步（stat 即
             // 失败）后，写入方可能在任何时刻归位新档——不论旁路扫描是否已捞到旧
-            // 态（曾只在零旁路时重探：捞到旧旁路+新档落位→返回旧值）。缺席即重探
-            try {
-                const st = await stat(this.path);
-                docs.push(makeDoc(st.mtimeMs, false, await readFile(this.path, "utf-8")));
-                dataMtimeMs = st.mtimeMs;
-                hasData = true;
-            } catch { /* 确无档 */ }
+            // 态（曾只在零旁路时重探：捞到旧旁路+新档落位→返回旧值）。缺席即重探。
+            // 重探读失败走 readDoc 分诊（Sol 87 P1-1）：EIO 归账非静默
+            const st = await stat(this.path).catch(() => null);
+            if (st) {
+                await readDoc(this.path, st.mtimeMs, false);
+                if (docs.some((d) => !d.aside)) {
+                    dataMtimeMs = st.mtimeMs;
+                    hasData = true;
+                }
+            }
         }
         return { docs, asides, dataMtimeMs, hasData, readFailures };
     }

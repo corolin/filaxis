@@ -116,6 +116,16 @@ export class StreamSessionManager {
         // Astra 十三轮 #1：此前硬编码 accept-new 在最前，重复 -o 首见生效压掉调用者策略）
         const argv = [...this.sshOpts, ...this.muxFlags(), ...this.destArgs, "--", command];
         const child = this.spawnImpl("ssh", argv, { stdio: ["ignore", "pipe", "pipe"] });
+        // spawn 启动失败前置监听（Sol 87 P2-8）：error 事件异步到达——桥到 start
+        // 的 reject（曾仅 finalizeStream→onExit→窗口 stale，open 照常返回零帧窗、
+        // 调用方收不到 ENOENT）。ready 竞速：已 resolve 则归 exit 路径
+        let startSettled = false;
+        const spawnFailure = new Promise<never>((_, reject) => {
+            child.once("error", (e: Error) => {
+                if (startSettled) return; // start 已返回——错误归流终态路径
+                reject(Object.assign(new Error(`本地 ssh 启动失败（${e.message}）——检查 PATH/可执行文件`), { code: (e as { code?: string }).code, cause: e }));
+            });
+        });
 
         const entry: StreamEntry = {
             sessionId, name: opts.name, command, destKey: this.destKey, child,
@@ -171,7 +181,13 @@ export class StreamSessionManager {
             });
         }
         this.log.info(`[StreamSession ${sessionId}] 流建立（mux=${this.muxFlags().length > 0}）`);
-        return { sessionId, name: opts.name };
+        // 启动失败竞速（Sol 87 P2-8）：error 在 start await 窗口内到达即 reject；
+        // 正常返回前置 settle 标记（后续 error 走流终态）
+        const handle = await Promise.race([spawnFailure, new Promise<"ok">((r) => setImmediate(() => r("ok")))]).then(
+            (r) => { if (r !== "ok") throw new Error("unreachable"); return { sessionId, name: opts.name }; },
+        );
+        startSettled = true;
+        return handle;
     }
 
     /** 流式 watcher：行到达即匹配（真流，无轮询间隔） */

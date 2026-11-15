@@ -74,6 +74,11 @@ export class CommandExecuter {
     private chains = new Map<string, Promise<unknown>>();
     /** 因终态不可确认被销毁的会话（自愈：重建后 has-session 探活即清除标记） */
     private deadSessions = new Set<string>();
+    /** 销毁确认集（Sol 87 P1-2）：本进程曾观测到该 id **消失**（kill 成功或
+     *  探活确认不在）——dead 自愈放行的必要条件。kill-session 失败的会话
+     *  不入此集：同名会话可能仍是旧前台任务持有，has-session 成功不能证明
+     *  是重建的新会话（曾放行把下一条命令文本送进上一条任务） */
+    private destroyConfirmed = new Set<string>();
     private log: FilaxisLogger = noopLogger;
 
     /** 配置注入（SDK 组装期一次性；测试可覆盖） */
@@ -100,12 +105,21 @@ export class CommandExecuter {
      *   重建后探活自愈）——绝不定时强行复用。
      */
     async execute(id: string, command: string, opts: RunOptions = {}): Promise<TerminalExecResult> {
-        // 自愈探活：dead 标记在但会话已被重建（同 id respawn）→ 清标记放行
+        // 自愈探活：dead 标记在但会话已被重建（同 id respawn）→ 清标记放行。
+        // **销毁确认闸**（Sol 87 P1-2）：放行须 destroyConfirmed 在场（本进程
+        // 观测过该 id 消失）——kill 失败的会话同名在场≠重建，曾放行致上一条
+        // 前台任务收到下一条命令文本
         if (this.deadSessions.has(id)) {
+            if (!this.destroyConfirmed.has(id)) {
+                throw new CommandExecError(
+                    `tmux session '${id}' 销毁结果未确认（kill-session 曾失败——同名会话可能仍被旧前台任务持有）——拒绝复用。请换 id 重建层或先确认旧会话已消失`,
+                );
+            }
             try {
                 const r = await TmuxInvoker.tryInvoke(["has-session", "-t", id]);
                 if (r.exitCode === 0) {
                     this.deadSessions.delete(id);
+                    this.destroyConfirmed.delete(id);
                     this.sttyOff.delete(id);
                 } else {
                     throw new CommandExecError(
@@ -214,7 +228,10 @@ export class CommandExecuter {
                         partial, "unknown",
                     );
                 }
-                try { await TmuxInvoker.invoke(["kill-session", "-t", id]); } catch { /* 已死 */ }
+                try {
+                    await TmuxInvoker.invoke(["kill-session", "-t", id]);
+                    this.destroyConfirmed.add(id); // kill 成功=销毁已确认（自愈闸钥匙）
+                } catch { /* kill 失败——不入 destroyConfirmed（Sol 87 P1-2）：同名在场≠重建 */ }
                 this.deadSessions.add(id);
                 this.sttyOff.delete(id);
                 throw new CommandExecError(
@@ -288,6 +305,7 @@ export class CommandExecuter {
                 throw new CommandExecError(
                     `tmux session '${id}' died while waiting for command to complete.`,
                     CommandExecuter.extractPartialOutput(buffer, markerPrefix, markerEchoNeedle, binaryDetected, binaryBytes),
+                    "unknown", //（Sol 87 P1-7）：命令已发、无完成哨兵——终态未核实（批处理/SDK 按 outcome 分诊重试）
                 );
             }
             // 注意：不在此处重置 lastActivityAt（Hydrogen R2 #1）——「会话存活」≠
@@ -312,13 +330,18 @@ export class CommandExecuter {
         };
     }
 
+    static __testParseExit(paneText: string, markerPrefix: string): number | null { // 测试导出面
+        return CommandExecuter.parseExitCode(paneText, markerPrefix);
+    }
+
     private static parseExitCode(paneText: string, markerPrefix: string): number | null {
-        for (const line of paneText.split("\n")) {
-            if (!line.includes(markerPrefix)) continue;
-            if (line.includes(`echo ${markerPrefix}`)) continue;
-            const match = line.match(new RegExp(`${markerPrefix}(\\d+)`));
-            if (match) return parseInt(match[1] ?? "0", 10);
-        }
+        // 折行防截断（Sol 87 P1-3）：窄窗格把 `---CMD_DONE_tk_127` 折断——单行
+        // 解析曾把折断的数字前缀（127→12→1）当完整退出码。折断行无法从单行
+        // 形态区分「完整/折断」（数字到行尾两者同形）——统一剥换行拼接后锚定
+        //（PTY 软折行无分隔语义；\d+ 只取哨兵后连续数字段，后续提示符自然截止）
+        const flat = paneText.split("\n").filter((l) => !l.includes(`echo ${markerPrefix}`)).join("").replace(/\r/g, "");
+        const m2 = flat.match(new RegExp(`${markerPrefix}(\\d+)`));
+        if (m2) return parseInt(m2[1] ?? "0", 10);
         return null;
     }
 

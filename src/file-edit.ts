@@ -323,10 +323,14 @@ async function casWrite(
         // stat -c 读八进制权限（GNU）→ chmod NNN 数字模式全平台通吃；stat 缺席 best-effort
         `__fx_pm=$(stat -c '%a' "$__fx_tgt" 2>/dev/null); [ -n "$__fx_pm" ] && chmod "$__fx_pm" ${sr.qp}.fx-tmp 2>/dev/null; ` +
         `chown --reference="$__fx_tgt" ${sr.qp}.fx-tmp 2>/dev/null || true; `;
+    // mv -T + 落位复验（Sol 87 P1-5 同 file-transfer）：CAS 校验与 mv 之间目标
+    // 被换成目录时，裸 mv 把 fx-tmp **搬进目录**返回 0——FX_OK 携带目录 stat
+    // 也曾被采信。-T 精确指目标；回落平台复验 [ -d ] 堵搬入
     const place = forceInplace
         ? `if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi`
-        : `if mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null; then echo "FX_OK $(${stampOf})"; ` +
-          `else if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; fi`;
+        : `if mv -T ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null; then echo "FX_OK $(${stampOf})"; ` +
+          `else if mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo "FX_OK $(${stampOf})"; ` +
+          `else if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; fi; fi`;
     const cmd =
         `( if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
         `else echo FX_DEGRADED_NO_LOCK; fi; ` +

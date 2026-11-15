@@ -1270,3 +1270,23 @@ describe("Sol 85：中转本地拒启直报", () => {
         await expect(run(["-V", "bad" + NUL], "x")).rejects.toThrow(/bad|NUL|null/i);
     }, 15_000);
 });
+
+// GPT Sol 八十七期 P1-4：PTY attach 的 spawn ssh ENOENT 曾是 unhandled error
+// 事件——崩宿主（调用方 try/catch 收不到）。归 readyRejecter。
+describe("Sol 87：attach spawn error", () => {
+    test.skipIf(!Bun.which("ssh"))("PATH 置空真 ENOENT：握手拒绝带 code，不崩宿主", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { attach(args: string[]): void; handshake(w: string): Promise<void> };
+        // 真实 ENOENT：env.PATH 置空让 spawn("ssh") 拒启——error 事件异步到达
+        //（node:fs/promises 不可 monkey-patch 同理——用环境真实故障，不做 stub）
+        const link = new Link();
+        const savedPath = process.env.PATH;
+        process.env.PATH = "";
+        try {
+            link.attach(["-G"]);
+            await expect(link.handshake("probe")).rejects.toMatchObject({ name: "Error" }); // 修前：uncaught 崩宿主
+        } finally {
+            process.env.PATH = savedPath;
+        }
+    }, 15_000);
+});

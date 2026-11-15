@@ -71,6 +71,16 @@ class PtyLink {
         this.fallbackSeen = undefined;
         const spawnAt = Date.now();
         this.proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
+        // spawn error 监听（Sol 87 P1-4）：ssh 不在 PATH 时 ENOENT 是异步 error
+        // 事件——无监听器=uncaughtException 崩**宿主**（调用方 try/catch 收不到
+        // 拒绝）。归 readyRejecter/pendingExitFailure（建链失败语义，非超时指纹）
+        this.proc.once("error", (e: Error) => {
+            const err = new Error(`本地 ssh 启动失败（${e.message}）——检查 PATH/可执行文件: ${(e as { code?: string }).code ?? ""}`);
+            const wrap = Object.assign(err, { code: (e as { code?: string }).code, cause: e });
+            if (this.readyRejecter) this.readyRejecter(wrap);
+            else this.pendingExitFailure = wrap;
+            this.onUnexpectedExit?.();
+        });
         // 双流各自解码器（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂——两管道交替喂
         // 同一 decoder 会混流撕字，必须 per-stream
         const outDec = new StringDecoder("utf-8");
@@ -356,6 +366,8 @@ export interface SshPtyDriverOptions {
 }
 
 /** SSH Transport driver：每层一条独立多跳 PTY + 双通道 exec + 远端会话/文件 */
+export const __testPtyLink = PtyLink; // 测试导出面（attach spawn error 验证）
+
 export class SshPtyDriver implements RuntimeDriver {
     readonly descriptor: RuntimeDescriptor;
     readonly fs: FileSystemDriver;
