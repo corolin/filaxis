@@ -354,10 +354,18 @@ export class CommandExecuter {
         return blank(curr) ? "" : curr; // 全屏重绘整屏返回（宁重复不丢）；空屏零信息
     }
 
-    /** 剥 marker/echo 噪声得纯净 stdout（marker 行起全停） */
+    /** 剥 marker/echo 噪声得纯净 stdout（marker 行起全停）。
+     *  回显判定**先于** marker 判定（Sol 86 P1-1）：包装命令的回显行含
+     *  `echo ---CMD_DONE_..` 字样——markerPrefix 是其子串，曾先撞 marker 检查
+     *  在回显行处 break——首执行（stty -echo 尚未生效）真实输出全被截掉 */
+    static __testStrip(log: string, markerPrefix: string, markerEchoNeedle: string): string { // 测试导出面
+        return CommandExecuter.stripMarkerNoise(log, markerPrefix, markerEchoNeedle);
+    }
+
     private static stripMarkerNoise(log: string, markerPrefix: string, markerEchoNeedle: string): string {
         const resultLines: string[] = [];
         for (const line of log.split("\n")) {
+            if (line.includes(markerEchoNeedle)) continue; // 回显行（echo 前缀在场）——先于 marker 检查跳过
             if (line.includes(markerPrefix)) {
                 // 保留 marker 前的前缀（Hydrogen R7 #1）：无尾换行输出的末行与 marker
                 // 粘连（hello---CMD_DONE_.._0）——前缀是真实输出不得随 marker 丢弃
@@ -365,7 +373,6 @@ export class CommandExecuter {
                 if (prefix !== "") resultLines.push(prefix);
                 break;
             }
-            if (line.includes(markerEchoNeedle)) continue;
             if (/__FX_DRAIN_[0-9a-z]+/.test(line)) continue; // DRAINING 探测哨兵执行输出行
             if (/__FX_DR%s/.test(line) || /AIN_[0-9a-z]{4,10}'?\s*$/.test(line)) continue; // 分段哨兵的命令回显（折行残段）
             if (/stty -echo/.test(line)) continue; // 初始化残章

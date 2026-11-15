@@ -1521,3 +1521,55 @@ describe("Sol 85：写路径故障中止/packages 元素", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十六期：P1-2 主档 EIO 曾静默跳过（inline catch）——load 用旁路覆盖、
+// upsert 部分态落盘。主档读失败分诊（EIO 进 readFailures、ENOENT 走恢复路径）。
+// P1-3 environment.python:42 曾通过校验——版本标量须字符串。
+describe("Sol 86：主档分诊/版本标量", () => {
+    const mk86 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}`, python: "3.12.0" },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("P1-2 主档读故障（EISDIR 注入）：upsert 抛错、旁路/主档内容留命", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env86-"));
+        try {
+            const p = join(dir, "env.json");
+            const aside = `${p}.111-222-iiii.fx-old`;
+            writeFileSync(aside, JSON.stringify({ layers: { asideOnly: mk86("asideOnly") }, _fx_rev: "9000000000000-1-a86" }));
+            mkdirSync(p); // 主档路径放目录——readFile EISDIR（真故障）
+            const s = new LayerEnvStore(p);
+            await expect(s.upsert("next", mk86("next"))).rejects.toThrow(/读故障在场/); // 修前：部分态落盘+清旁路
+            expect(existsSync(aside)).toBe(true);
+            // 故障解除后主档独有条目本就该在——此处主档本就坏，验证的是旁路未丢
+            rmSync(p, { recursive: true, force: true });
+            writeFileSync(p, JSON.stringify({ layers: { mainOnly: mk86("mainOnly") }, _fx_rev: "1000000000000-1-m86" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.mainOnly?.connection.target).toBe("mainOnly");
+            expect(cfg.layers.asideOnly?.connection.target).toBe("asideOnly"); // 旁路内容未丢
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("P1-3 environment.python:42：残缺提名不作有效——字符串前代胜出 + matchLayers 不崩", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env86b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { one: mk86("full") }, _fx_rev: "5000000000000-1-m86b" }));
+            writeFileSync(`${p}.111-222-jjjj.fx-old`, JSON.stringify({
+                layers: { one: { connection: { driver: "ssh", target: "x" }, environment: { python: 42 }, discovered_at: "t", fingerprint: "fp-num" } }, // 数字版本
+                _fx_rev: "9000000000000-1-n86", _fx_seen: ["5000000000000-1-m86b"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one?.environment.python).toBe("3.12.0"); // 修前：42 覆盖
+            const { matchLayers } = await import("../src/layer-env.js");
+            expect(() => matchLayers(cfg, ["python>=3.12"])).not.toThrow();
+            expect(matchLayers(cfg, ["python>=3.12"]).length).toBe(1);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

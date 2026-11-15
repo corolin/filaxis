@@ -273,15 +273,20 @@ export class TmuxSessionDriver implements RuntimeDriver {
             this.attached = true;
         }
         if (this.descriptor.cwd && this.descriptor.terminalId && !isAttach) {
-            // cd 仅 spawn 路径（Sol 77 P1-1）：attach 路径的 cd 会改共享会话状态
-            try {
-                await this.terminal.runCommand(
-                    this.descriptor.terminalId,
-                    // 引号安全化（Astra 五轮 P1：双引号不挡 $()/反引号注入）；best-effort 语义不变
-                    `cd ${q(this.descriptor.cwd)} 2>/dev/null || true`,
-                    10_000,
+            // cd 仅 spawn 路径（Sol 77 P1-1）：attach 路径的 cd 会改共享会话状态。
+            // exitCode 严验证（Sol 86 P2-4）：`|| true` best-effort 曾把不存在的
+            // cwd 吞成成功（句柄声明该目录、实际 pwd 停在旧处）——与 attach 路径
+            // 同款 exitCode 判定，失败即拒（新建层 cwd 错=配置错误，快失败）
+            const probe = await this.terminal.runCommand(
+                this.descriptor.terminalId,
+                `cd ${q(this.descriptor.cwd)}`,
+                10_000,
+            ).catch(() => ({ stdout: "", exitCode: 1 }));
+            if (probe.exitCode !== 0) {
+                throw new Error(
+                    `tmux 层目录切换失败：cd '${this.descriptor.cwd}' 退出码 ${probe.exitCode}（目录不存在或无权限）——init 拒绝半挂（句柄声明与实际目录不符）。请修正 cwd 或先建目录`,
                 );
-            } catch { /* cwd 恢复失败不阻断初始化 */ }
+            }
         }
     }
 

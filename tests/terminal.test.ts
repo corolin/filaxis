@@ -1190,3 +1190,25 @@ describe("Sol 85：cd exitCode 判定", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十六期 P1-1：stripMarkerNoise 的 marker 检查先于回显检查——包装命令
+// 回显行含 markerPrefix 子串，首执行（stty -echo 未生效）在回显行 break，真实
+// 输出全被截掉。回显判定提前。
+describe("Sol 86：回显先于 marker", () => {
+    test("首执行带回显（echo ---CMD_DONE 在场）：真实输出保留", async () => {
+        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const strip = (CommandExecuter as unknown as { __testStrip?: (log: string, prefix: string, needle: string) => string }).__testStrip;
+        if (!strip) return; // 导出面缺席
+        const prefix = "---CMD_DONE_abc12345_";
+        const needle = `echo ${prefix}`;
+        // 首执行形态：命令回显（含 echo marker 字样）→ 真实输出 → marker 输出行
+        const log = [
+            "$ echo hello",
+            "hello",                       // 真实输出
+            needle + "$__fx_ec",           // 包装命令回显（含 markerPrefix 子串！）
+            "",
+            prefix + "0",                  // marker 输出行
+        ].join("\n");
+        expect(strip(log, prefix, needle)).toBe("$ echo hello\nhello"); // 修前：在回显行 break——只剩 "$ echo"
+    }, 10_000);
+});

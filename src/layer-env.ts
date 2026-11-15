@@ -215,10 +215,19 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
         //+environment+fingerprint 四要素——缺任一跳过）
         if (v != null && typeof v === "object" && !Array.isArray(v)) {
             const conn = (v as LayerEnvEntry).connection as { driver?: unknown; target?: unknown } | null | undefined;
+        const scalarsOk = (env: unknown): boolean => {
+            const e = env as Record<string, unknown> | null | undefined;
+            if (e == null) return true;
+            for (const k of ["os", "python", "node", "bun", "java", "cuda"]) {
+                const v = e[k];
+                if (v != null && typeof v !== "string") return false; // 版本标量须字符串（Sol 86 P1-3）：python:42 曾通过校验、matchLayers .split 崩
+            }
+            return true;
+        };
             const env = (v as LayerEnvEntry).environment as { packages?: unknown } | null | undefined;
             const pkgsM = env?.packages;
             const pkgsOkM = pkgsM == null || (Array.isArray(pkgsM) && pkgsM.every((x) => typeof x === "string"));
-            const envOk = env != null && typeof env === "object" && !Array.isArray(env) && pkgsOkM;
+            const envOk = env != null && typeof env === "object" && !Array.isArray(env) && pkgsOkM && scalarsOk(env);
             if (conn != null && typeof conn === "object" && typeof conn.driver === "string"
                 && envOk
                 && typeof (v as LayerEnvEntry).fingerprint === "string") {
@@ -391,10 +400,20 @@ export class LayerEnvStore {
                     if (v == null || typeof v !== "object" || Array.isArray(v)) return true;
                     const e = v as LayerEnvEntry;
                     const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
+                const scalarsOkR = (env: unknown): boolean => {
+                    const e = env as Record<string, unknown> | null | undefined;
+                    if (e == null) return true;
+                    for (const k of ["os", "python", "node", "bun", "java", "cuda"]) {
+                                const v = e[k];
+                                if (v != null && typeof v !== "string") return false; // 版本标量须字符串（Sol 86 P1-3）：python:42 曾通过校验、matchLayers .split 崩
+                    }
+                    return true;
+                };
+
                     const envR = e.environment as { packages?: unknown } | null | undefined;
                     const pkgsR = envR?.packages;
                     const pkgsOkR = pkgsR == null || (Array.isArray(pkgsR) && pkgsR.every((x) => typeof x === "string"));
-                    const envOk = envR != null && typeof envR === "object" && !Array.isArray(envR) && pkgsOkR;
+                    const envOk = envR != null && typeof envR === "object" && !Array.isArray(envR) && pkgsOkR && scalarsOkR(envR);
                     return !(conn != null && typeof conn === "object" && typeof conn.driver === "string"
                         && envOk
                         && typeof e.fingerprint === "string");
@@ -470,9 +489,18 @@ export class LayerEnvStore {
             // P1-4：字符串 packages 曾覆盖备份并让 matchLayers 崩）+ fingerprint
             // 字符串。target **不作要求**（Sol 84 P1-3：embedded 等自定义驱动的
             // 默认层无落点合法——白名单豁免曾漏掉第三方驱动，探测记录被过滤删除）
+        const scalarsOk = (env: unknown): boolean => {
+            const e = env as Record<string, unknown> | null | undefined;
+            if (e == null) return true;
+            for (const k of ["os", "python", "node", "bun", "java", "cuda"]) {
+                const v = e[k];
+                if (v != null && typeof v !== "string") return false; // 版本标量须字符串（Sol 86 P1-3）：python:42 曾通过校验、matchLayers .split 崩
+            }
+            return true;
+        };
             const pkgs = (e.environment as { packages?: unknown } | null | undefined)?.packages;
-            const pkgsOk = pkgs == null || (Array.isArray(pkgs) && pkgs.every((x) => typeof x === "string")); // 元素须字符串（Sol 85 P1-4：[42] 曾通过数组检查、matchLayers .split 崩）
-            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment) && pkgsOk;
+            const pkgsOk = pkgs == null || (Array.isArray(pkgs) && pkgs.every((x) => typeof x === "string"));
+            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment) && pkgsOk && scalarsOk(e.environment);
             return conn != null && typeof conn === "object" && typeof conn.driver === "string"
                 && envOk
                 && typeof e.fingerprint === "string";
@@ -559,18 +587,23 @@ export class LayerEnvStore {
         if (hasData) {
             try {
                 docs.push(makeDoc(dataMtimeMs, false, await readFile(this.path, "utf-8")));
-            } catch {
-                // stat 与读之间现行态被移开——重列旁路（rename 先于读失败，必见）；
-                // 主档也重读（Sol 63 P2-3）：完整提交可能已跨过我们的读
-                //（move→link→清旁路全毕）——只重扫旁路曾读成空档
-                const known = new Set(asides.map((x) => x.p));
-                for (const a of await this.listAsides()) {
-                    if (known.has(a.p)) continue;
-                    try { docs.push(makeDoc(a.mtimeMs, true, await readFile(a.p, "utf-8"))); } catch { /* 竞态消失 */ }
+            } catch (e) {
+                // **主档读失败分诊**（Sol 86 P1-2）：EIO 等真故障必须进 readFailures
+                //（曾静默跳过——load 用旁路覆盖主档、upsert 部分态落盘，主档独有
+                // 条目永久丢失）；ENOENT=舞步移开走重列旁路恢复路径
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") {
+                    readFailures.push(`${this.path}: ${code ?? (e as Error).message}`);
+                } else {
+                    // stat 与读之间现行态被移开——重列旁路（rename 先于读失败，必见）；
+                    // 主档也重读（Sol 63 P2-3）：完整提交可能已跨过我们的读
+                    const known = new Set(asides.map((x) => x.p));
+                    for (const a of await this.listAsides()) {
+                        if (known.has(a.p)) continue;
+                        await readDoc(a.p, a.mtimeMs, true);
+                    }
+                    await readDoc(this.path, (await stat(this.path).catch(() => ({ mtimeMs: dataMtimeMs }))).mtimeMs, false);
                 }
-                try {
-                    docs.push(makeDoc((await stat(this.path)).mtimeMs, false, await readFile(this.path, "utf-8")));
-                } catch { /* 仍缺席——旁路已并入 */ }
             }
         }
         if (!hasData) {
@@ -865,7 +898,7 @@ export function matchLayers(cfg: LayerEnvConfigFile, needs: string[]): LayerMatc
             if (name === "cuda") return spec.cuda != null;
             if (name === "python" || name === "node" || name === "bun" || name === "java") {
                 const have = spec[name];
-                if (!have) return false;
+                if (typeof have !== "string") return false; // 防御（Sol 86 P1-3）：非字符串标量按缺席——不再 .split 崩
                 if (!op || !want) return true;
                 return compareVersion(extractVersion(have) ?? "0", want, op);
             }

@@ -950,9 +950,13 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
         throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转已终止本地 shell，远端进程状态未核实）", "AbortError"), { outcome: "unknown" });
     }
     if (spawnErr) {
-        // 本地启动失败直报（Sol 84 P2 → Sol 85 P2 重落）：修前吞成「无哨兵
-        // exit=null」——本地拒启≠远端结果未知
-        throw new Error(`本地 ssh 启动失败（${spawnErr.message}）——检查 PATH/可执行文件。中转模式（FILAXIS_SSH_STDIO_MODE=inherit）`);
+        // 本地启动失败直报（Sol 84 P2 → Sol 85 P2 → Sol 86 P2-5 结构化）：
+        // 修前吞成「无哨兵 exit=null」；上轮直报但包成普通 Error——code/cause
+        // 全丢（消费方按 code 分诊不可用）。code 透传 + cause 挂原错误
+        throw Object.assign(
+            new Error(`本地 ssh 启动失败（${spawnErr.message}）——检查 PATH/可执行文件。中转模式（FILAXIS_SSH_STDIO_MODE=inherit）`),
+            { code: (spawnErr as { code?: string }).code, cause: spawnErr },
+        );
     }
     return { stdout: out, stderr: err, exitCode };
 }
