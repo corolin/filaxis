@@ -640,3 +640,72 @@ describe("Sol 75：持久 shell 语义/组长身份", () => {
         }
     }, 20_000);
 });
+
+// GPT Sol 七十六期 #4：组长退出后孙进程持组+**有 .st 记录**——pidGuardedKill
+// 曾因 /proc/$p 不可读整段卡死（stop 转一圈 unknown、孙进程照跑）。组长确死
+// 放行组信号。#5：has-session 1 但 list-sessions **真列出**该会话 → 探测失败
+// 保留（曾只查退出码就删）。
+describe("Sol 76：组长死放行组信号/registry 列表甄别", () => {
+    test.skipIf(!Bun.which("sh"))("#4 组长死+孙活+有 .st：stopSession 终止孙进程", async () => {
+        const sh = Bun.which("sh")!;
+        const g = Bun.spawnSync([sh, "-c",
+            "setsid sh -c 'sleep 8 >/dev/null 2>&1 </dev/null & exit 0' >/dev/null 2>&1 </dev/null & " +
+            "w=$!; sleep 0.3; awk '{print $5}' /proc/$w/stat 2>/dev/null"]);
+        const pgid = g.stdout.toString().trim();
+        if (!/^\d+$/.test(pgid)) return;
+        mkdirSync("/tmp/filaxis-sessions", { recursive: true });
+        const sid = `fxst76${Math.random().toString(36).slice(2, 6)}`;
+        const base = `/tmp/filaxis-sessions/${sid}`;
+        writeFileSync(`${base}.pid`, pgid);
+        writeFileSync(`${base}.pgid`, pgid);
+        writeFileSync(`${base}.st`, "12345.67"); // 有身份戳记录（组长已死——读不出）
+        const stubTerminal = {
+            spawnSession: async () => "fx76",
+            runCommand: async (_id: string, cmd: string, _t?: number) => {
+                const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+                p.stdin.write(cmd);
+                await p.stdin.end();
+                const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+                return { stdout, stderr: "", exitCode: code };
+            },
+            destroySession: async () => undefined,
+        };
+        try {
+            const drv = new TmuxSessionDriver(
+                { driver: "tmux", terminalId: "fx76", config: { launchCmd: "bash" } } as never,
+                { terminalManager: stubTerminal as never },
+            );
+            expect((await drv.verifySession(sid)).status).toBe("running"); // 孙进程当家
+            const t0 = Date.now();
+            const st = await drv.stopSession(sid); // 修前：unknown（.st 卡死不放行）+孙进程照跑
+            expect(["stopped", "unknown"]).toContain(st.status);
+            // 组信号已放行——孙进程应死（组探不到了）
+            const probe = Bun.spawnSync([sh, "-c", `/bin/kill -0 -- -${pgid} 2>/dev/null && echo ALIVE || echo DEAD`]);
+            expect(probe.stdout.toString().trim()).toBe("DEAD");
+            void t0;
+        } finally {
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code; /bin/kill -KILL -- -${pgid} 2>/dev/null; true`]);
+        }
+    }, 30_000);
+
+    test("#5 registry：has-session 1 但列表真含该会话 → 保留（探测失败）", async () => {
+        const real = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        const mk = async () => {
+            const dir = mkdtempSync(join(tmpdir(), "fx-reg76-"));
+            const reg = new SessionRegistry(() => dir);
+            await reg.save({ id: "z76", driver: "tmux", createdAt: new Date().toISOString(), lastUsedAt: new Date().toISOString() } as never);
+            return { dir, reg };
+        };
+        try {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async (args: string[]) =>
+                args[0] === "list-sessions"
+                    ? { stdout: "z76: 1 windows\nother: 2 windows\n", stderr: "", exitCode: 0 } // 服务端健在且真列出 z76
+                    : { stdout: "", stderr: "", exitCode: 1 }; // has-session 单次失败
+            const a = await mk();
+            await a.reg.init();
+            expect(existsSync(join(a.dir, "z76.json"))).toBe(true); // 修前：只查 list 退出码→删了活会话 profile
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real;
+        }
+    }, 10_000);
+});

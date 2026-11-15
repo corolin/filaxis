@@ -85,11 +85,12 @@ export class SessionRegistry {
                     this.log.info(`[reconcile] 会话 [${id}] 仍存活，保留（已重连）`);
                 } else if (r.exitCode === 1) {
                     // exit 1 双义（Sol 74 #5 → Sol 75 P2-6）：会话不存在 **或** 服务端
-                    // 不可用（socket 目录建不起来等——TMUX_TMPDIR 指向坏路径时
-                    // has-session 同样返 1）。二次甄别：list-sessions 通=服务端健在
-                    // →会话真不存在，可删；不通=环境异常，保守保留
+                    // 不可用/单次探测抽风。二次甄别（Sol 76 P2-5）：list-sessions
+                    // **通且真列出该会话** → has-session 的 1 是探测失败（会话明明
+                    // 在）→保留；通但列表无此会话 → 真不存在可删；不通 → 环境异常保留
                     const ls = await TmuxInvoker.tryInvoke(["list-sessions"]);
-                    if (ls.exitCode === 0) {
+                    const listed = ls.exitCode === 0 && ls.stdout.split("\n").some((l) => l.startsWith(`${id}:`));
+                    if (ls.exitCode === 0 && !listed) {
                         await this.remove(id);
                         removed++;
                         this.log.warn(`[reconcile] 僵尸会话 [${id}] 已清理`);

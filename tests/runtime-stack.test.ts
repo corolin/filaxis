@@ -8,6 +8,7 @@ import { RuntimeStack } from "../src/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import { RuntimeFactory } from "../src/factory.js";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
+import { TmuxSessionDriver } from "../src/tmux-driver.js";
 import { SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { enterStepsOf } from "../src/ssh-helpers.js";
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
@@ -1200,5 +1201,64 @@ describe("Sol 75：重挂复用/回收/事件桥", () => {
         await (shared as unknown as MockLayerDriver).destroy();
         RuntimeStack.evictDriver({ driver: "kA", target: "x" } as RuntimeDescriptor);
         RuntimeStack.evictDriver({ driver: "kB", target: "x" } as RuntimeDescriptor);
+    }, 15_000);
+});
+
+// GPT Sol 七十六期：P1-1 terminalId 索引裸 id 串线（不同 driver/不同 cwd 的重挂
+// 拿到第一个 driver）；#3 同 tid 多实例 destroy 连坐会话；#6 全逐出后同 driver
+// 复用事件不转发（扇出未重装）。
+describe("Sol 76：索引判别/会话引用计数/扇出重装", () => {
+    test("P1-1 不同 driver 同 tid 不串线；同 driver 不同 cwd 重挂不命中索引", async () => {
+        let madeA = 0, madeB = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("tmA", (d: RuntimeDescriptor) => { madeA++; return new MockLayerDriver({ ...d, terminalId: "TX" }) as unknown as RuntimeDriver; });
+        stack.registerDriver("tmB", (d: RuntimeDescriptor) => { madeB++; return new MockLayerDriver({ ...d, terminalId: "TX" }) as unknown as RuntimeDriver; });
+        const a = await stack.connect({ driver: "tmA", target: "t" } as RuntimeDescriptor);
+        const b = await stack.connect({ driver: "tmB", target: "t" } as RuntimeDescriptor); // 同 tid 不同 driver
+        expect(b).not.toBe(a); // 修前：索引裸 id 命中——命令送到第一个 driver
+        expect(madeA).toBe(1); expect(madeB).toBe(1);
+        // 同 driver 不同 cwd 重挂：不命中（cwd 是身份列）——新建实例（attach 计数护会话）
+        const c1 = await stack.connect({ driver: "tmA", target: "t", cwd: "/x" } as RuntimeDescriptor);
+        expect(c1).not.toBe(a); // 修前：裸 id 命中旧实例（cwd 被吞、命令落旧目录）
+        RuntimeStack.evictDriverHome(a); RuntimeStack.evictDriverHome(b); RuntimeStack.evictDriverHome(c1);
+        for (const d of [a, b, c1]) await (d as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+
+    test("#3 同 tid 两实例：destroy 一个不杀共享会话（归零才杀）", async () => {
+        const destroyedSessions: string[] = [];
+        const mkDrv = (tid: string, cwd?: string) => new TmuxSessionDriver(
+            // 无 terminalId 走 spawn 路径（stub 起"会话"）——避免 init 的真 tmux 探测
+            { driver: "tmux", cwd, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => tid,
+                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                destroySession: async (id: string) => { destroyedSessions.push(id); },
+            } as never },
+        );
+        const d1 = mkDrv("SH76", "/tmp");
+        const d2 = mkDrv("SH76", "/"); // 不同 cwd 重挂——第二实例共指同一会话
+        await d1.init(); await d2.init();
+        await d1.destroy(); // 修前：直接杀会话——d2 报会话不存在
+        expect(destroyedSessions).toEqual([]); // 还有持有人
+        await d2.destroy(); // 归零
+        expect(destroyedSessions).toEqual(["SH76"]);
+    }, 15_000);
+
+    test("#6 全逐出后同 driver 复用：事件仍转发（扇出重装）", async () => {
+        const shared = new MockLayerDriver({ driver: "reb76" } as RuntimeDescriptor) as unknown as RuntimeDriver & {
+            sessions: { onEvent?: (e: unknown) => void; __fxSubs?: Set<(e: unknown) => void>; __fxOrig?: (e: unknown) => void };
+        };
+        shared.sessions = { onEvent: () => undefined }; // 桥守卫要求 onEvent 是函数（driver 自有消费方）
+        const stack = new RuntimeStack();
+        stack.registerDriver("reb76", () => shared); // 工厂恒返同实例（复用场景）
+        await stack.addLayer("a", { driver: "reb76", target: "x" });
+        const got: unknown[] = [];
+        stack.events.on("*", (e) => got.push(e));
+        stack.evict({ driver: "reb76", target: "x" } as RuntimeDescriptor); // 全逐出（onEvent 还原）
+        await stack.connect({ driver: "reb76", target: "x" } as RuntimeDescriptor); // 复用同 driver 重连
+        shared.sessions.onEvent?.({ type: "exit", sessionId: "s" }); // 会话侧发事件
+        expect(got.length).toBe(1); // 修前：0（扇出没重装——订阅进了没人遍历的集合）
+        await stack.removeLayer("a", { destroy: true });
+        await new Promise((r) => setTimeout(r, 20));
     }, 15_000);
 });

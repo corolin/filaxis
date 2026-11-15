@@ -101,9 +101,13 @@ export class RuntimeStack {
             };
         }).sessions;
         if (!sm || typeof sm.onEvent !== "function") return;
-        if (!sm.__fxSubs) {
-            sm.__fxSubs = new Set();
-            sm.__fxOrig = sm.onEvent.bind(sm);
+        // 扇出重装（Sol 76 P2-6）：全逐出时 onEvent 曾还原为 __fxOrig 而 __fxSubs
+        // 空集仍在——复用同 driver 重连时守卫跳过重装，订阅者进了一个没人遍历
+        // 的集合（exit 事件不再转发）。__fxOrig 在场且 onEvent 即原回调=需重装
+        const tornDown = sm.__fxOrig != null && sm.onEvent === sm.__fxOrig;
+        if (!sm.__fxSubs || tornDown) {
+            sm.__fxSubs = sm.__fxSubs ?? new Set();
+            sm.__fxOrig ??= sm.onEvent.bind(sm);
             sm.onEvent = (e: SessionEvent) => {
                 try { sm.__fxOrig?.(e); } catch { /* 原消费方异常不外溢（AC-10 同哲学） */ }
                 for (const sub of sm.__fxSubs ?? []) {
@@ -192,10 +196,12 @@ export class RuntimeStack {
         const tid = (descriptor as { terminalId?: string }).terminalId;
         if (tid) {
             const byTid = RuntimeStack.terminalIdIndex.get(tid);
-            if (byTid) {
+            // finalKey 全等才复用（Sol 76 P1-1）：不同 driver/target/config/cwd 的
+            // 同 id 重挂不串线——走正常 miss 路径（新建/逐出后重连，互不冒认）
+            if (byTid && byTid.finalKey === key) {
                 this.log.debug(`[Filaxis] terminalId 命中复用连接: ${tid}`);
-                this.bridgeSessionEvents(byTid);
-                return byTid;
+                this.bridgeSessionEvents(byTid.drv);
+                return byTid.drv;
             }
         }
         const cached = RuntimeStack.driverCache.get(key);
@@ -240,7 +246,7 @@ export class RuntimeStack {
             // 拿回已销毁实例。不重挂键（descriptor 可能丢 config 信息、砸键控
             // 缓存）——逐出按「本 driver 实际挂在哪个键」实例核对（evictDriverHome）
             { const keys = RuntimeStack.driverHomeKeys.get(drv) ?? new Set<string>(); keys.add(key); RuntimeStack.driverHomeKeys.set(drv, keys); }
-            { const t = (drv.descriptor as { terminalId?: string }).terminalId; if (t) RuntimeStack.terminalIdIndex.set(t, drv); }
+            { const t = (drv.descriptor as { terminalId?: string }).terminalId; if (t) RuntimeStack.terminalIdIndex.set(t, { finalKey: this.cacheKeyOf(drv.descriptor), drv }); } // 终态键（含 init 补写的 terminalId）——与重挂方算键同口径
             this.log.info(`[Filaxis] 新建连接: ${descriptor.driver}/${descriptor.target ?? "local"}`);
             return drv;
         })();
@@ -303,7 +309,7 @@ export class RuntimeStack {
             if (!keys || keys.size === 0) {
                 RuntimeStack.driverHomeKeys.delete(drv);
                 const t = (drv.descriptor as { terminalId?: string }).terminalId;
-                if (t && RuntimeStack.terminalIdIndex.get(t) === drv) RuntimeStack.terminalIdIndex.delete(t);
+                if (t && RuntimeStack.terminalIdIndex.get(t)?.drv === drv) RuntimeStack.terminalIdIndex.delete(t);
                 fullyEvicted = true;
             }
         }
@@ -359,9 +365,11 @@ export class RuntimeStack {
      *  不一致；自定义工厂还可让**同一 driver 挂多键**（曾只记一个键——销毁后
      *  另一键仍能拿到已销毁实例）。按实例记全部键，逐出实例核对全清 */
     private static readonly driverHomeKeys = new Map<RuntimeDriver, Set<string>>();
-    /** terminalId → driver 索引（Sol 75 P2-1）：tmux 会话全局唯一——带 id 重挂
-     *  直接复用既有 driver，杜绝双实例共指一会话互杀 */
-    private static readonly terminalIdIndex = new Map<string, RuntimeDriver>();
+    /** terminalId → {finalKey, driver} 索引（Sol 75 P2-1 → Sol 76 P1-1 判别化）：
+     *  tmux 会话全局唯一——带 id 重挂复用既有 driver。**finalKey 判别**：命中
+     *  须缓存键全等（driver/target/config/cwd 一致）——裸 id 索引曾把不同工厂、
+     *  不同 cwd 的重挂串到第一个 driver（命令送错驱动/目录） */
+    private static readonly terminalIdIndex = new Map<string, { finalKey: string; drv: RuntimeDriver }>();
     private activeName?: string;
 
     /** 层注册表只读视图 */

@@ -1136,3 +1136,44 @@ describe("Sol 75：数组条目档", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 七十六期 P1-2：`{"layers":{"one":{}}}`（缺必填 connection 的空对象
+// 条目）曾通过校验——后继旁路压过前代有效条目、空对象落进主档。
+describe("Sol 76：空对象条目档", () => {
+    const mk76 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}` },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("全空对象条目旁路不作锚——有效前代胜出", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env76-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { one: mk76("real") }, _fx_rev: "5000000000000-1-mm76" }));
+            writeFileSync(`${p}.111-222-pppp.fx-old`, JSON.stringify({ layers: { one: {} }, _fx_rev: "9000000000000-1-empty76" }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one!.connection.target).toBe("real"); // 修前：one={}（空对象压过前代）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("混入空对象条目的有效档：空对象不落盘", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env76b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { good: mk76("good"), bad: {} }, _fx_rev: "9000000000000-1-mix76" }));
+            const s = new LayerEnvStore(p);
+            const cfg = await s.load();
+            expect(cfg.layers.good).toBeTruthy();
+            expect(cfg.layers.bad).toBeUndefined();
+            await s.upsert("next", mk76("next"));
+            const onDisk = JSON.parse(readFileSync(p, "utf-8")) as LayerEnvConfigFile;
+            expect(onDisk.layers.bad).toBeUndefined(); // 修前：{} 写进主档
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

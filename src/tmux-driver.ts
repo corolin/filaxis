@@ -28,6 +28,11 @@ export interface TmuxDriverOptions {
     logger?: FilaxisLogger;
 }
 
+/** 同 terminalId 的在册 driver 数（Sol 76 P2-1）：不同 cwd/描述符的重挂会各建
+ *  driver 实例但**共指同一 tmux 会话**——任一 destroy 曾直接杀会话连坐其余层。
+ *  模块级计数：归零才真 destroySession（driver 实例各自独立，会话是共享物） */
+const sessionAttachRefs = new Map<string, number>();
+
 export class TmuxSessionDriver implements RuntimeDriver {
     descriptor: RuntimeDescriptor;
     fs: FileSystemDriver;
@@ -158,6 +163,10 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
             }
         }
+        { // 在册登记（Sol 76 P2-1）：spawn 与重挂 attach 同权计数
+            const tid = this.descriptor.terminalId!;
+            sessionAttachRefs.set(tid, (sessionAttachRefs.get(tid) ?? 0) + 1);
+        }
         if (this.descriptor.cwd && this.descriptor.terminalId) {
             try {
                 await this.terminal.runCommand(
@@ -174,7 +183,9 @@ export class TmuxSessionDriver implements RuntimeDriver {
     private ownedSessions = new Set<string>();
 
     /** destroy：只停**本实例**启动的后台进程（审查问题 1：全目录扫杀会误杀同机其他
-     * Filaxis 实例/其他层的任务——/tmp/filaxis-sessions 是共享目录），再销毁会话 */
+     * Filaxis 实例/其他层的任务——/tmp/filaxis-sessions 是共享目录），再销毁会话——
+     * **引用计数护会话**（Sol 76 P2-1）：同 terminalId 的其他 driver 实例仍在
+     *用时（不同 cwd 重挂等）不杀会话，归零才真销毁 */
     async destroy(): Promise<void> {
         if (this.descriptor.terminalId) {
             for (const sid of this.ownedSessions) {
@@ -188,7 +199,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 } catch { /* best-effort：单个会话清理失败不阻断其余 */ }
             }
             this.ownedSessions.clear();
-            await this.terminal.destroySession(this.descriptor.terminalId);
+            const tid = this.descriptor.terminalId;
+            const refs = Math.max(0, (sessionAttachRefs.get(tid) ?? 1) - 1);
+            if (refs === 0) {
+                sessionAttachRefs.delete(tid);
+                await this.terminal.destroySession(tid);
+            } else {
+                sessionAttachRefs.set(tid, refs); // 他实例仍持有——会话留命
+            }
         }
     }
 
@@ -434,13 +452,18 @@ export class TmuxSessionDriver implements RuntimeDriver {
     private pidGuardedKill(base: string, sig: "TERM" | "KILL" = "TERM"): string {
         // 组感知（Hydrogen R5 #3）：.pgid==pid 时组杀全树（/bin/kill 绝对路径——dash
         // kill 内建不认负 PID）；缺席/不匹配回落单杀
+        // 组长已死放行组信号（Sol 76 P2-3）：.st 比对要求 /proc/$p 可读——组长
+        // 退出后孙进程持组存活时比不出来，曾整段卡死（stopSession 转一圈
+        // unknown、孙进程照跑）。放行条件=组长确死（kill -0 失败）：组若仍活
+        // 必是我组孙进程（pgid 被我成员持有不可复用）；复用组的新组长必活、
+        // 走不进此分支（活组长戳不符仍拦截）
         return (
             `p=$(cat ${q(base)}.pid 2>/dev/null); [ -n "$p" ] && { ` +
             `s=$(cat ${q(base)}.st 2>/dev/null); ` +
-            `{ [ -z "$s" ] || [ "$s" = "$(awk '{print $22}' /proc/$p/stat 2>/dev/null)" ] && { ` +
+            `{ [ -z "$s" ] || [ "$s" = "$(awk '{print $22}' /proc/$p/stat 2>/dev/null)" ] || ! kill -0 "$p" 2>/dev/null; } && { ` +
             `g=$(cat ${q(base)}.pgid 2>/dev/null); ` +
             `if [ -n "$g" ] && [ "$g" = "$p" ]; then /bin/kill -${sig} -- "-$g" 2>/dev/null; ` +
-            `else kill -${sig} "$p" 2>/dev/null; fi; }; }; }; true`
+            `else kill -${sig} "$p" 2>/dev/null; fi; }; }; true`
         );
     }
     /** 会话核实（unknown 闭环）：.code 在场=exited（真实码）；否则 kill -0 实测 pid
