@@ -14,6 +14,7 @@
  * - logger 注入；自动重连（3 次退避）/层状态机/退化哨兵全平移
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import * as fsSync from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import * as crypto from "node:crypto";
 import type {
@@ -881,8 +882,8 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
     // 直 spawn + 文件 fd（Sol 80 P1-1/P2-5）：无 shell——cmd 的 %VAR% 展开曾改写
     // -i 密钥路径等参数字面量；shell 包装还使 kill 只杀到外层 shell（ssh 替身
     // 照跑到底）。stdio 三路全部接文件句柄（沙箱拦的是**匿名管道**，文件句柄
-    // 放行）——无引用、无展开、kill 直达 ssh 本体
-    const fsSync = await import("node:fs");
+    // 放行）——无引用、无展开、kill 直达 ssh 本体。
+    // fsSync 静态导入（Sol 81 P2-4）：动态 import 的 await 窗口内取消曾被放过
     let inFd = -1, outFd = -1, errFd = -1;
     try {
         inFd = fsSync.openSync(inFile, "r");
@@ -894,7 +895,21 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
         throw e;
     }
     let aborted = false;
-    const p = spawn("ssh", argv, { stdio: [inFd, outFd, errFd] });
+    let p: ReturnType<typeof spawn>;
+    try {
+        if (opts.signal?.aborted) { // spawn 前最后一核（fd 打开窗口内取消）
+            for (const fd of [inFd, outFd, errFd]) fsSync.closeSync(fd);
+            await cleanup();
+            throw Object.assign(new DOMException("exec aborted by AbortSignal（spawn 前检出）", "AbortError"), { outcome: "unknown" });
+        }
+        p = spawn("ssh", argv, { stdio: [inFd, outFd, errFd] });
+    } catch (e) {
+        // spawn 同步抛错清场（Sol 81 P2-5）：argv 含 NUL 等被 Node 拒启——
+        // fd 与三个中转文件曾全部滞留
+        for (const fd of [inFd, outFd, errFd]) if (fd >= 0) { try { fsSync.closeSync(fd); } catch { /* 双关 */ } }
+        await cleanup();
+        throw e;
+    }
     const exitCode = await new Promise<number | null>((resolve) => {
         const onAbort = () => { aborted = true; p.kill("SIGTERM"); resolve(null); };
         const t = opts.timeoutMs ? setTimeout(() => { p.kill("SIGTERM"); resolve(null); }, opts.timeoutMs) : null;

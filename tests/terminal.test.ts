@@ -945,3 +945,56 @@ describe("Sol 80：未声明 cwd 守卫/竞态归零", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十一期：P1-1 并发首挂同会话不同 cwd——两边都过守卫各自 cd、
+// 后到者覆盖（两边 pwd 同值）。cwd 早登记（同步占位）。P2-3 restore 到不存在的
+// 目录曾静默成功（句柄声明与实际不符）——cd 严格验证失败即拒。
+describe("Sol 81：并发首挂/restore 严验证", () => {
+    test("P1-1 并发首挂不同 cwd：先到者胜、后到者拒（不再互相覆盖）", async () => {
+        const real81 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        let releaseProbe!: () => void;
+        const probeGate = new Promise<void>((r) => { releaseProbe = r; });
+        let probeCount = 0;
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => { probeCount++; if (probeCount === 1) await probeGate; return { stdout: "", stderr: "", exitCode: 0 }; };
+        const cds: string[] = [];
+        const mk = (cwd: string) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH81", cwd, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH81",
+                runCommand: async (_id: string, cmd: string) => { if (cmd.includes("cd ")) cds.push(cmd); return { stdout: "ok", stderr: "", exitCode: 0 }; },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            const d1 = mk("/");
+            const d2 = mk("/tmp");
+            const p1 = d1.init(); // 首挂 /：cwd 早登记（同步）后探活挂起
+            await new Promise((r) => setTimeout(r, 20));
+            await expect(d2.init()).rejects.toThrow(/已以 cwd/); // 修前：d2 也过守卫（登记在探活后）→ 双 cd 互相覆盖
+            releaseProbe();
+            await p1;
+            expect(cds.filter((c) => c.includes("/tmp")).length).toBe(0); // d2 的 cd 从未执行
+            await d1.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real81;
+        }
+    }, 15_000);
+
+    test("P2-3 restore 到不存在的目录：拒绝（不再静默半挂）", async () => {
+        const real81 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH81b", cwd: "/nonexistent-fx81", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH81b",
+                runCommand: async () => ({ stdout: "__FX_CD_FAIL", stderr: "", exitCode: 0 }), // cd 失败标记
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await expect(drv.init()).rejects.toThrow(/恢复目录失败/); // 修前：静默成功（pwd 停在旧处）
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real81;
+        }
+    }, 15_000);
+});

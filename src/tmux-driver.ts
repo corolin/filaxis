@@ -168,9 +168,10 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 throw new Error(`tmux 会话 '${tid0}' 销毁进行中——稍后重试重挂或新建层（Sol 78 #5：在途销毁的会话 has-session 尚可通过，重挂拿到的将是将死句柄）`);
             }
             const wanted = this.descriptor.cwd;
-            // 重挂 cwd 冲突守卫（Sol 77 P1-1 → Sol 80 P1-3 扩面）：会话工作目录是
-            // **会话级状态**。在册实例（**含未声明 cwd 的**——其实际目录不可知，
-            // 曾被跳过检查）与重挂声明的 cwd 冲突/不可证一致 → 拒绝
+            // **先登记后异步**（Sol 81 P1-1）：检查→登记之间曾隔着探活/cd 两个
+            // await——并发首挂同会话两边都过守卫、各自 cd，后到者覆盖先到者的
+            // 目录（两边 pwd 都=/tmp）。JS 单线程：同步完成守卫+登记，异步探活
+            // 失败再回滚——并发第二挂进守卫时第一挂已在册（不同 cwd 即拒）
             if (wanted != null) {
                 const cwds = sessionCwds.get(tid0);
                 if (cwds) {
@@ -192,41 +193,63 @@ export class TmuxSessionDriver implements RuntimeDriver {
                     }
                 }
             }
+            const firstAttach = !sessionCwds.has(tid0);
+            const refsBefore = sessionAttachRefs.get(tid0) ?? 0;
+            // **cwd 早登记**（同步，守卫面即刻生效；refs 仍走共享块——探活失败/
+            // 竞态拒只回滚 cwd）：并发第二挂在守卫处即见第一挂的目录占位
+            { const key = wanted ?? ""; const cwds = sessionCwds.get(tid0) ?? new Map<string, number>(); cwds.set(key, (cwds.get(key) ?? 0) + 1); sessionCwds.set(tid0, cwds); }
+            const rollback = (): void => {
+                const cwds = sessionCwds.get(tid0);
+                const key = wanted ?? "";
+                const n = (cwds?.get(key) ?? 1) - 1;
+                if (n > 0) cwds!.set(key, n);
+                else { cwds?.delete(key); if (cwds && cwds.size === 0) sessionCwds.delete(tid0); }
+            };
             // 重连探活（Hydrogen R9 #3）：restore(snap) 携 terminalId 时曾静默成功——
             // 宿主重启/tmux server 已退要到首次 exec 才报错。显式 has-session 探测，
             // 死会话立即抛错（快失败优于延迟失败），不自动重建（消费方决定重建或换层）
-            const refsBefore = sessionAttachRefs.get(tid0) ?? 0;
             const alive = await TmuxInvoker.tryInvoke(["has-session", "-t", tid0]);
             if (alive.exitCode !== 0) {
+                rollback();
                 throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
             }
-            // 首挂 cd（Sol 79 P1-3）：attach 时 cwd 只在本进程**无任何在册实例**
-            //（cwd 注册表整表缺席）才执行——快照 restore 的会话本进程没人用过、
-            // pwd 是旧目录；他实例在册（无论声明与否）=共享会话状态不动的纪律保持
-            if (wanted != null && !sessionCwds.has(tid0)) {
-                try {
-                    await this.terminal.runCommand(tid0, `cd ${q(wanted)} 2>/dev/null || true`, 10_000);
-                } catch { /* cwd 恢复失败不阻断初始化 */ }
+            // 首挂 cd + 严格验证（Sol 79 P1-3 → Sol 81 P2-3）：attach 时 cwd 只在
+            // 本进程无任何在册实例才执行（restore 的会话 pwd 是旧目录）；cd 后 pwd
+            // 复核——目录不存在曾静默成功（句柄声明该目录、实际停在旧处）
+            if (wanted != null && firstAttach) {
+                const probe = await this.terminal.runCommand(
+                    tid0,
+                    `cd ${q(wanted)} 2>/dev/null && pwd || echo __FX_CD_FAIL`,
+                    10_000,
+                ).catch(() => ({ stdout: "__FX_CD_FAIL", stderr: "", exitCode: 1 }));
+                if (probe.stdout.includes("__FX_CD_FAIL")) { // 只判失败标记——pwd 精确比对受 PTY 回显/波浪号展开干扰
+                    rollback();
+                    throw new Error(
+                        `tmux 会话 '${tid0}' 恢复目录失败：cd '${wanted}' 未生效（目录不存在或无权限）——restore 拒绝半挂（句柄声明与实际目录不符）。请修正快照 cwd 或先建目录`,
+                    );
+                }
             }
-            // 探活-登记竞态守卫（Sol 79 #5 → Sol 80 #4 双向校准）：**登记紧前**终检
-            //（探活/cd 两个 await 窗口内的销毁全兜住）。**归零判据**：仅当此前有
-            // 在册（refsBefore>0）而现在归零——多引用销毁其一（2→1）另一层仍在用
-            // 是合法场景（曾因降量被误拒）；首次 restore（refsBefore=0）放行
+            // 探活-登记竞态守卫（Sol 79 #5 → Sol 80 #4）：**归零判据**——仅当此前有
+            // 在册（refsBefore>0）而现在归零（我们自己的登记也被清=整会话被销毁）。
+            // 多引用销毁其一（2→1）合法放行；首挂（refsBefore=0）放行
             if ((refsBefore > 0 && (sessionAttachRefs.get(tid0) ?? 0) === 0) || sessionDestroying.has(tid0)) {
+                rollback();
                 throw new Error(`tmux 会话 '${tid0}' 在重挂探活期间被销毁（竞态检出）——请重试重挂或新建层`);
             }
         }
         { // 在册登记（Sol 76 P2-1）：spawn 与重挂 attach 同权计数。
           // **登记即置位**（Sol 77 P1-2）：attach 探活失败抛错时未曾登记——
-          // destroy 的引用扣减曾照扣（?? 1 把缺席当 1），原层会话被连带销毁
+          // destroy 的引用扣减曾照扣（?? 1 把缺席当 1），原层会话被连带销毁。
+          // cwd：spawn 在此登记；attach 已在守卫段**早登记**（Sol 81 P1-1 同步
+          // 占位）——此处再记会双计（销毁清不净、守卫永拦）
             const tid = this.descriptor.terminalId!;
             sessionAttachRefs.set(tid, (sessionAttachRefs.get(tid) ?? 0) + 1);
-            { // cwd 计数登记（Sol 78 P1-4 → Sol 80 P1-3）：未声明 cwd 以 "" 键登记
-              //（在册事实本身是守卫依据——实际目录不可知也要挡不同 cwd 的重挂）
-              const cwds = sessionCwds.get(tid) ?? new Map<string, number>();
-              const key = this.descriptor.cwd ?? "";
-              cwds.set(key, (cwds.get(key) ?? 0) + 1);
-              sessionCwds.set(tid, cwds); }
+            if (!isAttach) {
+                const cwds = sessionCwds.get(tid) ?? new Map<string, number>();
+                const key = this.descriptor.cwd ?? "";
+                cwds.set(key, (cwds.get(key) ?? 0) + 1);
+                sessionCwds.set(tid, cwds);
+            }
             this.attached = true;
         }
         if (this.descriptor.cwd && this.descriptor.terminalId && !isAttach) {

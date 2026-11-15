@@ -1299,3 +1299,30 @@ describe("Sol 80：回救面全档", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十一期 P1-2：`{connection:{driver:"ssh"}}`（缺 target/指纹等）残缺
+// 条目曾通过校验——永久覆盖完整备份并删除旁路。fingerprint 必填。
+describe("Sol 81：残缺条目", () => {
+    test("缺 fingerprint 的残缺条目不作有效提名——完整前代胜出", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env81-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk81 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            writeFileSync(p, JSON.stringify({ layers: { one: mk81("full") }, _fx_rev: "5000000000000-1-mm81" }));
+            writeFileSync(`${p}.111-222-yyyy.fx-old`, JSON.stringify({
+                layers: { one: { connection: { driver: "ssh" } } }, // 残缺（无 fingerprint/target）
+                _fx_rev: "9000000000000-1-frag81", _fx_seen: ["5000000000000-1-mm81"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one!.connection.target).toBe("full"); // 修前：残缺条目覆盖完整备份
+            expect(typeof cfg.layers.one!.fingerprint).toBe("string");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

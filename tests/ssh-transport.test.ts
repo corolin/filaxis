@@ -1242,3 +1242,18 @@ describe("Sol 80：中转直 spawn", () => {
         expect(r.stdout).toContain(literal); // 修前（win）：被 cmd 展开成环境变量值
     }, 15_000);
 });
+
+// GPT Sol 八十一期：P2-5 spawn 同步抛错（argv 含 NUL）泄漏中转文件与描述符。
+describe("Sol 81：中转 spawn 清场", () => {
+    test("P2-5 argv 含 NUL：spawn 拒启即清场（.in/.out/.err 不留盘）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<unknown> }).__testFileRedirect;
+        if (!run) return;
+        const os = await import("node:os");
+        const before = (await import("node:fs")).readdirSync(os.tmpdir()).filter((f) => f.includes("fx-ssh-io"));
+        const NUL = String.fromCharCode(0);
+        await expect(run(["-V", "bad" + NUL + "arg"], "x")).rejects.toThrow(); // 含 NUL 由 Node 拒
+        const after = (await import("node:fs")).readdirSync(os.tmpdir()).filter((f) => f.includes("fx-ssh-io"));
+        expect(after.length).toBe(before.length); // 修前：+3（.in/.out/.err 滞留）
+    }, 15_000);
+});

@@ -213,7 +213,8 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     for (const [k, v] of Object.entries(layers)) {
         if (v != null && typeof v === "object" && !Array.isArray(v)
             && typeof v.connection === "object" && v.connection != null
-            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string") {
+            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string"
+            && typeof (v as LayerEnvEntry).fingerprint === "string") { // fingerprint 必填（Sol 81 P1-2）
             dst.layers[k] = v as LayerEnvEntry;
         }
     }
@@ -374,7 +375,8 @@ export class LayerEnvStore {
                 const invalidEntry = (v: unknown): boolean =>
                     !(v != null && typeof v === "object" && !Array.isArray(v)
                         && typeof (v as LayerEnvEntry).connection === "object" && (v as LayerEnvEntry).connection != null
-                        && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string");
+                        && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string"
+                        && typeof (v as LayerEnvEntry).fingerprint === "string"); // fingerprint 必填（Sol 81 P1-2）
                 for (const src of [anchor.parsed, ...heirs.map(({ d }) => d.parsed)]) {
                     for (const [k, v] of Object.entries(layerEntries(src))) {
                         if (invalidEntry(v) && cfg.layers[k] == null) mentionedInvalid.add(k);
@@ -440,7 +442,8 @@ export class LayerEnvStore {
         const validEntry = (v: unknown): boolean =>
             v != null && typeof v === "object" && !Array.isArray(v)
             && typeof (v as LayerEnvEntry).connection === "object" && (v as LayerEnvEntry).connection != null
-            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string"; // 必填 driver（Sol 77 P1-3）：{"connection":{}} 曾压过前代
+            && typeof (v as { connection: { driver?: unknown } }).connection.driver === "string" // 必填 driver（Sol 77 P1-3）：{"connection":{}} 曾压过前代
+            && typeof (v as LayerEnvEntry).fingerprint === "string"; // 必填 fingerprint（Sol 81 P1-2）：残缺条目 {connection:{driver}} 曾覆盖完整备份
         const vals = Object.values(layers);
         return vals.length === 0 || vals.some(validEntry);
     }
