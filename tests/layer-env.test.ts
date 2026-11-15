@@ -1475,3 +1475,49 @@ describe("Sol 84：读故障/无 target 自定义驱动/packages 形状", () => 
         }
     }, 15_000);
 });
+
+// GPT Sol 八十五期：P1-2 upsert/压实的二次读取遇 EIO 曾照删旁路；P1-4
+// packages:[42] 曾通过数组检查、matchLayers .split 崩。
+describe("Sol 85：写路径故障中止/packages 元素", () => {
+    const mk85 = (k: string): LayerEnvEntry => ({
+        connection: { driver: "ssh", target: k },
+        environment: { os: `os-${k}`, packages: ["torch@2.4"] },
+        discovered_at: new Date().toISOString(),
+        fingerprint: `fp-${k}`,
+    });
+
+    test("P1-2 upsert 遇旁路读故障：抛错不落盘（旁路留命）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env85-"));
+        try {
+            const p = join(dir, "env.json");
+            const aside = `${p}.111-222-gggg.fx-old`;
+            writeFileSync(p, JSON.stringify({ layers: { main: mk85("main") }, _fx_rev: "5000000000000-1-m85" }));
+            mkdirSync(aside); // EISDIR 故障注入（Bun fs/promises 只读不可 monkey-patch）
+            const s = new LayerEnvStore(p);
+            await expect(s.upsert("next", mk85("next"))).rejects.toThrow(/读故障在场/); // 修前：stale:false 落盘并清旁路
+            expect(existsSync(aside)).toBe(true); // 旁路未被删
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.main?.connection.target).toBe("main"); // 主档独有条目未丢（部分态没落盘）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("P1-4 packages:[42]：残缺提名不作有效——字符串数组前代胜出 + matchLayers 不崩", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env85b-"));
+        try {
+            const p = join(dir, "env.json");
+            writeFileSync(p, JSON.stringify({ layers: { one: mk85("full") }, _fx_rev: "5000000000000-1-m85b" }));
+            writeFileSync(`${p}.111-222-hhhh.fx-old`, JSON.stringify({
+                layers: { one: { connection: { driver: "ssh", target: "x" }, environment: { packages: [42] }, discovered_at: "t", fingerprint: "fp-num" } }, // 数字元素
+                _fx_rev: "9000000000000-1-n85", _fx_seen: ["5000000000000-1-m85b"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one?.environment.packages?.[0]).toBe("torch@2.4"); // 修前：[42] 覆盖
+            const { matchLayers } = await import("../src/layer-env.js");
+            expect(() => matchLayers(cfg, ["torch"])).not.toThrow();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

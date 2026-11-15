@@ -216,8 +216,9 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
         if (v != null && typeof v === "object" && !Array.isArray(v)) {
             const conn = (v as LayerEnvEntry).connection as { driver?: unknown; target?: unknown } | null | undefined;
             const env = (v as LayerEnvEntry).environment as { packages?: unknown } | null | undefined;
-            const envOk = env != null && typeof env === "object" && !Array.isArray(env)
-                && (env.packages == null || Array.isArray(env.packages));
+            const pkgsM = env?.packages;
+            const pkgsOkM = pkgsM == null || (Array.isArray(pkgsM) && pkgsM.every((x) => typeof x === "string"));
+            const envOk = env != null && typeof env === "object" && !Array.isArray(env) && pkgsOkM;
             if (conn != null && typeof conn === "object" && typeof conn.driver === "string"
                 && envOk
                 && typeof (v as LayerEnvEntry).fingerprint === "string") {
@@ -391,8 +392,9 @@ export class LayerEnvStore {
                     const e = v as LayerEnvEntry;
                     const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
                     const envR = e.environment as { packages?: unknown } | null | undefined;
-                    const envOk = envR != null && typeof envR === "object" && !Array.isArray(envR)
-                        && (envR.packages == null || Array.isArray(envR.packages));
+                    const pkgsR = envR?.packages;
+                    const pkgsOkR = pkgsR == null || (Array.isArray(pkgsR) && pkgsR.every((x) => typeof x === "string"));
+                    const envOk = envR != null && typeof envR === "object" && !Array.isArray(envR) && pkgsOkR;
                     return !(conn != null && typeof conn === "object" && typeof conn.driver === "string"
                         && envOk
                         && typeof e.fingerprint === "string");
@@ -468,8 +470,9 @@ export class LayerEnvStore {
             // P1-4：字符串 packages 曾覆盖备份并让 matchLayers 崩）+ fingerprint
             // 字符串。target **不作要求**（Sol 84 P1-3：embedded 等自定义驱动的
             // 默认层无落点合法——白名单豁免曾漏掉第三方驱动，探测记录被过滤删除）
-            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment)
-                && ((e.environment as { packages?: unknown }).packages == null || Array.isArray((e.environment as { packages?: unknown }).packages));
+            const pkgs = (e.environment as { packages?: unknown } | null | undefined)?.packages;
+            const pkgsOk = pkgs == null || (Array.isArray(pkgs) && pkgs.every((x) => typeof x === "string")); // 元素须字符串（Sol 85 P1-4：[42] 曾通过数组检查、matchLayers .split 崩）
+            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment) && pkgsOk;
             return conn != null && typeof conn === "object" && typeof conn.driver === "string"
                 && envOk
                 && typeof e.fingerprint === "string";
@@ -589,7 +592,8 @@ export class LayerEnvStore {
     private async compact(aged: Array<{ p: string; mtimeMs: number }>): Promise<void> {
         const release = await this.acquireLock();
         try {
-            const fresh = await this.readMergedRaw();
+            const { cfg: fresh, readFailures } = await this.readMergedChecked();
+            if (readFailures.length > 0) return; // 读故障中止压实（Sol 85 P1-2）：旁路留盘
             await this.saveLocked(fresh, () => release.verifyHeld());
             const { unlink } = await import("node:fs/promises");
             for (const a of aged) await unlink(a.p).catch(() => undefined);
@@ -598,10 +602,15 @@ export class LayerEnvStore {
         }
     }
 
-    /** 盘面全量读（旁路+data 按序戳/mtime 排序并+新旧门控——load 的纯读核） */
+    /** 盘面全量读+读故障透传（Sol 85 P1-2：压实的二次读取遇 EIO 曾照删旁路
+     *  ——一次 load 返回恢复条目、二次读取时条目已永久消失） */
+    private async readMergedChecked(): Promise<{ cfg: LayerEnvConfigFile; readFailures: string[] }> {
+        const { docs, readFailures } = await this.collectDocs();
+        return { cfg: LayerEnvStore.mergeDocs(docs), readFailures };
+    }
+
     private async readMergedRaw(): Promise<LayerEnvConfigFile> {
-        const { docs } = await this.collectDocs();
-        return LayerEnvStore.mergeDocs(docs);
+        return (await this.readMergedChecked()).cfg;
     }
 
     /** 原子写（公共）：抢跨实例文件锁后走 saveLocked（含锁属复核——Sol 59 P2-1：
@@ -774,8 +783,13 @@ export class LayerEnvStore {
                 try {
                     // 锁内强制重读（Sol 63 P1-2）：mtime 缓存在同刻写入下失明——
                     // A 缓存{a}+B 同刻写 b 后，A 持锁 upsert 曾从旧缓存取基线写
-                    // {a,c}，b 蒸发。写者不信缓存，锁内永远读盘面新鲜态
-                    const cfg = await this.load(true);
+                    // {a,c}，b 蒸发。写者不信缓存，锁内永远读盘面新鲜态。
+                    // **读故障中止**（Sol 85 P1-2）：EIO 挡住的旁路曾照常丢——
+                    // upsert 以部分态落盘并清旁路=stale:false 谎报+数据丢失
+                    const { cfg, readFailures } = await this.readMergedChecked();
+                    if (readFailures.length > 0) {
+                        throw new Error(`LayerEnvStore 读故障在场——upsert 拒绝以部分态落盘（${readFailures[0]}）。请解除故障后重试: ${key}`);
+                    }
                     const existing = cfg.layers[key];
                     if (existing && !force && existing.fingerprint !== entry.fingerprint) {
                         return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
@@ -856,7 +870,7 @@ export function matchLayers(cfg: LayerEnvConfigFile, needs: string[]): LayerMatc
                 return compareVersion(extractVersion(have) ?? "0", want, op);
             }
             // 包名匹配（matchNames 别名 + @ 版本）
-            const pkgList = Array.isArray(spec.packages) ? spec.packages : []; // 防御（Sol 84 P1-4）：损坏 packages 不再崩查询
+            const pkgList = (Array.isArray(spec.packages) ? spec.packages : []).filter((x) => typeof x === "string"); // 防御（Sol 84/85 P1-4）：损坏/非字符串元素不再崩查询
             const pkg = pkgList.find((p) => {
                 const base = p.split("@")[0]!;
                 const def = PROBE_PACKAGES.find((d) => base === d.key || d.matchNames.includes(base));

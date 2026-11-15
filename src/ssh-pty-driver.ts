@@ -895,6 +895,7 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
         throw e;
     }
     let aborted = false;
+    let spawnErr: Error | undefined; // 本地启动错误（Sol 84 P2 上轮补丁断言失败未落盘——本轮重落+验证）
     let p: ReturnType<typeof spawn>;
     const closeFds = (): void => {
         // fd 双关防线（Sol 82 P2-8）：启动前取消分支关过一次、catch 再关同编号
@@ -909,6 +910,7 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
             throw Object.assign(new DOMException("exec aborted by AbortSignal（spawn 前检出）", "AbortError"), { outcome: "unknown" });
         }
         p = spawn("ssh", argv, { stdio: [inFd, outFd, errFd] });
+        p.once("error", (e: Error) => { spawnErr = e; }); // 本地拒启归账（ENOENT 等）——区别于远端执行结果
     } catch (e) {
         // spawn 同步抛错清场（Sol 81 P2-5）：argv 含 NUL 等被 Node 拒启——
         // fd 与三个中转文件曾全部滞留
@@ -946,6 +948,11 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
     if (aborted) {
         // AbortError+outcome（Sol 79 #4）：修前返回普通错误且替身照跑到底
         throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转已终止本地 shell，远端进程状态未核实）", "AbortError"), { outcome: "unknown" });
+    }
+    if (spawnErr) {
+        // 本地启动失败直报（Sol 84 P2 → Sol 85 P2 重落）：修前吞成「无哨兵
+        // exit=null」——本地拒启≠远端结果未知
+        throw new Error(`本地 ssh 启动失败（${spawnErr.message}）——检查 PATH/可执行文件。中转模式（FILAXIS_SSH_STDIO_MODE=inherit）`);
     }
     return { stdout: out, stderr: err, exitCode };
 }

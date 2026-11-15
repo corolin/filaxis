@@ -987,10 +987,7 @@ describe("Sol 81：并发首挂/restore 严验证", () => {
             { driver: "tmux", terminalId: "SH81b", cwd: "/nonexistent-fx81", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
                 spawnSession: async () => "SH81b",
-                runCommand: async (_id: string, cmd: string) => {
-                    const m = cmd.match(/echo (__FX_CDFX_\w+__)/); // nonce 标记回显（cd 失败模拟）
-                    return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 };
-                },
+                runCommand: async () => ({ stdout: "", exitCode: 1 }), // cd 失败（exitCode 判定——Sol 85 口径）
                 destroySession: async () => undefined,
             } as never },
         );
@@ -1018,9 +1015,8 @@ describe("Sol 82：验证互斥/幽灵占位/nonce 标记", () => {
             { terminalManager: {
                 spawnSession: async () => "SH82",
                 runCommand: async (_id: string, cmd: string) => {
-                    const m = cmd.match(/echo (__FX_CDOk_\w+__)/);
-                    if (cmd.includes("cd ") && cmd.includes("pwd")) { cdCount++; await cdGate; return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 }; }
-                    return { stdout: m ? m[1]! : "ok", stderr: "", exitCode: 0 };
+                    if (cmd.includes("cd ")) { cdCount++; await cdGate; }
+                    return { stdout: "ok", exitCode: 0 };
                 },
                 destroySession: async () => undefined,
             } as never },
@@ -1150,27 +1146,47 @@ describe("Sol 83：回显行判定/互斥提前", () => {
 // GPT Sol 八十四期 P1-1：真机 tmux 上失败标记 echo 未被输出窗口捕获——标记
 // 缺席曾当成功。正向确认：成功必出 OK 行，缺席/FAIL 行都判失败。
 describe("Sol 84：cd 正向确认", () => {
-    test("成功标记缺席（输出只有回显）→ 拒绝；OK 行在场 → 通过", async () => {
+    test("输出截断但 exitCode 是唯一真相（Sol 85 口径收编）", async () => {
         const real84 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
         (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
-        const mk = (echoOk: boolean) => new TmuxSessionDriver(
-            { driver: "tmux", terminalId: echoOk ? "SH84ok" : "SH84no", cwd: "/tmp", config: { launchCmd: "bash" } } as never,
+        const mk = (ok: boolean) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: ok ? "SH84ok" : "SH84no", cwd: "/tmp", config: { launchCmd: "bash" } } as never,
             { terminalManager: {
-                spawnSession: async () => echoOk ? "SH84ok" : "SH84no",
-                runCommand: async (_id: string, cmd: string) => {
-                    const m = cmd.match(/echo (__FX_CDOk_\w+__)/);
-                    // 模拟真机病态：只有命令回显、标记 echo 未被捕获（echoOk=false）；
-                    // 健态：pwd + OK 行都在
-                    return { stdout: cmd + "\n" + (echoOk && m ? "/tmp\n" + m[1]! + "\n" : ""), stderr: "", exitCode: 0 };
-                },
+                spawnSession: async () => ok ? "SH84ok" : "SH84no",
+                runCommand: async () => ({ stdout: "", exitCode: ok ? 0 : 1 }), // 截断模拟——exitCode 判定
                 destroySession: async () => undefined,
             } as never },
         );
         try {
-            await expect(mk(false).init()).rejects.toThrow(/未确认生效/); // 修前：标记缺席=成功
-            await mk(true).init(); // OK 行在场——通过
+            await mk(true).init(); // exitCode 0——通过
+            await expect(mk(false).init()).rejects.toThrow(/退出码 1/);
         } finally {
             (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real84;
+        }
+    }, 15_000);
+});
+
+// GPT Sol 八十五期 P1-1：输出清洗（stripMarkerNoise）在命令回显的退出标记处
+// 截断——OK 标记行在截断点之后被丢，cd 已生效仍报错。exitCode 判定（不解析
+// stdout）根治。旧 stub 全部改 exitCode: 0 语义（runCommand 契约）。
+describe("Sol 85：cd exitCode 判定", () => {
+    test("输出被截断（无标记行）但 exitCode=0 → 通过；exitCode≠0 → 拒", async () => {
+        const real85 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const mk = (ok: boolean) => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: ok ? "SH85ok" : "SH85no", cwd: "/tmp", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => ok ? "SH85ok" : "SH85no",
+                // 模拟 Sol 85 P1-1 病态：输出清洗截断——stdout 空；exitCode 才是真相
+                runCommand: async () => ({ stdout: "", exitCode: ok ? 0 : 1 }),
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await mk(true).init(); // cd 已生效（exitCode 0）——修前：标记行被截断→误报失败
+            await expect(mk(false).init()).rejects.toThrow(/退出码 1/);
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real85;
         }
     }, 15_000);
 });

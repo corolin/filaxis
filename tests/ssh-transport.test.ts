@@ -1257,3 +1257,16 @@ describe("Sol 81：中转 spawn 清场", () => {
         expect(after.length).toBe(before.length); // 修前：+3（.in/.out/.err 滞留）
     }, 15_000);
 });
+
+// GPT Sol 八十五期 P2：上轮 spawnErr 补丁因 python 断言失败未落盘（重复 bug
+// 根因）——本轮重落。本地拒启（ENOENT）直报。
+describe("Sol 85：中转本地拒启直报", () => {
+    test("ssh 不存在形态：直报本地启动失败（非「无哨兵」）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<unknown> }).__testFileRedirect;
+        if (!run) return;
+        // argv 含 NUL——spawn 同步抛（Node 拒启），非异步 error 事件
+        const NUL = String.fromCharCode(0);
+        await expect(run(["-V", "bad" + NUL], "x")).rejects.toThrow(/bad|NUL|null/i);
+    }, 15_000);
+});

@@ -228,23 +228,20 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 if (alive.exitCode !== 0) {
                     throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
                 }
-                // 首挂 cd + 严格验证（Sol 79→83→84）：**正向确认**——失败标记缺席
-                // 曾被当成功（真机：输出只有回显、标记 echo 未被捕获窗口收到）。
-                // 双 nonce 标记：成功必出 OK 行；缺席或 FAIL 行在场都判失败
+                // 首挂 cd + 严格验证（Sol 79→85）：**exitCode 判定**——不解析 stdout。
+                // 输出清洗（stripMarkerNoise）在命令回显的退出标记处截断（Sol 85
+                // P1-1 真机实锤：OK 标记行在截断点之后被丢——cd 已生效仍报错）。
+                // runCommand 的 exitCode=完成哨兵捕获的 $?（cd 本体的退出码）——
+                // 无回显/截断干扰
                 if (needsValidation) {
-                    const ok = `__FX_CDOk_${crypto.randomBytes(4).toString("hex")}__`;
-                    const bad = `__FX_CDBad_${crypto.randomBytes(4).toString("hex")}__`;
                     const probe = await this.terminal.runCommand(
                         tid0,
-                        `cd ${q(wanted)} 2>/dev/null && pwd && echo ${ok} || echo ${bad}`,
+                        `cd ${q(wanted)}`,
                         10_000,
-                    ).catch(() => ({ stdout: "", stderr: "", exitCode: 1 }));
-                    const lines = probe.stdout.split(/\r?\n/).map((l) => l.trim());
-                    const okSeen = lines.includes(ok); // 整行全等——回显行含 echo 前缀不等
-                    const badSeen = lines.includes(bad);
-                    if (!okSeen || badSeen) {
+                    ).catch(() => ({ stdout: "", exitCode: 1 }));
+                    if (probe.exitCode !== 0) {
                         throw new Error(
-                            `tmux 会话 '${tid0}' 恢复目录失败：cd '${wanted}' 未确认生效${badSeen ? "（失败标记在场——目录不存在或无权限）" : "（成功标记缺席——输出窗口未见确认，视为未生效）"}——restore 拒绝半挂（句柄声明与实际目录不符）。请修正快照 cwd 或先建目录`,
+                            `tmux 会话 '${tid0}' 恢复目录失败：cd '${wanted}' 退出码 ${probe.exitCode}（目录不存在或无权限）——restore 拒绝半挂（句柄声明与实际目录不符）。请修正快照 cwd 或先建目录`,
                         );
                     }
                 }
