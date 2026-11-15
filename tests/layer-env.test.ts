@@ -1352,3 +1352,51 @@ describe("Sol 82：四要素契约", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十三期：P1-3 默认 tmux 层（无 target）探测记录曾因四要素被判
+// 残缺——load 过滤丢弃、下次写入删除。target 豁免 local/tmux。P1-4
+// environment 数组曾通过 typeof object 检查。
+describe("Sol 83：tmux 默认层/环境数组", () => {
+    test("P1-3 tmux 无 target 条目合法（探测记录可读回）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env83-"));
+        try {
+            const p = join(dir, "env.json");
+            const tmuxEntry: LayerEnvEntry = {
+                connection: { driver: "tmux" }, // 默认层无落点
+                environment: { os: "Linux" },
+                discovered_at: new Date().toISOString(),
+                fingerprint: "fp-tmux-default",
+            };
+            const s = new LayerEnvStore(p);
+            await s.upsert("tmux:default", tmuxEntry);
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers["tmux:default"]?.connection.driver).toBe("tmux"); // 修前：被过滤丢弃
+            expect(cfg.layers["tmux:default"]?.fingerprint).toBe("fp-tmux-default");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("P1-4 environment 为数组：残缺条目不作有效提名——完整前代胜出", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env83b-"));
+        try {
+            const p = join(dir, "env.json");
+            const mk83 = (k: string): LayerEnvEntry => ({
+                connection: { driver: "ssh", target: k },
+                environment: { os: `os-${k}` },
+                discovered_at: new Date().toISOString(),
+                fingerprint: `fp-${k}`,
+            });
+            writeFileSync(p, JSON.stringify({ layers: { one: mk83("full") }, _fx_rev: "5000000000000-1-mm83" }));
+            writeFileSync(`${p}.111-222-aaaa.fx-old`, JSON.stringify({
+                layers: { one: { connection: { driver: "ssh", target: "x" }, environment: [], discovered_at: "t", fingerprint: "fp-env-arr" } }, // environment 数组
+                _fx_rev: "9000000000000-1-arr83", _fx_seen: ["5000000000000-1-mm83"],
+            }));
+            const cfg = await new LayerEnvStore(p).load(true);
+            expect(cfg.layers.one!.connection.target).toBe("full"); // 修前：数组条目覆盖完整备份
+            expect(cfg.layers.one!.environment.os).toBe("os-full");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});

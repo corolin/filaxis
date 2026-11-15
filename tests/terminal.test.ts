@@ -1083,3 +1083,57 @@ describe("Sol 82：验证互斥/幽灵占位/nonce 标记", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十三期：P1-1 PTY 回显命令原文（含 echo <mark> 字样）曾把成功
+// cd 误判失败——整行全等判定。P1-2 互斥标记曾晚于探活——探活后验证前的
+// 窗口第二挂跳过验证。
+describe("Sol 83：回显行判定/互斥提前", () => {
+    test("P1-1 命令回显含标记字样不误判（cd 成功照常）", async () => {
+        const real83 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        // PTY 真实形态：回显命令原文（含 echo __FX_CDFX_...__）+ pwd 成功输出
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH83", cwd: "/tmp", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH83",
+                runCommand: async (_id: string, cmd: string) => ({ stdout: `${cmd}\r\n/tmp\r\n`, stderr: "", exitCode: 0 }),
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await drv.init(); // 修前：回显行 includes(mark) 误判失败——cd 已生效仍报错
+            await drv.destroy();
+        } finally {
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real83;
+        }
+    }, 15_000);
+
+    test("P1-2 探活后验证前的窗口：第二挂仍被拒（互斥早登记）", async () => {
+        const real83 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        let releaseProbe!: () => void;
+        const probeGate = new Promise<void>((r) => { releaseProbe = r; });
+        let probeCount = 0;
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => { probeCount++; if (probeCount === 1) await probeGate; return { stdout: "", stderr: "", exitCode: 0 }; };
+        const mk = () => new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "SH83b", cwd: "/bad-fx83", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "SH83b",
+                runCommand: async () => ({ stdout: "ok", stderr: "", exitCode: 0 }),
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            const d1 = mk();
+            const p1 = d1.init(); // 首挂：探活挂起（返回后才会做 cd 验证）
+            await new Promise((r) => setTimeout(r, 20));
+            const d2 = mk(); // 同 cwd 第二挂——修前：互斥标记晚于探活→此窗第二挂跳过验证成功
+            await expect(d2.init()).rejects.toThrow(/验证进行中/);
+            releaseProbe();
+            await p1;
+            await d1.destroy();
+        } finally {
+            releaseProbe();
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = real83;
+        }
+    }, 15_000);
+});

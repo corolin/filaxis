@@ -196,9 +196,10 @@ export class TmuxSessionDriver implements RuntimeDriver {
                     }
                 }
             }
-            // **验证期互斥**（Sol 82 P1-1）：同 cwd 并发首挂——第一挂占位后暂停在
-            // cd 验证，第二挂曾因「目录已占位=已恢复」跳过验证直接成功（旧目录
-            // 执行）。验证在途=同 tid 的后续 attach 一律等首挂验证结论
+            // **验证期互斥**（Sol 82 P1-1 → Sol 83 P1-2 提前到登记处）：互斥集曾
+            // 在 cd 验证启动时才加入——探活返回后、验证开始前的窗口内第二挂曾
+            // 过守卫（占位在场→firstAttach=false→跳过验证直接成功）。首挂的
+            // 互斥标记在**早登记的同时**加入，验证结束/回滚时清除
             if (cwdValidating.has(tid0)) {
                 throw new Error(`tmux 会话 '${tid0}' 目录恢复验证进行中——并发重挂请稍候（首挂验证结论未出前不放行）`);
             }
@@ -207,12 +208,15 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // **cwd 早登记**（同步，守卫面即刻生效；refs 仍走共享块——探活失败/
             // 竞态拒只回滚 cwd）：并发第二挂在守卫处即见第一挂的目录占位
             { const key = wanted ?? ""; const cwds = sessionCwds.get(tid0) ?? new Map<string, number>(); cwds.set(key, (cwds.get(key) ?? 0) + 1); sessionCwds.set(tid0, cwds); }
+            const needsValidation = wanted != null && firstAttach;
+            if (needsValidation) cwdValidating.add(tid0);
             const rollback = (): void => {
                 const cwds = sessionCwds.get(tid0);
                 const key = wanted ?? "";
                 const n = (cwds?.get(key) ?? 1) - 1;
                 if (n > 0) cwds!.set(key, n);
                 else { cwds?.delete(key); if (cwds && cwds.size === 0) sessionCwds.delete(tid0); }
+                cwdValidating.delete(tid0);
             };
             // 探活/cd 全程 try（Sol 82 P2-6）：探活**抛错**（tmux 不在 PATH 等
             // ENOENT）曾不经 rollback——cwd 占位滞留，恢复 PATH 后重挂被幽灵占位拒
@@ -224,26 +228,21 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 if (alive.exitCode !== 0) {
                     throw new Error(`tmux 会话 '${this.descriptor.terminalId}' 不存在（server 重启或已销毁）——请重建层或 restore 前 respawn`);
                 }
-                // 首挂 cd + 严格验证（Sol 79 P1-3 → Sol 81 P2-3 → Sol 82 P2-7）：attach
-                // 时 cwd 只在本进程无任何在册实例才执行（restore 的会话 pwd 是旧目录）；
-                // 失败标记带**随机 nonce**——静态 __FX_CD_FAIL 曾被合法目录名（pwd 输出
-                // 含该字样）误判为恢复失败
-                if (wanted != null && firstAttach) {
-                    cwdValidating.add(tid0);
+                // 首挂 cd + 严格验证（Sol 79 P1-3 → Sol 83 P1-1 行级判定）：失败标记
+                // 带 nonce，且**整行全等**判定——PTY 会回显命令原文（含 `echo <mark>`
+                // 字样），`includes` 曾把成功回显误判为失败（cd 已生效仍报错）
+                if (needsValidation) {
                     const cdMark = `__FX_CDFX_${crypto.randomBytes(4).toString("hex")}__`;
-                    try {
-                        const probe = await this.terminal.runCommand(
-                            tid0,
-                            `cd ${q(wanted)} 2>/dev/null && pwd || echo ${cdMark}`,
-                            10_000,
-                        ).catch(() => ({ stdout: cdMark, stderr: "", exitCode: 1 }));
-                        if (probe.stdout.includes(cdMark)) { // 只判 nonce 标记——pwd 精确比对受 PTY 回显/波浪号展开干扰
-                            throw new Error(
-                                `tmux 会话 '${tid0}' 恢复目录失败：cd '${wanted}' 未生效（目录不存在或无权限）——restore 拒绝半挂（句柄声明与实际目录不符）。请修正快照 cwd 或先建目录`,
-                            );
-                        }
-                    } finally {
-                        cwdValidating.delete(tid0);
+                    const probe = await this.terminal.runCommand(
+                        tid0,
+                        `cd ${q(wanted)} 2>/dev/null && pwd || echo ${cdMark}`,
+                        10_000,
+                    ).catch(() => ({ stdout: cdMark, stderr: "", exitCode: 1 }));
+                    const markLine = probe.stdout.split(/\r?\n/).some((l) => l.trim() === cdMark); // 整行全等——回显行含 `echo <mark>` 不等
+                    if (markLine) {
+                        throw new Error(
+                            `tmux 会话 '${tid0}' 恢复目录失败：cd '${wanted}' 未生效（目录不存在或无权限）——restore 拒绝半挂（句柄声明与实际目录不符）。请修正快照 cwd 或先建目录`,
+                        );
                     }
                 }
                 // 探活-登记竞态守卫（Sol 79 #5 → Sol 80 #4）：**归零判据**——仅当此前有
@@ -256,6 +255,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 rollback();
                 throw e;
             }
+            cwdValidating.delete(tid0); // 验证通过——互斥解除（成功路径）
         }
         { // 在册登记（Sol 76 P2-1）：spawn 与重挂 attach 同权计数。
           // **登记即置位**（Sol 77 P1-2）：attach 探活失败抛错时未曾登记——

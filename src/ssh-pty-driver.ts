@@ -929,9 +929,18 @@ async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { t
         p.once("error", () => done(null));
     });
     for (const fd of [inFd, outFd, errFd]) { try { fsSync.closeSync(fd); } catch { /* 已随进程关闭 */ } }
+    // stderr 读取失败不静默（Sol 83 P2-9）：EIO 等曾吞成空串——退出码照回而
+    // 诊断内容丢失，调用方无从知晓。落诊断占位（stdout 同罪同判）
+    const readOrNote = async (f: string, what: string): Promise<string> => {
+        try {
+            return await fsp.readFile(f, "utf-8");
+        } catch (e) {
+            return `[filaxis] ${what} 读取失败（${(e as Error).message}）——诊断内容丢失`;
+        }
+    };
     const [out, err] = await Promise.all([
-        fsp.readFile(outFile, "utf-8").catch(() => ""),
-        fsp.readFile(errFile, "utf-8").catch(() => ""),
+        readOrNote(outFile, "stdout"),
+        readOrNote(errFile, "stderr"),
     ]);
     await cleanup();
     if (aborted) {

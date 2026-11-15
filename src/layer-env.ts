@@ -215,9 +215,10 @@ function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
         //+environment+fingerprint 四要素——缺任一跳过）
         if (v != null && typeof v === "object" && !Array.isArray(v)) {
             const conn = (v as LayerEnvEntry).connection as { driver?: unknown; target?: unknown } | null | undefined;
+            const env = (v as LayerEnvEntry).environment;
             if (conn != null && typeof conn === "object" && typeof conn.driver === "string"
-                && (conn.driver === "local" || typeof conn.target === "string")
-                && (v as LayerEnvEntry).environment != null && typeof (v as LayerEnvEntry).environment === "object"
+                && (conn.driver === "local" || conn.driver === "tmux" || typeof conn.target === "string")
+                && env != null && typeof env === "object" && !Array.isArray(env)
                 && typeof (v as LayerEnvEntry).fingerprint === "string") {
                 dst.layers[k] = v as LayerEnvEntry;
             }
@@ -382,9 +383,10 @@ export class LayerEnvStore {
                     if (v == null || typeof v !== "object" || Array.isArray(v)) return true;
                     const e = v as LayerEnvEntry;
                     const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
+                    const envR = e.environment;
                     return !(conn != null && typeof conn === "object" && typeof conn.driver === "string"
-                        && (conn.driver === "local" || typeof conn.target === "string")
-                        && e.environment != null && typeof e.environment === "object"
+                        && (conn.driver === "local" || conn.driver === "tmux" || typeof conn.target === "string")
+                        && envR != null && typeof envR === "object" && !Array.isArray(envR)
                         && typeof e.fingerprint === "string");
                 };
                 for (const src of [anchor.parsed, ...heirs.map(({ d }) => d.parsed)]) {
@@ -453,12 +455,14 @@ export class LayerEnvStore {
             if (v == null || typeof v !== "object" || Array.isArray(v)) return false;
             const e = v as LayerEnvEntry;
             const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
-            // 最小完整契约（Sol 77→81→82 逐轮收紧的定版）：driver 字符串 + 非 local
-            // 须 target（local 无落点合法）+ environment 对象 + fingerprint 字符串
-            //——缺任一=残缺条目（保留指纹但缺目标/环境的主档曾覆盖完整备份）
+            // 最小完整契约（Sol 77→83 逐轮收紧的定版）：driver 字符串 + 非
+            // local/tmux 须 target（local/tmux 默认层无落点合法——Sol 83 P1-3：
+            // tmux:default 探测记录曾因四要素被判残缺过滤丢弃）+ environment
+            // 非空对象且非数组（Sol 83 P1-4：[] 曾通过 typeof object）+ fingerprint
+            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment);
             return conn != null && typeof conn === "object" && typeof conn.driver === "string"
-                && (conn.driver === "local" || typeof conn.target === "string")
-                && e.environment != null && typeof e.environment === "object"
+                && (conn.driver === "local" || conn.driver === "tmux" || typeof conn.target === "string")
+                && envOk
                 && typeof e.fingerprint === "string";
         };
         const vals = Object.values(layers);
