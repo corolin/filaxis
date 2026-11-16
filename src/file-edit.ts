@@ -316,11 +316,15 @@ async function casWrite(
     // 未动），tmp 载荷保留供核实/重试
     // 落位目标解析走**原路径**（Sol 59 P1-1）：__fx_tgt 曾由缩短名 fxBase 解析
     // ——240 字符长名编辑报 atomic-replace 成功，实际写进同目录缩短名旁路文件
-    // （原文件分毫未动）。fxBase 只准锚 tmp/lock 伴生文件，目标本体永远是原路径
-    const tgtSetup = `__fx_tgt=$(readlink -f ${q(path)} 2>/dev/null || echo ${q(path)}); ` +
-        // 数字模式权限保持（Hydrogen R8 #2）：chmod/chown --reference 仅 GNU——macOS/
-        // FreeBSD/busybox 不认，mv 后目标静默回退 umask 默认（0600 私钥→0644 可读）。
-        // stat -c 读八进制权限（GNU）→ chmod NNN 数字模式全平台通吃；stat 缺席 best-effort
+    // （原文件分毫未动）。fxBase 只准锚 tmp/lock 伴生文件，目标本体永远是原路径。
+    // **真身前置**（Sol 90 P1-2）：readlink -f 解析提前到 CAS 核验**之前**、
+    // 核验与落位同锚 "$__fx_tgt"——曾「核验读原路径（跟随符号链接）→落位时才
+    // 解析真身」，两步之间换链会把基于 A 校验的内容写到未经校验的 B
+    const tgtResolve = `__fx_tgt=$(readlink -f ${q(path)} 2>/dev/null || echo ${q(path)}); `;
+    // 数字模式权限保持（Hydrogen R8 #2）：chmod/chown --reference 仅 GNU——macOS/
+    // FreeBSD/busybox 不认，mv 后目标静默回退 umask 默认（0600 私钥→0644 可读）。
+    // stat -c 读八进制权限（GNU）→ chmod NNN 数字模式全平台通吃；stat 缺席 best-effort
+    const permSetup =
         `__fx_pm=$(stat -c '%a' "$__fx_tgt" 2>/dev/null); [ -n "$__fx_pm" ] && chmod "$__fx_pm" ${sr.qp}.fx-tmp 2>/dev/null; ` +
         `chown --reference="$__fx_tgt" ${sr.qp}.fx-tmp 2>/dev/null || true; `;
     // mv -T + 落位五防（Sol 87 P1-5 → Sol 88 P1-6 → Sol 89 P1-4/P1-5 同
@@ -328,9 +332,12 @@ async function casWrite(
     // **搬移证据**（__fx_mv=1 只在裸 mv 成功后置位——曾无条件按 basename 回搬
     // 目录里恰同名的无关文件误当载荷）+ **设备号分流**（fx-tmp 在原路径一侧、
     // 符号链接真身可跨文件系统——mv 跨设备退化复制曾谎报 atomic-replace；同
-    // 设备才走 rename 链，跨设备/不可判走 cat=FX_INPLACE 诚实非原子）
+    // 设备才走 rename 链，跨设备/不可判走 cat=FX_INPLACE 诚实非原子）。
+    // cat 形态用 `< src > tgt`（Sol 90 P1-3）：shell 从左到右处理重定向——源
+    // 打开失败时目标**尚未被截断**（`cat src > tgt` 是 cat 自己开源、shell 先
+    // 截目标——载荷曾丢失后把原文件截成 0 字节）
     const place = forceInplace
-        ? `if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi`
+        ? `if cat < ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else if [ ! -e ${sr.qp}.fx-tmp ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi`
         : `__fx_tb=$(basename ${sr.qp}.fx-tmp 2>/dev/null); ` +
           `__fx_od=$(stat -c %d ${sr.qp}.fx-tmp 2>/dev/null || stat -f %d ${sr.qp}.fx-tmp 2>/dev/null); ` +
           `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
@@ -340,17 +347,18 @@ async function casWrite(
           `if mv -T ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null; then echo "FX_OK $(${stampOf})"; ` +
           `else if [ ! -d "$__fx_tgt" ] && mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null && __fx_mv=1 && [ ! -d "$__fx_tgt" ]; then echo "FX_OK $(${stampOf})"; ` +
           `else if [ "$__fx_mv" = "1" ] && [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_tb" ${sr.qp}.fx-tmp 2>/dev/null; then echo FX_IS_DIR; ` +
-          `else if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; ` +
+          `else if cat < ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else if [ ! -e ${sr.qp}.fx-tmp ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; fi; ` +
           `else ` +
           `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
-          `if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; ` +
+          `if cat < ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else if [ ! -e ${sr.qp}.fx-tmp ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; ` +
           `fi`;
     const cmd =
-        `( if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
+        `( ${tgtResolve}` +
+        `if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
         `else echo FX_DEGRADED_NO_LOCK; fi; ` +
-        `if [ "$(${statCmdOf(q(path))})" = "${sr.statStamp}" ] && ` + // 核验走**原路径**（Sol 58 P2-4——fxBase 缩短名曾致 CAS 假冲突）
-        `[ "$(${shaCmdOf(q(path))})" = "${sr.shaStamp}" ]; then ` +
-        `printf %s ${q(newB64)} | ${sr.dec} > ${sr.qp}.fx-tmp && { ${tgtSetup}${place}; }; ` +
+        `if [ "$(${statCmdOf(`"$__fx_tgt"`)})" = "${sr.statStamp}" ] && ` + // 核验锚**解析后真身**（与落位同锚——Sol 90 P1-2）
+        `[ "$(${shaCmdOf(`"$__fx_tgt"`)})" = "${sr.shaStamp}" ]; then ` +
+        `printf %s ${q(newB64)} | ${sr.dec} > ${sr.qp}.fx-tmp && { ${permSetup}${place}; }; ` +
         `else echo FX_CAS_FAIL; fi ) 9>${sr.qp}.fx-lock`;
     const cas = await drv.exec(cmd, { timeoutMs: 30_000 });
     const out = (cas.stdout || "").trim();
@@ -366,6 +374,9 @@ async function casWrite(
     }
     if (payload.startsWith("FX_IS_DIR")) { // 目录目标（Sol 88 P1-6）：载荷已回撤——恢复路径在场
         throw new Error(`CAS 写回失败（目标已被换成现存目录——目录未动，完整载荷保留在 ${path}.fx-tmp 可重试）: ${path}`);
+    }
+    if (payload.startsWith("FX_NO_PAYLOAD")) { // 载荷落位前消失（Sol 90 P1-3）——目标未动（重定向排序保证未截断）
+        throw new Error(`CAS 写回中止（载荷在落位前消失——外部移除？）——目标未动（重定向排序保证未截断）: ${path}`);
     }
     if (payload.startsWith("FX_INPLACE_FAIL")) { // 须在 FX_INPLACE 前判定（FAIL 是其前缀延伸）
         throw new Error(

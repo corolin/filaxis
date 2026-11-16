@@ -777,27 +777,46 @@ export class LayerEnvStore {
         // 整个舞步时持有权早失。还原优先（Sol 63 P2-4）：盘上仍是本舞步产物
         //（无人再动过）时把移开态搬回主位——陈值不留主位；时钟回拨/同刻下
         // 序戳不可靠，物理还原是活检测路径上最诚实的序。盘面已变则留给合并序。
-        // 首次写无移开态可还原（Sol 64 #2）：搬回失败即撤下自己的产物——
-        // 报冲突的写入不留盘（盘面回到无档原态）
+        // **无锁安全化**（Sol 90 P1-1）：旧实现「读主档比对内容→无条件 rename/
+        // unlink」——比对与破坏动作之间他方可接管陈锁完成提交，A 的回滚删掉 B
+        // 的已提交主档（load 空配置）。新不变量：**锁失后只动自己拥有的名字 +
+        // 唯一一次 absent-only 落位**——①把主档原子取到恢复旁路名（并发读方经
+        // 合并协议可见，无丢失窗口）；②内容仍是本舞步产物 → 撤下它，并用
+        // link-CAS 归位旧档（EEXIST=他人已提交→中止留锚）；不是 → CAS 放回
+        //（放不回=又有新提交——它已在恢复旁路名下，无需再动）；③主位缺席时
+        // 旧档同样 link-CAS 归位。任何路径都不可能删/盖他人的主档
         if (verifyHeld && !(await verifyHeld())) {
             try {
-                const cur = await readFile(this.path, "utf-8");
-                if (cur === payloadText) {
-                    const moved = await rename(aside, this.path).then(() => true, () => false);
-                    if (!moved) {
-                        // 恢复失败（EIO 等）→ 撤下自己的产物，盘面回「无主档+旁路」
-                        // ——下次 load 从旁路恢复提交前状态（失败语义=本提交未发生）。
-                        // **旁路必须留命**（Sol 89 P1-1）：移开过主档时旁路是唯一恢复
-                        // 副本——曾无条件 unlink 把主档产物与旁路一起删掉，下次 load
-                        // 返回空配置。只有首次写（hadPriorMain=false，旁路从未存在）
-                        // 才走「撤产物+清旁路」的整体撤销
-                        await unlink(this.path).catch(() => undefined);
-                        if (!hadPriorMain) await unlink(aside).catch(() => undefined);
+                const uniq2 = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                const scratchAside = `${this.path}.${uniq2}${ASIDE_SUFFIX}`;
+                let hadMain = true;
+                try { await rename(this.path, scratchAside); } catch { hadMain = false; }
+                if (hadMain) {
+                    const cur = await readFile(scratchAside, "utf-8").catch(() => null);
+                    if (cur === payloadText) {
+                        // 仍是本舞步产物——hadPriorMain 时先归位旧档（absent-only）
+                        if (hadPriorMain) {
+                            try {
+                                await link(aside, this.path);
+                                await unlink(aside).catch(() => undefined); // link 立第二名字——消原
+                            } catch { /* 他人主档已落位（EEXIST）——我的 aside 留盘作恢复锚 */}
+                        }
+                        await unlink(scratchAside).catch(() => undefined); // 撤下自己的产物（首次写=盘面回无档原态）
                     } else {
-                        await unlink(aside).catch(() => undefined); // 恢复成功——aside 已被 rename 消费，此为兜底
+                        // 他人已提交的主档——CAS 放回；放不回（又有新提交）则它已
+                        // 在恢复旁路名下（并发基线可见），留给合并协议
+                        const back = await link(scratchAside, this.path).then(() => true, () => false);
+                        if (back) await unlink(scratchAside).catch(() => undefined);
                     }
+                } else if (hadPriorMain) {
+                    // 主位缺席（他人舞步在途/崩溃残留）——absent-only 归位旧档
+                    try {
+                        await link(aside, this.path);
+                        await unlink(aside).catch(() => undefined);
+                    } catch { /* 已有他人落位——留锚 */}
                 }
-            } catch { /* 盘面已变——旁路留恢复锚 */}
+                // 首次写且主位缺席：产物已不在主位，盘面即原态——无事可做
+            } catch { /* 回滚自身故障——全部产物留盘（恢复锚语义） */}
             throw new Error("__FX_LOCK_LOST__");
         }
         // 成功收尾：消费自己移开的旁路 + 盘点在册的历史旁路（Sol 60 P2-2 +

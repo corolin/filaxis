@@ -1568,3 +1568,133 @@ describe("Sol 89：哨兵失败封存/跨执行器互斥/清洗收窄", () => {
         }
     }, 60_000);
 });
+
+// GPT Sol 九十期：P1-4 业务命令首次发送失败（sendKeys=写文本+回车两段——结果
+// 未知时 raw 抛放行队列，下一条照进本条前台任务）；P1-5 跨进程同会话串台
+//（模块级 Map 只护单进程——OS 级文件锁）；P2-1/P2-2 readdir 的 ..hidden 漏项
+// 与 CDPATH 改写。
+describe("Sol 90：首发失败封存/跨进程锁/readdir 补全", () => {
+    test("P1-4 业务命令首次发送失败：unknown+封存——已入队下一条被拒", async () => {
+        const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
+        const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        const sentTexts: string[] = [];
+        let lastText = "";
+        const invoke = async (args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+            const a0 = args[0] ?? "";
+            if (a0 === "send-keys" && args[3] === "-l") { lastText = String(args[4] ?? ""); sentTexts.push(lastText); }
+            if (a0 === "send-keys" && args[3] === "C-m") {
+                // 业务命令的回车提交失败（文本已写入 pane——执行与否不可知）
+                if (lastText.includes("FIRST-BIZ")) throw new Error("注入：业务命令回车提交失败");
+            }
+            return { stdout: "", stderr: "", exitCode: 0 };
+        };
+        (TmuxInvoker as unknown as { invoke: unknown }).invoke = invoke;
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const ce = new CommandExecuter({ config: { poll_interval_ms: 30 } as never });
+        try {
+            const p1 = ce.execute("S90F", "echo FIRST-BIZ", { timeoutMs: 30_000 });
+            await new Promise((r) => setTimeout(r, 150));
+            const p2 = ce.execute("S90F", "echo second-must-not-run", { timeoutMs: 5_000 });
+            let e1: (Error & { outcome?: string }) | undefined;
+            try { await p1; } catch (e) { e1 = e as Error & { outcome?: string }; }
+            expect(e1?.outcome).toBe("unknown"); // 修前：raw 异常无 outcome
+            expect(e1?.message).toMatch(/发送失败|封存/);
+            let e2: Error | undefined;
+            try { await p2; } catch (e) { e2 = e as Error; }
+            expect(e2?.message).toMatch(/销毁结果未确认/); // 修前：放行队列——文本进旧前台任务
+            expect(sentTexts.some((t) => t.includes("second-must-not-run"))).toBe(false);
+        } finally {
+            (TmuxInvoker as unknown as { invoke: unknown }).invoke = realInvoke;
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = realTry;
+        }
+    }, 15_000);
+
+    test("P1-5 跨进程会话锁：他进程持锁时排队等待；死 pid 陈锁立即回收", async () => {
+        const { CommandExecuter: CE } = await import("../src/terminal/command-executer.js");
+        const { writeFileSync, rmSync: rm90 } = await import("node:fs");
+        const lockPath = (CE as unknown as { __testSessLockPath(id: string): string }).__testSessLockPath("S90X");
+        // ① 子进程持锁 1.5s 后自删——父进程 execute 排队后照常完成
+        const child = Bun.spawn(["bun", "-e",
+            `require("node:fs").writeFileSync(${JSON.stringify(lockPath)}, process.pid + "-t90");` +
+            `setTimeout(() => require("node:fs").rmSync(${JSON.stringify(lockPath)}), 1500);`,
+        ], { stdout: "ignore", stderr: "ignore" });
+        await new Promise((r) => setTimeout(r, 250)); // 子进程落锁
+        const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
+        const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        let marker = "";
+        (TmuxInvoker as unknown as { invoke: unknown }).invoke = async (args: string[]) => {
+            const a0 = args[0] ?? "";
+            if (a0 === "send-keys" && args[3] === "-l") {
+                const em = String(args[4] ?? "").match(/(---CMD_DONE_\w+)_\$__fx_ec#$/);
+                if (em) marker = em[1]!;
+            }
+            return { stdout: a0 === "capture-pane" && marker ? `out\n${marker}_0#\n$` : "", stderr: "", exitCode: 0 };
+        };
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const ce = new CommandExecuter({ config: { poll_interval_ms: 30 } as never });
+        try {
+            const t0 = Date.now();
+            const r = await ce.execute("S90X", "echo locked-wait", { timeoutMs: 30_000 });
+            const waited = Date.now() - t0;
+            expect(r.exitCode).toBe(0);
+            expect(waited).toBeGreaterThanOrEqual(1_000); // 修前：无跨进程锁——立即执行（串台）
+        } finally {
+            (TmuxInvoker as unknown as { invoke: unknown }).invoke = realInvoke;
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = realTry;
+            await child.exited;
+            rm90(lockPath, { force: true });
+        }
+        // ② 死 pid 陈锁：立即回收（不等待）
+        writeFileSync(lockPath, "999999999-0-dead");
+        const t1 = Date.now();
+        const ce2 = new CommandExecuter({ config: { poll_interval_ms: 30 } as never });
+        const realInvoke2 = TmuxInvoker.invoke.bind(TmuxInvoker);
+        const realTry2 = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        let marker2 = "";
+        (TmuxInvoker as unknown as { invoke: unknown }).invoke = async (args: string[]) => {
+            const a0 = args[0] ?? "";
+            if (a0 === "send-keys" && args[3] === "-l") {
+                const em = String(args[4] ?? "").match(/(---CMD_DONE_\w+)_\$__fx_ec#$/);
+                if (em) marker2 = em[1]!;
+            }
+            return { stdout: a0 === "capture-pane" && marker2 ? `out\n${marker2}_0#\n$` : "", stderr: "", exitCode: 0 };
+        };
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        try {
+            const r2 = await ce2.execute("S90X", "echo stale", { timeoutMs: 10_000 });
+            expect(r2.exitCode).toBe(0);
+            expect(Date.now() - t1).toBeLessThan(5_000); // 死锁即时回收（25ms 轮询级）
+        } finally {
+            (TmuxInvoker as unknown as { invoke: unknown }).invoke = realInvoke2;
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = realTry2;
+            rm90(lockPath, { force: true });
+        }
+    }, 30_000);
+
+    // P2-1/P2-2 真机：..hidden 补全 + 相对路径 readdir 抗 CDPATH
+    test("P2-1/P2-2 readdir：..hidden 在册 + 相对目标抗 CDPATH（有 tmux 才跑）", async () => {
+        if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
+        const dir = mkdtempSync(join(tmpdir(), "fx-ls90"));
+        const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 60 } });
+        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
+        await drv.init();
+        try {
+            const parent = join(dir, "here");
+            const decoyParent = join(dir, "decoy");
+            mkdirSync(join(parent, "ls-target"), { recursive: true });
+            mkdirSync(join(decoyParent, "ls-target"), { recursive: true });
+            writeFileSync(join(parent, "ls-target", "..hidden-dot"), "x"); // 修前：.[!.]* 静默漏掉
+            writeFileSync(join(parent, "ls-target", "plain"), "x");
+            writeFileSync(join(decoyParent, "ls-target", "DECOY-FILE"), "x");
+            await drv.exec(`cd ${JSON.stringify(parent)}`);
+            await drv.exec(`export CDPATH=${JSON.stringify(decoyParent)}`); // cd ls-target 会被带去 decoy
+            const entries = await drv.fs.readdir("ls-target"); // 相对路径（修前：CDPATH 改写+cd 打印毁 hex 帧）
+            const got = entries.map((e) => e.name).sort();
+            expect(got).toEqual(["..hidden-dot", "plain"]); // 修前：漏 ..hidden / 列出 DECOY-FILE / 帧损坏
+        } finally {
+            await drv.destroy();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 30_000);
+});

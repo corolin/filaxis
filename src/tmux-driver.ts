@@ -142,9 +142,14 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 //（字符集 [0-9a-f]）+ `;` 帧分隔（不出现在 hex 中）；stdout 里的
                 // 换行全是折行伪影——整体拼接后按分号切帧再解码。
                 // **子 shell cd 进目标**（真机抓回首版 bug：glob 跑在会话 cwd——
-                // 列出来的是别处）；cd 失败零输出=空列表（旧 ls || true 同语义）
+                // 列出来的是别处）；**cd 锚定 cdTargetArg**（Sol 90 P2-2：相对路径
+                // 裸交 cd 被 CDPATH 改写到另一棵树、命中还打印路径进 hex 流触发帧
+                // 损坏）；**glob 用 `.* *` + case 排 . / ..**（Sol 90 P2-1：`.[!.]*`
+                // 曾把 `..hidden` 这类「第二个字符是点」的合法名静默漏掉）；cd 失败
+                // 零输出=空列表（旧 ls || true 同语义）
                 const r = await self.exec(
-                    `( cd ${q(p)} 2>/dev/null && for __fx_e in .[!.]* *; do [ -e "$__fx_e" ] || [ -L "$__fx_e" ] || continue; ` +
+                    `( cd ${q(cdTargetArg(p))} 2>/dev/null && for __fx_e in .* *; do case "$__fx_e" in .|..) continue;; esac; ` +
+                    `[ -e "$__fx_e" ] || [ -L "$__fx_e" ] || continue; ` +
                     `printf %s "$__fx_e" | od -An -v -tx1 | tr -d ' \\n'; printf ';'; done )`,
                 );
                 const frames = r.stdout.replace(/[\r\n]+/g, "").split(";").filter(Boolean);

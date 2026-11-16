@@ -1680,3 +1680,49 @@ describe("Sol 89：锁失回滚语义", () => {
         }
     }, 20_000);
 });
+
+// GPT Sol 九十期 P1-1：A 锁失回滚与 B 接管提交的竞态——A 的回滚曾无条件
+// rename/unlink，比对与破坏动作之间 B 完成提交后 A 删掉 B 的已提交主档
+//（load 空配置/丢 B 的键）。无锁安全化后：take-scratch→身份验证→link-CAS，
+// 任何路径不可能删/盖他人主档。
+describe("Sol 90：回滚无锁安全化（双实例竞态）", () => {
+    test("P1-1 A 回滚期间 B 接管提交：B 的主档存活（load 含 B 的键，不再空配置）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env90-"));
+        try {
+            const p = join(dir, "env.json");
+            const ent = (t: string) => ({ connection: { driver: "ssh", target: t }, environment: { os: "o" }, discovered_at: "t", fingerprint: "f" + t });
+            const A = new LayerEnvStore(p);
+            await A.upsert("base", ent("b")); // 旧档（A 的基线）
+            // 注入：A 的 verifyHeld 两段相位——#2（落位后）先等陈锁阈值过线、让 B
+            // 完整接管提交，再返回 false 触发 A 的回滚（B 抢 A 的陈锁：age>5s）
+            const origAcquire = (A as unknown as { acquireLock: () => Promise<unknown> }).acquireLock.bind(A);
+            let verifyCalls = 0;
+            (A as unknown as { acquireLock: unknown }).acquireLock = async () => {
+                const real = await origAcquire() as unknown as { (): Promise<void>; verifyHeld(): Promise<boolean>; finalize(): Promise<void> };
+                return Object.assign(
+                    async () => { await real(); },
+                    {
+                        verifyHeld: async () => {
+                            verifyCalls++;
+                            if (verifyCalls === 1) return true;
+                            await new Promise((r) => setTimeout(r, 5_300)); // 陈锁阈值（>5s）过线，B 可强占
+                            const B = new LayerEnvStore(p);
+                            await B.save({ layers: { fromB: ent("bb") } }); // B 接管+完整提交（修前场景同款）
+                            return false;
+                        },
+                        finalize: () => real.finalize(),
+                    },
+                );
+            };
+            await expect(A.save({ layers: { fromA: ent("aa") } })).rejects.toThrow(/并发冲突/);
+            // B 的已提交主档必须存活：主档内容=B 的快照；load 含 fromB（修前：A 的
+            // 回滚删掉 B 主档——load 丢 fromB/空配置）
+            const main = JSON.parse(readFileSync(p, "utf-8")) as { layers?: Record<string, unknown> };
+            expect(main.layers?.["fromB"]).toBeTruthy();
+            const cfg = await A.load();
+            expect(cfg.layers.fromB).toBeTruthy(); // 修前：fromB 消失
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 25_000);
+});

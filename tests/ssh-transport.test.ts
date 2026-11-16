@@ -1391,3 +1391,33 @@ describe("Sol 89：发送同步抛归 caller/cdTargetArg", () => {
         expect(cdTargetArg("../y")).toBe("../y");
     }, 10_000);
 });
+
+// GPT Sol 九十期 P2-3：PTY 子进程自然退出（非 kill、非 EPIPE）曾保持 ready=true
+//——执行中 markerCycle 的断链感知（轮询 !ready）不触发，调用方干等到自身超时。
+// 退出事件先翻 ready=false 再分发。
+describe("Sol 90：PTY 自然退出快速感知", () => {
+    test.skipIf(!Bun.which("ssh"))("P2-3 执行中自然退出：调用快速收 unknown（不等自身超时）", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => {
+            attach(a: string[]): void;
+            execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown>;
+            proc?: { emit(ev: string, code: number | null): void };
+            ready: boolean;
+            send(s: string): void;
+        };
+        const link = new Link();
+        link.attach(["-V"]); // 真实 spawn（管线真实；-V 快退不影响——我们手动发事件）
+        (link as unknown as { ready: boolean }).ready = true; // 模拟已建链、执行中
+        (link as unknown as { send(s: string): void }).send = () => { /* noop */ };
+        const t0 = Date.now();
+        // 创建即挂 handler（reject 到 catch 之间若隔 macrotask 轮，bun 记 unhandled）
+        const p = link.execMarker("long-running-cmd", 5_000)
+            .then(() => { throw new Error("不应 resolve"); }, (err) => err as Error & { outcome?: string });
+        await new Promise((r) => setTimeout(r, 150));
+        link.proc!.emit("exit", 0); // 自然退出事件（对端关连接/超时同路径）
+        const e = await p;
+        expect(e?.outcome).toBe("unknown");
+        expect(e?.message).toMatch(/断开|断链/);
+        expect(Date.now() - t0).toBeLessThan(3_000); // 修前：ready 不翻 false——干等到 5s 超时
+    }, 15_000);
+});

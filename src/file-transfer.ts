@@ -138,7 +138,7 @@ export async function putContent(
         `__fx_pm=$(stat -c '%a' "$__fx_tgt" 2>/dev/null); [ -n "$__fx_pm" ] && chmod "$__fx_pm" ${q(out)} 2>/dev/null; ` +
         `chown --reference="$__fx_tgt" ${q(out)} 2>/dev/null || true; `;
     const place = opts.forceInplace
-        ? `if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi`
+        ? `if cat < ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else if [ ! -e ${q(out)} ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi`
         : `__fx_ob=$(basename ${q(out)} 2>/dev/null); ` +
           `__fx_od=$(stat -c %d ${q(out)} 2>/dev/null || stat -f %d ${q(out)} 2>/dev/null); ` +
           `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
@@ -148,10 +148,10 @@ export async function putContent(
           `if mv -T ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
           `else if [ ! -d "$__fx_tgt" ] && mv ${q(out)} "$__fx_tgt" 2>/dev/null && __fx_mv=1 && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
           `else if [ "$__fx_mv" = "1" ] && [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_ob" ${q(out)} 2>/dev/null; then echo FX_IS_DIR; ` +
-          `else if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; ` +
+          `else if cat < ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else if [ ! -e ${q(out)} ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; fi; ` +
           `else ` +
           `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
-          `if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; ` +
+          `if cat < ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else if [ ! -e ${q(out)} ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; ` +
           `fi`;
     // 落位五防（Sol 87 P1-5 → Sol 88 P1-6 → Sol 89 P1-4/P1-5）：
     // ①前置 [ -d ] 快速拒绝（外层 test 与本处之间目标被换成目录）；
@@ -161,12 +161,21 @@ export async function putContent(
     // ⑤**设备号分流**（跨设备上传曾谎报 atomic-replace）：载荷临时在原路径
     // 一侧，符号链接真身可在另一文件系统——mv 跨设备时退化为复制仍报原子。
     // stat -c/-f 双方言取设备号，同设备才走 rename 链；跨设备/不可判一律走
-    // cat（FX_MV_CAT→inplace-write 诚实标注，无法判定时保守按跨设备）
+    // cat（FX_MV_CAT→inplace-write 诚实标注，无法判定时保守按跨设备）。
+    // cat 形态一律 `< src > tgt`（Sol 90 P1-3）：shell 从左到右处理重定向——
+    // 源打开失败时目标尚未被截断（`cat src > tgt` 是 cat 自己开源、shell 先
+    // 截目标——载荷丢失后原文件曾被截成 0 字节且恢复路径无存）
     const mv = await exec(`test ! -d ${q(remotePath)} || { echo FX_IS_DIR; exit 1; }; { ${tgtSetup}${place}; }`);
     const mvOut = (mv.stdout || "").trim();
     if (mvOut.includes("FX_IS_DIR")) {
         await cleanup();
         throw new Error(`put 落位失败（目标是现存目录）——目标未动: ${remotePath}`);
+    }
+    if (mvOut.includes("FX_NO_PAYLOAD")) {
+        // 载荷在落位前已消失（Sol 90 P1-3）：`< src > tgt` 重定向排序保证目标
+        // **未被截断**——零接触；专错不谎称恢复路径在场
+        await cleanup();
+        throw new Error(`put 落位中止（已校验载荷在落位前消失——外部移除？）——目标未动（重定向排序保证未截断）: ${remotePath}`);
     }
     if (mvOut.includes("FX_INPLACE_FAIL")) {
         // 不 cleanup：out 载荷保留供核实/重试（目标可能已是半截——处置属调用方）

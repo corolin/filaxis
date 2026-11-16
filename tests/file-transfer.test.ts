@@ -60,7 +60,7 @@ function mockRemote() {
             return { stdout: "FX_MV_OK", exitCode: 0 };
         }
         // forceInplace 形态（显式请求保留 inode 写）——cat src > "$tgt" && rm src
-        mm = cmd.match(/^cat '([^']+)' > [^&]+ && rm -f '([^']+)' && echo FX_MV_CAT$/);
+        mm = cmd.match(/^cat < '([^']+)' > [^&]+ && rm -f '([^']+)' && echo FX_MV_CAT$/); // < src > tgt（Sol 90 P1-3 重定向排序）
         if (mm) {
             const b = files.get(mm[1]!);
             if (!b) return { stdout: "", exitCode: 1 };
@@ -473,6 +473,54 @@ describe("putFile（真实 shell 回归）", () => {
         } finally {
             rmSync(shmDir, { recursive: true, force: true });
         }
+    }, 20_000);
+
+
+    // GPT Sol 九十期 P1-3：载荷（已校验的 out/fx-tmp）在落位开始时被移除——
+    // `cat src > tgt` 由 cat 自己开源、shell 先截断目标：原文件被截成 0 字节且
+    // 错误所称恢复路径无存。修后 `cat < src > tgt`：shell 从左到右处理重定向，
+    // 源打开失败时目标尚未被截断。
+    test.skipIf(!hasSh)("Sol 90 P1-3 载荷丢失：mv 失败回落 cat——目标零接触（不再截空）", async () => {
+        const dst = fwd(join(dirR, "p3-target.bin"));
+        writeFileSync(join(dirR, "p3-target.bin"), "PRECIOUS-CONTENT");
+        let outPath = "";
+        const evil: TransferExec = async (cmd) => {
+            const dm = cmd.match(/base64 -d < '([^']+)' > '([^']+)'/);
+            if (dm) outPath = dm[2]!;
+            if (cmd.includes("__fx_mv=0")) {
+                // 落位开始：移除已校验载荷（模拟丢失/外部清理）
+                if (outPath) rmSync(outPath, { force: true });
+            }
+            return realExec(cmd);
+        };
+        await expect(putContent(evil, GNU, Buffer.from("new-payload"), dst)).rejects.toThrow(/载荷在落位前消失/);
+        expect(readFileSync(join(dirR, "p3-target.bin"), "utf-8")).toBe("PRECIOUS-CONTENT"); // 修前：0 字节+谎称恢复路径在场
+    }, 20_000);
+
+    // Sol 90 P1-2（受控编辑侧同款防御的形状锚）：CAS 核验与落位同锚解析后真身
+    test.skipIf(!hasSh)("Sol 90 P1-2 editFile 命令形状：真身解析先于核验（同锚 __fx_tgt）", async () => {
+        const { editFile } = await import("../src/file-edit.js");
+        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const drv = new LocalRuntimeDriver();
+        const target = fwd(join(dirR, "p2-real.bin"));
+        writeFileSync(join(dirR, "p2-real.bin"), "V=1\n");
+        const cmds: string[] = [];
+        const rec = Object.create(drv) as typeof drv;
+        (rec as unknown as { exec(c: string, o?: unknown): Promise<unknown> }).exec = async (c: string, o?: unknown) => {
+            cmds.push(c);
+            return (drv.exec as (c: string, o?: unknown) => Promise<unknown>)(c, o);
+        };
+        await editFile(rec, target, "V=1", "V=2");
+        const cas = cmds.find((c) => c.includes("FX_CAS_FAIL") || c.includes("flock"));
+        expect(cas).toBeTruthy();
+        const iResolve = cas!.indexOf("__fx_tgt=$(readlink -f");
+        const iStat = cas!.indexOf("stat -c '%Y %s'");
+        const iSha = cas!.indexOf("sha256sum");
+        expect(iResolve).toBeGreaterThanOrEqual(0);
+        expect(iResolve).toBeLessThan(iStat); // 修前：核验在前、真身解析在落位段
+        expect(cas).toContain("stat -c '%Y %s' \"$__fx_tgt\""); // 核验锚**真身**（修前：原路径）
+        expect(cas).toContain('sha256sum "$__fx_tgt"');
+        expect(readFileSync(join(dirR, "p2-real.bin"), "utf-8")).toBe("V=2\n"); // 编辑本身仍成功
     }, 20_000);
 
     afterAll(() => {

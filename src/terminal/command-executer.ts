@@ -12,6 +12,8 @@ import { TmuxInvoker } from "./tmux-invoker.js";
 import { OutputBuffer, type BufferStats } from "./output-buffer.js";
 import { compilePromptPatterns, DEFAULT_TERMINAL_CONFIG, type PromptPayload, type PromptResponder, type TerminalConfig } from "./types.js";
 import { noopLogger, type FilaxisLogger } from "../logger.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export interface ProgressSnapshot {
     tail: string;
@@ -76,6 +78,14 @@ const sessionChains = new Map<string, Promise<unknown>>();
 const sessionSttyOff = new Set<string>();
 const sessionDead = new Set<string>();
 const sessionDestroyConfirmed = new Set<string>();
+
+/** 跨进程会话锁路径（Sol 90 P1-5）：tmux 会话 id 是**OS 级全局命名空间**——
+ *  模块级 Map 只串行化本进程，两个独立进程引用同一 terminalId 时 send-keys
+ *  仍交错（实测无需注入即现，命令文本互相送进对方前台任务）。锁文件落 tmpdir */
+function sessionLockPath(id: string): string {
+    const safe = id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(-80) || "sess";
+    return join(tmpdir(), `filaxis-sess-${safe}.lock`);
+}
 
 export class CommandExecuter {
     private cfg: TerminalConfig = { ...DEFAULT_TERMINAL_CONFIG };
@@ -144,6 +154,62 @@ export class CommandExecuter {
 
     private async executeLocked(id: string, command: string, opts: RunOptions = {}): Promise<TerminalExecResult> {
         await this.assertReusable(id); // 出队后复检（Sol 88 P1-1）：入队后才翻 dead 的会话在此拦截
+        // 跨进程互斥（Sol 90 P1-5）：等待上限=本命令超时+7s（DRAINING 5s+余量）
+        const release = await CommandExecuter.acquireSessionLock(id, (opts.timeoutMs ?? this.cfg.command_timeout_ms) + 7_000);
+        try {
+            return await this.executeCommand(id, command, opts);
+        } finally {
+            await release();
+        }
+    }
+
+    /** 跨进程会话锁（Sol 90 P1-5）：O_CREAT|O_EXCL 探针 + 陈锁回收——持锁进程
+     *  已死（pid 活性：EPERM=活无权、ESRCH=死）或锁龄>1h（pid 复用兜底）才可
+     *  回收；释放只删自己 token 的锁。同进程内先经全局链串行，锁无自竞争 */
+    private static async acquireSessionLock(id: string, waitMs: number): Promise<() => Promise<void>> {
+        const { open, unlink, readFile, stat } = await import("node:fs/promises");
+        const lockPath = sessionLockPath(id);
+        const myToken = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const deadline = Date.now() + waitMs;
+        let fh: Awaited<ReturnType<typeof open>> | null = null;
+        while (Date.now() < deadline) {
+            try {
+                fh = await open(lockPath, "wx");
+                await fh.write(myToken);
+                break;
+            } catch (e) {
+                const code = (e as { code?: string }).code;
+                if (code !== "EEXIST") throw e;
+                try {
+                    const [tok, st] = await Promise.all([readFile(lockPath, "utf-8"), stat(lockPath)]);
+                    const holderPid = parseInt((tok.split("-")[0] ?? "").trim(), 10);
+                    let alive = Number.isFinite(holderPid) && holderPid > 0;
+                    if (alive) {
+                        try { process.kill(holderPid, 0); } catch (err) { alive = (err as { code?: string }).code === "EPERM"; }
+                    }
+                    if (!alive || Date.now() - st.mtimeMs > 3_600_000) await unlink(lockPath).catch(() => undefined);
+                } catch { /* 锁文件刚好消失——下轮抢 */ }
+                await sleep(25);
+            }
+        }
+        if (!fh) {
+            throw new CommandExecError(`tmux 会话 '${id}' 正被另一进程使用（跨进程锁等待 ${waitMs}ms 超时）——命令串行重试或换 terminalId 分层`);
+        }
+        const held = fh;
+        return async () => {
+            await held.close().catch(() => undefined);
+            try {
+                const cur = await readFile(lockPath, "utf-8");
+                if (cur.trim() === myToken) await unlink(lockPath);
+            } catch { /* 已被回收/删除 */ }
+        };
+    }
+
+    static __testSessLockPath(id: string): string { // 测试导出面（跨进程锁路径）
+        return sessionLockPath(id);
+    }
+
+    private async executeCommand(id: string, command: string, opts: RunOptions = {}): Promise<TerminalExecResult> {
         const cfg = this.cfg;
         const timeoutMs = opts.timeoutMs ?? cfg.command_timeout_ms;
 
@@ -184,7 +250,20 @@ export class CommandExecuter {
         const markerEchoNeedle = `echo ${markerPrefix}`;
         const safeCommand = `${SAFE_PREFIX} ${command}`;
 
-        await this.sendKeys(id, safeCommand);
+        try {
+            await this.sendKeys(id, safeCommand);
+        } catch (e) {
+            // **业务命令首次发送失败**（Sol 90 P1-4）：sendKeys=写文本+提交回车两段
+            //——文本（或回车）送达与否不可知=执行结果未知。raw 抛曾直接放行队列，
+            // 下一条已入队命令的文本照进本条前台任务。与哨兵失败（Sol 89 P1-2）
+            // 同判：标 dead（无销毁确认）+ unknown——出队复检拦截待重建
+            sessionDead.add(id);
+            sessionSttyOff.delete(id);
+            throw new CommandExecError(
+                `业务命令发送失败（${e instanceof Error ? e.message : String(e)}）——命令文本可能已送达且终态不可确认，会话已封存待重建`,
+                "", "unknown",
+            );
+        }
         // 前置换行（Hydrogen R7 #1）：命令输出无尾换行（printf "OK"）时 marker 输出
         // 粘连同一行——单独靠 strip 前缀保留是兜底，源头先保证分行为主防线。
         // **终止符 #**（Sol 88 P1-2）：折行拼接还原后，数字段曾吃到**下一行的

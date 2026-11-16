@@ -105,7 +105,12 @@ class PtyLink {
         this.proc.stdout.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(outDec.write(d)); });
         this.proc.stderr.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(errDec.write(d)); });
         this.proc.on("exit", (code) => {
-            if (!this.ready) {
+            // 退出即断链（Sol 90 P2-3）：ready 只在 kill() 里翻 false——自然退出
+            //（对端关连接/超时）曾保持 ready=true，执行中的 markerCycle 断链感知
+            //（轮询 !this.ready）不触发，调用方干等到自身超时。先翻 false 再分发
+            const wasReady = this.ready;
+            this.ready = false;
+            if (!wasReady) {
                 // 沙箱 stdio 管道损坏快速诊断（DeepSeek Harness 反馈）：PTY 常驻通道
                 // 无法降级重试（attach 是长连接），但给明确错误而非「建链期间退出」
                 // 的笼统话——秒退 255+零输出=管道句柄被沙箱拦截的指纹
