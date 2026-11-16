@@ -49,9 +49,10 @@ function mockRemote() {
         // { __fx_tgt=$(readlink -f …); chmod/chown --reference…; if mv src …; }——
         // mock 无挂载无写入失败，mv 恒成功（落点取 test ! -d 的目标=真身）
         // R8 #2 数字模式权限保持后形态：__fx_pm=$(stat -c …)+[ -n ]&&chmod …; chown …; if mv …
-        mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; __fx_pm=[^;]*; \[ -n "[^"]*" \] && chmod[^;]*; (?:chown)[^;]*; if mv (?:-T )?'(.+?)' /);
+        // Sol 88 P1-6 目录四防前段：__fx_ob=$(basename …); if [ -d … ]; then …; fi;
+        mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; __fx_pm=[^;]*; \[ -n "[^"]*" \] && chmod[^;]*; (?:chown)[^;]*; (?:__fx_ob=[^;]*; )?(?:if \[ -d "\$__fx_tgt" \]; then echo FX_IS_DIR; exit 1; fi; )?if mv (?:-T )?'(.+?)' /);
         if (!mm) { // 兼容旧形态（无 __fx_pm 段）
-            mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; (?:chmod|chown)[^;]*; (?:chmod|chown)[^;]*; if mv (?:-T )?'(.+?)' /);
+            mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; (?:chmod|chown)[^;]*; (?:chmod|chown)[^;]*; (?:__fx_ob=[^;]*; )?(?:if \[ -d "\$__fx_tgt" \]; then echo FX_IS_DIR; exit 1; fi; )?if mv (?:-T )?'(.+?)' /);
         }
         if (mm) {
             const b = files.get(mm[2]!);

@@ -1290,3 +1290,73 @@ describe("Sol 87：attach spawn error", () => {
         }
     }, 15_000);
 });
+
+// GPT Sol 八十八期：P1-7 PTY 链 stdin 写入 EPIPE 无监听=uncaughtException 崩
+// 宿主（execChannel 早有同款防护，PTY 链漏挂）；P1-8 预触发 AbortSignal 不再
+// 派发事件——发送前须显式核验（命令曾照发+exitCode:0 谎报）；P1-9 PTY exec
+// 静默丢弃 cwd；P1-10 销毁后排程中的重连到期曾照样新建链拉起 ssh 进程。
+describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
+    test.skipIf(!Bun.which("ssh"))("P1-7 stdin 断裂写 EPIPE：归链失败语义，不崩宿主", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { attach(a: string[]): void; send(s: string): void; handshake(w: string): Promise<void> };
+        // 真实 EPIPE：ssh -V 立即退出（读端关闭）→ 对已死管道 write
+        const link = new Link();
+        link.attach(["-V"]);
+        await new Promise((r) => setTimeout(r, 1_200)); // 等进程退出
+        link.send("anything\n"); // 修前：stdin Socket 无 error 监听——EPIPE 崩宿主
+        await new Promise((r) => setTimeout(r, 500)); // 错误事件异步到达
+        // 活着=通过；且失败已归账——下一次握手拿到明确拒绝（不悬空等待）
+        await expect(link.handshake("probe")).rejects.toThrow(/退出|stdin/);
+    }, 15_000);
+
+    test("P1-8 预触发 AbortSignal：命令零发送（未执行，可安全重试）", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        const link = new Link() as unknown as { ready: boolean; send(s: string): void; execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        link.ready = true;
+        const sent: string[] = [];
+        link.send = (s: string) => { sent.push(s); };
+        const ac = new AbortController();
+        ac.abort(); // 已触发——不再派发 abort 事件
+        let e: (Error & { name?: string }) | undefined;
+        try { await link.execMarker("touch /tmp/fx88-should-not-exist", 5_000, ac.signal); } catch (err) { e = err as Error & { name?: string }; }
+        expect(e?.name).toBe("AbortError");
+        expect(sent).toEqual([]); // 修前：命令照发+exitCode:0
+    }, 10_000);
+
+    test("P1-9 PTY exec cwd 单次覆盖：子 shell+上下换行包裹；无 cwd 不包裹", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const drv = new SshPtyDriver({ driver: "ssh", target: "t88" } as never);
+        const cmds: string[] = [];
+        (drv as unknown as { link: unknown }).link = {
+            execMarker: async (c: string) => { cmds.push(c); return { stdout: "", stderr: "", exitCode: 0 }; },
+            kill() { /* no-op */ },
+        };
+        try {
+            await drv.exec("printf 'done\\n' # trailing comment", { channel: "pty", cwd: "/opt/x" });
+            expect(cmds[0]).toBe("( cd '/opt/x' && {\nprintf 'done\\n' # trailing comment\n} )"); // 修前：cwd 被静默丢弃
+            await drv.exec("pwd", { channel: "pty" });
+            expect(cmds[1]).toBe("pwd"); // 无 cwd：层内持久状态直跑
+        } finally {
+            await drv.destroy();
+        }
+    }, 10_000);
+
+    test("P1-10 销毁后排程中的重连不拉新进程（到期复查+定时器清理）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const realDelays = (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS;
+        (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS = [80];
+        const drv = new SshPtyDriver({ driver: "ssh", target: "t88r" } as never);
+        let inits = 0;
+        (drv as unknown as { init: () => Promise<void> }).init = async () => { inits++; };
+        try {
+            (drv as unknown as { scheduleReconnect(): void }).scheduleReconnect();
+            await drv.destroy(); // 退避到期前销毁
+            await new Promise((r) => setTimeout(r, 400));
+            expect(inits).toBe(0); // 修前：80ms 回调照样新建链+init（新 ssh PID 存活）
+        } finally {
+            (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS = realDelays;
+            await drv.destroy();
+        }
+    }, 15_000);
+});

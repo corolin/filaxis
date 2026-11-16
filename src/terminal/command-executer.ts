@@ -105,39 +105,44 @@ export class CommandExecuter {
      *   重建后探活自愈）——绝不定时强行复用。
      */
     async execute(id: string, command: string, opts: RunOptions = {}): Promise<TerminalExecResult> {
-        // 自愈探活：dead 标记在但会话已被重建（同 id respawn）→ 清标记放行。
-        // **销毁确认闸**（Sol 87 P1-2）：放行须 destroyConfirmed 在场（本进程
-        // 观测过该 id 消失）——kill 失败的会话同名在场≠重建，曾放行致上一条
-        // 前台任务收到下一条命令文本
-        if (this.deadSessions.has(id)) {
-            if (!this.destroyConfirmed.has(id)) {
-                throw new CommandExecError(
-                    `tmux session '${id}' 销毁结果未确认（kill-session 曾失败——同名会话可能仍被旧前台任务持有）——拒绝复用。请换 id 重建层或先确认旧会话已消失`,
-                );
-            }
-            try {
-                const r = await TmuxInvoker.tryInvoke(["has-session", "-t", id]);
-                if (r.exitCode === 0) {
-                    this.deadSessions.delete(id);
-                    this.destroyConfirmed.delete(id);
-                    this.sttyOff.delete(id);
-                } else {
-                    throw new CommandExecError(
-                        `tmux session '${id}' 已因超时终态不可确认被销毁——请重建层（同 id respawn 后自动恢复）再执行`,
-                    );
-                }
-            } catch (e) {
-                if (e instanceof CommandExecError) throw e;
-                throw new CommandExecError(`tmux session '${id}' 已销毁且探活失败——请重建层`);
-            }
-        }
+        await this.assertReusable(id); // 入队前快检（新调用快速失败）
         const prev = this.chains.get(id) ?? Promise.resolve();
         const run = prev.catch(() => undefined).then(() => this.executeLocked(id, command, opts));
         this.chains.set(id, run.catch(() => undefined));
         return run;
     }
 
+    /** 复用资格核验（Sol 87 P1-2 → Sol 88 P1-1）：dead 标记 + 销毁确认闸 +
+     *  探活自愈。**入队前与出队后（executeLocked 顶）双检**——首检曾只在入队
+     *  前：第一条在链内超时、kill-session 失败标 dead 时，此前已入队的第二条
+     *  绕过首检直接 executeLocked，has-session 对旧前台任务持有的同名会话照样
+     *  成功——下一条命令文本送进了旧前台进程 */
+    private async assertReusable(id: string): Promise<void> {
+        if (!this.deadSessions.has(id)) return;
+        if (!this.destroyConfirmed.has(id)) {
+            throw new CommandExecError(
+                `tmux session '${id}' 销毁结果未确认（kill-session 曾失败——同名会话可能仍被旧前台任务持有）——拒绝复用。请换 id 重建层或先确认旧会话已消失`,
+            );
+        }
+        try {
+            const r = await TmuxInvoker.tryInvoke(["has-session", "-t", id]);
+            if (r.exitCode === 0) {
+                this.deadSessions.delete(id);
+                this.destroyConfirmed.delete(id);
+                this.sttyOff.delete(id);
+                return;
+            }
+            throw new CommandExecError(
+                `tmux session '${id}' 已因超时终态不可确认被销毁——请重建层（同 id respawn 后自动恢复）再执行`,
+            );
+        } catch (e) {
+            if (e instanceof CommandExecError) throw e;
+            throw new CommandExecError(`tmux session '${id}' 已销毁且探活失败——请重建层`);
+        }
+    }
+
     private async executeLocked(id: string, command: string, opts: RunOptions = {}): Promise<TerminalExecResult> {
+        await this.assertReusable(id); // 出队后复检（Sol 88 P1-1）：入队后才翻 dead 的会话在此拦截
         const cfg = this.cfg;
         const timeoutMs = opts.timeoutMs ?? cfg.command_timeout_ms;
 
@@ -180,8 +185,20 @@ export class CommandExecuter {
 
         await this.sendKeys(id, safeCommand);
         // 前置换行（Hydrogen R7 #1）：命令输出无尾换行（printf "OK"）时 marker 输出
-        // 粘连同一行——单独靠 strip 前缀保留是兜底，源头先保证分行为主防线
-        await this.sendKeys(id, `__fx_ec=$?; printf '\n'; echo ${markerPrefix}$__fx_ec`);
+        // 粘连同一行——单独靠 strip 前缀保留是兜底，源头先保证分行为主防线。
+        // **终止符 #**（Sol 88 P1-2）：折行拼接还原后，数字段曾吃到**下一行的
+        // 提示符数字**（PS1=123 下退出码 1 被拼成 1123）——非数字终止符收口数字
+        // 段长度（`#` 词中非注释：紧贴变量展开，echo 原样输出）
+        try {
+            await this.sendKeys(id, `__fx_ec=$?; printf '\n'; echo ${markerPrefix}$__fx_ec#`);
+        } catch (e) {
+            // 哨兵注入失败（Sol 88 P1-3）：业务命令已提交执行中——终态不可核实。
+            // raw 异常曾直抛，调用方无从分诊可否重试；归 unknown 语义（同中途死亡）
+            throw new CommandExecError(
+                `完成哨兵注入失败（${e instanceof Error ? e.message : String(e)}）——命令已提交，远端终态未核实`,
+                "", "unknown",
+            );
+        }
 
         const buffer = new OutputBuffer({
             pendingChars: cfg.buffer_pending_chars,
@@ -241,6 +258,10 @@ export class CommandExecuter {
             }
 
             const paneText = await this.capturePane(id, cfg.capture_scrollback);
+            // 折行还原视图（Sol 88 P1-2）：窄窗格把哨兵前缀本身折断时，**原文**
+            // includes 永远不命中——完成判定根本进不来（命令超时假象）。剥行
+            // 拼接后的 flat 才是判据（软折行无分隔语义）
+            const flatPane = CommandExecuter.flattenPane(paneText, markerPrefix);
 
             if (paneText !== lastPaneText) {
                 lastActivityAt = Date.now();
@@ -254,7 +275,7 @@ export class CommandExecuter {
                     } else {
                         const delta = CommandExecuter.computeDelta(lastPaneText, paneText);
                         if (delta.length > 0) buffer.append(delta);
-                        if (opts.onProgress && !paneText.includes(markerPrefix)) {
+                        if (opts.onProgress && !flatPane.includes(markerPrefix)) {
                             try {
                                 opts.onProgress({ tail: buffer.readTail(), stats: buffer.stats });
                             } catch { /* 进度回调失败不阻断 */ }
@@ -264,8 +285,8 @@ export class CommandExecuter {
                 lastPaneText = paneText;
             }
 
-            if (paneText.includes(markerPrefix)) {
-                const exitCode = CommandExecuter.parseExitCode(paneText, markerPrefix);
+            if (flatPane.includes(markerPrefix)) {
+                const exitCode = CommandExecuter.parseFlatExitCode(flatPane, markerPrefix);
                 if (exitCode !== null) {
                     if (binaryDetected) {
                         return { stdout: `[binary output: ${binaryBytes} bytes omitted]`, exitCode };
@@ -334,13 +355,25 @@ export class CommandExecuter {
         return CommandExecuter.parseExitCode(paneText, markerPrefix);
     }
 
+    /** 剥行拼接（Sol 87 P1-3 → Sol 88 P1-2）：滤哨兵回显行 → 无分隔拼接 →
+     *  剥 \r。PTY 软折行无分隔语义——还原成逻辑流。拼接也会把**下一逻辑行**
+     *（提示符）焊上来，故退出码锚定须要求完整哨兵（终止符 #）而非裸 \d+ */
+    private static flattenPane(paneText: string, markerPrefix: string): string {
+        return paneText.split("\n").filter((l) => !l.includes(`echo ${markerPrefix}`)).join("").replace(/\r/g, "");
+    }
+
     private static parseExitCode(paneText: string, markerPrefix: string): number | null {
+        return CommandExecuter.parseFlatExitCode(CommandExecuter.flattenPane(paneText, markerPrefix), markerPrefix);
+    }
+
+    private static parseFlatExitCode(flat: string, markerPrefix: string): number | null {
         // 折行防截断（Sol 87 P1-3）：窄窗格把 `---CMD_DONE_tk_127` 折断——单行
         // 解析曾把折断的数字前缀（127→12→1）当完整退出码。折断行无法从单行
-        // 形态区分「完整/折断」（数字到行尾两者同形）——统一剥换行拼接后锚定
-        //（PTY 软折行无分隔语义；\d+ 只取哨兵后连续数字段，后续提示符自然截止）
-        const flat = paneText.split("\n").filter((l) => !l.includes(`echo ${markerPrefix}`)).join("").replace(/\r/g, "");
-        const m2 = flat.match(new RegExp(`${markerPrefix}(\\d+)`));
+        // 形态区分「完整/折断」（数字到行尾两者同形）——剥换行拼接后锚定。
+        // **终止符 # 收口**（Sol 88 P1-2）：裸 \d+ 曾把折行拼接进来的下一行
+        // 提示符数字当退出码尾部（PS1=123 下 1 → 1123）；要求 prefix+数字+#
+        // 三段齐整——# 是发送侧哨兵自带的，提示符数字接在 # 后不再入数
+        const m2 = flat.match(new RegExp(`${markerPrefix}(\\d+)#`));
         if (m2) return parseInt(m2[1] ?? "0", 10);
         return null;
     }
@@ -387,7 +420,9 @@ export class CommandExecuter {
 
     private static stripMarkerNoise(log: string, markerPrefix: string, markerEchoNeedle: string): string {
         const resultLines: string[] = [];
-        for (const line of log.split("\n")) {
+        const lines = log.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i]!;
             if (line.includes(markerEchoNeedle)) continue; // 回显行（echo 前缀在场）——先于 marker 检查跳过
             if (line.includes(markerPrefix)) {
                 // 保留 marker 前的前缀（Hydrogen R7 #1）：无尾换行输出的末行与 marker
@@ -396,6 +431,20 @@ export class CommandExecuter {
                 if (prefix !== "") resultLines.push(prefix);
                 break;
             }
+            // 折断哨兵跨行还原（Sol 88 真机补全）：窄窗格把 marker 前缀本身折断——
+            // 单行 includes 不命中，残段曾整段漏进 stdout（20 列真机实锤）。向前拼
+            // 两行判定：哨兵**自本行开始**（起点落在行内）→ 保起点前段后弃全部；
+            // 起点在后续行 → 本行是真实输出照常保留（下一行自会命中折断判定）
+            const joined = line + (lines[i + 1] ?? "") + (lines[i + 2] ?? "");
+            const mIdx = joined.indexOf(markerPrefix);
+            if (mIdx !== -1 && mIdx < line.length) {
+                if (mIdx > 0) resultLines.push(line.slice(0, mIdx));
+                break;
+            }
+            // 回显折断跨行同样跳过——但须**起点落在本行内**（Sol 86 回归）：无分隔
+            // 拼接曾在行边界拼出假 needle（"hello"+"echo ---…"）误跳真实输出行
+            const nIdx = joined.indexOf(markerEchoNeedle);
+            if (nIdx !== -1 && nIdx < line.length) continue;
             if (/__FX_DRAIN_[0-9a-z]+/.test(line)) continue; // DRAINING 探测哨兵执行输出行
             if (/__FX_DR%s/.test(line) || /AIN_[0-9a-z]{4,10}'?\s*$/.test(line)) continue; // 分段哨兵的命令回显（折行残段）
             if (/stty -echo/.test(line)) continue; // 初始化残章
@@ -434,7 +483,7 @@ export class CommandExecuter {
         while (Date.now() < deadline) {
             const pane = await this.capturePane(id, 80);
             if (CommandExecuter.paneShowsDrainEvidence(pane, drainToken)) return true;
-            if (pane.includes(markerPrefix) && CommandExecuter.parseExitCode(pane, markerPrefix) !== null) return true;
+            if (CommandExecuter.parseExitCode(pane, markerPrefix) !== null) return true; // flatten 内含（折断前缀同样可信）
             await sleep(120);
         }
         return false;

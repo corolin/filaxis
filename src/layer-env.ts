@@ -625,8 +625,17 @@ export class LayerEnvStore {
             // 主档重探（Sol 64 #1 → Sol 65 #4）：读取自「主档已移开」起步（stat 即
             // 失败）后，写入方可能在任何时刻归位新档——不论旁路扫描是否已捞到旧
             // 态（曾只在零旁路时重探：捞到旧旁路+新档落位→返回旧值）。缺席即重探。
-            // 重探读失败走 readDoc 分诊（Sol 87 P1-1）：EIO 归账非静默
-            const st = await stat(this.path).catch(() => null);
+            // 重探读失败走 readDoc 分诊（Sol 87 P1-1）：EIO 归账非静默。
+            // **重探 stat 本身分诊**（Sol 88 P1-4）：catch-null 曾把 stat 的 EIO 也
+            // 吞成「仍缺席」——hasData 假阴性下 upsert 以旁路部分视图落盘，主档
+            // 独有条目永久蒸发。非 ENOENT 一律归 readFailures
+            let st: { mtimeMs: number } | null = null;
+            try {
+                st = await stat(this.path);
+            } catch (e) {
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") readFailures.push(`${this.path}(re-probe stat): ${code ?? (e as Error).message}`);
+            }
             if (st) {
                 await readDoc(this.path, st.mtimeMs, false);
                 if (docs.some((d) => !d.aside)) {
@@ -643,9 +652,9 @@ export class LayerEnvStore {
     private async compact(aged: Array<{ p: string; mtimeMs: number }>): Promise<void> {
         const release = await this.acquireLock();
         try {
-            const { cfg: fresh, readFailures } = await this.readMergedChecked();
+            const { cfg: fresh, readFailures, asidePaths, revs } = await this.readMergedChecked();
             if (readFailures.length > 0) return; // 读故障中止压实（Sol 85 P1-2）：旁路留盘
-            await this.saveLocked(fresh, () => release.verifyHeld());
+            await this.saveLocked(fresh, () => release.verifyHeld(), { asidePaths, revs });
             const { unlink } = await import("node:fs/promises");
             for (const a of aged) await unlink(a.p).catch(() => undefined);
         } finally {
@@ -655,9 +664,22 @@ export class LayerEnvStore {
 
     /** 盘面全量读+读故障透传（Sol 85 P1-2：压实的二次读取遇 EIO 曾照删旁路
      *  ——一次 load 返回恢复条目、二次读取时条目已永久消失） */
-    private async readMergedChecked(): Promise<{ cfg: LayerEnvConfigFile; readFailures: string[] }> {
-        const { docs, readFailures } = await this.collectDocs();
-        return { cfg: LayerEnvStore.mergeDocs(docs), readFailures };
+    private async readMergedChecked(): Promise<{
+        cfg: LayerEnvConfigFile;
+        readFailures: string[];
+        /** 合并基线（Sol 88 P1-5）：本次读到的旁路路径与 rev 集——saveLocked
+         *  的 seen 记录与旁路消费**只认基线**：晚于基线出现的恢复旁路（他方
+         *  舞步崩溃残留）既不记「见过」也不删除，留盘待下次 load 救回 */
+        asidePaths: string[];
+        revs: string[];
+    }> {
+        const { docs, asides, readFailures } = await this.collectDocs();
+        return {
+            cfg: LayerEnvStore.mergeDocs(docs),
+            readFailures,
+            asidePaths: asides.map((a) => a.p),
+            revs: docs.map((d) => d.rev).filter((r): r is string => r != null),
+        };
     }
 
     private async readMergedRaw(): Promise<LayerEnvConfigFile> {
@@ -693,20 +715,29 @@ export class LayerEnvStore {
     private async saveLocked(
         cfg: LayerEnvConfigFile,
         verifyHeld?: () => Promise<boolean>,
+        baseline?: { asidePaths: string[]; revs: string[] },
     ): Promise<void> {
         const { link, unlink } = await import("node:fs/promises");
         await mkdir(dirname(this.path), { recursive: true });
         const uniq = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const tmp = `${this.path}.${uniq}.tmp`;
         const aside = `${this.path}.${uniq}${ASIDE_SUFFIX}`;
-        // 舞步开场旁路快照（Sol 61 P2-2）：成功收尾时一并消费——上轮只消自己的
-        // 旁路，崩溃遗留的历史旁路仍会把整档替换已删的层复活
-        const preAsides = (await this.listAsides()).map((a) => a.p);
-        // 血统快照（Sol 66 #3 → Sol 67 集合化）：锁内盘面全部 rev=本轮作者「确切
-        // 见过」的状态集——集合成员判定免疫时钟回拨（上界 base 在首写见空盘与
-        // 旁路戳超上界两端都误判）。写入 _fx_seen（_fx_base 保留作旧档回落）
-        const diskDocs = (await this.collectDocs()).docs;
-        const seenRevs = diskDocs.map((d) => d.rev).filter((r): r is string => r != null);
+        // 舞步开场盘点（Sol 61 P2-2 → Sol 88 P1-5）：成功收尾时一并消费的旁路
+        // + 血统 seen 的 rev 集。**基线驱动**：upsert/compact 传入合并读的基线
+        //——基线之后才出现的恢复旁路（他方舞步崩溃残留）曾既被提交时的重新
+        // 枚举记入 _fx_seen（「作者见过」谎报）又被物理删除，其条目从未并入
+        // 任何合并=永久丢失。seen 与消费都只认基线；无基线（save 整档快照）
+        // 也只**单次**枚举（旧实现 preAsides/diskDocs 两轮枚举间隙同病）
+        let consumableAsides: string[];
+        let seenRevs: string[];
+        if (baseline) {
+            consumableAsides = baseline.asidePaths;
+            seenRevs = baseline.revs;
+        } else {
+            const opening = await this.collectDocs();
+            consumableAsides = opening.asides.map((a) => a.p);
+            seenRevs = opening.docs.map((d) => d.rev).filter((r): r is string => r != null);
+        }
         const baseRev = seenRevs.reduce<string | null>((m, r) => (!m || r > m ? r : m), null);
         // 内嵌序戳（Sol 62 P2-4）：文档自带提交时刻——rename/link 迁移不损，
         // 同刻 mtime 平局由戳裁决（mergeLayers 只读 layers，戳不外泄）。
@@ -757,13 +788,14 @@ export class LayerEnvStore {
             } catch { /* 盘面已变——旁路留恢复锚 */}
             throw new Error("__FX_LOCK_LOST__");
         }
-        // 成功收尾：消费自己移开的旁路 + 舞步开场在场的历史旁路（Sol 60 P2-2 +
-        // Sol 61 P2-2）——保留它们会让整档替换已删的层经恢复协议复活。post-check
-        // 通过=本舞步持锁期间无他方提交：upsert 的 cfg 基线（锁内 load）⊇ 旁路
-        // 内容；save 的整档替换语义本就覆盖删除。中止/崩溃路径不消费——旁路是
-        // 恢复锚
+        // 成功收尾：消费自己移开的旁路 + 盘点在册的历史旁路（Sol 60 P2-2 +
+        // Sol 61 P2-2 → Sol 88 P1-5 基线化）——保留它们会让整档替换已删的层经
+        // 恢复协议复活；但**只消基线内的**（cfg 合并确曾看过它们）。post-check
+        // 通过=本舞步持锁期间无他方提交：upsert 的 cfg 基线（锁内 load）⊇ 基线
+        // 旁路内容；save 的整档替换语义本就覆盖删除。中止/崩溃路径不消费——
+        // 旁路是恢复锚；基线外新落者留盘待下次合并
         await unlink(aside).catch(() => undefined);
-        for (const p of preAsides) await unlink(p).catch(() => undefined);
+        for (const p of consumableAsides) await unlink(p).catch(() => undefined);
     }
 
     /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */
@@ -837,7 +869,7 @@ export class LayerEnvStore {
                     // {a,c}，b 蒸发。写者不信缓存，锁内永远读盘面新鲜态。
                     // **读故障中止**（Sol 85 P1-2）：EIO 挡住的旁路曾照常丢——
                     // upsert 以部分态落盘并清旁路=stale:false 谎报+数据丢失
-                    const { cfg, readFailures } = await this.readMergedChecked();
+                    const { cfg, readFailures, asidePaths, revs } = await this.readMergedChecked();
                     if (readFailures.length > 0) {
                         throw new Error(`LayerEnvStore 读故障在场——upsert 拒绝以部分态落盘（${readFailures[0]}）。请解除故障后重试: ${key}`);
                     }
@@ -848,8 +880,9 @@ export class LayerEnvStore {
                     cfg.layers[key] = entry;
                     try {
                         // rename 紧前复核（Sol 58 P2-1）：失败时 rename 未发生，盘上
-                        // 新 holder 数据完好——本轮放弃，loop 重新拿锁+重读+重合并
-                        await this.saveLocked(cfg, () => release.verifyHeld());
+                        // 新 holder 数据完好——本轮放弃，loop 重新拿锁+重读+重合并。
+                        // 基线随行（Sol 88 P1-5）：seen/旁路消费与合并读同源
+                        await this.saveLocked(cfg, () => release.verifyHeld(), { asidePaths, revs });
                         return { stale: false } as const;
                     } catch (e) {
                         if (e instanceof Error && e.message === "__FX_LOCK_LOST__") continue; // 重试

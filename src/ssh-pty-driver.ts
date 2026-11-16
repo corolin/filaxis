@@ -81,6 +81,17 @@ class PtyLink {
             else this.pendingExitFailure = wrap;
             this.onUnexpectedExit?.();
         });
+        // stdin 管道错误监听（Sol 88 P1-7）：对端关闭读端后继续 write 抛 EPIPE
+        //——错误事件发在 **stdin Socket** 上，proc 的 error 监听收不到；无监听器
+        //= uncaughtException 崩**宿主**（调用方 try/catch 收不到——execChannel
+        // 早有同款防护，PTY 链漏挂）。归 readyRejecter/pendingExitFailure +
+        // onUnexpectedExit（断链语义，走三层退避重连）
+        this.proc.stdin.on("error", (e: Error) => {
+            const err = new Error(`ssh stdin 写入失败（${e.message}）——PTY 链已断: ${(e as { code?: string }).code ?? ""}`);
+            if (this.readyRejecter) this.readyRejecter(err);
+            else if (!this.pendingExitFailure) this.pendingExitFailure = err;
+            this.onUnexpectedExit?.();
+        });
         // 双流各自解码器（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂——两管道交替喂
         // 同一 decoder 会混流撕字，必须 per-stream
         const outDec = new StringDecoder("utf-8");
@@ -202,6 +213,17 @@ ${command}
         caller: { resolve: (r: ExecResult) => void; reject: (e: unknown) => void },
     ): Promise<void> {
         return new Promise<void>((cycleDone) => {
+            // 预触发信号核验（Sol 88 P1-8）：已 abort 的信号不再派发事件——只挂
+            // listener 曾照样发命令、exitCode:0 谎报成功。出队后、发送前显式拒
+            //（命令未发出，可安全重试——不带 outcome unknown）
+            if (abortSignal?.aborted) {
+                caller.reject(new DOMException(
+                    "SshPty exec aborted by AbortSignal（命令发送前已取消——未执行，可安全重试）",
+                    "AbortError",
+                ));
+                cycleDone();
+                return;
+            }
             let notified = false; // 调用方已归（超时/abort）——INTERRUPTING 起点标志
             let drained = false; // DRAINING 兜底定时器已布
             this.lineBuffer = [];
@@ -382,6 +404,8 @@ export class SshPtyDriver implements RuntimeDriver {
     execInFlight = false;
     reconnecting = false;
     private reconnectAttempts = 0;
+    /** 在途重连定时器（Sol 88 P1-10）：exit() 显式清——到期复查之外的双保险 */
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly log: FilaxisLogger;
 
     private static readonly MAX_RECONNECT = 3;
@@ -525,11 +549,16 @@ export class SshPtyDriver implements RuntimeDriver {
             this.reconnectAttempts++;
             const delay = SshPtyDriver.RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempts - 1, SshPtyDriver.RECONNECT_DELAYS_MS.length - 1)]!;
             const timer = setTimeout(() => {
+                this.reconnectTimer = null;
+                // 到期复查（Sol 88 P1-10）：存活检查曾只在**调度时**——destroy()
+                // 后到期的回调照样新建链拉起 ssh 子进程（销毁后冒出新 PID 且存活）
+                if (!this.alive) { this.reconnecting = false; return; }
                 void (async () => {
                     try {
                         this.link = new PtyLink();
                         this.bindLink();
                         await this.init();
+                        if (!this.alive) { this.link.kill(); this.reconnecting = false; return; } // init 在途销毁——回收新链
                         this.reconnecting = false;
                         this.reconnectAttempts = 0;
                         this.lastActivityAt = Date.now();
@@ -540,6 +569,7 @@ export class SshPtyDriver implements RuntimeDriver {
                 })();
             }, delay);
             timer.unref?.();
+            this.reconnectTimer = timer; // exit() 显式回收（到期复查的双保险）
         };
         attempt();
     }
@@ -591,6 +621,7 @@ export class SshPtyDriver implements RuntimeDriver {
         this.alive = false;
         this.reconnecting = false;
         this.layerState = "dead";
+        if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; } // 排程中的重连不再到期拉新进程（Sol 88 P1-10）
         this.link.kill();
     }
 
@@ -621,7 +652,14 @@ export class SshPtyDriver implements RuntimeDriver {
             }
             this.execInFlight = true;
             try {
-                const r = await this.link.execMarker(command, options?.timeoutMs ?? 120_000, options?.signal);
+                // cwd 单次覆盖（Sol 88 P1-9）：曾静默丢弃——pwd/相对路径全落旧位置。
+                // 子 shell 隔离（单次覆盖不得污染层内持久 cd 状态）+ 上下换行
+                //（业务尾注释吞 `; }` 同病——execSession 二十期 #2 同款双防）；
+                // cd 失败 && 短路——退出码可探测
+                const cmd = options?.cwd
+                    ? `( cd ${q(options.cwd)} && {\n${command}\n} )`
+                    : command;
+                const r = await this.link.execMarker(cmd, options?.timeoutMs ?? 120_000, options?.signal);
                 if (r.effectiveUser) this.effectiveUser = r.effectiveUser;
                 return r;
             } finally {

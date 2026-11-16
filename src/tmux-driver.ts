@@ -151,7 +151,10 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 无 force 删缺席路径都报正常完成。凭证纪律同 readFile/writeFile
             async rm(p, options) {
                 const r = await self.exec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}${q(p)}`);
-                if (r.exitCode !== 0 && !options?.force) throw new Error(`rm 失败（exit=${r.exitCode}）: ${p}`);
+                // force 只影响命令形态（-f 豁免缺席路径——exit 0）；非零退出=真实
+                // 失败（目录未递归删等）照传（Sol 88 P2-1：曾 force 下吞掉一切非零
+                //——对现存目录的非递归删除谎报完成、目录仍在）
+                if (r.exitCode !== 0) throw new Error(`rm 失败（exit=${r.exitCode}）: ${p}`);
             },
             async mkdir(p, options) {
                 const r = await self.exec(`mkdir ${options?.recursive ? "-p " : ""}${q(p)}`);
@@ -366,9 +369,12 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // cwd 支持（Hydrogen R4 #3 → Sol 87 P1-6 作用域隔离）：曾静默丢弃；后修
         // cd 前缀**裸跑在父 shell**——单次 exec 的 cwd 覆盖永久改掉持久 shell 的
         // 目录（下一条无 cwd 的 pwd 仍在新目录、相对路径全落错）。改子 shell
-        // 隔离：( cd X && cmd )——cd 只活在本条命令；退出码经子 shell 天然透传
+        // 隔离：( cd X && cmd )——cd 只活在本条命令；退出码经子 shell 天然透传。
+        // **上下换行**（Sol 88 P2-2）：单行 `{ cmd; } )` 下业务尾注释
+        // `cmd # cmt` 把 `; } )` 一并注释掉——包装永不闭合，命令挂到超时。命令
+        // 与闭合语法分行（execSession 二十期 #2 同款双防）
         const cmd = options?.cwd
-            ? `( cd ${q(options.cwd)} && { ${command}; } )`
+            ? `( cd ${q(options.cwd)} && {\n${command}\n} )`
             : command;
         if (options?.channel === "pty") {
             // tmux 后端本身即 PTY 语义（send-keys/capture-pane）

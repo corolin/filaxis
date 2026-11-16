@@ -1222,11 +1222,166 @@ describe("Sol 87：折行退出码/销毁确认闸/outcome", () => {
         const parse = (CommandExecuter as unknown as { __testParseExit?: (t: string, p: string) => number | null }).__testParseExit;
         if (!parse) return;
         const prefix = "---CMD_DONE_tk87_";
-        // 80 列：完整一行
-        expect(parse(`out\n${prefix}127\n$`, prefix)).toBe(127);
-        // 23 列：`---CMD_DONE_tk87_12` + 折行 `7`
-        expect(parse(`out\n${prefix}12\n7\n$`, prefix)).toBe(127);
-        // 22 列：`---CMD_DONE_tk87_1` + 折行 `27`
-        expect(parse(`out\n${prefix}1\n27\n$`, prefix)).toBe(127);
+        // 80 列：完整一行（Sol 88 P1-2 起哨兵带 # 终止符）
+        expect(parse(`out\n${prefix}127#\n$`, prefix)).toBe(127);
+        // 23 列：`---CMD_DONE_tk87_12` + 折行 `7#`
+        expect(parse(`out\n${prefix}12\n7#\n$`, prefix)).toBe(127);
+        // 22 列：`---CMD_DONE_tk87_1` + 折行 `27#`
+        expect(parse(`out\n${prefix}1\n27#\n$`, prefix)).toBe(127);
+        // 数字与终止符一并被折开（终止符自己换行）
+        expect(parse(`out\n${prefix}127\n#\n$`, prefix)).toBe(127);
+    }, 10_000);
+});
+
+// GPT Sol 八十八期 P1-2：剥换行拼接把**下一行提示符数字**焊进退出码（PS1=123
+// 下 false 的 1 被拼成 1123）；20 列把哨兵前缀本身折断——原文 includes 判定
+// 永不命中（完成分支进不来→超时假象）。终止符 # 收口数字段 + flat 判据。
+describe("Sol 88：哨兵终止符/前缀折断", () => {
+    test("P1-2 提示符数字接龙：PS1=123 下退出码 1 ≠ 1123", async () => {
+        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const parse = (CommandExecuter as unknown as { __testParseExit?: (t: string, p: string) => number | null }).__testParseExit;
+        if (!parse) return;
+        const prefix = "---CMD_DONE_ps1x_";
+        // marker 输出行 + 下一行提示符 123（用户命令里 export PS1=123 后回提示符）
+        expect(parse(`out\n${prefix}1#\n123`, prefix)).toBe(1);
+        // 折行中段也吃提示符：`_1` 折断 + `2#123`（下一行恰以数字续上）
+        expect(parse(`out\n${prefix}1\n2#\n123`, prefix)).toBe(12);
+        // 无终止符的残影（旧协议档/伪造）不作数——null 而非猜数
+        expect(parse(`out\n${prefix}127\n$`, prefix)).toBeNull();
+    }, 10_000);
+
+    test("P1-2 前缀本身折断（20 列）：回显折段不误配、执行输出跨行还原", async () => {
+        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const parse = (CommandExecuter as unknown as { __testParseExit?: (t: string, p: string) => number | null }).__testParseExit;
+        if (!parse) return;
+        // 20 列：回显行折成两段（needle 不全在任何单行——滤不掉，但含 $__fx_ec
+        // 无数字不作数）；执行输出 `---CMD_DONE_abcdefgh_127#` 同样折断
+        const echoFrag1 = `printf '\\n'; echo ---CMD` ;
+        const echoFrag2 = `_DONE_abcdefgh_$__fx_ec#`;
+        const outFrag1 = `---CMD_DONE_abcdefg`;
+        const outFrag2 = `h_127#`;
+        const pane = [echoFrag1, echoFrag2, outFrag1, outFrag2, "123"].join("\n");
+        expect(parse(pane, "---CMD_DONE_abcdefgh_")).toBe(127);
+    }, 10_000);
+
+    test("P1-2 strip 折断哨兵：残段不漏进 stdout（真机 20 列实锤形态）", async () => {
+        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const strip = (CommandExecuter as unknown as { __testStrip?: (log: string, prefix: string, needle: string) => string }).__testStrip;
+        if (!strip) return;
+        const prefix = "---CMD_DONE_c505g50d_";
+        const needle = `echo ${prefix}`;
+        // 真机实录形态：提示符 123 + 空行 + 折断 marker（前缀被 20 列切断）+ 续行 + 提示符
+        const log = ["123", "", "", "---CMD_DONE_c505g50d", "_1#", "123"].join("\n");
+        expect(strip(log, prefix, needle)).toBe("123"); // 修前：残段全漏——"123\n\n\n---CMD_DONE_c505g50d\n_1#\n123"
+        // 粘连 + 折断复合：本行尾带部分前缀、数字折到下一行——保起点前段
+        const log2 = ["hello---CMD_DONE_abc", "12345_0#", "123"].join("\n");
+        expect(strip(log2, "---CMD_DONE_abc12345_", `echo ---CMD_DONE_abc12345_`)).toBe("hello");
+        // 折断起点在后续行：本行是真实输出，完整保留
+        const log3 = ["hello", "---CMD_DONE_abc", "12345_0#", "123"].join("\n");
+        expect(strip(log3, "---CMD_DONE_abc12345_", `echo ---CMD_DONE_abc12345_`)).toBe("hello");
+    }, 10_000);
+});
+
+// GPT Sol 八十八期：P1-1 复用检查只在入队前——第一条在链内超时、kill 失败标
+// dead 后，此前已入队的第二条绕过检查把命令文本送进旧前台进程；P1-3 完成哨兵
+// 注入失败时业务命令已提交——raw 异常直抛丢 outcome unknown；P2-1 rm force 吞
+// 真实删除错误；P2-2 单行 cwd 包裹被业务尾注释吞掉闭合。
+describe("Sol 88：队列复用双检/哨兵注入失败/rm force/cwd 换行", () => {
+    test("P1-1 已入队调用在出队后被拒（kill 失败的 dead 会话不吃第二条命令）", async () => {
+        const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
+        const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        const sentTexts: string[] = [];
+        // 场景：cmd1 永不完成（pane 无 marker）→ 超时 → ^C → drain 证据永不出 →
+        // kill-session **失败**（旧前台任务持有同名会话）→ dead 无销毁确认。
+        // cmd2 在超时前已入队——出队时必须被复用检查拦截，文本零发送。
+        // 注意：断言用手工 try/catch——bun 1.4.4 的 expect(p).rejects 匹配器在
+        // 本形态（链上挂着第二条 execute）下冻结事件循环（排障实录见轮次档案）
+        const invoke = async (args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+            const a0 = args[0] ?? "";
+            if (a0 === "kill-session") throw new Error("kill-session 失败（注入：旧前台任务持有）");
+            if (a0 === "send-keys" && args[3] === "-l") sentTexts.push(String(args[4] ?? ""));
+            return { stdout: a0 === "capture-pane" ? "still running..." : "", stderr: "", exitCode: 0 };
+        };
+        (TmuxInvoker as unknown as { invoke: unknown }).invoke = invoke;
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const ce = new CommandExecuter({ config: { poll_interval_ms: 30, no_output_timeout_ms: 60_000, capture_scrollback: 20 } as never });
+        try {
+            const p1 = ce.execute("S88Q", "sleep 300", { timeoutMs: 250 });
+            await new Promise((r) => setTimeout(r, 120)); // cmd1 在链内运行中
+            const p2 = ce.execute("S88Q", "echo second-should-never-run", { timeoutMs: 5_000 });
+            let e1: Error & { outcome?: string } | undefined;
+            try { await p1; } catch (e) { e1 = e as Error & { outcome?: string }; }
+            expect(e1?.outcome).toBe("unknown"); // 超时+kill 失败 → dead
+            let e2: Error | undefined;
+            try { await p2; } catch (e) { e2 = e as Error; }
+            expect(e2?.message).toMatch(/销毁结果未确认/); // 修前：出队直跑——文本送进旧前台任务
+            // cmd2 的业务文本从未发出
+            expect(sentTexts.some((t) => t.includes("second-should-never-run"))).toBe(false);
+        } finally {
+            (TmuxInvoker as unknown as { invoke: unknown }).invoke = realInvoke;
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = realTry;
+        }
+    }, 20_000);
+
+    test("P1-3 完成哨兵注入失败：业务命令已提交——outcome unknown（非 raw 异常）", async () => {
+        const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
+        const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        const invoke = async (args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+            const a0 = args[0] ?? "";
+            if (a0 === "send-keys" && args[3] === "-l" && String(args[4] ?? "").includes("__fx_ec=$?")) {
+                throw new Error("注入：哨兵 send-keys 失败");
+            }
+            return { stdout: "", stderr: "", exitCode: 0 };
+        };
+        (TmuxInvoker as unknown as { invoke: unknown }).invoke = invoke;
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const ce = new CommandExecuter({ config: { poll_interval_ms: 30 } as never });
+        try {
+            // 业务命令 send-keys 已成功（未被注入拦）——只有第二段哨兵注入失败
+            let e: Error & { outcome?: string } | undefined;
+            try { await ce.execute("S88M", "true", { timeoutMs: 5_000 }); } catch (err) { e = err as Error & { outcome?: string }; }
+            expect(e?.outcome).toBe("unknown");
+            expect(e?.message).toMatch(/完成哨兵注入失败/);
+        } finally {
+            (TmuxInvoker as unknown as { invoke: unknown }).invoke = realInvoke;
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = realTry;
+        }
+    }, 15_000);
+
+    test("P2-1 force rm 非零退出照传（-f 只豁免缺席路径）", async () => {
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "S88R", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "S88R",
+                runCommand: async (_id: string, cmd: string) => ({ stdout: "", stderr: "", exitCode: cmd.includes("s88-dir") ? 1 : 0 }), // rm -f 目录未递归删：真实 rm 退出 1（缺席路径 -f=exit 0）
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await expect(drv.fs.rm("/tmp/s88-dir", { force: true })).rejects.toThrow(/rm 失败/); // 修前：force 吞掉 exit 1——Promise 正常完成、目录仍在
+            await expect(drv.fs.rm("/tmp/s88-missing", { force: true })).resolves.toBeUndefined(); // 缺席（exit 0）不受影响
+        } finally {
+            await drv.destroy();
+        }
+    }, 10_000);
+
+    test("P2-2 exec cwd 包裹上下换行：尾注释不再吞掉闭合", async () => {
+        const cmds: string[] = [];
+        const drv = new TmuxSessionDriver(
+            { driver: "tmux", terminalId: "S88C", config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => "S88C",
+                runCommand: async (_id: string, cmd: string) => { cmds.push(cmd); return { stdout: "", stderr: "", exitCode: 0 }; },
+                destroySession: async () => undefined,
+            } as never },
+        );
+        try {
+            await drv.exec("printf 'done\\n' # trailing comment", { cwd: "/opt/x" });
+            expect(cmds[0]).toBe("( cd '/opt/x' && {\nprintf 'done\\n' # trailing comment\n} )"); // 修前：单行 `{ cmd; } )`——`; } )` 全进注释
+            await drv.exec("pwd", {}); // 无 cwd：不包裹
+            expect(cmds[1]).toBe("pwd");
+        } finally {
+            await drv.destroy();
+        }
     }, 10_000);
 });

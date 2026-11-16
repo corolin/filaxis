@@ -1592,3 +1592,46 @@ describe("Sol 87：探测面故障", () => {
         }
     }, 20_000);
 });
+
+// GPT Sol 八十八期 P1-5：提交阶段曾用**提交时的重新枚举**决定 seen 与旁路消费
+//——基线读完后才出现的恢复旁路（他方舞步崩溃残留）既被记入 _fx_seen（「作者
+// 见过」谎报）又被物理删除，其条目从未并入任何合并=永久丢失。基线驱动修复后：
+// 晚于基线的旁路不记见过、不删除——下次 load 照常救回。
+describe("Sol 88：提交基线与恢复旁路竞态", () => {
+    test("P1-5 晚于基线的 recover 旁路：不被 seen 谎报、不被删除——load 救回", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env88-"));
+        try {
+            const p = join(dir, "env.json");
+            const s = new LayerEnvStore(p);
+            const ent = (t: string) => ({ connection: { driver: "ssh", target: t }, environment: { os: "o" }, discovered_at: "t", fingerprint: "f" + t });
+            await s.upsert("base", ent("b"));
+            // 注入：包装实例 readMergedChecked——返回基线后、提交前，盘上落一个
+            // 仅含 recover 的旁路（模拟他方舞步在 rename 后崩溃的残留）
+            const asidePath = `${p}.9999999999999-77-race88.fx-old`;
+            const raceRev = "9999999999999-77-race88";
+            const orig = (s as unknown as { readMergedChecked: () => Promise<{ cfg: unknown; readFailures: string[]; asidePaths: string[]; revs: string[] }> }).readMergedChecked.bind(s);
+            (s as unknown as { readMergedChecked: unknown }).readMergedChecked = async () => {
+                const r = await orig();
+                writeFileSync(asidePath, JSON.stringify({ layers: { recover: ent("r") }, _fx_rev: raceRev }));
+                return r;
+            };
+            try {
+                await s.upsert("other", ent("o")); // 提交（成功——非本用例的失败点）
+            } finally {
+                delete (s as unknown as { readMergedChecked?: unknown }).readMergedChecked;
+            }
+            // ① 旁路未被提交消费（仍在盘上）
+            expect(existsSync(asidePath)).toBe(true);
+            // ② 新主档 _fx_seen 不含竞态旁路的 rev（不谎报「见过」）
+            const main = JSON.parse(readFileSync(p, "utf-8")) as { _fx_seen?: string[] };
+            expect(main._fx_seen ?? []).not.toContain(raceRev);
+            // ③ 下次 load：recover 救回（heirs 并入），other/base 俱在
+            const cfg = await s.load();
+            expect(cfg.layers.recover).toBeTruthy(); // 修前：seen 谎报→删除成立→recover 永久丢失
+            expect(cfg.layers.other).toBeTruthy();
+            expect(cfg.layers.base).toBeTruthy();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+});

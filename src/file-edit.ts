@@ -323,14 +323,20 @@ async function casWrite(
         // stat -c 读八进制权限（GNU）→ chmod NNN 数字模式全平台通吃；stat 缺席 best-effort
         `__fx_pm=$(stat -c '%a' "$__fx_tgt" 2>/dev/null); [ -n "$__fx_pm" ] && chmod "$__fx_pm" ${sr.qp}.fx-tmp 2>/dev/null; ` +
         `chown --reference="$__fx_tgt" ${sr.qp}.fx-tmp 2>/dev/null || true; `;
-    // mv -T + 落位复验（Sol 87 P1-5 同 file-transfer）：CAS 校验与 mv 之间目标
-    // 被换成目录时，裸 mv 把 fx-tmp **搬进目录**返回 0——FX_OK 携带目录 stat
-    // 也曾被采信。-T 精确指目标；回落平台复验 [ -d ] 堵搬入
+    // mv -T + 落位四防（Sol 87 P1-5 → Sol 88 P1-6 同 file-transfer）：CAS 校验
+    // 与 mv 之间目标被换成目录时，裸 mv 曾把 fx-tmp **搬进目录**才被复验发现
+    //——目录里留下新内容、错误所称恢复路径 fx-tmp 已不存在。place 前置 [ -d ]
+    // 快速拒绝 + -T 精确指目标（拒绝零副作用）+ 裸 mv 回落**前置守卫**+守卫间
+    // 极窄竞态的**载荷回搬**分支（目录内搬回 fx-tmp 再报 FX_IS_DIR——目标净
+    // 效果为零、恢复路径保真）
     const place = forceInplace
         ? `if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi`
-        : `if mv -T ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null; then echo "FX_OK $(${stampOf})"; ` +
-          `else if mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo "FX_OK $(${stampOf})"; ` +
-          `else if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; fi; fi`;
+        : `__fx_tb=$(basename ${sr.qp}.fx-tmp 2>/dev/null); ` +
+          `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+          `if mv -T ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null; then echo "FX_OK $(${stampOf})"; ` +
+          `else if [ ! -d "$__fx_tgt" ] && mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo "FX_OK $(${stampOf})"; ` +
+          `else if [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_tb" ${sr.qp}.fx-tmp 2>/dev/null; then echo FX_IS_DIR; ` +
+          `else if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi`;
     const cmd =
         `( if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
         `else echo FX_DEGRADED_NO_LOCK; fi; ` +
@@ -349,6 +355,9 @@ async function casWrite(
         throw new EditConflictError(
             `TOCTOU 冲突：CAS 戳不符（他人先写）: ${path}（读时 stat ${sr.statStamp} sha ${sr.shaStamp}）`,
         );
+    }
+    if (payload.startsWith("FX_IS_DIR")) { // 目录目标（Sol 88 P1-6）：载荷已回撤——恢复路径在场
+        throw new Error(`CAS 写回失败（目标已被换成现存目录——目录未动，完整载荷保留在 ${path}.fx-tmp 可重试）: ${path}`);
     }
     if (payload.startsWith("FX_INPLACE_FAIL")) { // 须在 FX_INPLACE 前判定（FAIL 是其前缀延伸）
         throw new Error(

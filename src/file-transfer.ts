@@ -139,13 +139,18 @@ export async function putContent(
         `chown --reference="$__fx_tgt" ${q(out)} 2>/dev/null || true; `;
     const place = opts.forceInplace
         ? `if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi`
-        : `if mv -T ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
-          `else if mv ${q(out)} "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
-          `else if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; fi; fi`;
-    // 落位三防（Sol 87 P1-5）：①前置目录检查与 mv 之间的竞态——外部把目标换成
-    // 目录后 GNU mv 把临时文件**搬进目录**（mv tmp dir/ = tmp 移入）返回 0。
-    // mv -T（--no-target-directory）精确指目标；不支持 -T 的平台回落裸 mv
-    // 后**落位复验**（[ ! -d ]）堵目录搬入
+        : `__fx_ob=$(basename ${q(out)} 2>/dev/null); ` +
+          `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+          `if mv -T ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
+          `else if [ ! -d "$__fx_tgt" ] && mv ${q(out)} "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
+          `else if [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_ob" ${q(out)} 2>/dev/null; then echo FX_IS_DIR; ` +
+          `else if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi`;
+    // 落位四防（Sol 87 P1-5 → Sol 88 P1-6）：①place 内前置 [ -d ] 快速拒绝
+    //（外层 test 与本处之间目标被换成目录）；②mv -T 精确指目标——拒绝目录时
+    // **零副作用**；③裸 mv 回落**前置守卫 + 事后复验**——曾裸 mv 先把载荷搬进
+    // 目录才复验发现（目录里留下新内容、错误所称恢复路径 out 已不存在）；
+    // ④守卫与 mv 之间极窄竞态的**载荷回搬**分支（目录内搬回 out 再报
+    // FX_IS_DIR）——目标净效果为零、恢复路径保真
     const mv = await exec(`test ! -d ${q(remotePath)} || { echo FX_IS_DIR; exit 1; }; { ${tgtSetup}${place}; }`);
     const mvOut = (mv.stdout || "").trim();
     if (mvOut.includes("FX_IS_DIR")) {
