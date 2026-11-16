@@ -66,25 +66,26 @@ export interface CommandExecuterOptions {
     logger?: FilaxisLogger;
 }
 
+/** 会话级共享注册表（Sol 89 P1-3）：tmux 会话 id 是**进程级全局命名空间**——
+ *  两个 TerminalManager 各持执行器引用同一会话时，实例级注册表互不可见，
+ *  双方并发 send-keys 把命令文本送进同一前台进程（实测无需注入故障即现）。
+ *  chains（互斥）与 sttyOff/deadSessions/destroyConfirmed（会话状态）全局
+ *  共享；**配置与 logger 保持实例级**（Hydrogen R3 #1 的实例隔离诉求只关乎
+ *  配置互相覆盖——会话状态恰须共享，两轴分家） */
+const sessionChains = new Map<string, Promise<unknown>>();
+const sessionSttyOff = new Set<string>();
+const sessionDead = new Set<string>();
+const sessionDestroyConfirmed = new Set<string>();
+
 export class CommandExecuter {
     private cfg: TerminalConfig = { ...DEFAULT_TERMINAL_CONFIG };
-    /** 已关回显的会话（每会话一次性 stty -echo——交互 shell 的命令回显不进 stdout） */
-    private sttyOff = new Set<string>();
-    /** per-session 命令链（审查问题 2：同会话命令必须串行——并发 send-keys 交错） */
-    private chains = new Map<string, Promise<unknown>>();
-    /** 因终态不可确认被销毁的会话（自愈：重建后 has-session 探活即清除标记） */
-    private deadSessions = new Set<string>();
-    /** 销毁确认集（Sol 87 P1-2）：本进程曾观测到该 id **消失**（kill 成功或
-     *  探活确认不在）——dead 自愈放行的必要条件。kill-session 失败的会话
-     *  不入此集：同名会话可能仍是旧前台任务持有，has-session 成功不能证明
-     *  是重建的新会话（曾放行把下一条命令文本送进上一条任务） */
-    private destroyConfirmed = new Set<string>();
     private log: FilaxisLogger = noopLogger;
 
     /** 配置注入（SDK 组装期一次性；测试可覆盖） */
     constructor(opts: CommandExecuterOptions = {}) {
-        // 实例化（Hydrogen R3 #1）：曾全 static——多个 TerminalManager 实例静默
-        // 互相覆盖配置/共享锁链与状态（注释宣称实例隔离实为假象）
+        // 配置实例化（Hydrogen R3 #1 → Sol 89 P1-3 分轴）：曾全 static——多实例
+        // 互相覆盖配置；R3 全实例化又把会话队列也隔离了（同会话双 manager 失去
+        // 互斥）。配置/logger=实例级，会话注册表=模块级共享（见上方注释）
         this.cfg = { ...DEFAULT_TERMINAL_CONFIG, ...opts.config };
         this.log = opts.logger ?? noopLogger;
     }
@@ -106,9 +107,9 @@ export class CommandExecuter {
      */
     async execute(id: string, command: string, opts: RunOptions = {}): Promise<TerminalExecResult> {
         await this.assertReusable(id); // 入队前快检（新调用快速失败）
-        const prev = this.chains.get(id) ?? Promise.resolve();
+        const prev = sessionChains.get(id) ?? Promise.resolve();
         const run = prev.catch(() => undefined).then(() => this.executeLocked(id, command, opts));
-        this.chains.set(id, run.catch(() => undefined));
+        sessionChains.set(id, run.catch(() => undefined));
         return run;
     }
 
@@ -118,8 +119,8 @@ export class CommandExecuter {
      *  绕过首检直接 executeLocked，has-session 对旧前台任务持有的同名会话照样
      *  成功——下一条命令文本送进了旧前台进程 */
     private async assertReusable(id: string): Promise<void> {
-        if (!this.deadSessions.has(id)) return;
-        if (!this.destroyConfirmed.has(id)) {
+        if (!sessionDead.has(id)) return;
+        if (!sessionDestroyConfirmed.has(id)) {
             throw new CommandExecError(
                 `tmux session '${id}' 销毁结果未确认（kill-session 曾失败——同名会话可能仍被旧前台任务持有）——拒绝复用。请换 id 重建层或先确认旧会话已消失`,
             );
@@ -127,9 +128,9 @@ export class CommandExecuter {
         try {
             const r = await TmuxInvoker.tryInvoke(["has-session", "-t", id]);
             if (r.exitCode === 0) {
-                this.deadSessions.delete(id);
-                this.destroyConfirmed.delete(id);
-                this.sttyOff.delete(id);
+                sessionDead.delete(id);
+                sessionDestroyConfirmed.delete(id);
+                sessionSttyOff.delete(id);
                 return;
             }
             throw new CommandExecError(
@@ -162,11 +163,11 @@ export class CommandExecuter {
         // ── 会话首次执行：关交互回显 + 清提示符（CI 实证：tmux 非登录 shell 的
         //    PS1 带 hostname 前缀裸奔，命令回显与提示符行全进 capture-pane）。
         //    stty/PS1 自身的回显经二次 clear 清除 ──
-        if (!this.sttyOff.has(id)) {
+        if (!sessionSttyOff.has(id)) {
             await this.sendKeys(id, "stty -echo 2>/dev/null; export PS1= PS2=;");
             await sleep(400);
             await TmuxInvoker.invoke(["clear-history", "-t", id]);
-            this.sttyOff.add(id);
+            sessionSttyOff.add(id);
         }
         // 每命令发送前清屏：clear-history 只清滚回区；可见 pane 的残留（CI 六发
         // 实证 PRE_TASK_OUT 滞留）必须经 shell 命令 `clear`（清终端+光标归位；
@@ -192,10 +193,15 @@ export class CommandExecuter {
         try {
             await this.sendKeys(id, `__fx_ec=$?; printf '\n'; echo ${markerPrefix}$__fx_ec#`);
         } catch (e) {
-            // 哨兵注入失败（Sol 88 P1-3）：业务命令已提交执行中——终态不可核实。
-            // raw 异常曾直抛，调用方无从分诊可否重试；归 unknown 语义（同中途死亡）
+            // 哨兵注入失败（Sol 88 P1-3 → Sol 89 P1-2）：业务命令已提交执行中——
+            // 终态不可核实，归 unknown 语义。**并标 dead（不入销毁确认集）**：
+            // throw 即释放执行链，已入队的下一条曾照常 executeLocked——has-session
+            // 对旧前台任务持有的会话照样成功，命令文本又送进旧前台进程（与
+            // kill 失败同族；dead+无确认=出队复检拦截，指引重建）
+            sessionDead.add(id);
+            sessionSttyOff.delete(id);
             throw new CommandExecError(
-                `完成哨兵注入失败（${e instanceof Error ? e.message : String(e)}）——命令已提交，远端终态未核实`,
+                `完成哨兵注入失败（${e instanceof Error ? e.message : String(e)}）——命令已提交且会话终态不可确认，已封存待重建`,
                 "", "unknown",
             );
         }
@@ -211,6 +217,10 @@ export class CommandExecuter {
         let lastPaneText = "";
         let binaryDetected = false;
         let binaryBytes = 0;
+        // 本轮 DRAIN 探测哨兵（超时路径生成——Sol 89 P2-2）：输出清洗的 drain 帧
+        // 过滤按**本轮 token** 收窄（全局形态模式曾删掉用户输出里的字面
+        // `__FX_DRAIN_xxx`/`stty -echo` 合法正文）
+        let drainToken: string | undefined;
 
         while (true) {
             if (Date.now() >= wallDeadline || Date.now() - lastActivityAt >= cfg.no_output_timeout_ms) {
@@ -221,13 +231,12 @@ export class CommandExecuter {
                 const reason = Date.now() >= wallDeadline
                     ? `Timeout waiting for command to finish in terminal ${id}`
                     : `Timeout waiting for command to finish in terminal ${id} (no output for ${cfg.no_output_timeout_ms}ms)`;
-                const partial = CommandExecuter.extractPartialOutput(buffer, markerPrefix, markerEchoNeedle, binaryDetected, binaryBytes);
                 try { await TmuxInvoker.invoke(["send-keys", "-t", id, "C-c"]); } catch { /* 会话可能已死 */ }
                 // ★ 交互 bash 中 ^C 杀整行 job（含本命令尾部的 marker echo）——原命令的
                 //   marker 可能永不出现。DRAINING 改用**独立探测哨兵**：发一条新的
                 //   echo（自身 ^C 幸存——它是 ^C 之后的新行），等它出现在 pane 即
                 //   shell 已回提示符（可信终态：可安全接手）。二者任一先到即算。
-                const drainToken = `__FX_DRAIN_${Math.random().toString(36).slice(2, 8)}`;
+                drainToken = `__FX_DRAIN_${Math.random().toString(36).slice(2, 8)}`;
                 try {
                     // 分段哨兵（GPT Astra 三轮 #4）：发送文本=printf '__FX_DR%s' 'AIN_<hex>'——
                     // **完整 token 永不出现在回显里**（引号/折行无论怎么切，回显单行至多含
@@ -237,6 +246,7 @@ export class CommandExecuter {
                     await TmuxInvoker.invoke(["send-keys", "-t", id, "-l", `printf '__FX_DR%s\\n' 'AIN_${drainToken.slice(11)}'`]);
                     await TmuxInvoker.invoke(["send-keys", "-t", id, "C-m"]);
                 } catch { /* 会话可能已死 */ }
+                const partial = CommandExecuter.extractPartialOutput(buffer, markerPrefix, markerEchoNeedle, binaryDetected, binaryBytes, drainToken);
                 const drained = await this.waitForDrain(id, markerPrefix, drainToken, 5_000);
                 if (drained) {
                     try { await TmuxInvoker.invoke(["clear-history", "-t", id]); } catch { /* best-effort */ }
@@ -247,10 +257,10 @@ export class CommandExecuter {
                 }
                 try {
                     await TmuxInvoker.invoke(["kill-session", "-t", id]);
-                    this.destroyConfirmed.add(id); // kill 成功=销毁已确认（自愈闸钥匙）
+                    sessionDestroyConfirmed.add(id); // kill 成功=销毁已确认（自愈闸钥匙）
                 } catch { /* kill 失败——不入 destroyConfirmed（Sol 87 P1-2）：同名在场≠重建 */ }
-                this.deadSessions.add(id);
-                this.sttyOff.delete(id);
+                sessionDead.add(id);
+                sessionSttyOff.delete(id);
                 throw new CommandExecError(
                     `${reason}（已发 ^C 但 5s 内未见可信终态——会话已销毁防残影串台；同 id respawn 后自动恢复）`,
                     partial, "unknown",
@@ -291,7 +301,7 @@ export class CommandExecuter {
                     if (binaryDetected) {
                         return { stdout: `[binary output: ${binaryBytes} bytes omitted]`, exitCode };
                     }
-                    const stdout = CommandExecuter.stripMarkerNoise(buffer.readLogText(), markerPrefix, markerEchoNeedle);
+                    const stdout = CommandExecuter.stripMarkerNoise(buffer.readLogText(), markerPrefix, markerEchoNeedle, drainToken);
                     return { stdout, exitCode };
                 }
             }
@@ -414,13 +424,17 @@ export class CommandExecuter {
      *  回显判定**先于** marker 判定（Sol 86 P1-1）：包装命令的回显行含
      *  `echo ---CMD_DONE_..` 字样——markerPrefix 是其子串，曾先撞 marker 检查
      *  在回显行处 break——首执行（stty -echo 尚未生效）真实输出全被截掉 */
-    static __testStrip(log: string, markerPrefix: string, markerEchoNeedle: string): string { // 测试导出面
-        return CommandExecuter.stripMarkerNoise(log, markerPrefix, markerEchoNeedle);
+    static __testStrip(log: string, markerPrefix: string, markerEchoNeedle: string, drainToken?: string): string { // 测试导出面
+        return CommandExecuter.stripMarkerNoise(log, markerPrefix, markerEchoNeedle, drainToken);
     }
 
-    private static stripMarkerNoise(log: string, markerPrefix: string, markerEchoNeedle: string): string {
+    private static stripMarkerNoise(log: string, markerPrefix: string, markerEchoNeedle: string, drainToken?: string): string {
         const resultLines: string[] = [];
         const lines = log.split("\n");
+        // DRAIN 帧清理按**本轮 token** 收窄（Sol 89 P2-2）：全局形态模式
+        //（/__FX_DRAIN_[0-9a-z]+/、裸 /stty -echo/）曾把用户输出里的同形合法
+        // 正文无提示删除。只在超时路径（drainToken 在场）清本轮的探测帧残段
+        const drainTail = drainToken ? drainToken.slice("__FX_DRAIN_".length) : null;
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i]!;
             if (line.includes(markerEchoNeedle)) continue; // 回显行（echo 前缀在场）——先于 marker 检查跳过
@@ -442,13 +456,19 @@ export class CommandExecuter {
                 break;
             }
             // 回显折断跨行同样跳过——但须**起点落在本行内**（Sol 86 回归）：无分隔
-            // 拼接曾在行边界拼出假 needle（"hello"+"echo ---…"）误跳真实输出行
+            // 拼接曾在行边界拼出假 needle（"hello"+"echo —…"）误跳真实输出行
             const nIdx = joined.indexOf(markerEchoNeedle);
             if (nIdx !== -1 && nIdx < line.length) continue;
-            if (/__FX_DRAIN_[0-9a-z]+/.test(line)) continue; // DRAINING 探测哨兵执行输出行
-            if (/__FX_DR%s/.test(line) || /AIN_[0-9a-z]{4,10}'?\s*$/.test(line)) continue; // 分段哨兵的命令回显（折行残段）
-            if (/stty -echo/.test(line)) continue; // 初始化残章
-            if (/__fx_ec=\$\?/.test(line)) continue; // 退出码捕获赋值的命令回显（R7 #1 配套）
+            if (drainToken) {
+                // 本轮 DRAIN 探测帧（Sol 89 P2-2 收窄）：整行全等 token=执行输出行；
+                // printf 回显/折行残段=含 __FX_DR%s 或以 'AIN_<尾段> 收尾
+                if (line.trim() === drainToken) continue;
+                if (line.includes("__FX_DR%s")) continue;
+                if (drainTail && line.endsWith(`AIN_${drainTail}`)) continue;
+                if (drainTail && line.endsWith(`AIN_${drainTail}'`)) continue;
+            }
+            if (/^stty -echo 2>\/dev\/null; export PS1= PS2=;?\s*$/.test(line)) continue; // 初始化残章（**整行全形态**——裸 /stty -echo/ 曾删用户正文）
+            if (/^__fx_ec=\$\?; printf ['"]\\n['"]/.test(line)) continue; // 退出码捕获赋值回显（**前缀全形态**——同上收窄）
             if (/\$\s*$/.test(line) && /debian_chroot|@\S+[:~]/.test(line)) continue; // hostname 提示符行（PS1 清理竞态兜底）
             if (/^\$\s*$/.test(line)) continue; // 清空后的空提示符
             resultLines.push(line);
@@ -461,10 +481,10 @@ export class CommandExecuter {
 
     private static extractPartialOutput(
         buffer: OutputBuffer, markerPrefix: string, markerEchoNeedle: string,
-        binaryDetected: boolean, binaryBytes: number,
+        binaryDetected: boolean, binaryBytes: number, drainToken?: string,
     ): string {
         if (binaryDetected) return `[binary output: ${binaryBytes} bytes omitted]`;
-        return CommandExecuter.stripMarkerNoise(buffer.readLogText(), markerPrefix, markerEchoNeedle);
+        return CommandExecuter.stripMarkerNoise(buffer.readLogText(), markerPrefix, markerEchoNeedle, drainToken);
     }
 
     private async sendKeys(id: string, text: string): Promise<void> {

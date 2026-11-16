@@ -467,6 +467,19 @@ export function envPrefixOf(env?: Record<string, string>): string {
 export type ExecChannelRender =
     | { kind: "ok"; remoteArgs: string[]; stdinCmd: string }
     | { kind: "unreachable"; reason: string; step: string };
+/** cd 落点 CDPATH 防改写（Sol 89 P1-7）：POSIX shell 的 cd 对**不含斜杠的相对
+ *  路径**先搜 CDPATH——CDPATH 下同名目录存在时执行落去另一棵树（当前目录的
+ *  sub 明明在场也被改写，实测），CDPATH 命中还向 stdout 打印路径污染输出。
+ *  `./` 前缀强制相对当前目录（含斜杠的操作数不搜 CDPATH，POSIX），双病同治。
+ *  tmux/ssh-pty 的 per-exec cwd、首挂 cd 验证、execSession/renderExecChannel
+ *  的 cd 前缀全链同判 */
+export function cdTargetArg(cwd: string): string {
+    // 盘符绝对路径（C:/…——Git Bash/MSYS sh 接受）同样已锚定不加 ./（首版漏判
+    // 曾把 C:/… 当相对路径前缀化，真 sh 实跑 cd 126 抓回）
+    const anchored = cwd.startsWith("/") || cwd.startsWith("./") || cwd.startsWith("../") || /^[A-Za-z]:[\/]/.test(cwd);
+    return anchored ? cwd : `./${cwd}`;
+}
+
 
 export function renderExecChannel(
     steps: EnterStep[],
@@ -522,7 +535,7 @@ export function renderExecChannel(
     // 命令注入）；② cd 失败 fail-closed——业务命令**不执行**，哨兵带 126 诚实回传
     // （退出码是数据；不吞 shell 原生 cd 报错行），绝不静默回退到错误目录继续跑。
     const cd = opts.cwd
-        ? `cd ${shellQuote(opts.cwd)} || { printf '\\n${opts.marker}:126:%s\\n' "$(id -un 2>/dev/null)"; exit 126; }; `
+        ? `cd ${shellQuote(cdTargetArg(opts.cwd))} || { printf '\\n${opts.marker}:126:%s\\n' "$(id -un 2>/dev/null)"; exit 126; }; `
         : "";
     // env 前缀（十轮自挖：远端语义——export K='V'; 先于 cd/业务命令）。
     // envPrefix/cd 拼在**终层脚本头部**（最内层执行——多层时 export 在第一层执行

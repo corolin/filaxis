@@ -2,11 +2,11 @@
  * 文件传输单测（AC-15：mock 远端 bash 语义——真机 sftp/OPNsense/Alpine 属 CI 矩阵）
  */
 import { describe, expect, test, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, readdirSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, readdirSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { putFile, getFile, sftpPutFile, sftpGetFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
+import { putFile, putContent, getFile, sftpPutFile, sftpGetFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
 import { probeDialect, NULL_DIALECT, type RemoteDialect } from "../src/dialect.js";
 
 const GNU: RemoteDialect = {
@@ -47,18 +47,16 @@ function mockRemote() {
         }
         // 落位三态形态（十八轮 #2 + 审计 H5 前缀）：test ! -d … || …;
         // { __fx_tgt=$(readlink -f …); chmod/chown --reference…; if mv src …; }——
-        // mock 无挂载无写入失败，mv 恒成功（落点取 test ! -d 的目标=真身）
-        // R8 #2 数字模式权限保持后形态：__fx_pm=$(stat -c …)+[ -n ]&&chmod …; chown …; if mv …
-        // Sol 88 P1-6 目录四防前段：__fx_ob=$(basename …); if [ -d … ]; then …; fi;
-        mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; __fx_pm=[^;]*; \[ -n "[^"]*" \] && chmod[^;]*; (?:chown)[^;]*; (?:__fx_ob=[^;]*; )?(?:if \[ -d "\$__fx_tgt" \]; then echo FX_IS_DIR; exit 1; fi; )?if mv (?:-T )?'(.+?)' /);
-        if (!mm) { // 兼容旧形态（无 __fx_pm 段）
-            mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; (?:chmod|chown)[^;]*; (?:chmod|chown)[^;]*; (?:__fx_ob=[^;]*; )?(?:if \[ -d "\$__fx_tgt" \]; then echo FX_IS_DIR; exit 1; fi; )?if mv (?:-T )?'(.+?)' /);
-        }
-        if (mm) {
-            const b = files.get(mm[2]!);
+        // mock 无挂载无写入失败，mv 恒成功。Sol 87→89 前缀渐长（权限保持/目录
+        // 四防/设备分流）——不再锚定全前缀：目标取外层 test ! -d 捕获、源取
+        // `if mv …` 捕获；mock 无设备概念恒走同设备 rename 链
+        const tgtM = cmd.match(/^test ! -d '(.+?)' \|\|/);
+        const mvM = cmd.match(/if mv (?:-T )?'(.+?)' "\$__fx_tgt"/);
+        if (mvM) {
+            const b = files.get(mvM[1]!);
             if (!b) return { stdout: "", exitCode: 1 }; // 源不存在 → 真实 mv 报错
-            files.set(mm[1]!, b);
-            files.delete(mm[2]!);
+            files.set(tgtM?.[1] ?? "", b);
+            files.delete(mvM[1]!);
             return { stdout: "FX_MV_OK", exitCode: 0 };
         }
         // forceInplace 形态（显式请求保留 inode 写）——cat src > "$tgt" && rm src
@@ -438,6 +436,43 @@ describe("putFile（真实 shell 回归）", () => {
         const dirLocal = join(dirR, "local-dir");
         mkdirSync(dirLocal);
         await expect(getFile(realExec, GNU, fwd(remoteSrc), dirLocal)).rejects.toThrow(/现存目录/);
+    }, 20_000);
+
+
+    // GPT Sol 八十九期 P1-4/P1-5：目录回搬分支曾不核实「本次是否真搬过」——mv
+    // 全败时目录里恰同名无关文件被搬出后删除/误当载荷；跨文件系统落位（载荷临时
+    // 在原路径一侧、符号链接真身在另一 fs）mv 退化为复制仍报 atomic-replace。
+    test.skipIf(!hasSh)("Sol 89 P1-4/P1-5 同设备形状：__fx_mv 证据闸 + 设备分流在场，atomic-replace 保持", async () => {
+        const cmds: string[] = [];
+        const recExec: TransferExec = async (cmd) => { cmds.push(cmd); return realExec(cmd); };
+        const dst = fwd(join(dirR, "shape89.bin"));
+        const r = await putContent(recExec, GNU, Buffer.from("hello-shape"), dst);
+        expect(r.verified).toBe(true);
+        expect(r.writeMode).toBe("atomic-replace"); // 同设备（本地 tmp 一侧）→ rename 链
+        expect(readFileSync(join(dirR, "shape89.bin"), "utf-8")).toBe("hello-shape");
+        const place = cmds.find((c) => c.includes("__fx_mv=0"));
+        expect(place).toBeTruthy(); // 五防 place 在场
+        // 证据序：__fx_mv=1 紧跟裸 mv 成功（&& 短路链内）；回搬守卫查 __fx_mv=1
+        //（曾无条件按 basename 回搬目录里恰同名的无关文件）
+        expect(place).toMatch(/mv [^;]* && __fx_mv=1 && \[ ! -d "\$__fx_tgt" \]/);
+        expect(place).toMatch(/\[ "\$__fx_mv" = "1" \] && \[ -d "\$__fx_tgt" \]/);
+        // 设备分流在场（stat %d 同设备才走 rename 链；跨设备/不可判走 cat）
+        expect(place).toContain("stat -c %d");
+    }, 20_000);
+
+    test.skipIf(!hasSh || !existsSync("/dev/shm"))("Sol 89 P1-5 跨设备上传（/tmp→/dev/shm 符号链接）：writeMode=inplace-write（不谎报原子）", async () => {
+        const shmDir = `/dev/shm/fx-xdev-${process.pid}`;
+        mkdirSync(shmDir, { recursive: true });
+        try {
+            const linkPath = fwd(join(dirR, "xdev-link.bin"));
+            symlinkSync(`${shmDir}/real.bin`, linkPath); // 原路径一侧的符号链接 → 真身跨设备
+            const r = await putContent(realExec, GNU, Buffer.from("cross-device-payload"), linkPath);
+            expect(r.verified).toBe(true);
+            expect(r.writeMode).toBe("inplace-write"); // 修前：mv 跨设备复制仍报 atomic-replace
+            expect(readFileSync(`${shmDir}/real.bin`, "utf-8")).toBe("cross-device-payload");
+        } finally {
+            rmSync(shmDir, { recursive: true, force: true });
+        }
     }, 20_000);
 
     afterAll(() => {

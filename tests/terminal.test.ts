@@ -1385,3 +1385,186 @@ describe("Sol 88：队列复用双检/哨兵注入失败/rm force/cwd 换行", (
         }
     }, 10_000);
 });
+
+// GPT Sol 八十九期：P1-2 哨兵发送失败后会话仍被队列复用（已入队下一条照进
+// 旧前台进程——Sol 88 只挡了 kill 失败路径）；P1-3 两个 TerminalManager 挂同
+// 一 tmux 会话——实例级执行链互不可见（并发 send-keys 交错）；P2-2 清洗的全局
+// 模式删掉业务正文里的字面 stty -echo/__FX_DRAIN_xxx；P1-7 CDPATH 改写；P2-1
+// readdir 引号转义/折行拆条目。
+describe("Sol 89：哨兵失败封存/跨执行器互斥/清洗收窄", () => {
+    test("P1-2 哨兵注入失败：会话标 dead——已入队下一条被拒（不再送进旧前台进程）", async () => {
+        const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
+        const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        const sentTexts: string[] = [];
+        const invoke = async (args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+            const a0 = args[0] ?? "";
+            if (a0 === "send-keys" && args[3] === "-l") {
+                const t = String(args[4] ?? "");
+                if (t.includes("__fx_ec=$?")) throw new Error("注入：哨兵 send-keys 失败");
+                sentTexts.push(t);
+            }
+            return { stdout: "", stderr: "", exitCode: 0 };
+        };
+        (TmuxInvoker as unknown as { invoke: unknown }).invoke = invoke;
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const ce = new CommandExecuter({ config: { poll_interval_ms: 30 } as never });
+        try {
+            const p1 = ce.execute("S89M", "sleep 60", { timeoutMs: 30_000 });
+            await new Promise((r) => setTimeout(r, 120)); // cmd1 在链内（哨兵即将失败）
+            const p2 = ce.execute("S89M", "echo second-must-not-run", { timeoutMs: 5_000 });
+            let e1: (Error & { outcome?: string }) | undefined;
+            try { await p1; } catch (e) { e1 = e as Error & { outcome?: string }; }
+            expect(e1?.outcome).toBe("unknown"); // Sol 88 语义保留
+            let e2: Error | undefined;
+            try { await p2; } catch (e) { e2 = e as Error; }
+            expect(e2?.message).toMatch(/销毁结果未确认/); // 修前：出队直跑——第二条文本进旧前台进程
+            expect(sentTexts.some((t) => t.includes("second-must-not-run"))).toBe(false);
+        } finally {
+            (TmuxInvoker as unknown as { invoke: unknown }).invoke = realInvoke;
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = realTry;
+        }
+    }, 15_000);
+
+    test("P1-3 跨执行器互斥：两个 CommandExecuter 同会话——A 完成前 B 零发送 + stty 只初始化一次", async () => {
+        const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
+        const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
+        const sentTexts: string[] = [];
+        let currentMarker: string | null = null;
+        let echoAt = 0;
+        const invoke = async (args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+            const a0 = args[0] ?? "";
+            if (a0 === "capture-pane") {
+                // 哨兵回显后 ≥1200ms 才现（时间门——A 的完成点稳定晚于修前 B 的发送点）
+                if (currentMarker && Date.now() - echoAt >= 1_200) {
+                    const m = currentMarker; currentMarker = null;
+                    return { stdout: `out\n${m}_0#\n$`, stderr: "", exitCode: 0 };
+                }
+                return { stdout: "running", stderr: "", exitCode: 0 };
+            }
+            if (a0 === "send-keys" && args[3] === "-l") {
+                const t = String(args[4] ?? "");
+                sentTexts.push(t);
+                const em = t.match(/(---CMD_DONE_\w+)_\$__fx_ec#$/);
+                if (em) { currentMarker = em[1]!; echoAt = Date.now(); }
+            }
+            return { stdout: "", stderr: "", exitCode: 0 };
+        };
+        (TmuxInvoker as unknown as { invoke: unknown }).invoke = invoke;
+        (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = async () => ({ stdout: "", stderr: "", exitCode: 0 });
+        const mkCe = () => new CommandExecuter({ config: { poll_interval_ms: 20, no_output_timeout_ms: 60_000 } as never });
+        const ceA = mkCe(); // 模拟两个 TerminalManager 各自的执行器实例
+        const ceB = mkCe();
+        let sentAtAEnd: string[] | null = null as string[] | null; // A 完成时刻的发送快照（then 闭包赋值）
+        try {
+            const pA = ceA.execute("SAME89", "echo AAA", { timeoutMs: 15_000 });
+            pA.then(() => { sentAtAEnd = [...sentTexts]; }, () => { sentAtAEnd = [...sentTexts]; });
+            await new Promise((r) => setTimeout(r, 100));
+            const pB = ceB.execute("SAME89", "echo BBB", { timeoutMs: 15_000 });
+            const [rA, rB] = await Promise.all([pA, pB]);
+            expect(rA.exitCode).toBe(0);
+            expect(rB.exitCode).toBe(0);
+            // A 完成时刻的快照里不得有 B 的任何文本（修前：实例链并发——B 的
+            // stty/业务文本在 A 运行中就发了出去）
+            expect(sentAtAEnd?.some((t) => t.includes("BBB"))).toBe(false);
+            // 会话级共享：stty 初始化恰一次（修前：两实例各发一次）
+            expect(sentTexts.filter((t) => t.includes("stty -echo")).length).toBe(1);
+            expect(sentTexts.some((t) => t.includes("AAA"))).toBe(true);
+        } finally {
+            (TmuxInvoker as unknown as { invoke: unknown }).invoke = realInvoke;
+            (TmuxInvoker as unknown as { tryInvoke: unknown }).tryInvoke = realTry;
+        }
+    }, 30_000);
+
+    test("P2-2 清洗不删业务正文：字面 stty -echo/__FX_DRAIN_example 保留；本轮 drain 帧才清", async () => {
+        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const strip = (CommandExecuter as unknown as { __testStrip?: (log: string, p: string, n: string, d?: string) => string }).__testStrip;
+        if (!strip) return;
+        const prefix = "---CMD_DONE_x89_";
+        const needle = `echo ${prefix}`;
+        // 用户正文恰含协议字面量（无 drainToken——非超时路径）：全保留
+        const log = ["echo stty -echo settings", "result __FX_DRAIN_example here", `${prefix}0#`].join("\n");
+        expect(strip(log, prefix, needle)).toBe("echo stty -echo settings\nresult __FX_DRAIN_example here"); // 修前：两行正文被删
+        // 超时路径（本轮 token）：执行输出行与 printf 回显残段被清
+        const log2 = ["real work", "__FX_DRAIN_abc123", "printf '__FX_DR%s\\n' 'AIN_abc123'", `${prefix}1#`].join("\n");
+        expect(strip(log2, prefix, needle, "__FX_DRAIN_abc123")).toBe("real work");
+    }, 10_000);
+
+    // P1-7 真机：CDPATH 改写防（相对 cwd 必落当前目录的同名子目录）
+    test("P1-7 CDPATH 改写防：相对 cwd 落当前目录（有 tmux 才跑）", async () => {
+        if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
+        const dir = mkdtempSync(join(tmpdir(), "fx-cdpath89"));
+        const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 60 } });
+        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
+        await drv.init();
+        try {
+            mkdirSync(join(dir, "sub"), { recursive: true });
+            mkdirSync(join(dir, "decoy", "sub"), { recursive: true });
+            writeFileSync(join(dir, "sub", "who.txt"), "LOCAL");
+            writeFileSync(join(dir, "decoy", "sub", "who.txt"), "DECOY");
+            await drv.exec(`cd ${JSON.stringify(dir)}`); // 会话先进测试目录（相对 cwd 的基准）
+            await drv.exec(`export CDPATH=${JSON.stringify(join(dir, "decoy"))}`); // 会话级设置 CDPATH
+            const r = await drv.exec("cat who.txt", { cwd: "sub", timeoutMs: 15_000 }); // 相对 cwd
+            expect(r.exitCode).toBe(0);
+            expect(r.stdout.trim()).toBe("LOCAL"); // 修前：cd sub 被 CDPATH 带去 decoy——读到 DECOY
+        } finally {
+            await drv.destroy();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 30_000);
+
+    // P2-1 真机：readdir 逐名 hex 帧——空格/超长/unicode 名无损
+    test("P2-1 readdir 特殊文件名无损（有 tmux 才跑）", async () => {
+        if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
+        const dir = mkdtempSync(join(tmpdir(), "fx-ls89"));
+        const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 60 } });
+        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
+        await drv.init();
+        try {
+            const target = join(dir, "ls-target"); // 独立子目录（terminalDir 里有 term_*.json 档案）
+            mkdirSync(target);
+            const names = ["with space.txt", "a".repeat(100) + ".long", "中文档案名.txt", "plain"];
+            for (const n of names) writeFileSync(join(target, n), "x");
+            mkdirSync(join(target, "a-dir"));
+            const entries = await drv.fs.readdir(target);
+            const got = entries.map((e) => e.name).sort();
+            expect(got).toEqual([...names, "a-dir"].sort()); // 修前：引号转义/折行拆条目
+            expect(entries.find((e) => e.name === "a-dir")?.isDirectory).toBe(true);
+        } finally {
+            await drv.destroy();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 30_000);
+
+    // P1-3 真机：两个 TerminalManager 挂同一会话——B 的命令排队到 A 完成后
+    test("P1-3 双 TerminalManager 同会话串行（有 tmux 才跑）", async () => {
+        if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
+        const dir = mkdtempSync(join(tmpdir(), "fx-dual89"));
+        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const tmA = new TerminalManager({ terminalDir: join(dir, "a"), config: { poll_interval_ms: 60 } });
+        const drvA = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tmA });
+        await drvA.init();
+        const tid = drvA.descriptor.terminalId!;
+        const tmB = new TerminalManager({ terminalDir: join(dir, "b"), config: { poll_interval_ms: 60 } });
+        const drvB = new TmuxSessionDriver({ driver: "tmux", terminalId: tid, config: { launchCmd: "bash" } }, { terminalManager: tmB });
+        await drvB.init(); // 重挂同一会话
+        try {
+            const marker = join(dir, "seq.txt");
+            // A 起长任务；100ms 后 B exec——全局链下 B 必须排队到 A 完成后
+            const pA = drvA.exec(`sleep 2; echo A-done > ${JSON.stringify(marker)}`, { timeoutMs: 30_000 });
+            await new Promise((r) => setTimeout(r, 100));
+            const t0 = Date.now();
+            await drvB.exec("echo B-ran", { timeoutMs: 30_000 });
+            const waitedMs = Date.now() - t0;
+            await pA;
+            // B 的执行被 A 的前台任务阻塞 ≥1.5s（修前：立即执行——文本打进 sleep）
+            expect(waitedMs).toBeGreaterThanOrEqual(1_500);
+            expect(existsSync(marker)).toBe(true);
+        } finally {
+            await drvB.destroy();
+            await drvA.destroy();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 60_000);
+});

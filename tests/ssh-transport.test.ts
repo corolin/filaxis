@@ -147,7 +147,7 @@ describe("ssh-helpers", () => {
         expect(r.kind).toBe("ok");
         if (r.kind !== "ok") return;
         // 单引号包裹：$()/反引号保持字面（双引号形态必须绝迹）
-        expect(r.stdinCmd).toContain(`cd '${evil}' ||`);
+        expect(r.stdinCmd).toContain(`cd './${evil}' ||`); // 相对形态强制 ./（Sol 89 P1-7——单引号字面化不受影响）
         expect(r.stdinCmd).not.toContain('cd "');
         // fail-closed：cd 失败 → 哨兵带 126 + exit 126（业务命令不执行——退出码是数据）
         expect(r.stdinCmd).toContain(`printf '\\nM:126:%s\\n' "$(id -un 2>/dev/null)"; exit 126`);
@@ -1305,6 +1305,11 @@ describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
         await new Promise((r) => setTimeout(r, 1_200)); // 等进程退出
         link.send("anything\n"); // 修前：stdin Socket 无 error 监听——EPIPE 崩宿主
         await new Promise((r) => setTimeout(r, 500)); // 错误事件异步到达
+        // Sol 89 P1-6 语义：stdin error 监听**主要保护 Node 宿主**（SDK dist 也
+        // 跑在 node 下——EPIPE 事件曾崩宿主）；Bun 双平台实测不向 stdin Socket
+        // 投递 EPIPE（写入静默缓冲/丢弃，真机 Linux 实证 proc 不清空）——Bun 侧
+        // 的防御由 markerCycle 发送同步抛路径承担（同 describe 单测）。此处不
+        // 断言 proc 状态
         // 活着=通过；且失败已归账——下一次握手拿到明确拒绝（不悬空等待）
         await expect(link.handshake("probe")).rejects.toThrow(/退出|stdin/);
     }, 15_000);
@@ -1359,4 +1364,30 @@ describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
             await drv.destroy();
         }
     }, 15_000);
+});
+
+// GPT Sol 八十九期 P1-6/P1-7：markerCycle 发送同步抛（write 对断管道可同步
+// EPIPE）曾逃出 Promise executor 被 queue 链吞掉——调用方永不 settle 直到自身
+// 超时；cd 落点 CDPATH 防改写（相对路径强制 ./，含斜杠操作数不搜 CDPATH）。
+describe("Sol 89：发送同步抛归 caller/cdTargetArg", () => {
+    test("P1-6 markerCycle 发送同步抛：caller 收 outcome unknown（不悬空到自身超时）", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        const link = new Link() as unknown as { ready: boolean; send(s: string): void; execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        link.ready = true;
+        link.send = () => { throw new Error("write EPIPE (sync)"); };
+        let e: (Error & { outcome?: string }) | undefined;
+        try { await link.execMarker("touch /tmp/fx89-sync", 5_000); } catch (err) { e = err as Error & { outcome?: string }; }
+        expect(e?.outcome).toBe("unknown"); // 修前：异常被 queue 链吞——调用方等到自身超时
+        expect(e?.message).toMatch(/发送失败/);
+    }, 10_000);
+
+    test("P1-7 cdTargetArg：相对路径强制 ./（CDPATH 不搜含斜杠操作数）", async () => {
+        const { cdTargetArg } = await import("../src/ssh-helpers.js");
+        expect(cdTargetArg("sub")).toBe("./sub");
+        expect(cdTargetArg("a/b")).toBe("./a/b");
+        expect(cdTargetArg("/abs/path")).toBe("/abs/path"); // 绝对路径本就不搜 CDPATH——原样
+        expect(cdTargetArg("./x")).toBe("./x");
+        expect(cdTargetArg("../y")).toBe("../y");
+    }, 10_000);
 });

@@ -1635,3 +1635,48 @@ describe("Sol 88：提交基线与恢复旁路竞态", () => {
         }
     }, 20_000);
 });
+
+// GPT Sol 八十九期 P1-1：落位后锁失的回滚路径——恢复失败的分支（rename EIO）
+// 曾无条件把主档产物与旁路一起删除（唯一恢复副本蒸发，下次 load 空配置）。
+// 修复=hadPriorMain 门控：移开过主档时旁路必须留命。EIO 子分支无确定性 fs
+// 注入法（rename 对文件失败不可造），回归钉住**可注入的邻路**：陈锁回滚成功
+// 路径的语义（旧档回主位、产物撤净、load 读回提交前状态）——该路径被重构
+// 破坏时同样暴露双删/丢档。
+describe("Sol 89：锁失回滚语义", () => {
+    test("P1-1 陈锁回滚：旧档回主位 + 旁路消费——load 读回提交前状态（非空非新）", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env89r-"));
+        try {
+            const p = join(dir, "env.json");
+            const s = new LayerEnvStore(p);
+            const ent = (t: string) => ({ connection: { driver: "ssh", target: t }, environment: { os: "o" }, discovered_at: "t", fingerprint: "f" + t });
+            await s.upsert("base", ent("b")); // 旧档
+            // 确定性注入（首版 interval 竞态在负载下错过舞步窗口——全量 flake）：
+            // 包装实例 acquireLock——verifyHeld 两段相位：#1（写前）true、#2（落位
+            // 后）false → 必然走回滚路径
+            const origAcquire = (s as unknown as { acquireLock: () => Promise<unknown> }).acquireLock.bind(s);
+            let verifyCalls = 0;
+            (s as unknown as { acquireLock: unknown }).acquireLock = async () => {
+                const real = await origAcquire() as unknown as { (): Promise<void>; verifyHeld(): Promise<boolean>; finalize(): Promise<void> };
+                return Object.assign(
+                    async () => { await real(); },
+                    {
+                        verifyHeld: async () => { verifyCalls++; return verifyCalls === 1; },
+                        finalize: () => real.finalize(),
+                    },
+                );
+            };
+            await expect(s.save({ layers: { other: ent("o") } })).rejects.toThrow(/并发冲突/);
+            // 回滚后：主档=旧档（base 在、other 不在）、旁路已消费、load=提交前状态
+            const main = JSON.parse(readFileSync(p, "utf-8")) as { layers?: Record<string, unknown> };
+            expect(main.layers?.["base"]).toBeTruthy();
+            expect(main.layers?.["other"]).toBeUndefined();
+            const leftovers = readdirSync(dir).filter((n) => n.endsWith(".fx-old"));
+            expect(leftovers).toEqual([]);
+            const cfg = await s.load();
+            expect(cfg.layers.base).toBeTruthy();
+            expect(cfg.layers.other).toBeUndefined(); // 修前若回滚被破坏：other 落盘=提交未撤销
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
+});

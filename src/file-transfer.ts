@@ -140,17 +140,28 @@ export async function putContent(
     const place = opts.forceInplace
         ? `if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi`
         : `__fx_ob=$(basename ${q(out)} 2>/dev/null); ` +
+          `__fx_od=$(stat -c %d ${q(out)} 2>/dev/null || stat -f %d ${q(out)} 2>/dev/null); ` +
+          `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
+          `if [ -n "$__fx_od" ] && [ "$__fx_od" = "$__fx_td" ]; then ` +
           `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+          `__fx_mv=0; ` +
           `if mv -T ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
-          `else if [ ! -d "$__fx_tgt" ] && mv ${q(out)} "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
-          `else if [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_ob" ${q(out)} 2>/dev/null; then echo FX_IS_DIR; ` +
-          `else if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi`;
-    // 落位四防（Sol 87 P1-5 → Sol 88 P1-6）：①place 内前置 [ -d ] 快速拒绝
-    //（外层 test 与本处之间目标被换成目录）；②mv -T 精确指目标——拒绝目录时
-    // **零副作用**；③裸 mv 回落**前置守卫 + 事后复验**——曾裸 mv 先把载荷搬进
-    // 目录才复验发现（目录里留下新内容、错误所称恢复路径 out 已不存在）；
-    // ④守卫与 mv 之间极窄竞态的**载荷回搬**分支（目录内搬回 out 再报
-    // FX_IS_DIR）——目标净效果为零、恢复路径保真
+          `else if [ ! -d "$__fx_tgt" ] && mv ${q(out)} "$__fx_tgt" 2>/dev/null && __fx_mv=1 && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
+          `else if [ "$__fx_mv" = "1" ] && [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_ob" ${q(out)} 2>/dev/null; then echo FX_IS_DIR; ` +
+          `else if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; ` +
+          `else ` +
+          `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+          `if cat ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else echo FX_INPLACE_FAIL; fi; ` +
+          `fi`;
+    // 落位五防（Sol 87 P1-5 → Sol 88 P1-6 → Sol 89 P1-4/P1-5）：
+    // ①前置 [ -d ] 快速拒绝（外层 test 与本处之间目标被换成目录）；
+    // ②mv -T 精确指目标——拒绝目录时零副作用；③裸 mv 回落前置守卫+事后复验；
+    // ④回搬分支带**搬移证据**（__fx_mv=1 只在裸 mv 成功后才置位——曾无条件
+    // 按 basename 回搬，把目录里**恰同名的无关文件**搬出后删除/误当载荷）；
+    // ⑤**设备号分流**（跨设备上传曾谎报 atomic-replace）：载荷临时在原路径
+    // 一侧，符号链接真身可在另一文件系统——mv 跨设备时退化为复制仍报原子。
+    // stat -c/-f 双方言取设备号，同设备才走 rename 链；跨设备/不可判一律走
+    // cat（FX_MV_CAT→inplace-write 诚实标注，无法判定时保守按跨设备）
     const mv = await exec(`test ! -d ${q(remotePath)} || { echo FX_IS_DIR; exit 1; }; { ${tgtSetup}${place}; }`);
     const mvOut = (mv.stdout || "").trim();
     if (mvOut.includes("FX_IS_DIR")) {

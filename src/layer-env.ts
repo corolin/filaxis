@@ -753,13 +753,15 @@ export class LayerEnvStore {
             await unlink(tmp).catch(() => undefined);
             throw new Error("__FX_LOCK_LOST__"); // 哨兵：落位未尝试，盘上数据未动
         }
+        let hadPriorMain = false; // 本舞步是否真的移开过主档（Sol 89 P1-1）——还原失败的分支依据
         try {
             await rename(this.path, aside);
+            hadPriorMain = true;
         } catch (e) {
             if ((e as { code?: string }).code !== "ENOENT") {
                 await unlink(tmp).catch(() => undefined); // 移开失败：tmp 不留残
                 throw e;
-            } // 缺席容忍（首次写）
+            } // 缺席容忍（首次写）——hadPriorMain=false：旁路从未存在
         }
         try {
             await link(tmp, this.path);
@@ -782,8 +784,18 @@ export class LayerEnvStore {
                 const cur = await readFile(this.path, "utf-8");
                 if (cur === payloadText) {
                     const moved = await rename(aside, this.path).then(() => true, () => false);
-                    if (!moved) await unlink(this.path).catch(() => undefined);
-                    await unlink(aside).catch(() => undefined); // rename 未遂时兜底（aside 可能已被收）
+                    if (!moved) {
+                        // 恢复失败（EIO 等）→ 撤下自己的产物，盘面回「无主档+旁路」
+                        // ——下次 load 从旁路恢复提交前状态（失败语义=本提交未发生）。
+                        // **旁路必须留命**（Sol 89 P1-1）：移开过主档时旁路是唯一恢复
+                        // 副本——曾无条件 unlink 把主档产物与旁路一起删掉，下次 load
+                        // 返回空配置。只有首次写（hadPriorMain=false，旁路从未存在）
+                        // 才走「撤产物+清旁路」的整体撤销
+                        await unlink(this.path).catch(() => undefined);
+                        if (!hadPriorMain) await unlink(aside).catch(() => undefined);
+                    } else {
+                        await unlink(aside).catch(() => undefined); // 恢复成功——aside 已被 rename 消费，此为兜底
+                    }
                 }
             } catch { /* 盘面已变——旁路留恢复锚 */}
             throw new Error("__FX_LOCK_LOST__");

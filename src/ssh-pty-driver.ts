@@ -25,7 +25,7 @@ import type {
     SessionStartOptions, SessionHandleInfo, WatchOptions, ReadLogOptions,
 } from "./session-types.js";
 import {
-    autonomousSshOpts, SSH_INPUT_WAIT_RE, enterStepsOf, hopLabel, rootSshSpawnArgs,
+    autonomousSshOpts, SSH_INPUT_WAIT_RE, enterStepsOf, hopLabel, rootSshSpawnArgs, cdTargetArg,
     sshArgsFor, renderExecChannel, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
 } from "./ssh-helpers.js";
 import { RemoteSessionManager } from "./remote-session-manager.js";
@@ -81,15 +81,20 @@ class PtyLink {
             else this.pendingExitFailure = wrap;
             this.onUnexpectedExit?.();
         });
-        // stdin 管道错误监听（Sol 88 P1-7）：对端关闭读端后继续 write 抛 EPIPE
-        //——错误事件发在 **stdin Socket** 上，proc 的 error 监听收不到；无监听器
-        //= uncaughtException 崩**宿主**（调用方 try/catch 收不到——execChannel
-        // 早有同款防护，PTY 链漏挂）。归 readyRejecter/pendingExitFailure +
-        // onUnexpectedExit（断链语义，走三层退避重连）
+        // stdin 管道错误监听（Sol 88 P1-7 → Sol 89 P1-6）：对端关闭读端后继续
+        // write 抛 EPIPE——错误事件发在 **stdin Socket** 上，proc 的 error 监听
+        // 收不到；无监听器=uncaughtException 崩**宿主**。归 readyRejecter/
+        // pendingExitFailure + onUnexpectedExit（断链语义，走三层退避重连）。
+        // **并当场 kill 本链**：只排定重连不清旧链时，重连替换 this.link 后
+        // destroy() 只收得到新链——旧 ssh 进程实测仍存活（双 PID 并存泄漏）。
+        // 运行时差异（真机 Linux/Windows 双实证）：Bun **不**向 stdin Socket 投
+        // 递 EPIPE（写入静默缓冲/丢弃）——本监听主要保护 **Node 宿主**（SDK dist
+        // 同发 node 包）；Bun 侧同类故障由 markerCycle 发送同步抛路径兜底
         this.proc.stdin.on("error", (e: Error) => {
             const err = new Error(`ssh stdin 写入失败（${e.message}）——PTY 链已断: ${(e as { code?: string }).code ?? ""}`);
             if (this.readyRejecter) this.readyRejecter(err);
             else if (!this.pendingExitFailure) this.pendingExitFailure = err;
+            this.kill();
             this.onUnexpectedExit?.();
         });
         // 双流各自解码器（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂——两管道交替喂
@@ -307,7 +312,23 @@ ${command}
                 }
             }, 25);
 
-            this.send(`${wrapped}\n`);
+            // 发送同步抛防御（Sol 89 P1-6）：write 对已断管道可同步抛 EPIPE——
+            // 同步异常曾逃出 Promise executor 使 markerCycle 以原始错误 reject，
+            // 被 queue 链的 catch 吞掉——调用方永不 settle 直到自身超时
+            try {
+                this.send(`${wrapped}\n`);
+            } catch (e) {
+                notify(() => {
+                    const err = new Error(
+                        `命令文本发送失败（${e instanceof Error ? e.message : String(e)}）——PTY 链已断，远端未核实`,
+                    ) as Error & { outcome: "unknown" };
+                    err.outcome = "unknown";
+                    caller.reject(err);
+                });
+                this.kill();
+                this.onUnexpectedExit?.();
+                cycleDone();
+            }
         });
     }
 
@@ -520,7 +541,7 @@ export class SshPtyDriver implements RuntimeDriver {
             // cd 即失效（PTY 目录从未切换），且多跳/交互 enter 层上 execChannel 会抛
             // 「不可直达」直接炸掉整层 init
             try {
-                await this.link.execMarker(`cd ${q(this.descriptor.cwd)}`, 10_000);
+                await this.link.execMarker(`cd ${q(cdTargetArg(this.descriptor.cwd))}`, 10_000); // CDPATH 防改写（Sol 89 P1-7）
             } catch { /* 目录可能已删——best-effort 语义保留（exec 通道每条命令另行 fail-closed） */ }
         }
         // 登录身份：握手已顺带实测（冷启动锦囊：省一次独立 ssh 握手——建层耗时近半）；
@@ -657,7 +678,7 @@ export class SshPtyDriver implements RuntimeDriver {
                 //（业务尾注释吞 `; }` 同病——execSession 二十期 #2 同款双防）；
                 // cd 失败 && 短路——退出码可探测
                 const cmd = options?.cwd
-                    ? `( cd ${q(options.cwd)} && {\n${command}\n} )`
+                    ? `( cd ${q(cdTargetArg(options.cwd))} && {\n${command}\n} )`
                     : command;
                 const r = await this.link.execMarker(cmd, options?.timeoutMs ?? 120_000, options?.signal);
                 if (r.effectiveUser) this.effectiveUser = r.effectiveUser;

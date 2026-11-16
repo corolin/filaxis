@@ -13,7 +13,7 @@ import type {
 } from "./driver.js";
 import { TerminalManager } from "./terminal-manager.js";
 import { TmuxInvoker } from "./terminal/tmux-invoker.js";
-import { ENV_NAME_RE } from "./ssh-helpers.js";
+import { ENV_NAME_RE, cdTargetArg } from "./ssh-helpers.js";
 import { sanitizeSessionName } from "./session-buffer.js";
 import { probeDialect, type RemoteDialect } from "./dialect.js";
 import type {
@@ -136,10 +136,25 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 return m ? { size: parseInt(m[1]!, 10), mtimeMs: parseInt(m[2]!, 10) * 1000 } : null;
             },
             async readdir(p): Promise<FileEntry[]> {
-                const r = await self.exec(`ls -1A ${q(p)} 2>/dev/null || true`);
-                const names = r.stdout.split("\n").filter(Boolean);
+                // 逐名 hex 帧传输（Sol 89 P2-1）：PTY 里 ls 的**终端展示形态**对
+                // 空格/换行/控制字符名加引号或转义、capture-pane 还按窗宽软折行
+                //（100 字符名曾拆成两个条目）——ls 输出结构性不可信。改 od hex
+                //（字符集 [0-9a-f]）+ `;` 帧分隔（不出现在 hex 中）；stdout 里的
+                // 换行全是折行伪影——整体拼接后按分号切帧再解码。
+                // **子 shell cd 进目标**（真机抓回首版 bug：glob 跑在会话 cwd——
+                // 列出来的是别处）；cd 失败零输出=空列表（旧 ls || true 同语义）
+                const r = await self.exec(
+                    `( cd ${q(p)} 2>/dev/null && for __fx_e in .[!.]* *; do [ -e "$__fx_e" ] || [ -L "$__fx_e" ] || continue; ` +
+                    `printf %s "$__fx_e" | od -An -v -tx1 | tr -d ' \\n'; printf ';'; done )`,
+                );
+                const frames = r.stdout.replace(/[\r\n]+/g, "").split(";").filter(Boolean);
                 const out: FileEntry[] = [];
-                for (const name of names) {
+                for (const h of frames) {
+                    if (!/^[0-9a-f]+$/.test(h) || h.length % 2 !== 0) {
+                        // 凭证纪律：帧损坏（非 od 产物）显式报错——不静默跳过/降级
+                        throw new Error(`readdir hex 帧损坏（${h.slice(0, 20)}…）: ${p}`);
+                    }
+                    const name = Buffer.from(h, "hex").toString("utf-8");
                     const full = `${p.replace(/\/$/, "")}/${name}`;
                     const d = await self.exec(`test -d ${q(full)} && echo Y || echo N`);
                     const st = await (this as FileSystemDriver).stat!(full);
@@ -247,7 +262,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 if (needsValidation) {
                     const probe = await this.terminal.runCommand(
                         tid0,
-                        `cd ${q(wanted)}`,
+                        `cd ${q(cdTargetArg(wanted))}`,
                         10_000,
                     ).catch(() => ({ stdout: "", exitCode: 1 }));
                     if (probe.exitCode !== 0) {
@@ -290,7 +305,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 同款 exitCode 判定，失败即拒（新建层 cwd 错=配置错误，快失败）
             const probe = await this.terminal.runCommand(
                 this.descriptor.terminalId,
-                `cd ${q(this.descriptor.cwd)}`,
+                `cd ${q(cdTargetArg(this.descriptor.cwd))}`,
                 10_000,
             ).catch(() => ({ stdout: "", exitCode: 1 }));
             if (probe.exitCode !== 0) {
@@ -372,9 +387,11 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // 隔离：( cd X && cmd )——cd 只活在本条命令；退出码经子 shell 天然透传。
         // **上下换行**（Sol 88 P2-2）：单行 `{ cmd; } )` 下业务尾注释
         // `cmd # cmt` 把 `; } )` 一并注释掉——包装永不闭合，命令挂到超时。命令
-        // 与闭合语法分行（execSession 二十期 #2 同款双防）
+        // 与闭合语法分行（execSession 二十期 #2 同款双防）。
+        // **CDPATH 防改写**（Sol 89 P1-7）：裸相对路径的 cd 先搜 CDPATH——
+        // CDPATH 下同名目录存在时执行落去另一棵树（当前目录的 sub 在场也拦不住）
         const cmd = options?.cwd
-            ? `( cd ${q(options.cwd)} && {\n${command}\n} )`
+            ? `( cd ${q(cdTargetArg(options.cwd))} && {\n${command}\n} )`
             : command;
         if (options?.channel === "pty") {
             // tmux 后端本身即 PTY 语义（send-keys/capture-pane）
@@ -422,7 +439,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
             crypto.randomBytes(3).toString("hex");
         const base = `/tmp/filaxis-sessions/${sessionId}`;
         // cd 显式失败码（R3 同款：`cd X &&` 前缀在 & 后台化下失败不可探测——幽灵会话）
-        const cd = opts?.cwd ? `cd ${q(opts.cwd)} || exit 1; ` : "";
+        const cd = opts?.cwd ? `cd ${q(cdTargetArg(opts.cwd))} || exit 1; ` : ""; // CDPATH 防改写（Sol 89 P1-7，cdTargetArg）
         // env 内联前缀（十轮 envPrefixOf 同款；execSession 的 env 此前被静默忽略——
         // nohup 后台跑无 send-keys 回显污染问题，支持优于静默丢弃）
         const envPrefix = opts?.env && Object.keys(opts.env).length > 0

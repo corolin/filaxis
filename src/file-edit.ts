@@ -323,20 +323,28 @@ async function casWrite(
         // stat -c 读八进制权限（GNU）→ chmod NNN 数字模式全平台通吃；stat 缺席 best-effort
         `__fx_pm=$(stat -c '%a' "$__fx_tgt" 2>/dev/null); [ -n "$__fx_pm" ] && chmod "$__fx_pm" ${sr.qp}.fx-tmp 2>/dev/null; ` +
         `chown --reference="$__fx_tgt" ${sr.qp}.fx-tmp 2>/dev/null || true; `;
-    // mv -T + 落位四防（Sol 87 P1-5 → Sol 88 P1-6 同 file-transfer）：CAS 校验
-    // 与 mv 之间目标被换成目录时，裸 mv 曾把 fx-tmp **搬进目录**才被复验发现
-    //——目录里留下新内容、错误所称恢复路径 fx-tmp 已不存在。place 前置 [ -d ]
-    // 快速拒绝 + -T 精确指目标（拒绝零副作用）+ 裸 mv 回落**前置守卫**+守卫间
-    // 极窄竞态的**载荷回搬**分支（目录内搬回 fx-tmp 再报 FX_IS_DIR——目标净
-    // 效果为零、恢复路径保真）
+    // mv -T + 落位五防（Sol 87 P1-5 → Sol 88 P1-6 → Sol 89 P1-4/P1-5 同
+    // file-transfer）：目录快速拒绝 + -T 精确指目标 + 裸 mv 前置守卫 + 回搬带
+    // **搬移证据**（__fx_mv=1 只在裸 mv 成功后置位——曾无条件按 basename 回搬
+    // 目录里恰同名的无关文件误当载荷）+ **设备号分流**（fx-tmp 在原路径一侧、
+    // 符号链接真身可跨文件系统——mv 跨设备退化复制曾谎报 atomic-replace；同
+    // 设备才走 rename 链，跨设备/不可判走 cat=FX_INPLACE 诚实非原子）
     const place = forceInplace
         ? `if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi`
         : `__fx_tb=$(basename ${sr.qp}.fx-tmp 2>/dev/null); ` +
+          `__fx_od=$(stat -c %d ${sr.qp}.fx-tmp 2>/dev/null || stat -f %d ${sr.qp}.fx-tmp 2>/dev/null); ` +
+          `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
+          `if [ -n "$__fx_od" ] && [ "$__fx_od" = "$__fx_td" ]; then ` +
           `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+          `__fx_mv=0; ` +
           `if mv -T ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null; then echo "FX_OK $(${stampOf})"; ` +
-          `else if [ ! -d "$__fx_tgt" ] && mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null && [ ! -d "$__fx_tgt" ]; then echo "FX_OK $(${stampOf})"; ` +
-          `else if [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_tb" ${sr.qp}.fx-tmp 2>/dev/null; then echo FX_IS_DIR; ` +
-          `else if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi`;
+          `else if [ ! -d "$__fx_tgt" ] && mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null && __fx_mv=1 && [ ! -d "$__fx_tgt" ]; then echo "FX_OK $(${stampOf})"; ` +
+          `else if [ "$__fx_mv" = "1" ] && [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_tb" ${sr.qp}.fx-tmp 2>/dev/null; then echo FX_IS_DIR; ` +
+          `else if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; ` +
+          `else ` +
+          `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+          `if cat ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else echo FX_INPLACE_FAIL; fi; ` +
+          `fi`;
     const cmd =
         `( if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
         `else echo FX_DEGRADED_NO_LOCK; fi; ` +
