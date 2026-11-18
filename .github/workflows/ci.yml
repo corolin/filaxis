@@ -38,9 +38,6 @@ jobs:
   node:
     name: Node LTS 兼容（类型/边界/内核真跑）
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node: [24]
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2 # 装依赖仍走 bun（Node 侧用包管理器无关的 node_modules）
@@ -48,7 +45,7 @@ jobs:
           bun-version: 1.4.4
       - uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node }}
+          node-version: '24'
       - run: bun install
       - run: node_modules/.bin/tsc --noEmit
       - run: node scripts/check-boundaries.ts # 纯 node: API——Node 直接跑即兼容实证
