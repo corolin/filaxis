@@ -1,6 +1,6 @@
 /** editFile 受控编辑测试（local driver 真跑 + toolkit 新工具真跑 + CLI 冒烟） */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync, readdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync, readdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
@@ -12,6 +12,43 @@ import type { RuntimeDriver } from "../src/driver.js";
 const dir = mkdtempSync(join(tmpdir(), "fx-edit-"));
 
 describe("editFile（TOCTOU+精确替换）", () => {
+    test.skipIf(process.platform !== "linux")("符号链接编辑与同目标别名共用 CAS 锁", async () => {
+        const fixture = mkdtempSync(join(tmpdir(), "fx-edit-aliases-"));
+        try {
+            const target = join(fixture, "target");
+            const a = join(fixture, "a");
+            const b = join(fixture, "b");
+            writeFileSync(target, "base-A base-B\n");
+            symlinkSync(target, a);
+            symlinkSync(target, b);
+            const drv = new LocalRuntimeDriver();
+            const exec = drv.exec.bind(drv);
+            let reads = 0;
+            let releaseReads!: () => void;
+            const bothRead = new Promise<void>((resolve) => { releaseReads = resolve; });
+            drv.exec = async (cmd, opts) => {
+                const result = await exec(cmd, opts);
+                if (cmd.includes("echo __FXS__")) {
+                    if (++reads === 2) releaseReads();
+                    await bothRead;
+                }
+                return result;
+            };
+            const results = await Promise.allSettled([
+                editFile(drv, a, "base-A", "edit-A"),
+                editFile(drv, b, "base-B", "edit-B"),
+            ]);
+            const success = results.filter((r) => r.status === "fulfilled");
+            expect(success).toHaveLength(1);
+            expect(success[0]?.value.mutex).toBe("flock");
+            expect(results.find((r) => r.status === "rejected")?.reason).toBeInstanceOf(EditConflictError);
+            expect(readFileSync(target, "utf-8")).toMatch(/^(edit-A base-B|base-A edit-B)\n$/);
+            expect(readdirSync(fixture).filter((n) => n.endsWith(".fx-lock"))).toEqual(["target.fx-lock"]);
+        } finally {
+            rmSync(fixture, { recursive: true, force: true });
+        }
+    });
+
     test("唯一命中替换成功（base64 写回保真）", async () => {
         const drv = new LocalRuntimeDriver();
         const p = join(dir, "a.env");
@@ -224,6 +261,22 @@ describe("editFile（TOCTOU+精确替换）", () => {
         rmSync(d10, { recursive: true, force: true });
     }, 20_000);
 
+    test("大文件回退可用相对路径编辑当前目录中的文件", async () => {
+        const fixture = mkdtempSync(join(tmpdir(), "fx-edit-relative-large-"));
+        try {
+            const name = "big file.conf";
+            const file = join(fixture, name);
+            const body = "x".repeat(75_000);
+            writeFileSync(file, "old=" + body);
+            const drv = new LocalRuntimeDriver({ cwd: fixture, execDir: join(fixture, "exec") });
+            const result = await editFile(drv, name, "old=", "new=");
+            expect(result.writeMode).toBe("inplace-write");
+            expect(readFileSync(file, "utf-8")).toBe("new=" + body);
+        } finally {
+            rmSync(fixture, { recursive: true, force: true });
+        }
+    }, 30_000);
+
     // GPT Astra #1：大文件回退路径曾丢弃原始读戳（读取后他人写被当新基准覆盖）——
     // 回退前核验原始 stat 戳，不符即 EditConflictError
     test("大文件回退核验：读取后他人先写 → EditConflictError（不覆盖他人内容）", async () => {
@@ -265,44 +318,66 @@ describe("toolkit 新工具（read_file/edit_file/observe_stream）", () => {
         rmSync(d2, { recursive: true, force: true });
     }, 20_000);
 
-    test("observe_stream 按流过滤", async () => {
+    test("observe_stream 持续接收，按流过滤、回看和游标续读", async () => {
         const tk = createAgentToolkit(new RuntimeStack(), {});
-        const r = await tk.handlers.observe_stream({
-            command: "echo O1; echo E1 1>&2; sleep 0.3; echo O2; echo E2 1>&2; sleep 2",
-            duration_ms: 2000,
-            stream: "stderr",
-        });
-        expect(r.lines.map((l) => l.text)).toContain("E1");
-        expect(r.lines.map((l) => l.text)).toContain("E2");
-        expect(r.lines.every((l) => l.stream === "stderr")).toBe(true);
-        expect(r.lines.map((l) => l.text)).not.toContain("O1");
-    }, 30_000);
-
-    // 第八季盲测 bug 回归：ssh 层 RemoteSessionManager.tailLines 是 async——
-    // 修复前 lines 是未 resolve 的 Promise（恒 truthy，兜底短路），lines.filter 抛
-    // TypeError。local 层 tailLines 恰是同步方法，故此前 local 测试全绿掩盖了本 bug。
-    test("observe_stream：async tailLines（ssh 形态）——Promise 必被 await", async () => {
-        const fakeRemote = {
-            descriptor: { driver: "ssh", target: "mock" },
-            execSession: async () => ({ sessionId: "s-async", logBase: "/tmp/s-async" }),
-            tailSession: async () => { throw new Error("tailLines 在场时不得走 stdout 投影兜底"); },
-            stopSession: async () => ({ exitCode: null }),
-            sessions: {
-                tailLines: async (_id: string, _n?: number) => [
-                    { stream: "stdout", text: "O_ASYNC" },
-                    { stream: "stderr", text: "E_ASYNC" },
-                ],
-            },
-        } as unknown as RuntimeDriver;
-        const tk = createAgentToolkit(new RuntimeStack(), { driver: fakeRemote });
-        const r = await tk.handlers.observe_stream({ command: "mock", duration_ms: 10, stream: "stderr" });
-        expect(r.lines).toEqual([{ stream: "stderr", text: "E_ASYNC" }]);
-        const both = await tk.handlers.observe_stream({ command: "mock", duration_ms: 10 });
-        expect(both.lines.length).toBe(2); // 无过滤全量（修前此处 Promise.filter 已炸）
-    }, 15_000);
+        const dir = mkdtempSync(join(tmpdir(), "fx-window-test-"));
+        const gate = join(dir, "gate");
+        const path = (await import("../src/ssh-helpers.js")).shellQuote(gate.replace(/\\/g, "/"));
+        try {
+            const { window_id } = await tk.handlers.observe_stream({
+                command: `echo IGNORE; printf 'E1\\nE2\\nE3\\n' >&2; while [ ! -f ${path} ]; do sleep 0.1; done; echo E4 >&2`,
+                stream: "stderr",
+            });
+            const first = await tk.handlers.read_stream({ window_id, since_seq: 0, wait_ms: 8000, limit: 1 });
+            expect(first.frames.map(({ text, stream }) => [text, stream])).toEqual([["E1", "stderr"]]);
+            const rest = await tk.handlers.read_stream({ window_id, since_seq: first.last_delivered_seq, wait_ms: 8000 });
+            expect(rest.frames.map((frame) => frame.text)).toEqual(["E2", "E3"]);
+            const backward = await tk.handlers.read_stream({ window_id, before_seq: rest.newest_seq, limit: 2 });
+            expect(backward.frames.map((frame) => frame.text)).toEqual(["E1", "E2"]);
+            const timeout = await tk.handlers.read_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 20 });
+            expect(timeout.timed_out).toBe(true);
+            writeFileSync(gate, "");
+            const late = await tk.handlers.read_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 8000 });
+            expect(late.frames.map((frame) => frame.text)).toEqual(["E4"]);
+            const history = await tk.handlers.read_stream({ window_id, window_ms: 30000 });
+            expect(history.frames.map((frame) => frame.text)).toEqual(["E1", "E2", "E3", "E4"]);
+            expect(await tk.handlers.close_stream({ window_id })).toEqual({ window_id, closed: true });
+        } finally {
+            tk.dispose?.();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 30000);
 });
 
 describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
+
+    test("layer save recovers a dead writer's claim and protects a live writer", async () => {
+        const { mkdirSync } = await import("node:fs");
+        const { spawn } = await import("node:child_process");
+        const { once } = await import("node:events");
+        const dir = mkdtempSync(join(tmpdir(), "fx-layer-claim-"));
+        const store = join(dir, "layers.json");
+        const lock = store + ".lock";
+        const generation = "00000000-0000-4000-8000-000000000001";
+        const run = () => Bun.spawnSync([process.execPath, "bin/filaxis.ts", "layer", "save", "probe", "--host", "web-01"], {
+            env: { ...process.env, FILAXIS_LAYERS: store },
+        });
+        try {
+            mkdirSync(lock);
+            const dead = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+            await once(dead, "exit");
+            expect(dead.pid).toBeDefined();
+            writeFileSync(join(lock, `${dead.pid}-${generation}`), "");
+            const active = join(lock, `${process.pid}-${generation}`);
+            writeFileSync(active, "");
+            expect(run().exitCode).not.toBe(0);
+            rmSync(active);
+            expect(run().exitCode).toBe(0);
+            expect(JSON.parse(readFileSync(store, "utf8")).probe.target).toBe("web-01");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
     test("exec + cat + edit + observe 本地真跑", async () => {
         const { execSync } = await import("node:child_process");
         const d3 = mkdtempSync(join(tmpdir(), "fx-cli-"));

@@ -2,12 +2,27 @@
  * local-driver 单测（AC-04 exec 语义：stderr 分离/退出码如实/marker effectiveUser/timeout/abort）
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
 
 const execDir = join(tmpdir(), "filaxis-test-exec");
+
+test("local session inherits layer cwd and rejects a missing explicit cwd", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fx-session-cwd-"));
+    const drv = new LocalRuntimeDriver({ cwd: dir, execDir: join(dir, "logs") });
+    try {
+        writeFileSync(join(dir, "fixture"), "in-layer");
+        const session = await drv.execSession("cat fixture");
+        await waitFor(() => drv.sessions.sessionState(session.sessionId)?.status === "exited");
+        expect((await drv.readSessionLog(session.sessionId, { stream: "stdout" })).trim()).toBe("in-layer");
+        await expect(drv.execSession("echo bad", { cwd: join(dir, "missing") })).rejects.toThrow();
+        expect(drv.listSessions().map(({ sessionId }) => sessionId)).toEqual([session.sessionId]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}, 30_000);
 
 /** 轮询等待谓词为真（flake 治理：全量并发下 Defender/负载可拖慢子进程与异步
  *  落盘——固定睡眠窗曾连续五轮在不同用例上翻车，一律改有界轮询） */
@@ -40,13 +55,12 @@ describe("LocalRuntimeDriver.exec（AC-04）", () => {
 
     test("exec 审计留痕：status.json 落盘 completed", async () => {
         const drv = new LocalRuntimeDriver({ execDir });
+        const before = new Set(readdirSync(execDir));
         await drv.exec("echo audit");
-        const list = readdirSync(execDir);
-        const statusFiles = list.filter((f) => f.endsWith(".status.json"));
-        expect(statusFiles.length).toBeGreaterThan(0);
-        const last = JSON.parse(readFileSync(join(execDir, statusFiles[statusFiles.length - 1]!), "utf-8"));
-        // 并行测试下最新文件可能是任意用例的——合法终态皆证明审计留痕在位
-        expect(["completed", "running", "aborted", "timeout"]).toContain(last.status);
+        const statusFiles = readdirSync(execDir).filter((f) => f.endsWith(".status.json") && !before.has(f));
+        expect(statusFiles).toHaveLength(1);
+        const status = JSON.parse(readFileSync(join(execDir, statusFiles[0]!), "utf-8"));
+        expect(status.status).toBe("completed");
     }, 20_000); // flake 治理同上
 
     test("timeout：超时 reject 且进程后台留日志", async () => {
@@ -77,6 +91,20 @@ describe("LocalRuntimeDriver.exec（AC-04）", () => {
 });
 
 describe("LocalRuntimeDriver fs + 会话族", () => {
+    test("readdir 按配置的 cwd 解析相对路径及条目元数据", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-local-readdir-"));
+        try {
+            const drv = new LocalRuntimeDriver({ cwd: dir, execDir });
+            writeFileSync(join(dir, "fixture.txt"), "hello");
+            const entries = await drv.fs.readdir(".");
+            expect(entries).toEqual([
+                { name: "fixture.txt", size: 5, isDirectory: false, mtime: expect.any(Number) },
+            ]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("fs 全家桶 roundtrip", async () => {
         const drv = new LocalRuntimeDriver({ execDir });
         const dir = join(execDir, "fs-test");

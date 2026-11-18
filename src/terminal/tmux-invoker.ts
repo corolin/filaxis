@@ -2,12 +2,14 @@
  * terminal/tmux-invoker.ts — tmux CLI 原子调用层（净室平移）
  *
  * stdout/stderr 严格分离；非零退出码 reject（带 exitCode+stderr）不吞错；
- * exit 与 close 双监听先到为准（真实环境 exit 及时，mock 只发 close 兼容）。
+ * close 后结算，确保 stdout/stderr 已读完。
  */
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { TmuxResult } from "./types.js";
 import { TmuxError } from "./types.js";
+
+export const FILAXIS_PANE_OPTION = "@filaxis-input-owner";
 
 export class TmuxInvoker {
     static invoke(args: string[]): Promise<TmuxResult> {
@@ -38,8 +40,11 @@ export class TmuxInvoker {
                     ));
                 }
             };
-            p.once("exit", (code, signal) => settle(code, signal));
-            p.once("close", (code, signal) => settle(code, signal));
+            p.once("close", (code, signal) => {
+                stdout += oDec.end();
+                stderr += eDec.end();
+                settle(code, signal);
+            });
             p.once("error", (err) => {
                 if (settled) return;
                 settled = true;

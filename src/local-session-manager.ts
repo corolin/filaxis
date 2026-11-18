@@ -32,6 +32,7 @@ import type {
 } from "./session-types.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 import { resolveLocalShell } from "./shell-discovery.js";
+import { startLocalObservation } from "./local-observation-process.js";
 /** 子串语义转义（与 WatchRegistry.toRegex 同规则） */
 function escapeRegExp(p: string): string {
     return p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -61,6 +62,11 @@ interface SessionEntry {
     logBytes: number;
     logCapped: boolean;
     proc?: ChildProcess;
+    supervisor?: ReturnType<typeof startLocalObservation>;
+    closed?: Promise<void>;
+    confirming?: Promise<boolean>;
+    stopping?: Promise<{ status: "exited" | "unknown"; exitCode?: number | null }>;
+    commandExitCode?: number | null;
     running: boolean;
     exitCode?: number | null;
     ttlTimer?: ReturnType<typeof setTimeout>;
@@ -101,7 +107,7 @@ export class LocalSessionManager {
         this.logDir = opts.logDir ?? path.join(tmpdir(), "filaxis-sessions");
         this.log = opts.logger ?? noopLogger;
         this.shell = resolveLocalShell(opts.shell, this.log);
-        this.spawnImpl = opts.spawnImpl ?? ((cmd, argv, o) => spawn(cmd, argv, o as never) as ChildProcess);
+        this.spawnImpl = opts.spawnImpl;
     }
 
     /** 启动长跑会话：立即返回句柄 */
@@ -137,25 +143,55 @@ export class LocalSessionManager {
 
         const env = { ...process.env, ...opts.env };
         const cwd = opts.cwd || process.cwd();
-        // 注：不 unref——unref 的子进程在 Bun 下不保活事件循环，close/exit 事件会静默丢失。
-        // POSIX 下 detached=true（审计 H1）：子进程自成进程组——stop 可组杀整棵树（管道/
-        // 守护孙进程不再孤儿化挂 PID 1）；Windows 走 taskkill /T 树杀，无需 detached。
         let proc: ChildProcess;
+        const rollback = () => {
+            this.entries.delete(sessionId);
+            for (const st of [entry.logStreams.stdout, entry.logStreams.stderr]) st.end();
+        };
         try {
-            proc = this.spawnImpl!(this.shell, ["-c", command], {
-                env,
-                cwd,
+            entry.supervisor = this.spawnImpl ? undefined : startLocalObservation(this.shell, command, cwd, env);
+            proc = entry.supervisor?.child ?? this.spawnImpl!(this.shell, ["-c", command], {
+                env, cwd,
                 stdio: ["ignore", "pipe", "pipe"],
                 ...(process.platform !== "win32" ? { detached: true } : {}),
             });
         } catch (e) {
-            // spawnImpl 同步异常回滚（Hydrogen R6 #5）：cwd 不存在/权限等——曾遗留
-            // 已登记 entry 与两个打开的 WriteStream（内存+fd 泄漏）
-            this.entries.delete(sessionId);
-            for (const st of [entry.logStreams.stdout, entry.logStreams.stderr]) st.end();
+            rollback();
             throw e;
         }
         entry.proc = proc;
+
+        if (entry.supervisor) {
+            const supervisor = entry.supervisor;
+            const seen = { stdoutBytes: 0, stderrBytes: 0 };
+            let drained: typeof seen | undefined;
+            const tryRetire = () => {
+                if (!drained || seen.stdoutBytes < drained.stdoutBytes || seen.stderrBytes < drained.stderrBytes) return;
+                drained = undefined;
+                supervisor.retireWhenIdle();
+            };
+            for (const stream of ["stdout", "stderr"] as const) {
+                proc[stream]?.on("data", (buf: Buffer) => {
+                    seen[`${stream}Bytes`] += buf.length;
+                    this.ingestChunk(entry, entry.decoders[stream].write(buf), stream);
+                    tryRetire();
+                });
+            }
+            supervisor.onExit((code) => { entry.commandExitCode = code; });
+            supervisor.onDrained((counts) => { drained = counts; tryRetire(); });
+            entry.closed = new Promise<void>((resolve) => proc.once("close", resolve));
+            void entry.closed.then(() => {
+                if (this.entries.get(sessionId) === entry) void this.confirmSupervisedExit(entry);
+            });
+            try {
+                await supervisor.started;
+            } catch (error) {
+                rollback();
+                try { supervisor.requestStop(); } catch { /* Startup failed before publishing a handle. */ }
+                throw error;
+            }
+            return { sessionId, logBase, pid: proc.pid };
+        }
 
         proc.stdout?.on("data", (buf: Buffer) => this.ingestChunk(entry, entry.decoders.stdout.write(buf), "stdout"));
         proc.stderr?.on("data", (buf: Buffer) => this.ingestChunk(entry, entry.decoders.stderr.write(buf), "stderr"));
@@ -172,6 +208,17 @@ export class LocalSessionManager {
         proc.on("exit", (code) => {
             setTimeout(() => this.finalize(entry, code), 2_000).unref?.();
         });
+        if (proc.pid == null) {
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    proc.once("spawn", resolve);
+                    proc.once("error", reject);
+                });
+            } catch (error) {
+                rollback();
+                throw error;
+            }
+        }
         proc.on("error", (err) => {
             this.ingestLine(entry, `[session-error] ${err.message}`, "stderr");
             this.finalize(entry, null);
@@ -379,6 +426,21 @@ export class LocalSessionManager {
         if (!entry.running) {
             return { status: "exited", exitCode: entry.exitCode };
         }
+        if (entry.supervisor) {
+            const supervisor = entry.supervisor;
+            entry.stopping ??= (async () => {
+                try { supervisor.requestStop("SIGTERM"); } catch { return { status: "unknown" as const }; }
+                const escalation = setTimeout(() => {
+                    try { supervisor.requestStop(); } catch { /* The confirmation path can still return unknown. */ }
+                }, KILL_GRACE_MS);
+                try {
+                    return await this.confirmSupervisedExit(entry)
+                        ? { status: "exited" as const, exitCode: entry.exitCode }
+                        : { status: "unknown" as const };
+                } finally { clearTimeout(escalation); }
+            })().finally(() => { entry.stopping = undefined; });
+            return entry.stopping;
+        }
         if (entry.proc?.pid) {
             const pid = entry.proc.pid;
             // 进程树收割（审计 H1）：顶级 shell 死后孙进程（管道段/守护脚本）存活——
@@ -421,6 +483,27 @@ export class LocalSessionManager {
         return { status: "unknown", exitCode: null }; // SIGKILL 已发仍未观察到退出——死亡未确认
     }
 
+    private confirmSupervisedExit(entry: SessionEntry): Promise<boolean> {
+        if (!entry.running) return Promise.resolve(true);
+        entry.confirming ??= (async () => {
+            const timeout = 3000;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await Promise.race([Promise.all([entry.supervisor!.waitForStop(Date.now() + timeout), entry.closed]), new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error("session stop confirmation timed out")), timeout);
+                })]);
+                if (this.entries.get(entry.sessionId) !== entry) return false;
+                this.finalize(entry, entry.commandExitCode ?? null);
+                return true;
+            } catch {
+                return false;
+            } finally {
+                clearTimeout(timer);
+            }
+        })().finally(() => { entry.confirming = undefined; });
+        return entry.confirming;
+    }
+
     /** 会话核实（Gemini Hydrogen 审查 #7）：内存态 + pid 实测——close 回调未达/
      *  exit 兜底窗内不谎报 running（与 RemoteSessionManager.verify 同语义） */
     verify(sessionId: string): { status: "running" | "exited" | "unknown"; exitCode?: number | null } {
@@ -433,6 +516,14 @@ export class LocalSessionManager {
         } catch {
             return { status: "unknown" }; // 已死但 close 未到——死亡未证实，终态不明
         }
+    }
+
+    /** Passive session state for lifecycle bookkeeping. */
+    sessionState(sessionId: string): { status: "running" | "exited" | "stopped"; exitCode: number | null } | undefined {
+        const entry = this.entries.get(sessionId);
+        if (!entry) return undefined;
+        const status = entry.running ? "running" : "exited";
+        return { status, exitCode: entry.exitCode ?? null };
     }
 
     list(): Array<{ sessionId: string; command: string; running: boolean; startedAt: number }> {

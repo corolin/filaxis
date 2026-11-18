@@ -27,7 +27,7 @@ for (let i = 0; i < argv.length; i++) {
     switch (a) {
         case "--host": {
             const v = argv[++i];
-            if (!v) { console.error("filaxis-mcp: --host 需要目标（user@host）——缺值曾静默落本机"); process.exit(2); }
+            if (!v || v.startsWith("-")) { console.error("filaxis-mcp: --host 需要目标（user@host）——缺值曾静默落本机"); process.exit(2); }
             o.host = v;
             break;
         }
@@ -50,6 +50,9 @@ async function main(): Promise<void> {
     let opts: Parameters<typeof createAgentToolkit>[1];
     if (o.layer) {
         throw new Error("filaxis-mcp 暂不支持 --layer 快照寻址（FEAT-04 后续）——用 --host/--enter");
+    }
+    if (!o.host && argv.length > 0) {
+        throw new Error("SSH 路径参数需要 --host");
     }
     if (o.host) {
         const config: Record<string, unknown> = {};

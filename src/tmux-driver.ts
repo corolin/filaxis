@@ -20,6 +20,7 @@ import type {
     SessionStartOptions, SessionHandleInfo, WatchOptions, ReadLogOptions,
 } from "./session-types.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
+import { renderSessionCodeGuard, renderSessionGroupState, renderSessionWorker } from "./session-group.js";
 
 const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
@@ -106,25 +107,11 @@ export class TmuxSessionDriver implements RuntimeDriver {
             },
             async writeFile(p, content) {
                 const buf = Buffer.from(content, "utf-8");
-                const b64 = buf.toString("base64");
-                // 小载荷单往返直写；大载荷走 putContent 分块链路（自排查 R5）。
-                // 阈值与分块尺寸按真机实证收紧：tmux server 单条命令 ~16-24K 即
-                // "command too long"（远端实测 16K OK / 24K FAIL）——12K 安全边距
-                if (b64.length <= 12_000) {
-                    const w = await self.exec(`printf %s ${q(b64)} | base64 -d > ${q(p)}`);
-                    // 凭证纪律（Sol 73 P1-2）：重定向失败（目标为目录等）曾静默
-                    // 返回成功——退出码入闸
-                    if (w.exitCode !== 0) throw new Error(`writeFile 失败（重定向退出码 ${w.exitCode}）: ${p}`);
-                    return;
-                }
-                const { putContent } = await import("./file-transfer.js");
-                await putContent(
-                    async (cmd) => self.exec(cmd),
-                    await self.dialect(),
-                    buf,
-                    p,
-                    { chunkB64: 12_000 },
-                );
+                const { putContent, writeInplaceContent } = await import("./file-transfer.js");
+                const exec = (cmd: string) => self.exec(cmd);
+                const dialect = await self.dialect();
+                if (buf.length <= 9_000) await writeInplaceContent(exec, dialect, buf, p, 12_000);
+                else await putContent(exec, dialect, buf, p, { chunkB64: 12_000 });
             },
             async exists(p) {
                 const r = await self.exec(`test -e ${q(p)} && echo Y || echo N`);
@@ -148,13 +135,21 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 // 曾把 `..hidden` 这类「第二个字符是点」的合法名静默漏掉）；cd 失败
                 // 零输出=空列表（旧 ls || true 同语义）
                 const r = await self.exec(
-                    `( cd ${q(cdTargetArg(p))} 2>/dev/null && for __fx_e in .* *; do case "$__fx_e" in .|..) continue;; esac; ` +
+                    `( unset GLOBIGNORE; set +f; cd ${q(cdTargetArg(p))} 2>/dev/null || exit; ` +
+                    `printf 'FX_LIST;'; __fx_n=0; for __fx_e in .[!.]* ..?* [!.]*; do ` +
                     `[ -e "$__fx_e" ] || [ -L "$__fx_e" ] || continue; ` +
-                    `printf %s "$__fx_e" | od -An -v -tx1 | tr -d ' \\n'; printf ';'; done )`,
+                    `__fx_hex=$(printf %s "$__fx_e" | od -An -v -tx1) || exit 1; ` +
+                    `printf %s "$__fx_hex" | tr -d ' \\n' || exit 1; printf ';'; __fx_n=$((__fx_n+1)); ` +
+                    `done; printf 'FX_COUNT_%s;\\n' "$__fx_n" )`,
                 );
-                const frames = r.stdout.replace(/[\r\n]+/g, "").split(";").filter(Boolean);
+                const frames = r.stdout.replace(/[\r\n]+/g, "").split(";");
+                const end = frames.at(-2)?.match(/^FX_COUNT_(\d+)$/);
+                if (r.exitCode !== 0 || frames[0] !== "FX_LIST" || frames.at(-1) !== "" ||
+                    !end || Number(end[1]) !== frames.length - 3) {
+                    throw new Error(`readdir 未收到完整目录列表（exit=${r.exitCode}）: ${p}`);
+                }
                 const out: FileEntry[] = [];
-                for (const h of frames) {
+                for (const h of frames.slice(1, -2)) {
                     if (!/^[0-9a-f]+$/.test(h) || h.length % 2 !== 0) {
                         // 凭证纪律：帧损坏（非 od 产物）显式报错——不静默跳过/降级
                         throw new Error(`readdir hex 帧损坏（${h.slice(0, 20)}…）: ${p}`);
@@ -326,52 +321,58 @@ export class TmuxSessionDriver implements RuntimeDriver {
     /** init 登记成功才置位（Sol 77 P1-2）：attach 探活失败的实例从未持有引用
      *  ——destroy 不得扣减/销毁（曾照扣致原层会话被连带杀） */
     private attached = false;
-    /** destroy 幂等（Sol 77 P1-2）：同 driver 二次 destroy 曾再扣一次引用，
-     *  提前耗尽其他层 */
-    private destroyedOnce = false;
+    private disposal?: Promise<void>;
 
     /** destroy：只停**本实例**启动的后台进程（审查问题 1：全目录扫杀会误杀同机其他
      * Filaxis 实例/其他层的任务——/tmp/filaxis-sessions 是共享目录），再销毁会话——
      * **引用计数护会话**（Sol 76 P2-1）：同 terminalId 的其他 driver 实例仍在
      *用时（不同 cwd 重挂等）不杀会话，归零才真销毁 */
     async destroy(): Promise<void> {
-        if (this.destroyedOnce) return; // 幂等（Sol 77 P1-2）：二次调用不再扣减
-        this.destroyedOnce = true;
+        if (!this.attached) return;
+        this.disposal ??= this.destroyAttached().catch((error: unknown) => {
+            this.disposal = undefined;
+            throw error;
+        });
+        await this.disposal;
+    }
+
+    private async destroyAttached(): Promise<void> {
         if (!this.attached) return; // 未登记=未持有引用（init 失败路径）——不动会话
         if (this.descriptor.terminalId) {
             for (const sid of this.ownedSessions) {
-                const base = this.sessionBase(sid);
                 try {
-                    await this.terminal.runCommand(
-                        this.descriptor.terminalId,
-                        `${this.pidGuardedKill(base)}; rm -f ${q(base)}.pid; true`,
-                        5_000,
-                    );
-                } catch { /* best-effort：单个会话清理失败不阻断其余 */ }
+                    const result = await this.stopSession(sid);
+                    if (result.status !== "unknown") this.ownedSessions.delete(sid);
+                } catch { /* 继续尝试核实其余会话 */ }
             }
-            this.ownedSessions.clear();
+            if (this.ownedSessions.size) {
+                const sessions = [...this.ownedSessions].map((sessionId) => ({ sessionId, logBase: this.sessionBase(sessionId) }));
+                const message = sessions.map(({ sessionId, logBase }) => `${sessionId} (${logBase})`).join(", ");
+                this.log.warn(`tmux 会话停止结果未知: ${message}`);
+                throw Object.assign(new Error(`tmux 会话停止结果未知: ${message}`), { outcome: "unknown", sessions });
+            }
             const tid = this.descriptor.terminalId;
             const refs = Math.max(0, (sessionAttachRefs.get(tid) ?? 1) - 1);
-            { // cwd 计数递减（Sol 78 P1-4 → Sol 80 P1-3：未声明以 "" 键同登记同减）
-              const key = this.descriptor.cwd ?? "";
-              const cwds = sessionCwds.get(tid);
-              const n = (cwds?.get(key) ?? 1) - 1;
-              if (n > 0) cwds!.set(key, n);
-              else {
-                  cwds?.delete(key);
-                  if (cwds && cwds.size === 0) sessionCwds.delete(tid);
-              } }
             if (refs === 0) {
-                sessionAttachRefs.delete(tid);
-                sessionDestroying.add(tid); // 销毁在途（Sol 78 #5）：重挂守卫依据
+                sessionDestroying.add(tid);
                 try {
                     await this.terminal.destroySession(tid);
                 } finally {
                     sessionDestroying.delete(tid);
                 }
+                sessionAttachRefs.delete(tid);
             } else {
-                sessionAttachRefs.set(tid, refs); // 他实例仍持有——会话留命
+                sessionAttachRefs.set(tid, refs);
             }
+            const key = this.descriptor.cwd ?? "";
+            const cwds = sessionCwds.get(tid);
+            if (cwds) {
+                const count = (cwds.get(key) ?? 1) - 1;
+                if (count > 0) cwds.set(key, count);
+                else cwds.delete(key);
+                if (cwds.size === 0) sessionCwds.delete(tid);
+            }
+            this.attached = false;
         }
     }
 
@@ -428,9 +429,12 @@ export class TmuxSessionDriver implements RuntimeDriver {
 
     private dialectPromise?: Promise<RemoteDialect>;
 
-    /** 方言惰性探测缓存（大文件 writeFile 的 putContent 链路用——每层一次） */
+    /** 方言惰性探测缓存。通道故障后允许重新探测。 */
     private async dialect(): Promise<RemoteDialect> {
-        this.dialectPromise ??= probeDialect((cmd) => this.exec(cmd));
+        this.dialectPromise ??= probeDialect((cmd) => this.exec(cmd)).catch((error) => {
+            this.dialectPromise = undefined;
+            throw error;
+        });
         return this.dialectPromise;
     }
 
@@ -441,7 +445,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // 白名单字符集 [a-zA-Z0-9_-] 内无任何 shell 元字符
         const sessionId =
             `${opts?.name ? sanitizeSessionName(opts.name) + "-" : "tsess-"}` +
-            crypto.randomBytes(3).toString("hex");
+            crypto.randomBytes(16).toString("hex");
         const base = `/tmp/filaxis-sessions/${sessionId}`;
         // cd 显式失败码（R3 同款：`cd X &&` 前缀在 & 后台化下失败不可探测——幽灵会话）
         const cd = opts?.cwd ? `cd ${q(cdTargetArg(opts.cwd))} || exit 1; ` : ""; // CDPATH 防改写（Sol 89 P1-7，cdTargetArg）
@@ -457,7 +461,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // execSession 才出生、带病出厂）：大括号形态下业务命令显式 `exit 7` 退出**整个
         // 包装 shell**——.code 永不写（进程已死但 stopSession 恒查不到终态）；单行拼接
         // 下业务尾注释 `cmd # cmt` 吞掉 `; }` 同病。子 shell 隔离 + 换行双防
-        const wrapped = `(\n${envPrefix}${command}\n); echo $? > ${base}.code`; // env 前缀进子 shell（同 remote）
+        const wrapped = renderSessionWorker(base, `${envPrefix}${command}`);
         // 启动握手（孪生对齐审计·二十一期 remote 模板漏改）：分号链里 mkdir 失败/
         // cd 失败被 & 吞/重定向失败/nohup 127 都不影响父 shell——$! 照样返回 PID =
         // 幽灵会话（.pid 空/指向已死壳，execSession 谎报成功）。wrapper 亲写 .pid +
@@ -472,14 +476,16 @@ export class TmuxSessionDriver implements RuntimeDriver {
             `( mkdir -p /tmp/filaxis-sessions 2>/dev/null || { echo FX_MKDIR_FAIL; exit 1; }; ` +
             // setsid 进程组（Hydrogen R5 #3）：wrapper 自成组长——stopSession 组杀全树
             // （单杀主 PID 漏孙进程后探针见主死=谎报 stopped）。缺席平台 pgid≠pid 自动回落
+            `(set -C; : > ${q(base)}.claim) 2>/dev/null || { echo FX_SESSION_COLLISION; exit 1; }; ` +
+            `for ext in pid pid.tmp pgid st code code.tmp members out err; do [ ! -e ${q(base)}."$ext" ] || { echo FX_SESSION_COLLISION; exit 1; }; done; ` +
             `${cd}__fx_sets=""; command -v setsid >/dev/null 2>&1 && __fx_sets=setsid; ` +
-            `$__fx_sets nohup sh -c ${q(`echo $$ > ${base}.pid.tmp; mv ${base}.pid.tmp ${base}.pid; ps -o pgid= -p $$ 2>/dev/null | tr -d ' 
-' > ${base}.pgid; ${wrapped}`)} > ${q(base)}.out 2> ${q(base)}.err < /dev/null & ` +
+            `$__fx_sets nohup sh -c ${q(wrapped)} > ${q(base)}.out 2> ${q(base)}.err < /dev/null & ` +
             `__fx_n=0; while [ ! -f ${q(base)}.pid ] && [ $__fx_n -lt 30 ]; do sleep 0.1; __fx_n=$((__fx_n+1)); done; ` +
             `[ -f ${q(base)}.pid ] || { echo FX_SPAWN_FAIL; exit 1; }; ` +
             `{ awk '{print $22}' /proc/$(cat ${q(base)}.pid)/stat 2>/dev/null || true; } > ${q(base)}.st; true )`,
         );
         const out = (r.stdout || "").trim();
+        if (out === "FX_SESSION_COLLISION") throw new Error(`tmux 会话 ID 已被占用: ${sessionId}`);
         if (out.includes("FX_MKDIR_FAIL")) {
             // 确定性失败：目录不可创建——后台任务物理上不可能启动，可安全重试
             throw new Error(`tmux 会话启动失败（/tmp/filaxis-sessions 不可创建）: ${command.slice(0, 60)}`);
@@ -550,7 +556,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // 复用，先 TERM 会误伤无辜进程。探针终态（CODE/DEAD/NOEV）直接返回，
         // 只有 ALIVE 才进入「身份戳守卫 TERM → 核实窗轮询」
         const probe = (
-            `if [ -f ${q(base)}.code ]; then echo CODE:$(cat ${q(base)}.code); ` +
+            `if [ -f ${q(base)}.code ]; then (${renderSessionCodeGuard(base)}echo CODE:$(cat ${q(base)}.code)) || echo NOEV; ` +
             // 组感知存活（Sol 74 P1-1）：.pgid==pid 时探**整组**（/bin/kill 绝对
             // 路径——dash 内建不认负 PID）——组长先退、孙进程持组存活曾报 DEAD
             // →stopped（孙进程实际还在跑）。组内任一存活=ALIVE
@@ -562,9 +568,11 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // →ALIVE；组全灭→DEAD
             `if kill -0 "$p" 2>/dev/null; then ` +
             `s=$(cat ${q(base)}.st 2>/dev/null); c=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); ` +
-            `if [ -z "$s" ] || [ "$s" = "$c" ]; then echo ALIVE; else echo STALE; fi; ` +
-            `elif /bin/kill -0 -- "-$g" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; ` +
-            `else if kill -0 "$p" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; fi; ` +
+            `if [ -z "$s" ] || [ "$s" = "$c" ]; then (${renderSessionGroupState("ALIVE")}); else echo STALE; fi; ` +
+            `else msg=$(LC_ALL=C /bin/kill -0 -- "-$g" 2>&1); ` +
+            `if [ "$?" -eq 0 ]; then (${renderSessionGroupState("ALIVE")}); else case "$msg" in *"No such process"*) echo DEAD;; *) echo NOEV;; esac; fi; fi; ` +
+            `else msg=$(LC_ALL=C kill -0 "$p" 2>&1); ` +
+            `if [ "$?" -eq 0 ]; then echo ALIVE; else case "$msg" in *"No such process"*) echo DEAD;; *) echo NOEV;; esac; fi; fi; ` +
             `else echo NOEV; fi`
         );
         // 探针解析（Astra 四十三期 #2）：CODE 须**整行全数字**（`CODE:7oops` 这种损坏
@@ -580,21 +588,21 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 const m = line.trim().match(/^CODE:(\d+)$/); // 整行严格：完整记录才算数
                 if (m) return { status: "exited", exitCode: parseInt(m[1]!, 10) };
             }
-            if (out.includes("DEAD")) return { status: "stopped" }; // pid 在场且已死（TERM 致死/迟到死亡）
-            if (out.includes("STALE")) return { status: "unknown" }; // 组长被复用（Sol 75 P2-3）——原会话状态不可知，绝不向复用组发信号
-            if (out.includes("NOEV")) return { status: "unknown" }; // 证据全缺——无从证实死亡
-            if (out.includes("ALIVE")) return undefined; // 明确存活——才允许进信号段
+            if (out.trim() === "DEAD") return { status: "stopped" };
+            if (out.trim() === "ALIVE") return undefined;
             return { status: "unknown" }; // 词不达意（空输出/截断混流）——探针失败同罪
         };
         const runProbe = async () => {
-            const r = await this.exec(probe);
-            return readout(r.stdout, r.exitCode === 0);
+            const r = await this.execSessionProbe(probe);
+            const result = readout(r?.stdout ?? "", r?.exitCode === 0);
+            if (result?.status === "exited" || result?.status === "stopped") this.ownedSessions.delete(sessionId);
+            return result;
         };
         const first = await runProbe();
         if (first) return first;
         // PID 身份戳比对（孪生对齐审计·H3二 remote 同款）：.st 与当前 starttime 不符
         // =PID 已被系统复用给无辜进程——不发信号（.st 缺席=老会话/非 Linux，放行）
-        await this.exec(this.pidGuardedKill(base, "TERM"));
+        if (!(await this.execSessionProbe(this.pidGuardedKill(base, "TERM")))) return { status: "unknown" };
         for (let i = 0; i < 4; i++) {
             const r = await runProbe();
             if (r) return r;
@@ -602,13 +610,21 @@ export class TmuxSessionDriver implements RuntimeDriver {
         }
         // SIGKILL 升级（对齐 remote 三段：顽固/不可中断进程 TERM 不动——KILL 再核，
         // .st 守卫同款防复用误杀；仍不死=不可中断态（D 状态 IO）→ unknown 如实）
-        await this.exec(this.pidGuardedKill(base, "KILL"));
+        if (!(await this.execSessionProbe(this.pidGuardedKill(base, "KILL")))) return { status: "unknown" };
         for (let i = 0; i < 2; i++) {
             const r = await runProbe();
             if (r) return r;
             await new Promise((res) => setTimeout(res, 300));
         }
         return { status: "unknown" }; // kill -0 持续说活（不可中断态）——死亡未证实
+    }
+    private async execSessionProbe(command: string): Promise<ExecResult | undefined> {
+        try {
+            const result = await this.exec(command);
+            return result.exitCode === 0 ? result : undefined;
+        } catch {
+            return undefined;
+        }
     }
     /** 会话路径派生（Astra 四十一期 #1）：sessionId 是外部输入——直接拼路径=注入面
      *  （本机 Bash 实测命令替换输出标记；启动侧四十期已规范化，读取/停止侧漏）。
@@ -620,7 +636,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
         }
         return `/tmp/filaxis-sessions/${sessionId}`;
     }
-    /** .st 身份戳守卫的信号发送（stopSession 三段与 destroy 共用；持久 shell 里禁裸 exit） */
+    /** .st 身份戳守卫的信号发送（持久 shell 里禁裸 exit） */
     private pidGuardedKill(base: string, sig: "TERM" | "KILL" = "TERM"): string {
         // 组感知（Hydrogen R5 #3）：.pgid==pid 时组杀全树（/bin/kill 绝对路径——dash
         // kill 内建不认负 PID）；缺席/不匹配回落单杀
@@ -629,13 +645,19 @@ export class TmuxSessionDriver implements RuntimeDriver {
         // unknown、孙进程照跑）。放行条件=组长确死（kill -0 失败）：组若仍活
         // 必是我组孙进程（pgid 被我成员持有不可复用）；复用组的新组长必活、
         // 走不进此分支（活组长戳不符仍拦截）
+        const matchesStamp = `[ "$s" = "$(awk '{print $22}' /proc/$p/stat 2>/dev/null)" ]`;
+        // Escalation requires positive identity evidence from this same command.
+        const identity = sig === "KILL"
+            ? `[ -n "$s" ] && ${matchesStamp}`
+            : `[ -z "$s" ] || ${matchesStamp} || ! kill -0 "$p" 2>/dev/null`;
         return (
             `p=$(cat ${q(base)}.pid 2>/dev/null); [ -n "$p" ] && { ` +
             `s=$(cat ${q(base)}.st 2>/dev/null); ` +
-            `{ [ -z "$s" ] || [ "$s" = "$(awk '{print $22}' /proc/$p/stat 2>/dev/null)" ] || ! kill -0 "$p" 2>/dev/null; } && { ` +
             `g=$(cat ${q(base)}.pgid 2>/dev/null); ` +
+            `{ ${identity}; } && { ` +
             `if [ -n "$g" ] && [ "$g" = "$p" ]; then /bin/kill -${sig} -- "-$g" 2>/dev/null; ` +
-            `else kill -${sig} "$p" 2>/dev/null; fi; }; }; true`
+            `else kill -${sig} "$p" 2>/dev/null; fi; }; }` +
+            (sig === "TERM" ? "; true" : "")
         );
     }
     /** 会话核实（unknown 闭环）：.code 在场=exited（真实码）；否则 kill -0 实测 pid
@@ -644,8 +666,8 @@ export class TmuxSessionDriver implements RuntimeDriver {
      *  真实状态不可知），绝不冒认。单探针合并往返（PTY 每往返数百 ms）。 */
     async verifySession(sessionId: string): Promise<{ status: "running" | "exited" | "unknown"; exitCode?: number | null }> {
         const base = this.sessionBase(sessionId);
-        const r = await this.exec(
-            `if [ -f ${q(base)}.code ]; then echo CODE:$(cat ${q(base)}.code); ` +
+        const r = await this.execSessionProbe(
+            `if [ -f ${q(base)}.code ]; then (${renderSessionCodeGuard(base)}echo CODE:$(cat ${q(base)}.code)) || echo NOEV; ` +
             // 组感知存活（Sol 74 P1-1 同 stopSession）：孙进程持组=running——
             // 组模式先探组（/bin/kill 负 PID），组长活着才做 .st 身份核验；
             // 组长已死组仍活（孙进程当家）=RUNNING（会话语义=整棵命令树）
@@ -658,23 +680,26 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 不可能被复用）→ RUNNING；组全灭 → DEAD
             `if kill -0 "$p" 2>/dev/null; then ` +
             `s=$(cat ${q(base)}.st 2>/dev/null); c=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); ` +
-            `if [ -z "$s" ] || [ "$s" = "$c" ]; then echo RUNNING; else echo STALE; fi; ` +
-            `elif /bin/kill -0 -- "-$g" 2>/dev/null; then echo RUNNING; else echo DEAD; fi; ` +
+            `if [ -z "$s" ] || [ "$s" = "$c" ]; then (${renderSessionGroupState("RUNNING")}); else echo STALE; fi; ` +
+            `elif /bin/kill -0 -- "-$g" 2>/dev/null; then (${renderSessionGroupState("RUNNING")}); else echo DEAD; fi; ` +
             `elif kill -0 "$p" 2>/dev/null; then ` +
             `s=$(cat ${q(base)}.st 2>/dev/null); c=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); ` +
             `if [ -z "$s" ] || [ "$s" = "$c" ]; then echo RUNNING; else echo STALE; fi; ` + // 复用：活着但身份不符
             `else echo DEAD; fi; ` +
             `else echo NOEV; fi`,
         );
+        if (!r) return { status: "unknown" };
         const out = r.stdout;
         // 探针失败（exitCode≠0）或 CODE 非整行全数字=证据无效（四十三期 #2：
         // `CODE:7oops` 损坏记录不得部分匹配成 7；#1 同罪——探针不可信不下结论）
-        if (r.exitCode !== 0) return { status: "unknown" };
         for (const line of out.split(/\r?\n/)) {
             const m = line.trim().match(/^CODE:(\d+)$/);
-            if (m) return { status: "exited", exitCode: parseInt(m[1]!, 10) };
+            if (m) {
+                this.ownedSessions.delete(sessionId);
+                return { status: "exited", exitCode: parseInt(m[1]!, 10) };
+            }
         }
-        if (out.includes("RUNNING")) return { status: "running" }; // 身份核实过的存活
+        if (out.trim() === "RUNNING") return { status: "running" }; // 身份核实过的存活
         return { status: "unknown" }; // STALE（PID 被复用——原会话状态不可知）/ DEAD（死因不明）/ NOEV / 词不达意
     }
     listSessions(): Array<{ sessionId: string; command: string; running: boolean; startedAt: number }> {

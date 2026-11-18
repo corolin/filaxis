@@ -1423,8 +1423,9 @@ describe("Sol 84：读故障/无 target 自定义驱动/packages 形状", () => 
             mkdirSync(aside);
             const old = new Date(Date.now() - 11 * 60_000);
             utimesSync(aside, old, old); // 超时触发压实
-            const cfg = await new LayerEnvStore(p).load();
-            expect(cfg.layers.live).toBeUndefined(); // 已读到的部分（主档空）
+            const store = new LayerEnvStore(p);
+            await expect(store.load()).rejects.toThrow(/无法读取完整配置/);
+            await expect(store.save({ layers: {} })).rejects.toThrow(/拒绝覆盖配置/);
             expect(existsSync(aside)).toBe(true); // 修前：压实删除——永久丢失
             // 故障解除（换回真文件）后可读回
             rmSync(aside, { recursive: true, force: true });
@@ -1496,6 +1497,8 @@ describe("Sol 85：写路径故障中止/packages 元素", () => {
             const s = new LayerEnvStore(p);
             await expect(s.upsert("next", mk85("next"))).rejects.toThrow(/读故障在场/); // 修前：stale:false 落盘并清旁路
             expect(existsSync(aside)).toBe(true); // 旁路未被删
+            await expect(s.load()).rejects.toThrow(/无法读取完整配置/);
+            rmSync(aside, { recursive: true, force: true });
             const cfg = await new LayerEnvStore(p).load(true);
             expect(cfg.layers.main?.connection.target).toBe("main"); // 主档独有条目未丢（部分态没落盘）
         } finally {
@@ -1686,6 +1689,28 @@ describe("Sol 89：锁失回滚语义", () => {
 //（load 空配置/丢 B 的键）。无锁安全化后：take-scratch→身份验证→link-CAS，
 // 任何路径不可能删/盖他人主档。
 describe("Sol 90：回滚无锁安全化（双实例竞态）", () => {
+    test("并发 upsert 跳过待撤销修订，仍能从同类旁路恢复其他提交", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-env-rejected-"));
+        try {
+            const p = join(dir, "env.json");
+            const base = "1000000000000-1-base";
+            const rejected = "1000000000001-1-rejected";
+            const foreign = "1000000000002-2-foreign";
+            writeFileSync(`${p}.1-2-old.fx-old`, JSON.stringify({ layers: { base: entry({ os: "base" }) }, _fx_rev: base }));
+            writeFileSync(`${p}.1-2-scratch.${rejected}.fx-old`, JSON.stringify({
+                layers: { rejected: entry({ os: "rejected" }) }, _fx_rev: rejected, _fx_seen: [base],
+            }));
+            writeFileSync(`${p}.2-2-scratch.${rejected}.fx-old`, JSON.stringify({
+                layers: { foreign: entry({ os: "foreign" }) }, _fx_rev: foreign,
+            }));
+            const store = new LayerEnvStore(p);
+            await expect(store.upsert("next", entry({ os: "next" }))).resolves.toEqual({ stale: false });
+            expect(Object.keys((await store.load()).layers).sort()).toEqual(["base", "foreign", "next"]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("P1-1 A 回滚期间 B 接管提交：B 的主档存活（load 含 B 的键，不再空配置）", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-env90-"));
         try {

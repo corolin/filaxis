@@ -13,6 +13,8 @@
  * - 会话族委托 RemoteSessionManager（nohup 双文件 + 终态三态）
  * - logger 注入；自动重连（3 次退避）/层状态机/退化哨兵全平移
  */
+import { StreamSessionManager } from "./stream-session-manager.js";
+import type { ObservationWindowOptions, StreamWindowRegistry } from "./stream-window.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fsSync from "node:fs";
 import { StringDecoder } from "node:string_decoder";
@@ -26,9 +28,11 @@ import type {
 } from "./session-types.js";
 import {
     autonomousSshOpts, SSH_INPUT_WAIT_RE, enterStepsOf, hopLabel, rootSshSpawnArgs, cdTargetArg,
-    sshArgsFor, renderExecChannel, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
+    sshArgsFor, renderExecChannel, shellQuote, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
 } from "./ssh-helpers.js";
 import { RemoteSessionManager } from "./remote-session-manager.js";
+import { probeDialect, type RemoteDialect } from "./dialect.js";
+import { writeInplaceContent } from "./file-transfer.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 const ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r(?!\n)/g;
@@ -309,9 +313,11 @@ ${command}
                     if (deadline) clearTimeout(deadline);
                     cleanupAbort();
                     notify(() => {
-                        const e = new Error(`PTY 链断开（执行期断链——远端终态未核实，outcome=unknown）: ${command.slice(0, 60)}`) as Error & { outcome: "unknown" };
-                        e.outcome = "unknown";
-                        caller.reject(e);
+                        const partialOutput = buf.join("\n").slice(-500);
+                        caller.reject(Object.assign(
+                            new Error(`PTY 链断开（远端终态未核实）: ${command.slice(0, 60)}\n部分输出:\n${partialOutput}`),
+                            { outcome: "unknown", partialOutput },
+                        ));
                     });
                     cycleDone(); // 链已由 onUnexpectedExit 重建路径接管——不 enterDraining
                 }
@@ -445,10 +451,14 @@ export class SshPtyDriver implements RuntimeDriver {
         this.log = opts.logger ?? noopLogger;
         const self = this;
         const fsExec = async (cmd: string) => self.execChannel(cmd, undefined);
+        let writeDialect: Promise<RemoteDialect> | undefined;
+        const parseStat = (output: string) => {
+            const m = output.trim().match(/^(\d+)\s+(-?\d+)$/);
+            return m ? { size: Number(m[1]), mtimeMs: Number(m[2]) * 1000 } : null;
+        };
         const statOf = async (p: string) => {
             const r = await fsExec(`stat -c '%s %Y' ${q(p)} 2>/dev/null || stat -f '%z %m' ${q(p)} 2>/dev/null || true`);
-            const m = r.stdout.trim().match(/^(\d+)\s+(\d+)$/);
-            return m ? { size: parseInt(m[1]!, 10), mtimeMs: parseInt(m[2]!, 10) * 1000 } : null;
+            return r.exitCode === 0 ? parseStat(r.stdout) : null;
         };
         this.fs = {
             async readFile(p) {
@@ -460,9 +470,11 @@ export class SshPtyDriver implements RuntimeDriver {
                 return Buffer.from(r.stdout.replace(/[^A-Za-z0-9+/=]/g, ""), "base64").toString("utf-8");
             },
             async writeFile(p, content) {
-                const b64 = Buffer.from(content, "utf-8").toString("base64");
-                const r = await fsExec(`printf %s ${q(b64)} | base64 -d > ${q(p)}`);
-                if (r.exitCode !== 0) throw new Error(`writeFile 失败（exit=${r.exitCode}）: ${p}`);
+                writeDialect ??= probeDialect(fsExec).catch((error) => {
+                    writeDialect = undefined;
+                    throw error;
+                });
+                await writeInplaceContent(fsExec, await writeDialect, Buffer.from(content, "utf-8"), p);
             },
             async exists(p) {
                 const r = await fsExec(`test -e ${q(p)} && echo Y || echo N`);
@@ -470,14 +482,23 @@ export class SshPtyDriver implements RuntimeDriver {
             },
             stat: statOf,
             async readdir(p): Promise<FileEntry[]> {
-                const r = await fsExec(`command ls -1A ${q(p)} 2>/dev/null || true`); // command 绕 alias（Hydrogen R4 #6）
-                const names = r.stdout.split("\n").filter(Boolean);
-                return Promise.all(names.map(async (name) => {
-                    const full = `${p.replace(/\/$/, "")}/${name}`;
-                    const d = await fsExec(`test -d ${q(full)} && echo Y || echo N`);
-                    const st = await statOf(full);
-                    return { name, isDirectory: d.stdout.trim() === "Y", size: st?.size, mtime: st?.mtimeMs };
-                }));
+                const r = await fsExec(`cd ${q(cdTargetArg(p))} && [ -r . ] || exit 1; ` +
+                    `for entry in .[!.]* ..?* [!.]*; do ` +
+                    `[ -e "./$entry" ] || [ -L "./$entry" ] || continue; ` +
+                    `if [ -d "./$entry" ]; then kind=d; else kind=f; fi; ` +
+                    `info=$(stat -c '%s %Y' "./$entry" 2>/dev/null || stat -f '%z %m' "./$entry" 2>/dev/null) || info=; ` +
+                    `printf '%s\\0%s\\0%s\\0' "$entry" "$kind" "$info" || exit 1; done`);
+                if (r.exitCode !== 0) throw new Error(`readdir 失败（exit=${r.exitCode}）: ${p}`);
+                const frames = r.stdout.split("\0");
+                if (frames.pop() !== "" || frames.length % 3 !== 0) throw new Error(`readdir 未收到完整目录列表: ${p}`);
+                const entries: FileEntry[] = [];
+                for (let index = 0; index < frames.length; index += 3) {
+                    const [name, kind, info] = frames.slice(index, index + 3);
+                    if (!name || (kind !== "d" && kind !== "f")) throw new Error(`readdir 收到无效目录条目: ${p}`);
+                    const stat = parseStat(info!);
+                    entries.push({ name, isDirectory: kind === "d", size: stat?.size, mtime: stat?.mtimeMs });
+                }
+                return entries;
             },
             async rm(p, options) {
                 const r = await fsExec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}${q(p)}`);
@@ -516,7 +537,8 @@ export class SshPtyDriver implements RuntimeDriver {
         };
 
         this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop), connParams));
-        await this.link.handshake(`ssh ${hopLabel(rootHop)}`);
+        try { await this.link.handshake(`ssh ${hopLabel(rootHop)}`); }
+        catch (error) { this.link.kill(); throw error; }
         for (const hop of hops) {
             const { hopSshCommand } = await import("./ssh-helpers.js");
             this.link.send(`${hopSshCommand(hop)}${this.link.registerFallbackStep()}\n`);
@@ -539,15 +561,13 @@ export class SshPtyDriver implements RuntimeDriver {
             this.assertNotFallenBack(`enter: ${step.cmd.slice(0, 40)}`);
         }
         if (this.descriptor.cwd) {
-            // best-effort 恢复（重连时目录可能已被删——不阻断建链）；引号安全化
-            // （Astra 五轮 P1：JSON.stringify 双引号不挡 $()/反引号注入）。exec 通道
-            // 每条命令另行 fail-closed 拼装 cwd（renderExecChannel）。PTY 会话目录恢复
-            // 必须走 execMarker（Hydrogen R5 #2）：曾误调 execChannel——独立一次性子进程
-            // cd 即失效（PTY 目录从未切换），且多跳/交互 enter 层上 execChannel 会抛
-            // 「不可直达」直接炸掉整层 init
             try {
-                await this.link.execMarker(`cd ${q(cdTargetArg(this.descriptor.cwd))}`, 10_000); // CDPATH 防改写（Sol 89 P1-7）
-            } catch { /* 目录可能已删——best-effort 语义保留（exec 通道每条命令另行 fail-closed） */ }
+                const result = await this.link.execMarker(`cd ${q(cdTargetArg(this.descriptor.cwd))}`, 10_000);
+                if (result.exitCode !== 0) throw new Error(`SSH 层无法进入工作目录 '${this.descriptor.cwd}'（exit=${result.exitCode}）`);
+            } catch (error) {
+                this.link.kill();
+                throw error;
+            }
         }
         // 登录身份：握手已顺带实测（冷启动锦囊：省一次独立 ssh 握手——建层耗时近半）；
         // 缺席（旧握手形态/极旧对端）时静默跳过——绝不回退独立 exec（回退即冷启动退化）
@@ -645,6 +665,7 @@ export class SshPtyDriver implements RuntimeDriver {
     async exit(): Promise<void> {
         if (!this.alive) return;
         this.alive = false;
+        this.sessions.closePolling();
         this.reconnecting = false;
         this.layerState = "dead";
         if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; } // 排程中的重连不再到期拉新进程（Sol 88 P1-10）
@@ -747,7 +768,8 @@ export class SshPtyDriver implements RuntimeDriver {
             // 的握手成本从「每条命令」降到「每 10min 窗口首条」（ControlPersist=600）；
             // 与观察流同一 socket（exec/observe 同主机共享一条主连接）
             const destArgs = sshArgsFor(rootHop);
-            const argv = [...autonomousSshOpts(connParams), ...muxFlagsFor(destArgs), ...destArgs, "--", ...render.remoteArgs];
+            const sshOptions = autonomousSshOpts(connParams);
+            const argv = [...sshOptions, ...muxFlagsFor(destArgs, { sshOptions }), ...destArgs, "--", ...render.remoteArgs];
             // 显式 stdio 模式覆盖（DeepSeek Harness 反馈）：FILAXIS_SSH_STDIO_MODE=inherit
             // 直接走文件中转（管道句柄在受限沙箱里被拦截——ssh 秒退 255 零输出）
             if (process.env.FILAXIS_SSH_STDIO_MODE === "inherit") {
@@ -883,11 +905,37 @@ export class SshPtyDriver implements RuntimeDriver {
         });
     }
 
+    async openStreamWindow(registry: StreamWindowRegistry, opts: ObservationWindowOptions) {
+        if (!this.alive || this.layerShellGone || this.reconnecting) {
+            throw new Error("SSH 层当前无法打开观察窗");
+        }
+        const config = this.descriptor.config;
+        if (Array.isArray(config?.sshHops) && config.sshHops.length) {
+            throw new Error("观察窗需要可非交互重放的 SSH 层，逐跳 PTY 登录链不可用");
+        }
+        const target = this.descriptor.target ?? "";
+        const connParams = config?.connParams as SshConnParams | undefined;
+        const hop: SshHop = connParams ? { host: target, conn: connParams } : target;
+        const render = renderExecChannel(enterStepsOf(config), opts.command, {
+            marker: `__FX_STREAM_${crypto.randomBytes(12).toString("hex")}`,
+            nonceWrapped: opts.command,
+            cwd: this.descriptor.cwd,
+        });
+        if (render.kind === "unreachable") throw new Error(`观察窗无法进入目标层：${render.reason}`);
+        const manager = new StreamSessionManager(sshArgsFor(hop), { connParams, logger: this.log });
+        return registry.open({
+            ...opts, layerAlias: target, manager,
+            transportCommand: render.remoteArgs.map(shellQuote).join(" "),
+            stdinScript: render.stdinCmd + "\n",
+        });
+    }
+
     // ── 会话族（委托 RemoteSessionManager）──
     async execSession(command: string, opts?: SessionStartOptions): Promise<SessionHandleInfo> {
         if (this.layerShellGone) throw new Error("层已退化——后台任务会落在父环境，请重建层后再启动");
         return this.sessions.start(command, opts);
     }
+    async recoverSession(sessionId: string) { return this.sessions.recover(sessionId); }
     async tailSession(sessionId: string, lines?: number): Promise<string[]> { return this.sessions.tail(sessionId, lines); }
     async readSessionLog(sessionId: string, opts?: ReadLogOptions): Promise<string> { return this.sessions.readLog(sessionId, opts); }
     watchSession(sessionId: string, opts: WatchOptions): { cancel(): void } { return this.sessions.watch(sessionId, opts); }

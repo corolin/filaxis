@@ -101,7 +101,8 @@ describe("StreamWindowRegistry", () => {
         await new Promise((r) => setTimeout(r, 50));
         expect(w.stale).toBe(true);
         reg.stop("vm:log");
-        expect(procs[0]!.killed).toBe(true); // 关窗收割流进程
+        expect(procs[0]!.killed).toBe(false); // 流已经自然退出
+        expect(reg.get("vm:log")).toBeUndefined();
         reg.dispose();
     });
 });
@@ -216,7 +217,7 @@ describe("三十九期", () => {
         const stopped: string[] = [];
         const manager = {
             start: async () => { await new Promise((r) => setTimeout(r, 80)); return { sessionId: "s-disp" }; },
-            stop: (sid: string) => { stopped.push(sid); },
+            stopAndWait: async (sid: string) => { stopped.push(sid); },
         } as unknown as StreamSessionManager;
         const reg = new StreamWindowRegistry();
         const p = reg.open({ name: "vm:disp", layerAlias: "vm", command: "x", manager });
@@ -470,4 +471,204 @@ describe("六十期：正文 CR+CRLF 叠字符", () => {
         expect(win.peekLast(2).frames.map((f) => f.text)).toEqual(["abc\r"]); // 修前 "abc"
         reg.dispose();
     }, 15_000);
+});
+
+test.skipIf(process.platform !== "linux")("关闭观察窗会终止忽略 SIGTERM 的进程", async () => {
+    const registry = new StreamWindowRegistry();
+    try {
+        const window = await registry.open({ name: "ignore-term", command: "trap '' TERM; echo READY; while :; do sleep 1; done" });
+        const deadline = Date.now() + 3000;
+        while (!window.peekLast().frames.some(({ text }) => text === "READY") && Date.now() < deadline) {
+            await Bun.sleep(20);
+        }
+        expect(window.peekLast().frames.some(({ text }) => text === "READY")).toBe(true);
+        const transport = (window as unknown as { transport: { child: ChildProcess } }).transport;
+        const exited = new Promise<string | null>((resolve) => transport.child.once("exit", (_, signal) => resolve(signal)));
+        await registry.stopConfirmed("ignore-term");
+        expect(transport.child.signalCode).toBe("SIGKILL");
+        expect(await exited).toBe("SIGKILL");
+    } finally {
+        registry.dispose();
+    }
+}, 5000);
+
+test("backward pages report gaps and preserve retained frames", () => {
+    const window = new StreamWindow("history", "local", "history", "", 3);
+    for (let i = 1; i <= 6; i++) window.push(String(i), "stdout");
+    expect(window.peekBefore(7, 2).frames.map((frame) => frame.seq)).toEqual([5, 6]);
+    const older = window.peekBefore(5, 2);
+    expect(older.frames.map((frame) => frame.seq)).toEqual([4]);
+    expect(older.gap).toBe(true);
+    expect(window.peekBefore(4, 2)).toMatchObject({ frames: [], gap: true });
+    expect(window.peekLast(3).frames.map((frame) => frame.seq)).toEqual([4, 5, 6]);
+});
+
+test.skipIf(process.platform !== "linux")("关窗可回收启动 shell 退出后仍存活的后台子进程", async () => {
+    const { readFileSync } = await import("node:fs");
+    const registry = new StreamWindowRegistry();
+    try {
+        const window = await registry.open({ name: "child-after-shell", command: "sleep 8 >/dev/null 2>&1 & echo $!; exit 37" });
+        const readyBy = Date.now() + 3000;
+        while (!window.stale && Date.now() < readyBy) await Bun.sleep(20);
+        const result = window.peekLast();
+        expect(result).toMatchObject({ stale: true, exitCode: 37 });
+        const pid = Number(result.frames[0]?.text);
+        expect(pid).toBeGreaterThan(0);
+        const alive = () => {
+            try { return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+                throw error;
+            }
+        };
+        expect(alive()).toBe(true);
+        await registry.stopConfirmed("child-after-shell");
+        expect(alive()).toBe(false);
+    } finally {
+        registry.dispose();
+    }
+}, 5000);
+
+test.skipIf(process.platform !== "win32")("Windows 关窗会回收祖先进程已退出的 Job 子进程", async () => {
+    const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { shellQuote } = await import("../src/ssh-helpers.js");
+    const dir = await mkdtemp(join(tmpdir(), "fx-window-job-"));
+    const fixture = join(dir, "fixture.mjs");
+    const pidFile = join(dir, "fixture.pid");
+    const shellPath = (path: string) => shellQuote(path.replaceAll("\\", "/"));
+    const registry = new StreamWindowRegistry();
+    try {
+        await writeFile(fixture, 'import {writeFileSync} from "node:fs"; writeFileSync(process.argv[2], String(process.pid)); setTimeout(() => {}, 10000);');
+        const window = await registry.open({
+            name: "windows-job",
+            command: `${shellPath(process.execPath)} ${shellPath(fixture)} ${shellPath(pidFile)} >/dev/null 2>&1 & exit 37`,
+        });
+        const deadline = Date.now() + 6000;
+        let pid = 0;
+        while (Date.now() < deadline && (!pid || !window.stale)) {
+            pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
+            if (!pid || !window.stale) await Bun.sleep(30);
+        }
+        expect(pid).toBeGreaterThan(0);
+        expect(window.peekLast()).toMatchObject({ stale: true, exitCode: 37 });
+        const alive = () => {
+            try { process.kill(pid, 0); return true; }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+                throw error;
+            }
+        };
+        expect(alive()).toBe(true);
+        await registry.stopConfirmed("windows-job");
+        expect(alive()).toBe(false);
+    } finally {
+        registry.dispose();
+        await rm(dir, { recursive: true, force: true });
+    }
+}, 20000);
+
+test("自然退出后释放本地监管进程，同时保留历史窗口", async () => {
+    const registry = new StreamWindowRegistry();
+    try {
+        const window = await registry.open({ name: "retire-owner", command: "printf RETAINED; exit 37" });
+        const transport = (window as unknown as { transport: { child: ChildProcess } }).transport;
+        const owner = transport.child;
+        const deadline = Date.now() + 5000;
+        while (owner.exitCode === null && owner.signalCode === null && Date.now() < deadline) {
+            await Bun.sleep(25);
+        }
+        expect(owner.exitCode !== null || owner.signalCode !== null).toBe(true);
+        expect(registry.get("retire-owner")?.peekLast()).toMatchObject({
+            stale: true, exitCode: 37, frames: [{ text: "RETAINED" }],
+        });
+    } finally {
+        registry.dispose();
+    }
+}, 15000);
+
+test("SSH 窗口在停止失败后保留窗口和内容，可重试关闭", async () => {
+    const { impl, procs } = fakeSpawn();
+    const registry = new StreamWindowRegistry();
+    try {
+        const manager = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
+        const window = await registry.open({ name: "try-close", layerAlias: "host", command: "fixture", manager });
+        const child = procs[0]!;
+        child.emitOut("KEEP\n");
+        child.kill = () => false;
+        await expect(registry.stopConfirmed(window.name)).rejects.toMatchObject({ outcome: "unknown" });
+        expect(registry.get(window.name)?.peekLast().frames.map(({ text }) => text)).toEqual(["KEEP"]);
+        child.kill = () => true;
+        const closed = registry.stopConfirmed(window.name);
+        expect(registry.get(window.name)).toBe(window);
+        child.exit();
+        await closed;
+        expect(registry.get(window.name)).toBeUndefined();
+    } finally {
+        registry.dispose();
+    }
+});
+
+test("本地窗口在停止失败或超时后保留历史，并等待重试的真实退出", async () => {
+    const child = new FakeChild();
+    const registry = new StreamWindowRegistry({ spawnImpl: (() => child) as unknown as typeof import("node:child_process").spawn });
+    try {
+        const window = await registry.open({ name: "local-retry", command: "fixture" });
+        child.emitOut("KEEP\n");
+        child.kill = () => false;
+        await expect(registry.stopConfirmed(window.name)).rejects.toMatchObject({ outcome: "unknown" });
+        let requests = 0;
+        child.kill = () => { requests++; return true; };
+        await expect(registry.stopConfirmed(window.name)).rejects.toMatchObject({ outcome: "unknown" });
+        expect(registry.get(window.name)?.peekLast().frames.map(({ text }) => text)).toEqual(["KEEP"]);
+        const one = registry.stopConfirmed(window.name);
+        const two = registry.stopConfirmed(window.name);
+        expect(registry.get(window.name)).toBe(window);
+        expect(requests).toBe(2);
+        child.exit();
+        await Promise.all([one, two]);
+        expect(registry.get(window.name)).toBeUndefined();
+    } finally {
+        child.exit();
+        registry.dispose();
+    }
+}, 8000);
+
+test.skipIf(process.platform !== "linux")("shell 退出后，继承输出管道的子进程仍能写入观察窗", async () => {
+    const registry = new StreamWindowRegistry({ shell: BASH });
+    try {
+        const window = await registry.open({
+            name: "inherited-output", command: "(sleep 2.3; printf LATE) & exit 17",
+        });
+        const deadline = Date.now() + 4500;
+        while (!window.stale && Date.now() < deadline) await Bun.sleep(25);
+        expect(window.peekLast()).toMatchObject({ stale: true, exitCode: 17, frames: [{ text: "LATE" }] });
+    } finally {
+        registry.dispose();
+    }
+}, 6000);
+
+test("销毁期间迟到的 SSH 窗口若关闭失败，注册表保留重试句柄", async () => {
+    const { procs, impl } = fakeSpawn();
+    const manager = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
+    const registry = new StreamWindowRegistry();
+    try {
+        const opened = registry.open({ name: "late-failed", layerAlias: "host", command: "fixture", manager });
+        const child = procs[0]!;
+        child.kill = () => false;
+        registry.dispose();
+        await expect(opened).rejects.toThrow(/已 dispose/);
+        expect(registry.get("late-failed")).toBeDefined();
+        expect(manager.list()).toHaveLength(1);
+        child.kill = () => true;
+        registry.dispose();
+        expect(registry.get("late-failed")).toBeDefined();
+        child.exit();
+        await Bun.sleep(0);
+        expect(registry.get("late-failed")).toBeUndefined();
+        expect(manager.list()).toHaveLength(0);
+    } finally {
+        registry.dispose();
+    }
 });

@@ -22,6 +22,8 @@
  */
 import * as crypto from "node:crypto";
 import type { RuntimeDriver } from "./driver.js";
+import { renderInplaceWrite, renderPreserveMode } from "./file-placement.js";
+import { cdTargetArg } from "./ssh-helpers.js";
 
 export interface EditFileOptions {
     /** 多处命中时全替换（缺省 false——多处命中报错，精确替换语义） */
@@ -181,6 +183,7 @@ export async function editFileMulti(
 // ── 内部：读戳与 CAS 写回（editFile / editFileMulti 共用） ──
 
 interface StampedRead {
+    target: string;
     qp: string;
     statStamp: string;
     shaStamp: string;
@@ -189,10 +192,32 @@ interface StampedRead {
     content0: string;
 }
 
+function resolveEditTarget(drv: RuntimeDriver, path: string): string {
+    const shellPath = process.platform === "win32" && drv.descriptor.driver === "local"
+        ? path.replace(/\\/g, "/") : path;
+    const quoted = q(cdTargetArg(shellPath));
+    return `__fx_path=${quoted}; __fx_tgt=$( ( readlink -f "$__fx_path" 2>/dev/null || { ` +
+        `[ ! -L "$__fx_path" ] && __fx_dir=\${__fx_path%/*} && cd -P "\${__fx_dir:-/}" && ` +
+        `__fx_dir=$(pwd -P && printf .) && printf '%s/%s\\n' "\${__fx_dir%??}" "\${__fx_path##*/}"; }; ) && printf .) || exit 1; ` +
+        `__fx_tgt=\${__fx_tgt%??}; `;
+}
+
 /** 读+戳+方言探测 合成一次往返（读时戳与读到的内容同窗——读后他人写 → CAS 必不符）。
  *  编码 base64 < file（stdin 全方言通吃，折行由解析侧 \s+ 归一消化）；解码探测
  *  printf | base64 -d：GNU/busybox 出 filaxis → -d，BSD → -D（行为判定）。 */
 async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRead> {
+    const qpRead = '"$__fx_tgt"';
+    const readCmd =
+        `( ${resolveEditTarget(drv, path)}${statCmdOf(qpRead)}; ${shaCmdOf(qpRead)}; echo __FXS__; ` +
+        `printf ZmlsYXhpcw== | base64 -d 2>/dev/null; echo __FXD__; base64 < ${qpRead} 2>/dev/null; ` +
+        `echo __FXP__; printf %s ${qpRead} | base64 )`;
+    const r = await drv.exec(readCmd, { timeoutMs: 30_000 });
+    const [stampPart, restPart] = (r.stdout || "").split("__FXS__");
+    const [decPart, body = ""] = (restPart ?? "").split("__FXD__");
+    const [b64Part = "", targetB64] = body.split("__FXP__");
+    const target = targetB64 ? Buffer.from(targetB64.replace(/\s+/g, ""), "base64").toString("utf-8") : "";
+    if (!target || r.exitCode !== 0) throw new Error(`无法解析或读取编辑目标: ${path}`);
+
     // NAME_MAX 安全基底（Hydrogen R5 #5）：.fx-tmp/.fx-lock 后缀拼接近上限 basename
     // 会 ENAMETOOLONG——接近上限截前段+短 hash（文件本体走目标原路径不受影响）。
     // hash 取名内容确定性摘要（Sol 60 P2-4）：随机后缀曾使同一长文件名的两次
@@ -201,25 +226,16 @@ async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRea
     // 字节口径（Sol 73 #5）：码元判定曾让 252B 中文文件名（84 码元）基底不缩
     //——伴生锁文件名追后缀即超限、CAS 编辑整体失败
     const fxBase = (() => {
-        const slash = path.lastIndexOf("/");
-        const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
-        const name = slash >= 0 ? path.slice(slash + 1) : path;
-        if (Buffer.byteLength(name, "utf-8") + Buffer.byteLength(".filaxis-lock-xxxxxxxx", "utf-8") <= 255) return path;
+        const slash = target.lastIndexOf("/");
+        const dir = slash >= 0 ? target.slice(0, slash + 1) : "";
+        const name = target.slice(slash + 1);
+        if (Buffer.byteLength(name, "utf-8") + Buffer.byteLength(".filaxis-lock-xxxxxxxx", "utf-8") <= 255) return target;
         const h = crypto.createHash("sha256").update(name).digest("hex").slice(0, 8);
         let cut = name.slice(0, Math.max(1, 255 - 32));
         while (Buffer.byteLength(cut, "utf-8") > Math.max(1, 255 - 32) && cut.length > 0) cut = cut.slice(0, -1);
         if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
         return dir + cut + "~" + h;
     })();
-    // 读原文件用**原路径**（Sol 57 P2-5）：fxBase 是缩短名——曾拿缩短路径去读/戳
-    // 原文件（240 字符合法文件名报不存在）。fxBase 只服务 .fx-tmp/.fx-lock 同目录
-    // 伴生文件的 NAME_MAX 安全
-    const qpRead = q(path);
-    const readCmd =
-        `${statCmdOf(qpRead)}; ${shaCmdOf(qpRead)}; echo __FXS__; ` +
-        `printf ZmlsYXhpcw== | base64 -d 2>/dev/null; echo __FXD__; base64 < ${qpRead} 2>/dev/null`;
-    const r = await drv.exec(readCmd, { timeoutMs: 30_000 });
-    const [stampPart, restPart] = (r.stdout || "").split("__FXS__");
     const originStampRaw = (stampPart ?? "").trim();
     const originLines = originStampRaw.split(/\n/);
     const statStamp = (originLines[0] ?? "").trim();
@@ -233,7 +249,6 @@ async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRea
         size: parseInt(originParts[1] ?? "0", 10),
     };
     if (!shaStamp) throw new Error(`文件不存在或指纹异常: ${path}（${originStampRaw}）`); // 空文件合法（size=0 有有效 sha）——仅指纹缺失才拒
-    const [decPart, b64Part = ""] = (restPart ?? "").split("__FXD__");
     const dec = (decPart ?? "").trim() === "filaxis" ? "base64 -d" : "base64 -D";
     const raw = Buffer.from(b64Part.replace(/\s+/g, ""), "base64");
     const content0 = raw.toString("utf-8");
@@ -255,7 +270,7 @@ async function readStamped(drv: RuntimeDriver, path: string): Promise<StampedRea
         );
     }
     const qp = q(fxBase); // tmp/lock 伴生文件锚（NAME_MAX 安全形态）
-    return { qp, statStamp, shaStamp, dec, origin, content0 }; // qp=fxBase 引用（tmp/lock 用）；读原文件已改走 qpRead（Sol 57 P2-5）
+    return { target, qp, statStamp, shaStamp, dec, origin, content0 };
 }
 
 /** CAS 原子写回（戳比对 + tmp 写 + mv + 新戳回执——远端一条命令原子完成） */
@@ -267,6 +282,8 @@ async function casWrite(
     forceInplace = false,
 ): Promise<{ bytesAfter: number; mutex: "flock" | "degraded"; writeMode: "atomic-replace" | "inplace-write" }> {
     const newB64 = Buffer.from(edited, "utf-8").toString("base64");
+    const target = q(sr.target);
+    const sameTarget = `[ "$__fx_tgt" = ${target} ]`;
     if (newB64.length > 90_000) {
         // 大文件回落 fs 层旧路径。门槛 90KB（MAX_ARG_STRLEN 单参数 128KB 安全线内留余量
         // ——30KB 旧值过保守，绝大多数文件因此被拒之 CAS 原子门外）。
@@ -274,21 +291,33 @@ async function casWrite(
         // 覆盖他人——内容指纹封死该盲区）；写后回验 sha 自证写入正确。
         // 残余窗口（核验→写入之间）fs 层无原子 CAS 可用，如实声明：>90KB 文件的受控编辑
         // 存在毫秒级核验-写入窗口，并发写场景请消费方自管锁。
-        // 核验/回验走**原路径**（Sol 59 P1-1 与 58 P2-4 同根）：sr.qp 是 NAME_MAX
-        // 缩短名——大文件回退路径三处 stat/sha 曾仍指缩短路径（不存在 → 假冲突）
+        // Verify the alias still resolves to the same target and keep subsequent
+        // I/O on that target, including the filesystem fallback.
+        const nativeWindows = process.platform === "win32" && drv.descriptor.driver === "local";
+        // The native filesystem cannot resolve the shell's mount paths, such as /tmp or /c.
+        // Convert the already verified target so the fallback never re-resolves the input alias.
+        const nativePath = nativeWindows
+            ? `; printf '\\n'; if command -v cygpath >/dev/null 2>&1; then cygpath -aw -- ${target}; ` +
+              `elif command -v wslpath >/dev/null 2>&1; then wslpath -aw ${target}; else printf '%s\\n' ${target}; fi`
+            : "";
         const verify = await drv.exec(
-            `${statCmdOf(q(path))}; ${shaCmdOf(q(path))}`, { timeoutMs: 30_000 },
+            `( ${resolveEditTarget(drv, path)}${sameTarget} || exit 1; ${statCmdOf(target)}; ${shaCmdOf(target)}${nativePath} )`,
+            { timeoutMs: 30_000 },
         );
         const vLines = (verify.stdout || "").trim().split(/\n/);
-        if ((vLines[0] ?? "").trim() !== sr.statStamp || (vLines[1] ?? "").trim() !== sr.shaStamp) {
+        if (verify.exitCode !== 0 || (vLines[0] ?? "").trim() !== sr.statStamp || (vLines[1] ?? "").trim() !== sr.shaStamp) {
             throw new EditConflictError(
                 `TOCTOU 冲突（大文件回退前核验）：读时 stat ${sr.statStamp} sha ${sr.shaStamp}，` +
                 `回退时 stat ${(vLines[0] ?? "?").trim()} sha ${(vLines[1] ?? "?").trim()}: ${path}`,
             );
         }
-        await editFileViaFs(drv, path, edited, 1);
+        const fsTarget = nativeWindows ? (vLines[2] ?? "").replace(/\r$/, "") : sr.target;
+        if (nativeWindows && !/^(?:[a-z]:[\\/]|[\\/]{2}[^\\/])/i.test(fsTarget)) {
+            throw new Error(`无法将已核验的路径转换为 Windows 原生路径: ${path}`);
+        }
+        await editFileViaFs(drv, fsTarget, edited, 1);
         // 写后回验：内容指纹确认写入结果（被并发覆盖或写坏立即暴露）
-        const post = await drv.exec(shaCmdOf(q(path)), { timeoutMs: 30_000 });
+        const post = await drv.exec(shaCmdOf(target), { timeoutMs: 30_000 });
         const expectSha = shaCmdOfContent(edited);
         if ((post.stdout || "").trim() !== expectSha) {
             throw new EditConflictError(
@@ -320,13 +349,7 @@ async function casWrite(
     // **真身前置**（Sol 90 P1-2）：readlink -f 解析提前到 CAS 核验**之前**、
     // 核验与落位同锚 "$__fx_tgt"——曾「核验读原路径（跟随符号链接）→落位时才
     // 解析真身」，两步之间换链会把基于 A 校验的内容写到未经校验的 B
-    const tgtResolve = `__fx_tgt=$(readlink -f ${q(path)} 2>/dev/null || echo ${q(path)}); `;
-    // 数字模式权限保持（Hydrogen R8 #2）：chmod/chown --reference 仅 GNU——macOS/
-    // FreeBSD/busybox 不认，mv 后目标静默回退 umask 默认（0600 私钥→0644 可读）。
-    // stat -c 读八进制权限（GNU）→ chmod NNN 数字模式全平台通吃；stat 缺席 best-effort
-    const permSetup =
-        `__fx_pm=$(stat -c '%a' "$__fx_tgt" 2>/dev/null); [ -n "$__fx_pm" ] && chmod "$__fx_pm" ${sr.qp}.fx-tmp 2>/dev/null; ` +
-        `chown --reference="$__fx_tgt" ${sr.qp}.fx-tmp 2>/dev/null || true; `;
+    const permSetup = renderPreserveMode(`${sr.qp}.fx-tmp`);
     // mv -T + 落位五防（Sol 87 P1-5 → Sol 88 P1-6 → Sol 89 P1-4/P1-5 同
     // file-transfer）：目录快速拒绝 + -T 精确指目标 + 裸 mv 前置守卫 + 回搬带
     // **搬移证据**（__fx_mv=1 只在裸 mv 成功后置位——曾无条件按 basename 回搬
@@ -336,8 +359,9 @@ async function casWrite(
     // cat 形态用 `< src > tgt`（Sol 90 P1-3）：shell 从左到右处理重定向——源
     // 打开失败时目标**尚未被截断**（`cat src > tgt` 是 cat 自己开源、shell 先
     // 截目标——载荷曾丢失后把原文件截成 0 字节）
+    const inplaceWrite = renderInplaceWrite(`${sr.qp}.fx-tmp`, '"$__fx_tgt"', `echo "FX_INPLACE $(${stampOf})"`);
     const place = forceInplace
-        ? `if cat < ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else if [ ! -e ${sr.qp}.fx-tmp ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi`
+        ? inplaceWrite
         : `__fx_tb=$(basename ${sr.qp}.fx-tmp 2>/dev/null); ` +
           `__fx_od=$(stat -c %d ${sr.qp}.fx-tmp 2>/dev/null || stat -f %d ${sr.qp}.fx-tmp 2>/dev/null); ` +
           `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
@@ -347,18 +371,18 @@ async function casWrite(
           `if mv -T ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null; then echo "FX_OK $(${stampOf})"; ` +
           `else if [ ! -d "$__fx_tgt" ] && mv ${sr.qp}.fx-tmp "$__fx_tgt" 2>/dev/null && __fx_mv=1 && [ ! -d "$__fx_tgt" ]; then echo "FX_OK $(${stampOf})"; ` +
           `else if [ "$__fx_mv" = "1" ] && [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_tb" ${sr.qp}.fx-tmp 2>/dev/null; then echo FX_IS_DIR; ` +
-          `else if cat < ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else if [ ! -e ${sr.qp}.fx-tmp ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; fi; ` +
+          `else ${inplaceWrite}; fi; fi; fi; ` +
           `else ` +
           `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
-          `if cat < ${sr.qp}.fx-tmp > "$__fx_tgt" && rm -f ${sr.qp}.fx-tmp && echo "FX_INPLACE $(${stampOf})"; then :; else if [ ! -e ${sr.qp}.fx-tmp ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; ` +
+          `${inplaceWrite}; ` +
           `fi`;
     const cmd =
-        `( ${tgtResolve}` +
-        `if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
+        `( if command -v flock >/dev/null 2>&1; then flock -x 9 || { echo FX_LOCK_FAIL; exit 1; }; ` +
         `else echo FX_DEGRADED_NO_LOCK; fi; ` +
+        `${resolveEditTarget(drv, path)}if ${sameTarget}; then __fx_tgt=${target}; else echo FX_CAS_FAIL; exit 1; fi; ` +
         `if [ "$(${statCmdOf(`"$__fx_tgt"`)})" = "${sr.statStamp}" ] && ` + // 核验锚**解析后真身**（与落位同锚——Sol 90 P1-2）
-        `[ "$(${shaCmdOf(`"$__fx_tgt"`)})" = "${sr.shaStamp}" ]; then ` +
-        `printf %s ${q(newB64)} | ${sr.dec} > ${sr.qp}.fx-tmp && { ${permSetup}${place}; }; ` +
+        `[ "$(${shaCmdOf(`"$__fx_tgt"`)})" = "${sr.shaStamp}" ]; then umask 077; ` +
+        `printf %s ${q(newB64)} | ${sr.dec} > ${sr.qp}.fx-tmp && { ${forceInplace ? "" : permSetup}${place}; }; ` +
         `else echo FX_CAS_FAIL; fi ) 9>${sr.qp}.fx-lock`;
     const cas = await drv.exec(cmd, { timeoutMs: 30_000 });
     const out = (cas.stdout || "").trim();
@@ -376,7 +400,10 @@ async function casWrite(
         throw new Error(`CAS 写回失败（目标已被换成现存目录——目录未动，完整载荷保留在 ${path}.fx-tmp 可重试）: ${path}`);
     }
     if (payload.startsWith("FX_NO_PAYLOAD")) { // 载荷落位前消失（Sol 90 P1-3）——目标未动（重定向排序保证未截断）
-        throw new Error(`CAS 写回中止（载荷在落位前消失——外部移除？）——目标未动（重定向排序保证未截断）: ${path}`);
+        throw new Error(`CAS 写回中止（载荷在落位前消失或无法打开，目标未动）: ${path}`);
+    }
+    if (payload.startsWith("FX_INPLACE_PAYLOAD_MISSING")) {
+        throw new Error(`CAS 原地写入失败（目标可能已被部分改写，恢复载荷已不在）：${path}`);
     }
     if (payload.startsWith("FX_INPLACE_FAIL")) { // 须在 FX_INPLACE 前判定（FAIL 是其前缀延伸）
         throw new Error(

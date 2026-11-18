@@ -3,15 +3,44 @@
  */
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     sshArgsFor, hopLabel, enterStepsOf, renderExecChannel, envPrefixOf, parseJumpSpec,
 } from "../src/ssh-helpers.js";
-import { resolveLayerState } from "../src/ssh-pty-driver.js";
+import { resolveLayerState, SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { RemoteSessionManager } from "../src/remote-session-manager.js";
 import type { SessionEvent } from "../src/session-types.js";
+
+test.skipIf(process.platform !== "linux")("SSH writeFile 解码器写出一部分再失败时保留原文件", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fx-ssh-write-"));
+    const target = join(dir, "target");
+    const driver = new SshPtyDriver({ driver: "ssh", target: "unused" });
+    const failDecode = `base64() { if [ "$1" = -d ] && [ -f /dev/stdin ]; then printf partial; return 42; fi; command base64 "$@"; }; `;
+    let fail = true;
+    Object.assign(driver, {
+        async execChannel(command: string) {
+            const result = Bun.spawnSync(["sh", "-c", (fail ? failDecode : "") + command]);
+            return { stdout: result.stdout.toString(), stderr: result.stderr.toString(), exitCode: result.exitCode };
+        },
+    });
+    try {
+        writeFileSync(target, "original");
+        await expect(driver.fs.writeFile(target, "replacement")).rejects.toThrow(/解码失败/);
+        expect(readFileSync(target, "utf-8")).toBe("original");
+        expect(readdirSync(dir)).toEqual(["target"]);
+        fail = false;
+        chmodSync(target, 0o200);
+        chmodSync(dir, 0o500);
+        await driver.fs.writeFile(target, "replacement");
+        chmodSync(target, 0o600);
+        expect(readFileSync(target, "utf-8")).toBe("replacement");
+    } finally {
+        chmodSync(dir, 0o700);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
 
 describe("ssh-helpers", () => {
     test("sshArgsFor：结构化参数渲染（ProxyJump/-i/-p/-L）", () => {
@@ -431,6 +460,59 @@ function fakeRemote() {
 }
 
 describe("RemoteSessionManager（mock 远端）", () => {
+    test("stop 采纳 TERM 期间写入的退出码", async () => {
+        let code = "";
+        const manager = new RemoteSessionManager({
+            pollMs: 60_000,
+            exec: async (cmd) => {
+                if (cmd.includes(".pid.tmp")) return { stdout: "4242", exitCode: 0 };
+                if (cmd.startsWith("cat ") && cmd.includes(".code 2>")) return { stdout: code, exitCode: 0 };
+                if (cmd.includes("kill -TERM")) code = "23";
+                if (cmd.includes("echo ALIVE")) return { stdout: "DEAD", exitCode: 0 };
+                return { stdout: "", exitCode: 0 };
+            },
+        });
+        const h = await manager.start("fixture");
+        const expected = { status: "exited", exitCode: 23 } as const;
+        expect(await manager.stop(h.sessionId)).toEqual(expected);
+        expect(await manager.verify(h.sessionId)).toEqual(expected);
+    });
+
+    test.each([
+        ["PID 复用", "22222", ["TERM"], "unknown"],
+        ["身份未变化", "11111", ["TERM", "KILL"], "stopped"],
+        ["未记录身份戳", "", ["TERM"], "unknown"],
+    ])("stop 在 %s 时按身份核验限制 KILL", async (label, afterTerm, expectedSignals, status) => {
+        const signals: string[] = [];
+        const initialStamp = label === "未记录身份戳" ? "" : "11111";
+        let stamp = initialStamp;
+        const m = new RemoteSessionManager({
+            pollMs: 60_000,
+            exec: async (cmd) => {
+                if (cmd.includes(".pid.tmp")) return { stdout: "4242", exitCode: 0 };
+                if (cmd.startsWith("cat ") && cmd.includes(".st 2>")) return { stdout: initialStamp, exitCode: 0 };
+                if (cmd.includes("echo ALIVE")) {
+                    return { stdout: signals.includes("KILL") ? "DEAD" : "ALIVE", exitCode: 0 };
+                }
+                if (/kill -(?:TERM|KILL)/.test(cmd)) {
+                    // Execute the generated guard with shell functions standing in for process I/O.
+                    const r = Bun.spawnSync(["bash", "-c",
+                        `cat() { :; }; awk() { printf '%s\\n' "$FX_TEST_STAMP"; }; ` +
+                        `pkill() { :; }; kill() { printf '%s\\n' "$1"; }; sleep() { :; }; ${cmd}`,
+                    ], { env: { ...process.env, FX_TEST_STAMP: stamp } });
+                    const signal = r.stdout.toString().trim().replace(/^-/, "");
+                    if (signal) signals.push(signal);
+                    if (signal === "TERM") stamp = afterTerm as string;
+                    return { stdout: "", exitCode: r.exitCode };
+                }
+                return { stdout: "", exitCode: 0 };
+            },
+        });
+        const { sessionId } = await m.start("fixture");
+        expect(await m.stop(sessionId)).toMatchObject({ status });
+        expect(signals).toEqual(expectedSignals);
+    }, 15_000);
+
     test("start→轮询发现终态→exited 事件带退出码（.code 文件核实）", async () => {
         const remote = fakeRemote();
         const m = new RemoteSessionManager({ exec: remote.exec, pollMs: 30 });
@@ -634,9 +716,7 @@ describe("host key 策略可配（AC-12）", () => {
 });
 
 describe("RemoteSessionManager.reapIdle（衰减回收）", () => {
-    // TODO(interval 竞态): 手动 poll 链已验证 reap→TERM→核实→finalize 逻辑正确
-    // （探查实证），但 interval 驱动路径在快速 mock 时钟下存在未定竞态——待查后启用
-    test.skip("无人消费超 TTL 收摊+广播；armed 不收", async () => {
+    test("无人消费超 TTL 收摊+广播；armed 不收", async () => {
         // 永活远端：nohup 不落盘（.code 永不出现——会话长跑才走 reap 路径）
         const procs = new Set<number>();
         let pid = 5000;
@@ -645,24 +725,24 @@ describe("RemoteSessionManager.reapIdle（衰减回收）", () => {
             if (cmd.startsWith("cat ")) return { stdout: "", exitCode: 0 };
             if (cmd.startsWith("tail -n +")) return { stdout: "", exitCode: 0 };
             const k0 = /kill -0 (\d+)/.exec(cmd);
-            if (k0) return { stdout: procs.has(parseInt(k0[1]!, 10)) ? "Y" : "N", exitCode: 0 };
+            if (k0) return { stdout: procs.has(parseInt(k0[1]!, 10)) ? "ALIVE" : "DEAD", exitCode: 0 };
             const kv = /kill -(?:TERM|KILL) (\d+)/.exec(cmd);
             if (kv) { procs.delete(parseInt(kv[1]!, 10)); return { stdout: "", exitCode: 0 }; }
             return { stdout: "", exitCode: 0 };
         };
-        const m = new (await import("../src/remote-session-manager.js")).RemoteSessionManager({ exec: aliveExec, pollMs: 50, idleReapMs: 1000 });
-        const events: unknown[] = [];
+        const m = new RemoteSessionManager({ exec: aliveExec, pollMs: 50, idleReapMs: 1000 });
+        const events: SessionEvent[] = [];
         m.onEvent = (e) => events.push(e);
         const { sessionId: s1 } = await m.start("idle");
         const { sessionId: s2 } = await m.start("armed");
         m.watch(s2, { pattern: "NEVER", once: false });
         m.reapIdle(Date.now() + 2000, 1000);
-        await new Promise((r) => setTimeout(r, 400)); // stop 核实链 + poll 轮落地
+        await waitFor(() => m.list().some((session) => session.sessionId === s1 && !session.running));
         const e1 = m.list().find((s) => s.sessionId === s1);
         const e2 = m.list().find((s) => s.sessionId === s2);
         expect(e1?.running).toBe(false); // 收摊：终态（句柄按语义保留）
         expect(e2?.running).toBe(true);  // armed = 常驻注意力不收
-        expect(events.length).toBeGreaterThan(0); // 回收广播
+        expect(events.filter((e) => e.type === "exit").map((e) => e.sessionId)).toEqual([s1]);
     });
 });
 
@@ -861,7 +941,7 @@ describe("Gemini 审查批回归", () => {
 // 的输出不是死亡凭证，与 .code 读同一纪律）②输出非精确标记（"NOT DEAD" 含 N）。
 // 修：exitCode=0 且 trim 后恰为 "N" 才判死（与 stop/verify 的精确匹配同口径）。
 describe("Sol 59：poll 探针脏结果不判死", () => {
-    test("exit 1+‘N’ 与 exit 0+‘NOT DEAD’ 均不终结；精确 ‘N’ 才判死（null 退出码）", async () => {
+    test("exit 1+‘N’ 与 exit 0+‘NOT DEAD’ 均不终结；精确 ‘DEAD’ 才判死（null 退出码）", async () => {
         const remote = fakeRemote();
         let probe: { stdout: string; exitCode: number } | null = null;
         const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
@@ -880,7 +960,10 @@ describe("Sol 59：poll 探针脏结果不判死", () => {
         probe = { stdout: "NOT DEAD", exitCode: 0 }; // 输出非精确标记（含 N 子串）
         await new Promise((r) => setTimeout(r, 150));
         expect(events.some((e) => e.type === "exit")).toBe(false); // 修前：同判死
-        probe = { stdout: "N\n", exitCode: 0 }; // 精确 N（trim 后）→ 判死
+        probe = { stdout: "UNKNOWN", exitCode: 0 };
+        await new Promise((r) => setTimeout(r, 150));
+        expect(events.some((e) => e.type === "exit")).toBe(false);
+        probe = { stdout: "DEAD\n", exitCode: 0 }; // 精确 N（trim 后）→ 判死
         await new Promise((r) => setTimeout(r, 150));
         const exit = events.find((e) => e.type === "exit") as Extract<SessionEvent, { type: "exit" }>;
         expect(exit).toBeTruthy();
@@ -891,7 +974,7 @@ describe("Sol 59：poll 探针脏结果不判死", () => {
 // GPT Sol 六十期 P2-5：verify() 存活探针 includes("Y") 子串匹配——"NOT Y" 等
 // 非标准输出曾判 running。改精确单标记（与 Sol 59 P1-2 的 poll 探针同口径）。
 describe("Sol 60：verify 探针精确匹配", () => {
-    test("stdout ‘NOT Y’ exit 0 → unknown；精确 ‘Y’ → running", async () => {
+    test("stdout ‘NOT Y’ exit 0 → unknown；精确 ‘ALIVE’ → running", async () => {
         const remote = fakeRemote();
         let probe: { stdout: string; exitCode: number } | null = null;
         const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
@@ -903,7 +986,7 @@ describe("Sol 60：verify 探针精确匹配", () => {
         const h = await m.start("sleep 60");
         probe = { stdout: "NOT Y", exitCode: 0 };
         expect((await m.verify(h.sessionId)).status).toBe("unknown"); // 修前：running
-        probe = { stdout: "Y\n", exitCode: 0 };
+        probe = { stdout: "ALIVE\n", exitCode: 0 };
         expect((await m.verify(h.sessionId)).status).toBe("running");
     }, 15_000);
 });

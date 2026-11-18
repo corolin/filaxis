@@ -15,7 +15,7 @@ import { SessionRegistry, type TerminalProfile } from "./terminal/session-regist
 import { SessionLauncher } from "./terminal/session-launcher.js";
 import { CommandExecuter, type RunOptions } from "./terminal/command-executer.js";
 import { TmuxInvoker } from "./terminal/tmux-invoker.js";
-import type { TerminalConfig } from "./terminal/types.js";
+import { TmuxError, type TerminalConfig } from "./terminal/types.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 export type { TerminalProfile } from "./terminal/session-registry.js";
@@ -70,11 +70,24 @@ export class TerminalManager {
         return this.executer.execute(id, command, opts);
     }
 
-    /** 销毁会话 + 删 profile（best-effort：kill-session 失败不阻断） */
+    /** Remove the profile after the terminal is confirmed gone. */
     async destroySession(id: string): Promise<void> {
         try {
-            await TmuxInvoker.invoke(["kill-session", "-t", id]);
-        } catch { /* best-effort */ }
+            await TmuxInvoker.invoke(["kill-session", "-t", `=${id}`]);
+        } catch (cause) {
+            const diagnostic = cause instanceof TmuxError ? cause.stderr.trim() : "";
+            const absent = cause instanceof TmuxError && cause.exitCode === 1 && (
+                diagnostic === `can't find session: =${id}` ||
+                diagnostic === `can't find session: ${id}` ||
+                /^no server running on [^\n]+$/.test(diagnostic) ||
+                /^error connecting to [^\n]+ \(No such file or directory\)$/.test(diagnostic)
+            );
+            if (!absent) {
+                throw Object.assign(new Error(`tmux 终端 '${id}' 的销毁结果未知`, { cause }), {
+                    outcome: "unknown", terminalId: id,
+                });
+            }
+        }
         await this.registry.remove(id);
     }
 

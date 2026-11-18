@@ -9,10 +9,13 @@
  * 未用层族时与旧行为一致，零破坏）；push_ssh/push_into/list_layers/remove_layer
  * 操作 RuntimeStack 命名层注册表（Paramiko 式句柄寻址——栈/焦点弱化归消费方）。
  */
+import { randomUUID } from "node:crypto";
+import { StreamWindowRegistry, type StreamFrame } from "./stream-window.js";
 import type { RuntimeStack } from "./runtime-stack.js";
 import { editFile } from "./file-edit.js";
 import { runBatch, type BatchStepWithDeps } from "./batch.js";
 import type { RuntimeDriver } from "./driver.js";
+import { SessionOwnership, type StopResult } from "./session-ownership.js";
 
 export interface AgentToolDef {
     type: "function";
@@ -31,18 +34,18 @@ export interface AgentToolHandlers {
     edit_file(args: { path: string; old: string; new: string; all?: boolean; write_mode?: "auto" | "inplace"; layer?: string }): Promise<{
         path: string; occurrences: number; bytes_before: number; bytes_after: number; mutex?: "flock" | "degraded"; write_mode?: "atomic-replace" | "inplace-write";
     }>;
-    observe_stream(args: { command: string; duration_ms?: number; stream?: "stdout" | "stderr" | "both"; name?: string; layer?: string }): Promise<{
-        session_id: string; lines: Array<{ stream: string; text: string }>;
-        /** 终态信息（Sol 59 P2-4：运行时 stop unknown 时已返回——类型声明补齐，
-         *  TypeScript 调用方可直接分支；stop_status 只在停止结果 unknown 时在场 */
-        stop_status?: string; verify_status?: string;
+    observe_stream(args: { command: string; stream?: "stdout" | "stderr" | "both"; name?: string; layer?: string }): Promise<{
+        window_id: string; name?: string; stale: boolean;
     }>;
+    read_stream(args: { window_id: string; limit?: number; since_seq?: number; before_seq?: number; window_ms?: number; wait_ms?: number }): Promise<{
+        window_id: string; oldest_seq: number; newest_seq: number; stale: boolean; frames: StreamFrame[];
+        last_delivered_seq?: number; gap?: boolean; timed_out?: boolean; exit_code?: number | null; error?: string;
+    }>;
+    close_stream(args: { window_id: string }): Promise<{ window_id: string; closed: true }>;
     spawn_and_observe(args: { command: string; ready_marker?: string; error_pattern?: string; name?: string; layer?: string }): Promise<{
         session_id: string; log_base: string; note?: string;
     }>;
-    stop_and_verify(args: { session_id: string }): Promise<{
-        status: "exited" | "stopped" | "unknown"; exit_code?: number | null; note?: string;
-    }>;
+    stop_and_verify(args: { session_id: string; layer?: string }): Promise<StopResult>;
     // ── 层族（第十季命名层注册表——Paramiko 式句柄寻址）──
     push_ssh(args: { host: string; port?: number; user?: string; key?: string; jump?: string; name?: string }): Promise<{
         layer: string; reused: boolean; reused_from?: string; note?: string;
@@ -69,6 +72,7 @@ export interface AgentToolkit {
     handlers: AgentToolHandlers;
     /** 工具面绑定的层（缺省 local；远端层经 stack.connect 后传入重绑） */
     readonly layer: Promise<RuntimeDriver>;
+    dispose?(): void;
 }
 
 export interface AgentToolkitOptions {
@@ -77,6 +81,10 @@ export interface AgentToolkitOptions {
     driver?: RuntimeDriver;
     /** 就绪握手与 watcher 轮询的超时上限 */
     readyTimeoutMs?: number;
+    /** Retain confirmed results after releasing their driver reference. */
+    sessionResultTtlMs?: number;
+    /** Interval for checking tracked sessions and expiring results. */
+    sessionCheckIntervalMs?: number;
 }
 
 /** 工具定义单一来源（REQ-0003 MCP tools/list 同源序列化——零漂移） */
@@ -185,6 +193,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                 type: "object",
                 properties: {
                     session_id: { type: "string", description: "spawn_and_observe 返回的 session_id" },
+                    layer: { type: "string", description: "外部或已过期会话需要指定所属层，初始层用 __initial__" },
                 },
                 required: ["session_id"],
             },
@@ -231,19 +240,47 @@ export const TOOL_DEFS: AgentToolDef[] = [
         type: "function",
         function: {
             name: "observe_stream",
-            description:
-                "长跑观察（限时快照）：启动长跑会话并观察一段时间（缺省 8s）按流过滤（stderr/stdout/both），" +
-                "返回行对象（带 stream 标记）。跨流序为到达序。",
+            description: "打开持续观察窗并立即返回 window_id。用 read_stream 回看或续读，用 close_stream 关闭。",
             parameters: {
                 type: "object",
                 properties: {
                     command: { type: "string" },
-                    duration_ms: { type: "number", description: "观察时长（缺省 8000）" },
-                    stream: { type: "string", enum: ["stdout", "stderr", "both"], description: "流过滤（缺省 both）" },
-                    name: { type: "string" },
-                    layer: { type: "string", description: "目标层名（缺省=默认层）" },
+                    stream: { type: "string", enum: ["stdout", "stderr", "both"], description: "流过滤，缺省 both" },
+                    name: { type: "string", description: "窗口显示名称" },
+                    layer: { type: "string", description: "目标层名，缺省使用默认层" },
                 },
                 required: ["command"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "read_stream",
+            description: "读取本地观察窗。可读最近帧、按 before_seq 向前翻页、按 window_ms 回看或按 since_seq 续读。每次续读用 last_delivered_seq，gap 表示游标区间有丢失。",
+            parameters: {
+                type: "object",
+                properties: {
+                    window_id: { type: "string" },
+                    limit: { type: "integer", minimum: 1, maximum: 200, description: "最多返回帧数，缺省 20" },
+                    since_seq: { type: "integer", minimum: 0, description: "读取此序号之后的帧" },
+                    before_seq: { type: "integer", minimum: 0, description: "读取此序号之前最近的帧" },
+                    window_ms: { type: "integer", minimum: 0, description: "回看最近多少毫秒" },
+                    wait_ms: { type: "integer", minimum: 0, maximum: 30000, description: "续读等待新增帧的毫秒数，仅用于 since_seq" },
+                },
+                required: ["window_id"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "close_stream",
+            description: "关闭观察窗并释放其观察流。",
+            parameters: {
+                type: "object",
+                properties: { window_id: { type: "string" } },
+                required: ["window_id"],
             },
         },
     },
@@ -321,12 +358,19 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
     // 复用=不自愈；每次工具调用重连）。driver 直注形态不注册（外部生命周期）
     const INITIAL_LAYER_NAME = "__initial__";
     let layerPromise: Promise<RuntimeDriver> | undefined;
+    let registeredInitial: RuntimeDriver | undefined;
     const layer = async (): Promise<RuntimeDriver> => {
         if (opts.driver) return opts.driver;
+        if (registeredInitial && stack.layers.get(INITIAL_LAYER_NAME)?.driver !== registeredInitial) {
+            registeredInitial = undefined;
+            layerPromise = undefined;
+        }
         layerPromise ??= (async () => {
             const drv = await stack.connect(opts.descriptor ?? { driver: "local" });
             if (opts.descriptor && opts.descriptor.driver !== "local") {
-                try { await stack.addLayer(INITIAL_LAYER_NAME, drv); } catch { /* 已注册/复用路径容忍 */ }
+                const existing = stack.layers.get(INITIAL_LAYER_NAME);
+                if (!existing) await stack.addLayer(INITIAL_LAYER_NAME, drv);
+                if (stack.layers.get(INITIAL_LAYER_NAME)?.driver === drv) registeredInitial = drv;
             }
             return drv;
         })().catch((e) => {
@@ -342,10 +386,17 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         if (layerName) return stack.layer(layerName).driver;
         return stack.active ?? await layer();
     };
-    /** 会话归属表（GPT Astra 二轮 #3）：sessionId → 启动它的 driver——
-     *  spawn 在远端层的会话必须回该层 stop（此前 stop_and_verify 固定用初始层，
-     *  跨层会话停错层=必然失败）。无记录（外部会话/跨进程）回退初始层语义。 */
-    const sessionOwner = new Map<string, RuntimeDriver>();
+    let windowRegistry: StreamWindowRegistry | undefined;
+    let observationDisposed = false;
+    const requireWindow = (windowId: string) => {
+        const window = windowRegistry?.get(windowId);
+        if (!window || window.closed) throw new Error(`观察窗 '${windowId}' 不存在或已关闭`);
+        return window;
+    };
+    const sessionOwner = new SessionOwnership(
+        opts.sessionResultTtlMs ?? 60_000,
+        opts.sessionCheckIntervalMs ?? 5_000,
+    );
 
     /** 启动后失败共享收口（Astra 三十五期 P1 + 三十六期 P1 提取）：任务已启动但
      *  任何后续步骤（watch/tail/stop）失败时——等 stop 三态 → verify 双通道 →
@@ -373,7 +424,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         } catch { /* 停止通道失败——unknown 处理 */ }
         const st = stopRes?.status;
         if (st === "exited" || st === "stopped") {
-            sessionOwner.delete(h.sessionId);
+            sessionOwner.remember(h.sessionId, { status: st, exit_code: stopRes?.exitCode });
             throw mk("stopped", `${st === "exited" ? "已停止（进程本已退出）" : "停止已核实"}${st === "exited" && stopRes?.exitCode != null ? `（exitCode=${stopRes.exitCode}）` : ""}${causeNote}`);
         }
         // unknown / 停止抛错：verify 双通道裁决（结论值放 try 外——三十四期教训）
@@ -385,7 +436,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
             else if (v.status === "exited") exitedViaVerify = v.exitCode ?? null;
         } catch { /* verify 不可达——保持 unknown */ }
         if (exitedViaVerify !== undefined) {
-            sessionOwner.delete(h.sessionId);
+            sessionOwner.remember(h.sessionId, { status: "exited", exit_code: exitedViaVerify });
             throw mk("stopped", `已退出（exitCode=${exitedViaVerify ?? "?"}）${causeNote}`);
         }
         throw mk("unknown", `${stillRunningNote ?? "停止结果未知（停止/核实通道均不可确认）"}${causeNote}`);
@@ -393,6 +444,10 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
 
     return {
         tools: TOOL_DEFS,
+        dispose() {
+            observationDisposed = true;
+            windowRegistry?.dispose();
+        },
         get layer(): Promise<RuntimeDriver> { return layer(); }, // 惰性 getter（失败不缓存+注册命名表——Hydrogen R7 #4）
         handlers: {
             async run_command({ command, timeout_ms, layer: layerName }) {
@@ -406,7 +461,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
             async spawn_and_observe({ command, ready_marker, error_pattern, name, layer: layerName }) {
                 const drv = await resolveDrv(layerName);
                 const h = await drv.execSession(command, name ? { name } : undefined);
-                sessionOwner.set(h.sessionId, drv); // 归属记录（stop_and_verify 按此寻层）
+                sessionOwner.track(h.sessionId, drv); // 归属记录（stop_and_verify 按此寻层）
                 // 启动后异常统一走 postLaunchFail（三十五期 P1 + 三十六期提取共享）
                 if (error_pattern) {
                     try {
@@ -436,13 +491,15 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                         // 空轮询整个 readyTimeoutMs 才报超时——每 10 轮（~1s）核实一次
                         // 会话状态，已退出即带真实退出码走 postLaunchFail
                         if (++ticks % 10 === 0) {
-                            try {
-                                const v = await drv.verifySession(h.sessionId);
-                                if (v.status !== "running") {
-                                    await postLaunchFail(drv, h,
-                                        `进程已退出（${v.status}${v.exitCode != null ? `, exitCode=${v.exitCode}` : ""}）——ready 标记 '${ready_marker}' 未出现`);
-                                }
-                            } catch { /* verify 通道异常不阻断轮询（超时兜底仍在） */ }
+                            const verified = await Promise.resolve()
+                                .then(() => drv.verifySession(h.sessionId))
+                                .catch(() => undefined);
+                            if (verified?.status === "exited") {
+                                sessionOwner.remember(h.sessionId, { status: "exited", exit_code: verified.exitCode });
+                                throw Object.assign(new Error(
+                                    `进程已退出（exitCode=${verified.exitCode ?? "?"}），未见 ready 标记 '${ready_marker}'`,
+                                ), { outcome: "exited", exitCode: verified.exitCode, sessionId: h.sessionId, logBase: h.logBase });
+                            }
                         }
                         await new Promise((r) => setTimeout(r, 100));
                     }
@@ -462,75 +519,59 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const r = await editFile(drv, path, old, newStr, { all, writeMode });
                 return { path: r.path, occurrences: r.occurrences, bytes_before: r.bytesBefore, bytes_after: r.bytesAfter, mutex: r.mutex, write_mode: r.writeMode };
             },
-            async observe_stream({ command, duration_ms, stream, name, layer: layerName }) {
+            async observe_stream(args) {
+                if ("duration_ms" in args) throw new Error("observe_stream 持续开窗，请用 read_stream 的 wait_ms 限制单次等待");
+                const { command, stream, name, layer: layerName } = args;
+                if (observationDisposed) throw new Error("工具集已关闭");
+                if (typeof command !== "string" || !command.trim()) throw new Error("command 需要非空字符串");
+                if (stream !== undefined && !["stdout", "stderr", "both"].includes(stream)) throw new Error("stream 无效");
                 const drv = await resolveDrv(layerName);
-                const h = await drv.execSession(command, name ? { name } : undefined);
-                sessionOwner.set(h.sessionId, drv); // 归属登记（三十五期 P2：远端观察的停止须回该层——旧形态 stop unknown 后 stop_and_verify 跑回初始层）
-                const dur = duration_ms ?? 8000;
-                await new Promise((r) => setTimeout(r, dur));
-                // 双流：driver 带 sessions.tailLines（local/ssh 均有）用行对象；否则 stdout 投影兜底。
-                // 双形态统一 await（第八季盲测 bug 实锤：local 同步返回数组、ssh 层
-                // RemoteSessionManager.tailLines 是 async——漏 await 时 Promise 恒 truthy，
-                // 兜底分支短路，lines.filter 直接 TypeError）。
-                // 读取异常走 postLaunchFail（三十六期 P1：旧形态跳过停止裸抛——任务
-                // 可能继续运行但调用者拿不到核实句柄）
-                const anyDrv = drv as unknown as {
-                    sessions?: {
-                        tailLines?: (
-                            id: string,
-                            n?: number,
-                        ) => Array<{ stream: string; text: string }> | Promise<Array<{ stream: string; text: string }>>;
-                    };
-                };
-                let lines: Array<{ stream: string; text: string }>;
-                try {
-                    // 行数归一（Hydrogen R7 #3）：tailLines 曾 local 热窗 50 行上限 vs
-                    // remote 双流各 500=1000 行（20 倍差且非到达序）——统一 readSessionLog
-                    // （双后端同走落盘文件+lines 尾窗），行对象形态保留由 readLog 文本重建
-                    // 后端兼容：readSessionLog 缺席（自定义 driver）回落 tailLines/tailSession
-                    if (typeof drv.readSessionLog === "function") {
-                        // 流感知读（readSessionLog 按 opts.stream 选 .out/.err——修前只读
-                        // stdout 侧，stream:"stderr" 过滤后恒空）
-                        const streams: Array<"stdout" | "stderr"> = stream === "both" || !stream ? ["stdout", "stderr"] : [stream];
-                        lines = [];
-                        for (const st of streams) {
-                            const log = await drv.readSessionLog(h.sessionId, { lines: 500, stream: st });
-                            for (const t of (log ?? "").split("\n")) {
-                                if (t !== "") lines.push({ stream: st, text: t });
-                            }
-                        }
-                    } else {
-                        const anyDrv = drv as unknown as { sessions?: { tailLines?: (id: string, n?: number) => Array<{ stream: string; text: string }> | Promise<Array<{ stream: string; text: string }>> } };
-                        lines = await (anyDrv.sessions?.tailLines?.(h.sessionId, 500)
-                            ?? (await drv.tailSession(h.sessionId, 500)).map((t) => ({ stream: "stdout", text: t })));
+                if (observationDisposed) throw new Error("工具集已关闭");
+                if (!drv.openStreamWindow) throw new Error(`层 '${layerName ?? drv.descriptor.driver}' 不支持持续观察窗`);
+                const registry = windowRegistry ??= new StreamWindowRegistry();
+                const id = randomUUID();
+                const window = await drv.openStreamWindow(registry, { name: id, command, stream, retainSequence: false });
+                return { window_id: id, ...(name ? { name } : {}), stale: window.stale };
+            },
+            async read_stream({ window_id, limit = 20, since_seq, before_seq, window_ms, wait_ms = 0 }) {
+                if ([since_seq, before_seq, window_ms].filter((value) => value !== undefined).length > 1) {
+                    throw new Error("since_seq、before_seq 和 window_ms 互斥");
+                }
+                for (const value of [since_seq, before_seq, window_ms, wait_ms]) {
+                    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+                        throw new Error("观察窗的游标和时长需要非负整数");
                     }
-                } catch (err) {
-                    await postLaunchFail(drv, h, "观察输出读取失败", err);
                 }
-                const filtered = (stream && stream !== "both") ? lines!.filter((l) => l.stream === stream) : lines!;
-                // 停止通道异常不再吞（Sol 58 P2-6）：catch(() => undefined) 曾把
-                // stopSession 抛错吞成普通快照——归 unknown 路径接 verify 同权处理
-                const stopR = await drv.stopSession(h.sessionId).catch(
-                    (e: unknown) => ({ status: "unknown", stopError: e instanceof Error ? e.message : String(e) }) as { status: "unknown"; stopError?: string },
-                );
-                // 快照语义：停止结果不进返回承诺，但终态确定即清归属（顺线扫——
-                // 未清会让后续 stop_and_verify 落到初始层白跑）；unknown 保留归属可核实
-                let terminal: { stop_status: string; verify_status?: string } | undefined;
-                if (stopR && stopR.status !== "unknown") {
-                    sessionOwner.delete(h.sessionId);
-                } else if (stopR) {
-                    // stop unknown 静默吞改核实（Sol 57 P2-7）：unknown 时任务可能仍在
-                    // 跑——接 verifySession 实测并把终态信息带进结果（调用方可分支）
-                    terminal = { stop_status: "unknown" };
-                    try {
-                        const v = await drv.verifySession(h.sessionId);
-                        terminal.verify_status = v.status;
-                        // 只在**确证 exited** 才清归属（Sol 57 修正：verify unknown/
-                        // running 时归属保留——stop_and_verify 仍按归属层核实）
-                        if (v.status === "exited") sessionOwner.delete(h.sessionId);
-                    } catch { terminal.verify_status = "unknown"; }
+                if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("limit 须在 1–200 之间");
+                if (wait_ms > 30000 || (wait_ms > 0 && since_seq === undefined)) {
+                    throw new Error("wait_ms 仅用于续读，且最大为 30000");
                 }
-                return { session_id: h.sessionId, lines: filtered, ...(terminal ?? {}) };
+                const window = requireWindow(window_id);
+                const deadline = Date.now() + wait_ms;
+                const read = () => since_seq !== undefined ? window.peekSince(since_seq, limit)
+                    : before_seq !== undefined ? window.peekBefore(before_seq, limit)
+                    : window_ms !== undefined ? window.peekWindow(window_ms, limit)
+                    : window.peekLast(limit);
+                let result = read();
+                while (since_seq !== undefined && !result.frames.length && !result.gap && !result.stale && Date.now() < deadline) {
+                    await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(50, deadline - Date.now()))));
+                    requireWindow(window_id);
+                    result = read();
+                }
+                return {
+                    window_id, oldest_seq: result.oldestSeq, newest_seq: result.newestSeq,
+                    stale: result.stale, frames: result.frames,
+                    ...(result.exitCode !== undefined ? { exit_code: result.exitCode } : {}),
+                    ...(result.error !== undefined ? { error: result.error } : {}),
+                    ...(result.lastDeliveredSeq !== undefined ? { last_delivered_seq: result.lastDeliveredSeq } : {}),
+                    ...(result.gap ? { gap: true } : {}),
+                    ...(wait_ms > 0 && !result.frames.length && !result.gap && !result.stale ? { timed_out: true } : {}),
+                };
+            },
+            async close_stream({ window_id }) {
+                requireWindow(window_id);
+                await windowRegistry!.stopConfirmed(window_id);
+                return { window_id, closed: true };
             },
             // ── 层族（第十季命名层注册表）──
             async push_ssh({ host, port, user, key, jump, name }) {
@@ -642,13 +683,20 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     })),
                 };
             },
-            async stop_and_verify({ session_id }) {
+            async stop_and_verify({ session_id, layer: layerName }) {
                 // 归属寻层（GPT Astra 二轮 #3 / 三轮 #1 / 四轮 #1）：spawn 在远端层的会话回该层停。
                 // unknown 时自动接一次 verifySession 核实原语（DeepSeek 评审追问的 unknown 闭环）——
                 // stop 的 unknown 是「停止瞬间核实不可达」，verify 是延迟后的独立探测通道。
                 // 停止通道抛错也归 unknown 继续 verify（三十七期 #2：旧形态 await
                 // 直接抛出——后面的 verify 根本不执行，裸抛无 unknown 标记）
-                const drv = sessionOwner.get(session_id) ?? await layer();
+                const entry = sessionOwner.get(session_id);
+                if (entry && "result" in entry) return { ...entry.result };
+                if (!entry && !layerName) {
+                    return { status: "unknown", note: "会话归属未知或已过期，verify 需要显式指定 layer" };
+                }
+                const drv = entry && "driver" in entry
+                    ? entry.driver
+                    : layerName === INITIAL_LAYER_NAME ? await layer() : stack.layer(layerName!).driver;
                 let r: { status?: string; exitCode?: number | null };
                 try {
                     r = await drv.stopSession(session_id);
@@ -670,9 +718,13 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                         }
                     } catch { /* verify 不可达——保持 unknown */ }
                 }
-                if (status !== "unknown") sessionOwner.delete(session_id);
-                if (status === "exited") return { status: "exited", exit_code: exitCode };
-                if (status === "stopped") return { status: "stopped", note: "终止已核实" };
+                if (status !== "unknown") {
+                    const result: StopResult = status === "exited"
+                        ? { status, exit_code: exitCode }
+                        : { status, note: "终止已核实" };
+                    sessionOwner.remember(session_id, result);
+                    return result;
+                }
                 return {
                     status: "unknown",
                     note: stillRunningNote ?? "stop 与 verify 双通道均不可达——重连后 verify_session 或显式上报",

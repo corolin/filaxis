@@ -103,10 +103,12 @@ export interface FileSystemDriver {
 
 import type {
     SessionStartOptions,
-    SessionHandleInfo,
+    SessionHandleInfo, SessionRecoveryResult,
     WatchOptions,
     ReadLogOptions,
 } from "./session-types.js";
+
+import type { ObservationWindowOptions, StreamWindow, StreamWindowRegistry } from "./stream-window.js";
 
 export interface RuntimeDriver {
     // 基础信息
@@ -118,6 +120,10 @@ export interface RuntimeDriver {
     // ── 长跑会话生命周期（execSession 即返 + 落盘日志 + 热窗口 + watcher）──
     /** 启动长跑会话（立即返回句柄：sessionId/logBase/pid——tail/readLog/watch/stop 用） */
     execSession(command: string, opts?: SessionStartOptions): Promise<SessionHandleInfo>;
+    /** Reattach to a durable session on this layer when supported. */
+    recoverSession?(sessionId: string): Promise<SessionRecoveryResult>;
+    /** Open a continuous observation in this execution environment. */
+    openStreamWindow?(registry: StreamWindowRegistry, opts: ObservationWindowOptions): Promise<StreamWindow>;
     /** 热窗口快照：最近 n 行 */
     tailSession(sessionId: string, lines?: number): Promise<string[]>;
     /** 读会话日志文件（全量/大范围） */

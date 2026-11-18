@@ -17,6 +17,7 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { RemoteDialect } from "./dialect.js";
+import { renderInplaceWrite, renderPreserveMode } from "./file-placement.js";
 
 /** 远端执行回调（通常是 driver 的 exec 通道） */
 export type TransferExec = (command: string) => Promise<{ stdout: string; exitCode: number }>;
@@ -59,6 +60,25 @@ export async function putFile(
     return putContent(exec, dialect, await fs.readFile(localPath), remotePath, opts);
 }
 
+export async function writeInplaceContent(
+    exec: TransferExec,
+    dialect: RemoteDialect,
+    content: Buffer,
+    remotePath: string,
+    chunkB64?: number,
+): Promise<TransferResult> {
+    const result = await exec("mktemp -d /tmp/filaxis-write.XXXXXXXXXX");
+    const stageDir = result.stdout.trim();
+    if (result.exitCode !== 0 || !/^\/tmp\/filaxis-write\.[A-Za-z0-9]{10}$/.test(stageDir)) {
+        throw new Error(`writeFile 无法创建暂存目录（目标未动）: ${remotePath}`);
+    }
+    try {
+        return await stageAndPlaceContent(exec, dialect, content, remotePath, { chunkB64, forceInplace: true }, `${stageDir}/payload`);
+    } finally {
+        await exec(`rmdir ${q(stageDir)}`).catch(() => undefined);
+    }
+}
+
 /**
  * 上行 put 主链路（内存载荷）：分块 base64 append 到远端临时文件 → 方言 decode
  * 到 **独立输出临时** → size + sha256 回读双校验（对临时输出）→ 校验通过才 mv
@@ -79,6 +99,17 @@ export async function putContent(
     remotePath: string,
     opts: { chunkB64?: number; forceInplace?: boolean } = {},
 ): Promise<TransferResult> {
+    return stageAndPlaceContent(exec, dialect, content, remotePath, opts, remotePath);
+}
+
+async function stageAndPlaceContent(
+    exec: TransferExec,
+    dialect: RemoteDialect,
+    content: Buffer,
+    remotePath: string,
+    opts: { chunkB64?: number; forceInplace?: boolean },
+    stageBase: string,
+): Promise<TransferResult> {
     if (!dialect.base64Decode.length) {
         throw new Error("远端 base64 原语不可用（方言探测 unknown）——该路径不支持文件传输");
     }
@@ -90,8 +121,8 @@ export async function putContent(
     }
     const b64 = content.toString("base64");
     const nonce = randomBytes(6).toString("hex");
-    const tmp = withSuffix(remotePath, `.filaxis-tmp-${nonce}`); // b64 分块临时（独占+NAME_MAX 安全——Hydrogen R5 #5）
-    const out = withSuffix(remotePath, `.filaxis-out-${nonce}`); // decode 输出临时（NAME_MAX 安全——Hydrogen R5 #5）
+    const tmp = withSuffix(stageBase, `.filaxis-tmp-${nonce}`); // b64 分块临时（独占+NAME_MAX 安全——Hydrogen R5 #5）
+    const out = withSuffix(stageBase, `.filaxis-out-${nonce}`); // decode 输出临时（NAME_MAX 安全——Hydrogen R5 #5）
     const cleanup = () => exec(`rm -f ${q(tmp)} ${q(out)}`).catch(() => undefined);
     const localSha = createHash("sha256").update(content).digest("hex");
     // 分块尺寸可调（真机实证：tmux server 单命令 ~16-24K 即 "command too long"——
@@ -116,7 +147,7 @@ export async function putContent(
         }
         // decode → 独立输出临时（同目录 mv = rename 原子落位；目标此时零接触）
         const dec = dialect.base64Decode.join(" ");
-        const dc = await exec(`${dec} < ${q(tmp)} > ${q(out)}`);
+        const dc = await exec(`(umask 077; ${dec} < ${q(tmp)} > ${q(out)})`);
         if (dc.exitCode !== 0) throw new Error(`put 解码失败（目标未动）: ${dc.stdout}`);
         // 双校验对**临时输出**：size + sha256（方言渲染）——校验不过目标同样零接触
         const v = await verify(exec, dialect, out, content.length, localSha);
@@ -128,18 +159,30 @@ export async function putContent(
         await cleanup();
         throw e;
     }
+    try {
+        const writeMode = await placeVerifiedUpload(exec, out, remotePath, opts.forceInplace);
+        return { bytes: content.length, sha256: localSha, verified: true, verification: level, writeMode };
+    } finally {
+        await exec(`rm -f ${q(tmp)}`).catch(() => undefined);
+    }
+}
+
+async function placeVerifiedUpload(
+    exec: TransferExec, out: string, remotePath: string, forceInplace = false,
+): Promise<TransferResult["writeMode"]> {
+    const cleanup = () => exec(`rm -f ${q(out)}`).catch(() => undefined);
     // 落位（GPT Astra 七轮 #3 + 八轮 #2 + bind mount 定案 + 十八轮 #2 三态 + 审计 H5）：
     // symlink 追踪（readlink -f 真身——mv 对链接路径会替换链接本身破坏拓扑）+ 属性
     // 保持（chmod/chown --reference best-effort）；mv 失败自动降级 cat 保留 inode；
     // 失败三态：目录=未动 / inplace 中断=可能已部分改写（载荷保留 out）/ 其余未动。
-    const tgtSetup = `__fx_tgt=$(readlink -f ${q(remotePath)} 2>/dev/null || echo ${q(remotePath)}); ` +
-        // 数字模式权限保持（Hydrogen R8 #2 同款）：--reference 仅 GNU——非 GNU 平台
-        // 静默回退 umask（敏感文件权限丢失）；stat -c '%a' → chmod NNN 全平台
-        `__fx_pm=$(stat -c '%a' "$__fx_tgt" 2>/dev/null); [ -n "$__fx_pm" ] && chmod "$__fx_pm" ${q(out)} 2>/dev/null; ` +
-        `chown --reference="$__fx_tgt" ${q(out)} 2>/dev/null || true; `;
-    const place = opts.forceInplace
-        ? `if cat < ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else if [ ! -e ${q(out)} ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi`
-        : `__fx_ob=$(basename ${q(out)} 2>/dev/null); ` +
+    const tgtSetup = `__fx_tgt=$(if readlink -f ${q(remotePath)} 2>/dev/null; then printf .; ` +
+        `elif [ -L ${q(remotePath)} ]; then exit 1; else printf '%s\\n.' ${q(remotePath)}; fi) ` +
+        `|| { echo FX_UNRESOLVED_LINK; exit 1; }; __fx_tgt=\${__fx_tgt%??}; `;
+    const preserveMode = renderPreserveMode(q(out));
+    const inplaceWrite = renderInplaceWrite(q(out), '"$__fx_tgt"', "echo FX_MV_CAT");
+    const place = forceInplace
+        ? inplaceWrite
+        : `${preserveMode}__fx_ob=$(basename ${q(out)} 2>/dev/null); ` +
           `__fx_od=$(stat -c %d ${q(out)} 2>/dev/null || stat -f %d ${q(out)} 2>/dev/null); ` +
           `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
           `if [ -n "$__fx_od" ] && [ "$__fx_od" = "$__fx_td" ]; then ` +
@@ -148,10 +191,10 @@ export async function putContent(
           `if mv -T ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
           `else if [ ! -d "$__fx_tgt" ] && mv ${q(out)} "$__fx_tgt" 2>/dev/null && __fx_mv=1 && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
           `else if [ "$__fx_mv" = "1" ] && [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_ob" ${q(out)} 2>/dev/null; then echo FX_IS_DIR; ` +
-          `else if cat < ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else if [ ! -e ${q(out)} ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; fi; fi; fi; ` +
+          `else ${inplaceWrite}; fi; fi; fi; ` +
           `else ` +
           `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
-          `if cat < ${q(out)} > "$__fx_tgt" && rm -f ${q(out)} && echo FX_MV_CAT; then :; else if [ ! -e ${q(out)} ]; then echo FX_NO_PAYLOAD; else echo FX_INPLACE_FAIL; fi; fi; ` +
+          `${inplaceWrite}; ` +
           `fi`;
     // 落位五防（Sol 87 P1-5 → Sol 88 P1-6 → Sol 89 P1-4/P1-5）：
     // ①前置 [ -d ] 快速拒绝（外层 test 与本处之间目标被换成目录）；
@@ -165,8 +208,12 @@ export async function putContent(
     // cat 形态一律 `< src > tgt`（Sol 90 P1-3）：shell 从左到右处理重定向——
     // 源打开失败时目标尚未被截断（`cat src > tgt` 是 cat 自己开源、shell 先
     // 截目标——载荷丢失后原文件曾被截成 0 字节且恢复路径无存）
-    const mv = await exec(`test ! -d ${q(remotePath)} || { echo FX_IS_DIR; exit 1; }; { ${tgtSetup}${place}; }`);
+    const mv = await exec(`( test ! -d ${q(remotePath)} || { echo FX_IS_DIR; exit 1; }; ${tgtSetup}${place} )`);
     const mvOut = (mv.stdout || "").trim();
+    if (mvOut === "FX_UNRESOLVED_LINK") {
+        await cleanup();
+        throw new Error(`put 落位失败（无法解析目标符号链接，链接已保留）: ${remotePath}`);
+    }
     if (mvOut.includes("FX_IS_DIR")) {
         await cleanup();
         throw new Error(`put 落位失败（目标是现存目录）——目标未动: ${remotePath}`);
@@ -175,7 +222,11 @@ export async function putContent(
         // 载荷在落位前已消失（Sol 90 P1-3）：`< src > tgt` 重定向排序保证目标
         // **未被截断**——零接触；专错不谎称恢复路径在场
         await cleanup();
-        throw new Error(`put 落位中止（已校验载荷在落位前消失——外部移除？）——目标未动（重定向排序保证未截断）: ${remotePath}`);
+        throw new Error(`put 落位中止（载荷在落位前消失或无法打开，目标未动）: ${remotePath}`);
+    }
+    if (mvOut.includes("FX_INPLACE_PAYLOAD_MISSING")) {
+        await cleanup();
+        throw new Error(`put 原地写入失败（目标可能已被部分改写，恢复载荷已不在）：${remotePath}`);
     }
     if (mvOut.includes("FX_INPLACE_FAIL")) {
         // 不 cleanup：out 载荷保留供核实/重试（目标可能已是半截——处置属调用方）
@@ -188,12 +239,7 @@ export async function putContent(
         await cleanup();
         throw new Error(`put 落位异常（目标未动）: ${remotePath}（输出 ${mvOut.slice(0, 80)}）`);
     }
-    const inplace = (mv.stdout || "").includes("FX_MV_CAT");
-    await exec(`rm -f ${q(tmp)}`).catch(() => undefined);
-    return {
-        bytes: content.length, sha256: localSha, verified: true, verification: level,
-        writeMode: inplace ? ("inplace-write" as const) : ("atomic-replace" as const),
-    };
+    return mvOut.includes("FX_MV_CAT") ? "inplace-write" : "atomic-replace";
 }
 
 /**
@@ -213,7 +259,10 @@ export async function getFile(
     }
     // 本地目标是现存目录早拒绝（自排查，顺 putFile 八轮 #2）：rename 对目录目标
     // 报 ENOTDIR——晚失败且信息不友好，先拒
-    const st = await fs.stat(localPath).catch(() => undefined);
+    const st = await fs.stat(localPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+    });
     if (st?.isDirectory()) {
         throw new Error(`本地目标是现存目录（拒绝下载落位）：${localPath}`);
     }
@@ -232,7 +281,8 @@ export async function getFile(
     // 追后缀 ENAMETOOLONG（上传/sftp 已修、此处漏）
     const localTmp = localTmpFor(localPath, `.filaxis-get-${randomBytes(6).toString("hex")}`);
     try {
-        await fs.writeFile(localTmp, content);
+        await fs.writeFile(localTmp, content, { flag: "wx", mode: 0o600 });
+        if (st) await fs.chmod(localTmp, st.mode & 0o777);
         await fs.rename(localTmp, localPath);
     } catch (e) {
         await fs.rm(localTmp, { force: true }).catch(() => undefined);
@@ -344,9 +394,24 @@ function assertSftpPath(p: string, what: string): void {
     }
 }
 
+async function resolveSftpRemotePath(exec: TransferExec, path: string): Promise<string> {
+    assertSftpPath(path, "远端");
+    if (path.startsWith("/")) return path;
+    // SFTP starts in its own working directory. Anchor relative paths in the
+    // same shell environment used for verification, placement and cleanup.
+    const cwd = await exec("pwd -P");
+    const directory = cwd.stdout.replace(/\n$/, "");
+    if (cwd.exitCode !== 0 || !directory.startsWith("/")) {
+        throw new Error(`SFTP 无法核实远端工作目录: ${path}`);
+    }
+    const resolved = `${directory === "/" ? "" : directory}/${path}`;
+    assertSftpPath(resolved, "远端");
+    return resolved;
+}
+
 /**
  * sftp 快路径 put：`sftp -b -` batch 模式（stdin 喂 `put` 命令）。
- * 成功后仍走 size/sha256 双校验（与 base64 路径同一信任标准——快路径不豁免校验）。
+ * 上传到独立暂存文件，校验通过后沿用普通上传的落位逻辑。
  * 缺席/失败由调用方捕获后降级 base64 管道（PRD FEAT-14 降级链）。
  */
 export async function sftpPutFile(
@@ -358,18 +423,26 @@ export async function sftpPutFile(
 ): Promise<TransferResult> {
     const doSpawn = opts.spawnImpl ?? defaultSftpSpawn;
     assertSftpPath(localPath, "本地");
-    assertSftpPath(remotePath, "远端");
-    const batch = `put ${q(localPath)} ${q(remotePath)}\n`;
-    const r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
-    if (r.exitCode !== 0) {
-        throw new Error(`sftp put 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);
-    }
+    const target = await resolveSftpRemotePath(exec, remotePath);
     const content = await fs.readFile(localPath);
     const localSha = createHash("sha256").update(content).digest("hex");
-    const v = await verify(exec, dialect, remotePath, content.length, localSha);
-    if (!v.verified) throw new TransferVerificationError("put", v.detail);
-    // sftp put 协议直写目标（open/truncate/write）——本质保留 inode 非原子，显式声明
-    return { bytes: content.length, sha256: localSha, verified: true, verification: v.level, writeMode: "inplace-write" as const };
+    const staged = withSuffix(target, `.filaxis-out-${randomBytes(6).toString("hex")}`);
+    let verification: TransferResult["verification"];
+    try {
+        const batch = `put ${q(localPath)} ${q(staged)}\n`;
+        const r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
+        if (r.exitCode !== 0) {
+            throw new Error(`sftp put 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);
+        }
+        const v = await verify(exec, dialect, staged, content.length, localSha);
+        if (!v.verified) throw new TransferVerificationError("put", v.detail);
+        verification = v.level;
+    } catch (error) {
+        await exec(`rm -f ${q(staged)}`).catch(() => undefined);
+        throw error;
+    }
+    const writeMode = await placeVerifiedUpload(exec, staged, target);
+    return { bytes: content.length, sha256: localSha, verified: true, verification, writeMode };
 }
 
 /** 本地下载临时名（Sol 63 P2-5）：basename+后缀超 255B 截前段+短 hash（NAME_MAX 安全） */
@@ -403,9 +476,14 @@ export async function sftpGetFile(
 ): Promise<TransferResult> {
     const doSpawn = opts.spawnImpl ?? defaultSftpSpawn;
     assertSftpPath(localPath, "本地");
-    assertSftpPath(remotePath, "远端");
+    const source = await resolveSftpRemotePath(exec, remotePath);
+    const existing = await fs.stat(localPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+    });
     const tmpLocal = localTmpFor(localPath, `.fx-dl-${process.pid}-${randomBytes(4).toString("hex")}`);
-    const batch = `get ${q(remotePath)} ${q(tmpLocal)}\n`;
+    await fs.writeFile(tmpLocal, "", { flag: "wx", mode: 0o600 });
+    const batch = `get ${q(source)} ${q(tmpLocal)}\n`;
     let r: Awaited<ReturnType<typeof doSpawn>>;
     try {
         r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
@@ -422,8 +500,9 @@ export async function sftpGetFile(
     try {
         const content = await fs.readFile(tmpLocal);
         const localSha = createHash("sha256").update(content).digest("hex");
-        const v = await verify(exec, dialect, remotePath, content.length, localSha);
+        const v = await verify(exec, dialect, source, content.length, localSha);
         if (!v.verified) throw new TransferVerificationError("get", v.detail);
+        if (existing) await fs.chmod(tmpLocal, existing.mode & 0o777);
         await fs.rename(tmpLocal, localPath);
         return { bytes: content.length, sha256: localSha, verified: true, verification: v.level, writeMode: "atomic-replace" as const };
     } catch (e) {

@@ -3,17 +3,25 @@
 > 场景：需要**持续观察**多条远端/本地流（tail -f / docker logs / 训练日志 / 抓包），随时按需快照读取、断点续读、多消费者共享同一条流——不重复建流、慢消费者不阻塞远端。面向 Agent 或工程师。
 > 体量 ~1K tokens · **何时不用**：等一个关键行就走的（execSession+watcher 更轻）；一次性 tail -n 快照（observe 足够）。
 
-## 剧本
+## Agent 与 MCP 工具
+
+1. 用 `observe_stream` 开窗并取得 `window_id`。窗口持续接收指定层的 stdout 和 stderr，可在开窗时按流过滤。
+2. 用 `read_stream` 回看。缺省返回最近帧。传 `before_seq` 可向前翻页，传 `window_ms` 可回看最近一段时间。
+3. 用 `since_seq` 续读，下一次从 `last_delivered_seq` 接着读。可用 `wait_ms` 等新增帧，等待超时后窗口继续接收。返回 `gap` 时从已有落盘日志补读被覆盖的历史。
+4. 用 `close_stream` 关窗。本地窗口等待所属进程组或 Windows Job 退出，SSH 窗口等待本地 SSH 观察进程退出。若停止失败或超时，返回 `outcome: "unknown"`，可用同一个窗口 ID 读取历史或重试关闭。流自然退出后，窗口在回收前仍保留可回看的帧，读取结果中的 `exit_code` 是观察进程的退出码。
+
+## SDK 剧本
 
 1. **命名即地址**：窗名建议 `层:用途`（如 `gpu:train`、`fw:drop`）——通配 peek（`gpu:*`）按前缀聚合。同名窗未 stop 不可重建（防双流）。
 2. **开窗即订阅**：`registry.open({name, layerAlias, command, manager})`——local 窗走本地 shell；remote 窗走 `StreamSessionManager`（引擎真流式，ControlMaster 共享主连接——观察是廉价的，连接是稀缺的）。
-3. **读取三模式，全非破坏**：
+3. **读取模式，全非破坏**：
    - `peekLast(n)`：最近 n 帧（快照）；
    - `peekWindow(ms)`：时间窗帧；
+   - `peekBefore(seq, n)`：指定帧之前最近的 n 帧；
    - `peekSince(since, n, consumerId)`：断点续读——帧号 per-window 单调递增、断连续编不归零；**消费者游标 per-consumer 互不干扰**——多 Agent / 多面板各读各的进度。
 4. **续读的正确姿势**：拿本次返回的 `lastDeliveredSeq` 当下次 `since`（**不要用 `newestSeq`**——限页翻读时它是窗内最新帧，拿它续读会跳过未读帧；带 `consumerId` 则游标自动记，`consumerSeq(id)` 直取）。返回 `gap: true` = 中间发生了环形覆盖（帧滚出窗）**或游标超前**（旧窗游标/异常值）——**显式空洞不是错误**，需要完整历史时开大 `maxFrames` 或落日志文件（窗是滚动缓冲不是无限历史）。
 5. **断流与复活**：流进程退出/断连 → `stale: true`（帧保留，`seq` 冻结）——重开同名窗**续编**（新流从冻结的 seq 之后继续）。
-6. **关窗收割**：`registry.stop(name)` 会**收割流进程**（不是只删窗）——防遗忘泄漏；空引用窗超 TTL 自动销毁（注意力衰减语义）。
+6. **关窗收割**：用 `await registry.stopConfirmed(name)` 等待停止确认。`registry.stop(name)` 同步发起停止请求。空引用窗超 TTL 后自动回收。
 
 ## TUI 全屏程序（watch/htop/nvtop）——VT100 屏桥
 

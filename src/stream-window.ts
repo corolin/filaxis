@@ -15,6 +15,7 @@
  * - 窗纯内存缓冲（不走消息路由——消费方自行桥接）
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { startLocalObservation, watchLocalProcess } from "./local-observation-process.js";
 import { StringDecoder } from "node:string_decoder";
 import { StreamSessionManager } from "./stream-session-manager.js";
 import { resolveLocalShell } from "./shell-discovery.js";
@@ -23,11 +24,19 @@ import { noopLogger, type FilaxisLogger } from "./logger.js";
 /** 单帧截断后缀（与 session-buffer.ts TRUNC_SUFFIX 同语义） */
 const TRUNC_SUFFIX = "…[truncated]";
 
+export interface ObservationWindowOptions {
+    name: string;
+    command: string;
+    stream?: "stdout" | "stderr" | "both";
+    retainSequence?: boolean;
+}
+
 export interface StreamFrame {
     seq: number;
     /** 帧到达本地时刻（时钟域统一本地） */
     ts: number;
     text: string;
+    stream?: "stdout" | "stderr";
 }
 
 export interface PeekResult {
@@ -35,6 +44,8 @@ export interface PeekResult {
     oldestSeq: number;
     newestSeq: number;
     stale: boolean;
+    exitCode?: number | null;
+    error?: string;
     frames: StreamFrame[];
     /** since 模式且中间发生环形覆盖时置 true（空洞显式可见，不静默） */
     gap?: boolean;
@@ -45,13 +56,8 @@ export interface PeekResult {
 }
 
 type Transport =
-    | { kind: "local"; child: ChildProcess }
+    | { kind: "local"; child: ChildProcess; requestStop(): void; waitForStop(deadline: number): Promise<void> }
     | { kind: "remote"; manager: StreamSessionManager; sessionId: string };
-
-/** 同名重开续编锚（模块级——直接 close() 也登记；Registry stop 时并入自己的表） */
-/** 续编锚（Sol 55 P2-H）：键带 namespace——模块级裸键曾串到其他注册表 */
-const __seqAnchors = new Map<string, number>();
-const __anchorKey = (ns: string, name: string): string => `${ns}::${name}`;
 
 export class StreamWindow {
     private frames: StreamFrame[] = [];
@@ -60,11 +66,14 @@ export class StreamWindow {
      *  未收到帧）的 newestSeq=0，用它续锚会把已存帧号归零覆盖、peekSince 误报
      *  gap。allocatedSeq 恒等于「本窗生命周期内发出的最大 seq」（含续编起点） */
     private allocated = 0;
-    private readonly anchorNs: string;
+    private readonly rememberSeq: (sequence: number) => void;
     private _stale = false;
+    private exitCode?: number | null;
+    private streamError?: string;
     private _closed = false;
     private readonly consumers = new Map<string, number>();
     private transport: Transport | null = null;
+    private closing?: Promise<void>;
     private lastActivityAt = Date.now();
 
     constructor(
@@ -77,9 +86,10 @@ export class StreamWindow {
         /** 帧号起点（Registry 同名重开续编——五十期 #1：文档承诺「重开续编」
          *  但实现归零，旧游标 peekSince 静默漏帧且 gap 不置位） */
         seqStart = 0,
-        anchorNs = "__bare__", // 裸窗全局 namespace（Registry 窗注入自身实例 id）
+        _anchorNs = "__bare__",
+        rememberSeq?: (sequence: number) => void, // 裸窗全局 namespace（Registry 窗注入自身实例 id）
     ) {
-        this.anchorNs = anchorNs;
+        this.rememberSeq = rememberSeq ?? (() => undefined);
         this.nextSeq = seqStart + 1;
         this.allocated = seqStart;
     }
@@ -94,7 +104,7 @@ export class StreamWindow {
     get lastActiveAt(): number { return this.lastActivityAt; }
 
     /** 行入窗（截断+环形覆盖；不更新消费者游标——游标只在 peek since 时推进） */
-    push(text: string): void {
+    push(text: string, stream?: "stdout" | "stderr"): void {
         if (this._closed) return;
         let line = text;
         // 字节口径（Sol 55 P2-G）：UTF-16 码元曾当字节——10 个「中」20 码元
@@ -119,7 +129,7 @@ export class StreamWindow {
         }
         const seq = this.nextSeq++;
         this.allocated = seq; // 已分配锚（空窗续编/超前判定用——非缓冲末帧）
-        this.frames.push({ seq, ts: Date.now(), text: line });
+        this.frames.push({ seq, ts: Date.now(), text: line, ...(stream ? { stream } : {}) });
         // maxFrames=0 曾因 slice(-0)=复制整个数组而失去上限（Sol 五十二期 #3：
         // 1000 帧全保留）。0 视为「无缓冲」——每帧即弃（seq 分配照常，续编/游标语义保持）
         if (this.maxFrames <= 0) {
@@ -140,11 +150,20 @@ export class StreamWindow {
         return this.snapshot(this.frames.slice(-n));
     }
 
+    /** Return the most recent retained frames strictly before the cursor. */
+    peekBefore(beforeSeq: number, n = 20): PeekResult {
+        if (n <= 0) return this.snapshot([]);
+        const result = this.snapshot(this.frames.filter((frame) => frame.seq < beforeSeq).slice(-n));
+        const through = Math.min(beforeSeq - 1, this.allocated);
+        if (through > 0 && (!this.frames.length || this.oldestSeq > Math.max(1, through - n + 1))) result.gap = true;
+        return result;
+    }
+
     /** 最近 ms 毫秒内的帧 */
-    peekWindow(ms: number): PeekResult {
+    peekWindow(ms: number, n = this.maxFrames): PeekResult {
         const cutoff = Date.now() - ms;
         const frames = this.frames.filter((f) => f.ts >= cutoff);
-        return this.snapshot(frames);
+        return this.snapshot(n <= 0 ? [] : frames.slice(-n));
     }
 
     /**
@@ -178,31 +197,76 @@ export class StreamWindow {
     }
 
     /** 流进程退出/断连 → stale（保留全部帧，seq 冻结在 nextSeq 上，重连续编） */
-    markStale(): void {
+    markStale(exitCode?: number | null, error?: string): void {
         if (this._closed) return;
         this._stale = true;
+        this.exitCode = exitCode;
+        this.streamError = error;
     }
 
-    attachTransport(t: Transport): void { this.transport = t; }
+    attachTransport(transport: Transport | { kind: "local"; child: ChildProcess }): void {
+        if (transport.kind !== "local" || "requestStop" in transport) {
+            this.transport = transport;
+            return;
+        }
+        const { child } = transport;
+        const state = watchLocalProcess(child);
+        this.transport = {
+            kind: "local", child,
+            requestStop() {
+                if (!state.exited() && !child.kill("SIGKILL") && !state.exited()) {
+                    throw new Error("无法向本地观察进程发送停止信号");
+                }
+            },
+            waitForStop: () => state.finished,
+        };
+    }
 
-    /** 关窗：收割流进程 + 内容清空（由 Registry 除名）。local kill 同步确定；
-     *  remote StreamSessionManager.stop 同步 void（kill 信号即时发出，无三态
-     *  返回——自审核实：与 toolkit 的 stop 三态不同，此处无结果可吞） */
+    /** Explicitly closing a local window terminates its dedicated process tree. */
     close(): void {
-        if (this._closed) return;
+        if (this._closed || this.closing) return;
+        if (this.transport?.kind === "remote" && !this._stale) {
+            this.transport.manager.stop(this.transport.sessionId);
+        }
+        if (this.transport?.kind === "local") this.transport.requestStop();
+        this.finishClose();
+    }
+
+    private finishClose(): void {
         this._closed = true;
-        // 续编锚登记（Sol 54 P2-17）：直接 close() 曾绕过 Registry.stop——同名重开
-        // 帧号归零，旧游标跳过新首帧。模块级锚表使任何关闭路径都被下一窗继承
-        __seqAnchors.set(__anchorKey(this.anchorNs, this.name), this.allocated);
-        try {
-            if (this.transport?.kind === "local") {
-                this.transport.child.kill("SIGTERM");
-            } else if (this.transport?.kind === "remote") {
-                this.transport.manager.stop(this.transport.sessionId);
-            }
-        } catch { /* 收割尽力而为 */ }
+        this.rememberSeq(this.allocated);
+        this.transport = null;
         this.frames = [];
         this.consumers.clear();
+    }
+
+    /** Release the window only after confirming that its observation process has stopped. */
+    async closeConfirmed(): Promise<void> {
+        if (this._closed) return;
+        const closing = this.closing ??= this.confirmTransportStop();
+        try { await closing; }
+        finally { if (this.closing === closing) this.closing = undefined; }
+    }
+
+    private async confirmTransportStop(): Promise<void> {
+        const transport = this.transport;
+        if (transport?.kind === "remote" && !this._stale) {
+            await transport.manager.stopAndWait(transport.sessionId);
+        } else if (transport?.kind === "local") {
+            const deadline = Date.now() + 3000;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                transport.requestStop();
+                await Promise.race([transport.waitForStop(deadline), new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error("等待本地观察进程退出超时")), 3000);
+                })]);
+            } catch (cause) {
+                throw Object.assign(new Error(`观察窗 '${this.name}' 停止结果未知`, { cause }), { outcome: "unknown" });
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+        this.finishClose();
     }
 
     private snapshot(frames: StreamFrame[]): PeekResult {
@@ -212,6 +276,8 @@ export class StreamWindow {
             oldestSeq: this.oldestSeq,
             newestSeq: this.newestSeq,
             stale: this._stale,
+            ...(this._stale && this.exitCode !== undefined ? { exitCode: this.exitCode } : {}),
+            ...(this._stale && this.streamError !== undefined ? { error: this.streamError } : {}),
             // 帧浅拷贝（五十期 #3）：返回元素曾与窗口内部共用引用——调用方改写
             // 返回帧的 seq/ts/text 会直接改写共享缓冲，殃及其他消费者
             frames: frames.map((f) => ({ ...f })),
@@ -344,11 +410,14 @@ class RemoteBridge {
         private readonly manager: StreamSessionManager,
     ) {}
 
-    async start(command: string): Promise<void> {
+    async start(command: string, stream?: ObservationWindowOptions["stream"], stdinScript?: string): Promise<void> {
         const { sessionId } = await this.manager.start(command, {
             name: this.window.name.replace(/[^A-Za-z0-9_-]/g, "_"),
-            onLine: (line) => this.window.push(line.text), // filaxis 行对象 → text 投影
-            onExit: () => this.window.markStale(),
+            stdinScript,
+            onLine: (line) => {
+                if (!stream || stream === "both" || stream === line.stream) this.window.push(line.text, line.stream);
+            }, // filaxis 行对象 → text 投影
+            onExit: (code, error) => this.window.markStale(code, error),
         });
         this.window.attachTransport({ kind: "remote", manager: this.manager, sessionId });
     }
@@ -375,7 +444,6 @@ export class StreamWindowRegistry {
      *  新帧从冻结 seq 之后继续——文档「重开续编」承诺的兑现；旧消费者游标直接有效 */
     private readonly lastSeqByName = new Map<string, number>();
     /** 续编锚 namespace（实例 id——跨注册表隔离） */
-    private readonly anchorNs = `reg-${Math.random().toString(36).slice(2, 10)}`;
     private readonly sweeper: ReturnType<typeof setInterval>;
     /** 已 dispose（Astra 四十期 #2）：在途 open 的迟注册收割依据 + 后续 open 早拒 */
     private _disposed = false;
@@ -394,10 +462,12 @@ export class StreamWindowRegistry {
     }
 
     /** 开窗（local 经 spawn shell -c；remote 经 StreamSessionManager 行桥） */
-    async open(opts: {
-        name: string;
+    async open(opts: ObservationWindowOptions & {
         layerAlias?: string;
-        command: string;
+        cwd?: string;
+        shell?: string;
+        stdinScript?: string;
+        transportCommand?: string;
         maxFrames?: number;
         maxLineBytes?: number;
         manager?: StreamSessionManager;
@@ -414,21 +484,22 @@ export class StreamWindowRegistry {
             const source = opts.name.split(":").slice(-1)[0] ?? opts.name;
             const win = new StreamWindow(
                 opts.name, layerAlias, source, opts.command, opts.maxFrames, opts.maxLineBytes,
-                __seqAnchors.get(__anchorKey(this.anchorNs, opts.name)) ?? this.lastSeqByName.get(opts.name) ?? 0, this.anchorNs, // 续编 close 锚优先+ns 隔离（Sol 55 P2-H）
+                this.lastSeqByName.get(opts.name) ?? 0, undefined,
+                (sequence) => { if (!this.disposed && opts.retainSequence !== false) this.lastSeqByName.set(opts.name, sequence); },
             );
             winRef = win;
 
-            if (layerAlias === "local") {
-                // shell -c（与 exec 同源——弃 shell:true：Windows 下 cmd 解释器会挂 unix 命令）。
-                // spawn error 必须监听（Astra 二十五期 #1）：shell 不存在时 spawn 先返回 child、
-                // 随后异步抛 spawn ENOENT——无 error 监听器 = uncaughtException 崩**宿主**，
-                // 外层 try/catch 捕不住。修：error 桥到 open() 的 reject + 不注册窗口
-                const child = this.spawnImpl
-                    ? this.spawnImpl(this.shell, ["-c", opts.command], { stdio: ["ignore", "pipe", "pipe"] })
-                    : spawn(this.shell, ["-c", opts.command], { stdio: ["ignore", "pipe", "pipe"] });
-                const spawnFailed = new Promise<Error>((resolve) => {
-                    child.once("error", (err: Error) => resolve(err));
+            if (layerAlias === "local" && !opts.manager) {
+                const shell = opts.shell ?? this.shell;
+                const supervised = this.spawnImpl ? undefined : startLocalObservation(shell, opts.command, opts.cwd);
+                const child = supervised ? supervised.child : this.spawnImpl!(shell, ["-c", opts.command], {
+                    cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32",
                 });
+                const push = (stream: "stdout" | "stderr", line: string) => {
+                    if (!opts.stream || opts.stream === "both" || opts.stream === stream) win.push(line, stream);
+                };
+                const spawnFailed = supervised ? undefined
+                    : new Promise<Error>((resolve) => child.once("error", resolve));
                 // 双流各配 Splitter（Astra 二十六期 #2）：共用一个会把 stdout 的半行与
                 // stderr 的下一行**拼成一行**（OUT_PART + ERR_LINE\n → "OUT_PARTERR_LINE"）。
                 // 分离缓冲后按完整行到达序聚合（窗口帧序=到达序，契约同 FEAT-05）
@@ -441,51 +512,78 @@ export class StreamWindowRegistry {
                 let finalized = false; // 声明前置（data 守卫引用）
                 const outDecoder = new StringDecoder("utf-8");
                 const errDecoder = new StringDecoder("utf-8");
+                let stdoutBytes = 0;
+                let stderrBytes = 0;
                 child.stdout?.on("data", (d: Buffer) => {
-                    if (finalized) return; // 收尾后迟到 data 丢弃（Sol 54 P2-14）：曾继续推帧把 stale 复活成活跃
-                    outSplitter.push(outDecoder.write(d), (l) => win.push(l));
+                    stdoutBytes += d.length;
+                    if (finalized) { checkDrained(); return; }
+                    outSplitter.push(outDecoder.write(d), (l) => push("stdout", l));
+                    checkDrained();
                 });
                 child.stderr?.on("data", (d: Buffer) => {
-                    if (finalized) return;
-                    errSplitter.push(errDecoder.write(d), (l) => win.push(l));
+                    stderrBytes += d.length;
+                    if (finalized) { checkDrained(); return; }
+                    errSplitter.push(errDecoder.write(d), (l) => push("stderr", l));
+                    checkDrained();
                 });
-                // 收尾统一到 close（Astra 三十九期 #2）：exit≠stdio 排空终点——
-                // `RE → exit → ADY\n → close` 合法顺序（pipe 缓冲未读尽时 data 迟到
-                // 于 exit 常见）下，exit 上冲刷把半行 RE 提前成帧、迟到的 ADY 又复
-                // 活 stale。close=stdio 全关的真终点，残余字节/半行在此一次冲刷；
-                // exit 只挂 2s 兜底（close 永不到的异常流序），两路幂等先到者收尾
-                const finalize = () => {
+                const finalize = (code: number | null) => {
                     if (finalized) return;
                     finalized = true;
-                    outSplitter.push(outDecoder.end(), (l) => win.push(l));
-                    errSplitter.push(errDecoder.end(), (l) => win.push(l));
-                    outSplitter.flush((l) => win.push(l));
-                    errSplitter.flush((l) => win.push(l));
-                    win.markStale();
+                    clearTimeout(closeGuard);
+                    outSplitter.push(outDecoder.end(), (l) => push("stdout", l));
+                    errSplitter.push(errDecoder.end(), (l) => push("stderr", l));
+                    outSplitter.flush((l) => push("stdout", l));
+                    errSplitter.flush((l) => push("stderr", l));
+                    win.markStale(code);
                 };
                 let closeGuard: ReturnType<typeof setTimeout> | undefined;
-                child.on("exit", () => {
-                    closeGuard = setTimeout(finalize, 2_000);
-                    closeGuard.unref?.();
-                });
-                child.on("close", () => {
-                    clearTimeout(closeGuard);
-                    finalize();
-                });
-                win.attachTransport({ kind: "local", child });
-                // 启动竞态窗：error 异步于 spawn 返回——让出一拍微任务再注册窗口，
-                // 启动失败（shell 缺席/ENOENT）时 open() 直接 reject，零窗口残留
-                const early = await Promise.race([spawnFailed, new Promise<null>((r) => setTimeout(r, 0))]);
-                if (early) throw new Error(`本地观察窗启动失败（shell='${this.shell}' 不可执行: ${early.message}）`);
+                let commandCode: number | null | undefined;
+                let expectedBytes: { stdoutBytes: number; stderrBytes: number } | undefined;
+                // IPC can arrive before pipe data. Wait until all reported bytes are consumed.
+                const checkDrained = () => {
+                    if (commandCode !== undefined && expectedBytes && stdoutBytes >= expectedBytes.stdoutBytes
+                        && stderrBytes >= expectedBytes.stderrBytes) {
+                        expectedBytes = undefined;
+                        finalize(commandCode);
+                        supervised?.retireWhenIdle();
+                    }
+                };
+                const observeExit = (code: number | null) => {
+                    commandCode = code;
+                    if (!supervised) {
+                        closeGuard = setTimeout(() => finalize(code), 2_000);
+                        closeGuard.unref?.();
+                    }
+                    checkDrained();
+                };
+                if (supervised) {
+                    supervised.onExit(observeExit);
+                    supervised.onDrained((bytes) => { expectedBytes = bytes; checkDrained(); });
+                } else {
+                    child.on("exit", observeExit);
+                }
+                child.on("close", (code) => finalize(supervised ? commandCode ?? null : code ?? commandCode ?? null));
+                win.attachTransport(supervised
+                    ? { kind: "local", child, requestStop: supervised.requestStop, waitForStop: supervised.waitForStop }
+                    : { kind: "local", child });
+                try {
+                    if (supervised) await supervised.started;
+                    else {
+                        const early = await Promise.race([spawnFailed!, new Promise<null>((r) => setTimeout(r, 0))]);
+                        if (early) throw early;
+                    }
+                } catch (cause) {
+                    const message = cause instanceof Error ? cause.message : String(cause);
+                    throw new Error(`本地观察窗启动失败（shell='${shell}' 不可执行: ${message}）`, { cause });
+                }
             } else {
                 if (!opts.manager) throw new Error(`remote 窗需要 StreamSessionManager（layer='${layerAlias}'）`);
-                await new RemoteBridge(win, opts.manager).start(opts.command);
+                await new RemoteBridge(win, opts.manager).start(opts.transportCommand ?? opts.command, opts.stream, opts.stdinScript);
             }
             // 启动途中 dispose（Astra 四十期 #2）：sweeper 已停，此刻注册的窗永远
             // 无人回收（在途流进程成漏网孤儿）——收割在途资源并拒绝迟注册
             if (this.disposed) {
-                win.close(); // 幂等收割（remote 引擎会话/local spawn 进程）
-                throw new Error(`观察窗 '${opts.name}' 启动途中 Registry 已 dispose——流进程已收割，窗口未注册`);
+                throw new Error(`观察窗 '${opts.name}' 启动途中 Registry 已 dispose`);
             }
             this.windows.set(opts.name, win);
             this.log.info(`[StreamWindow] open '${opts.name}' (layer=${layerAlias})`);
@@ -493,19 +591,30 @@ export class StreamWindowRegistry {
         } catch (e) {
             // 启动中途失败：收割已 attach 的传输（幂等——remote bridge 失败时无
             // transport 零动作；local attach 先于启动竞态检查，失败时 kill 无害）
-            winRef?.close();
+            if (winRef) {
+                try { await winRef.closeConfirmed(); }
+                catch (cleanupError) {
+                    this.windows.set(opts.name, winRef);
+                    this.log.warn(String(cleanupError));
+                }
+            }
             throw e;
         } finally {
             this.pendingNames.delete(opts.name);
+            this.stopSweeperIfDisposed();
         }
     }
 
     stop(name: string): void {
         const win = this.require(name);
-        this.lastSeqByName.set(name, win.allocatedSeq); // 续编锚
-        __seqAnchors.delete(__anchorKey(this.anchorNs, name)); // ns 键清理（Sol 55 P2-H）（allocatedSeq——空窗〔重开后未收帧〕的 newestSeq=0 不再归零覆盖，五十一期 #1）
         win.close();
-        this.windows.delete(name);
+        if (win.closed) this.windows.delete(name);
+    }
+
+    async stopConfirmed(name: string): Promise<void> {
+        const win = this.require(name);
+        await win.closeConfirmed();
+        if (this.windows.get(name) === win) this.windows.delete(name);
     }
 
     /** 通配聚合 peek：glob 如 "gpu:*"（* 与 ?；无通配=精确名） */
@@ -544,21 +653,33 @@ export class StreamWindowRegistry {
     private sweep(): void {
         const now = Date.now();
         for (const [name, w] of this.windows) {
-            if (now - w.lastActiveAt > this.idleTtlMs) {
+            if (this._disposed || now - w.lastActiveAt > this.idleTtlMs) {
                 this.log.info(`[StreamWindow] '${name}' 空引用超时 → 销毁`);
-                this.stop(name);
+                this.cleanup(name);
             }
         }
+        this.stopSweeperIfDisposed();
     }
 
     get disposed(): boolean { return this._disposed; }
 
     dispose(): void {
-        const wasD = this._disposed;
         this._disposed = true;
-        void wasD; // 先置位：并发在途 open 在注册前检查到此标志即自收割
-        clearInterval(this.sweeper);
-        for (const name of [...this.windows.keys()]) this.stop(name);
+        for (const name of [...this.windows.keys()]) {
+            this.cleanup(name);
+        }
+        this.stopSweeperIfDisposed();
+        this.lastSeqByName.clear();
+    }
+
+    private stopSweeperIfDisposed(): void {
+        if (this._disposed && !this.windows.size && !this.pendingNames.size) clearInterval(this.sweeper);
+    }
+
+    private cleanup(name: string): void {
+        void this.stopConfirmed(name)
+            .catch((error) => this.log.warn(String(error)))
+            .finally(() => this.stopSweeperIfDisposed());
     }
 }
 

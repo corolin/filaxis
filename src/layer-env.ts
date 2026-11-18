@@ -204,6 +204,12 @@ function looksLikeGpuModel(val: string): boolean {
 /** 旁路文件后缀：<path>.<uniq>.fx-old（link 舞步的移开态/中止残留——load 并入恢复） */
 const ASIDE_SUFFIX = ".fx-old";
 
+interface AsideFile {
+    p: string;
+    mtimeMs: number;
+    rejectedRevision?: string;
+}
+
 /** 层条目并入（dst 被 src 覆盖同键——后并入者新） */
 function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
     const layers = (src as LayerEnvConfigFile | null)?.layers;
@@ -287,14 +293,14 @@ export class LayerEnvStore {
     /** 列旁路（mtime 升序）。故障透传（Sol 87 P1-1）：readdir/单档 stat 的
      *  EIO 等真故障曾静默吞成空列表——压实把本轮未成功读取的恢复文件照删。
      *  非 ENOENT 故障直接抛（collectDocs 归入 readFailures） */
-    private async listAsides(): Promise<Array<{ p: string; mtimeMs: number }>> {
+    private async listAsides(): Promise<AsideFile[]> {
         const { readdir } = await import("node:fs/promises");
         const dir = dirname(this.path);
         const ci = process.platform === "win32" || process.platform === "darwin";
         const pre = `${basename(this.path)}.`;
         const preCmp = ci ? pre.toLowerCase() : pre;
-        const uniqTail = new RegExp(`^\\d+-\\d+-[a-z0-9]{1,12}\\${ASIDE_SUFFIX}$`);
-        const out: Array<{ p: string; mtimeMs: number }> = [];
+        const uniqTail = /^\d+-\d+-[a-z0-9]{1,12}(?:\.(\d+-\d+-[a-z0-9]{1,12}))?\.fx-old$/;
+        const out: AsideFile[] = [];
         const names = await readdir(dir).catch((e: unknown) => {
             const code = (e as { code?: string }).code;
             if (code === "ENOENT" || code === "ENOTDIR") return []; // 目录缺席=无旁路
@@ -303,9 +309,10 @@ export class LayerEnvStore {
         for (const n of names) {
             const nCmp = ci ? n.toLowerCase() : n;
             if (!nCmp.startsWith(preCmp)) continue;
-            if (!uniqTail.test(nCmp.slice(preCmp.length))) continue;
+            const artifact = uniqTail.exec(nCmp.slice(preCmp.length));
+            if (!artifact) continue;
             const p = join(dir, n); // 盘面实名（大小写不敏感平台按实名开档最稳）
-            try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs }); } catch (e) {
+            try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs, rejectedRevision: artifact[1] }); } catch (e) {
                 const code = (e as { code?: string }).code;
                 if (code !== "ENOENT") throw new Error(`listAsides stat 故障（${code ?? (e as Error).message}）: ${p}`);
                 /* ENOENT=竞态消失（他方舞步收尾）——跳过 */
@@ -321,10 +328,8 @@ export class LayerEnvStore {
         // →A 的 load 仍旧值）——env 档案小、读取廉，正确性优先于省一次读
         const { docs, asides, hasData, readFailures } = await this.collectDocs();
         if (readFailures.length > 0) {
-            // 读故障在场（Sol 84 P1-2）：跳过压实与旁路清理——EIO 挡住的旁路
-            // 曾被照常压实删除（唯一恢复数据永久丢失）。返回已读到的部分，
-            // 故障旁路留盘待解除后重试
-            return LayerEnvStore.snapshot(LayerEnvStore.mergeDocs(docs));
+            // 不返回可被 save 当作全量快照的部分配置，也保留恢复旁路。
+            throw new Error(`LayerEnvStore 无法读取完整配置：${readFailures[0]}`);
         }
         if (!hasData && docs.length === 0) return { layers: {} };
         const cfg = LayerEnvStore.mergeDocs(docs);
@@ -565,7 +570,7 @@ export class LayerEnvStore {
      *  之间被移开→重列旁路捞回。两个舞步窗口都不再读成空档 */
     private async collectDocs(): Promise<{
         docs: FxDoc[];
-        asides: Array<{ p: string; mtimeMs: number }>;
+        asides: AsideFile[];
         dataMtimeMs: number;
         hasData: boolean;
         /** 读失败（EIO 等非缺席类）——在场时 load 跳过压实（Sol 84 P1-2：
@@ -576,9 +581,12 @@ export class LayerEnvStore {
         let hasData = false;
         const readFailures: string[] = [];
         const docs: FxDoc[] = [];
-        const readDoc = async (p: string, mtimeMs: number, aside: boolean): Promise<void> => {
+        const readDoc = async (p: string, mtimeMs: number, aside: boolean, rejectedRevision?: string): Promise<void> => {
             try {
-                docs.push(makeDoc(mtimeMs, aside, await readFile(p, "utf-8")));
+                const doc = makeDoc(mtimeMs, aside, await readFile(p, "utf-8"));
+                // A rollback artifact can hold a rejected local revision or a newer
+                // foreign commit. Its name identifies the only revision to suppress.
+                if (doc.rev !== rejectedRevision) docs.push(doc);
             } catch (e) {
                 const code = (e as { code?: string }).code;
                 if (code !== "ENOENT") readFailures.push(`${p}: ${code ?? (e as Error).message}`); // EIO 等真故障（ENOENT=舞步竞态归缺席）
@@ -592,12 +600,12 @@ export class LayerEnvStore {
             const code = (e as { code?: string }).code;
             if (code !== "ENOENT") readFailures.push(`${this.path}(stat): ${code ?? (e as Error).message}`);
         }
-        const asides = await this.listAsides().catch((e: unknown): Array<{ p: string; mtimeMs: number }> => {
+        const asides = await this.listAsides().catch((e: unknown): AsideFile[] => {
             readFailures.push((e as Error).message); // readdir/stat 真故障（Sol 87 P1-1）——旁路清单不可信
             return [];
         }); // stat 先于列旁路（Sol 62 P2-3）——次序是读穿舞步窗口的依据，勿动
         for (const a of asides) {
-            await readDoc(a.p, a.mtimeMs, true);
+            await readDoc(a.p, a.mtimeMs, true, a.rejectedRevision);
         }
         if (hasData) {
             try {
@@ -615,7 +623,8 @@ export class LayerEnvStore {
                     const known = new Set(asides.map((x) => x.p));
                     for (const a of await this.listAsides()) {
                         if (known.has(a.p)) continue;
-                        await readDoc(a.p, a.mtimeMs, true);
+                        asides.push(a);
+                        await readDoc(a.p, a.mtimeMs, true, a.rejectedRevision);
                     }
                     await readDoc(this.path, (await stat(this.path).catch(() => ({ mtimeMs: dataMtimeMs }))).mtimeMs, false);
                 }
@@ -735,6 +744,9 @@ export class LayerEnvStore {
             seenRevs = baseline.revs;
         } else {
             const opening = await this.collectDocs();
+            if (opening.readFailures.length > 0) {
+                throw new Error(`LayerEnvStore 读故障在场——save 拒绝覆盖配置：${opening.readFailures[0]}`);
+            }
             consumableAsides = opening.asides.map((a) => a.p);
             seenRevs = opening.docs.map((d) => d.rev).filter((r): r is string => r != null);
         }
@@ -788,11 +800,14 @@ export class LayerEnvStore {
         if (verifyHeld && !(await verifyHeld())) {
             try {
                 const uniq2 = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                const scratchAside = `${this.path}.${uniq2}${ASIDE_SUFFIX}`;
+                const scratchAside = `${this.path}.${uniq2}.${rev}${ASIDE_SUFFIX}`;
                 let hadMain = true;
-                try { await rename(this.path, scratchAside); } catch { hadMain = false; }
+                try { await rename(this.path, scratchAside); } catch (e) {
+                    if ((e as { code?: string }).code !== "ENOENT") throw e;
+                    hadMain = false;
+                }
                 if (hadMain) {
-                    const cur = await readFile(scratchAside, "utf-8").catch(() => null);
+                    const cur = await readFile(scratchAside, "utf-8");
                     if (cur === payloadText) {
                         // 仍是本舞步产物——hadPriorMain 时先归位旧档（absent-only）
                         if (hadPriorMain) {

@@ -57,6 +57,7 @@ export async function discoverLayer(
             const r2 = await driver.exec(buildProbeStage2(), {
                 timeoutMs: opts.stage2TimeoutMs ?? 120_000,
             });
+            if (r2.exitCode !== 0) throw new Error(`exit=${r2.exitCode}`);
             const spec2 = parseProbeOutput(r2.stdout);
             spec.packages = spec2.packages; // stage2 增量合并（包）
         } catch (err) {

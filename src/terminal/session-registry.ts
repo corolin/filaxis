@@ -3,6 +3,7 @@
  * （净室平移；logger 换注入）
  */
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { TmuxInvoker } from "./tmux-invoker.js";
 import { noopLogger, type FilaxisLogger } from "../logger.js";
 
@@ -38,7 +39,14 @@ export class SessionRegistry {
     }
 
     async save(profile: TerminalProfile): Promise<void> {
-        await fs.writeFile(`${this.dirResolver()}/${profile.id}.json`, JSON.stringify(profile, null, 2));
+        const path = `${this.dirResolver()}/${profile.id}.json`;
+        const temporary = `${path}.${randomUUID()}.tmp`;
+        try {
+            await fs.writeFile(temporary, JSON.stringify(profile, null, 2), { flag: "wx", mode: 0o600 });
+            await fs.rename(temporary, path);
+        } finally {
+            await fs.unlink(temporary).catch(() => undefined);
+        }
     }
 
     /** 缺失返回 null（不抛） */
@@ -74,8 +82,8 @@ export class SessionRegistry {
             const id = file.slice(0, -5);
             const profile = await this.load(id);
             if (!profile || profile.id !== id) {
-                await this.remove(id);
-                removed++;
+                kept++;
+                this.log.warn(`[reconcile] 无法读取会话档案 [${id}]，保留档案`);
                 return;
             }
             try {

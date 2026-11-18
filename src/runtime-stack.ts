@@ -13,6 +13,7 @@ import * as os from "node:os";
 import type { RuntimeDriver, RuntimeDescriptor } from "./driver.js";
 import { RuntimeFactory } from "./factory.js";
 import { EventBus } from "./events.js";
+import { settleRejection } from "./async-guard.js";
 import {
     enterStepsOf, layerDisplayName, layerPathIdentities, resolveSshIdentity, ENTER_ALIAS_KEYS,
     hopHost, type SshHop, type SshConnParams,
@@ -109,7 +110,7 @@ export class RuntimeStack {
             sm.__fxSubs = sm.__fxSubs ?? new Set();
             sm.__fxOrig ??= sm.onEvent.bind(sm);
             sm.onEvent = (e: SessionEvent) => {
-                try { sm.__fxOrig?.(e); } catch { /* 原消费方异常不外溢（AC-10 同哲学） */ }
+                try { settleRejection(sm.__fxOrig?.(e)); } catch { /* 原消费方异常不外溢（AC-10 同哲学） */ }
                 for (const sub of sm.__fxSubs ?? []) {
                     try { sub(e); } catch { /* 订阅方异常不外溢 */ }
                 }
@@ -293,12 +294,12 @@ export class RuntimeStack {
      *  ns：命名空间（默认共享缓存传 ""；自定义工厂的 stack 内部逐出走自身 ns） */
     /** 实例逐出（Sol 73 #3 → Sol 74 #6 多键全清）：本 driver 挂载的**全部**键
      *  逐个实例核对清（缓存里就是它才清——同键别代不误伤） */
-    static evictDriverHome(drv: RuntimeDriver): RuntimeDriver | undefined {
+    static evictDriverHome(drv: RuntimeDriver, keepSessionEvents = false): RuntimeDriver | undefined {
         const keys = RuntimeStack.driverHomeKeys.get(drv);
         if (keys == null || keys.size === 0) return undefined;
         let evicted: RuntimeDriver | undefined;
         for (const key of [...keys]) {
-            const r = RuntimeStack.evictByKey(key);
+            const r = RuntimeStack.evictByKey(key, keepSessionEvents);
             if (r) evicted = r;
         }
         return evicted;
@@ -309,7 +310,7 @@ export class RuntimeStack {
         return RuntimeStack.evictByKey(key);
     }
 
-    private static evictByKey(key: string): RuntimeDriver | undefined {
+    private static evictByKey(key: string, keepSessionEvents = false): RuntimeDriver | undefined {
         const drv = RuntimeStack.driverCache.get(key);
         RuntimeStack.driverCache.delete(key);
         // 集合化（Sol 74 #6）：摘本键，同 driver 他键保留；集合空=该 driver 已无
@@ -339,14 +340,16 @@ export class RuntimeStack {
         // 事件订阅登记清空（二十八期 #2 生命周期）——仅**全逐出**才拆桥
         //（Sol 75 P2-8：同 driver 多键别名时，逐出一个别名曾把整个事件桥拆掉，
         // 其余别名的 exit 事件从此丢失）
-        if (drv && fullyEvicted) {
-            const sm = (drv as { sessions?: { __fxSubs?: Set<unknown>; onEvent?: (e: never) => void; __fxOrig?: (e: never) => void } }).sessions;
-            if (sm?.__fxSubs) {
-                sm.__fxSubs.clear();
-                if (sm.__fxOrig) sm.onEvent = sm.__fxOrig;
-            }
-        }
+        if (drv && fullyEvicted && !keepSessionEvents) RuntimeStack.unbridgeSessionEvents(drv);
         return drv;
+    }
+
+    private static unbridgeSessionEvents(drv: RuntimeDriver): void {
+        const sm = (drv as { sessions?: { __fxSubs?: Set<unknown>; onEvent?: (e: never) => void; __fxOrig?: (e: never) => void } }).sessions;
+        if (sm?.__fxSubs) {
+            sm.__fxSubs.clear();
+            if (sm.__fxOrig) sm.onEvent = sm.__fxOrig;
+        }
     }
 
     /** 开放注册（透传 factory；AC-09 第三方 Transport 同权）。注册即退出共享缓存
@@ -378,7 +381,8 @@ export class RuntimeStack {
     private static readonly driverRefs = new Map<RuntimeDriver, number>();
     /** 已调度延迟销毁的 driver（Sol 71 #2 去重）：定时器触发前的重复移除不再
      *  二次调度 destroy */
-    private static readonly destroyScheduled = new WeakSet<RuntimeDriver>();
+    private static readonly destroyScheduled = new WeakMap<RuntimeDriver, Promise<void>>();
+    private static readonly destroyingDrivers = new WeakSet<RuntimeDriver>();
     /** driver 实际挂载的缓存键集合（Sol 73 #3 → Sol 74 #6 集合化）：建链时
      *  descriptor 可能被 init 补写（tmux terminalId）——按描述符算键与实际键
      *  不一致；自定义工厂还可让**同一 driver 挂多键**（曾只记一个键——销毁后
@@ -553,7 +557,7 @@ export class RuntimeStack {
         // 延迟复核销毁（Sol 69 #1 ↔ Sol 70 #1 两难的正解）：connect 归还与层登记
         // 之间隔调用方代码——同步判 0 会追杀在途登记（Sol 69）；而 connect 归还
         // 即计数（claim）无释放出口，裸 connect 永久占用、最后一层无法释放
-        //（Sol 70）。登记计数 + 宏任务级复核：removeLayer 即返，destroy 前重查
+        //（Sol 70）。登记计数 + 宏任务级复核：先除名，destroy 前重查
         // 在册数——微任务链上的在途登记必然先落地（复核见 0 才真销毁+逐出缓存）
         const refs = Math.max(0, (RuntimeStack.driverRefs.get(h.driver) ?? 0) - 1);
         if (refs === 0) RuntimeStack.driverRefs.delete(h.driver);
@@ -562,21 +566,22 @@ export class RuntimeStack {
             // 缓存同步逐出（Sol 71 #2 → Sol 73 #3 homeKey）：按本 driver 实际
             // 挂载键实例核对清——按描述符算键曾因 init 补写 terminalId 键不匹配
             // （旧缓存残留、重连拿回已销毁实例）；定时器只复核+销毁本代（不逐出）
-            RuntimeStack.evictDriverHome(h.driver);
-            // 销毁去重（Sol 71 #2）：定时器触发前同 driver 重新登记又移除曾触发
-            // 两次 destroy()
-            if (RuntimeStack.destroyScheduled.has(h.driver)) return;
-            RuntimeStack.destroyScheduled.add(h.driver);
-            setTimeout(() => {
-                void (async () => {
-                    if ((RuntimeStack.driverRefs.get(h.driver) ?? 0) > 0) {
-                        RuntimeStack.destroyScheduled.delete(h.driver); // 在途登记已落地——不追杀（标记释放供后续移除再调度）
-                        return;
+            RuntimeStack.evictDriverHome(h.driver, true);
+            let disposal = RuntimeStack.destroyScheduled.get(h.driver);
+            if (!disposal) {
+                disposal = new Promise<void>((resolve) => setTimeout(resolve, 0)).then(async () => {
+                    if ((RuntimeStack.driverRefs.get(h.driver) ?? 0) > 0) return;
+                    RuntimeStack.destroyingDrivers.add(h.driver);
+                    try {
+                        await h.driver.destroy();
+                    } finally {
+                        RuntimeStack.unbridgeSessionEvents(h.driver);
+                        RuntimeStack.destroyingDrivers.delete(h.driver);
                     }
-                    RuntimeStack.destroyScheduled.delete(h.driver);
-                    await h.driver.destroy().catch(() => undefined);
-                })();
-            }, 0);
+                }).finally(() => RuntimeStack.destroyScheduled.delete(h.driver));
+                RuntimeStack.destroyScheduled.set(h.driver, disposal);
+            }
+            await disposal;
         }
     }
 
@@ -643,6 +648,10 @@ export class RuntimeStack {
     /** 层注册计数（Sol 68 #2：跨 stack 共享 driver 的销毁门——所有建层路径
      *  统一口径=在册层数；connect 不计数（Sol 70 #1：claim 无释放出口）） */
     private trackDriver(handle: LayerHandle): void {
+        if (RuntimeStack.destroyingDrivers.has(handle.driver)) {
+            throw new Error(`层 '${handle.name}' 的连接正在销毁，请重新建链`);
+        }
+        this.bridgeSessionEvents(handle.driver);
         RuntimeStack.driverRefs.set(handle.driver, (RuntimeStack.driverRefs.get(handle.driver) ?? 0) + 1);
     }
 
@@ -676,25 +685,46 @@ export class RuntimeStack {
         if (enterStepsOf((descriptor.config ?? {}) as Record<string, unknown>).length > 0) return undefined;
         const dest = layerPathIdentities(descriptor).at(-1);
         if (!dest) return undefined;
-        return this.findIdentityHopHit(dest);
+        return this.findIdentityHopHit(dest, (candidate) => {
+            const contextKey = (d: RuntimeDescriptor) => RuntimeStack.driverKey({
+                ...d,
+                target: undefined,
+                config: {
+                    ...d.config,
+                    sshHops: undefined,
+                    connParams: RuntimeStack.sshHopContext(layerPathIdentities(d)[0]),
+                },
+            });
+            return contextKey(descriptor) === contextKey(candidate);
+        });
+    }
+
+    private static sshHopContext(hop?: SshHop): unknown {
+        const conn = typeof hop === "object" ? hop.conn : undefined;
+        const { user, port, ...context } = conn ?? {};
+        return RuntimeStack.stableStringify(context);
     }
 
     /** terminal=true：identity 命中在该层路径**末节点**（同落点构造性成立，免 hostname 探测）；
      *  false：命中途经节点（identity 撞了中间跳——hostname 落点校验把关） */
-    private async findIdentityHopHit(dest: SshHop): Promise<{ handle: LayerHandle; terminal: boolean } | undefined> {
+    private async findIdentityHopHit(dest: SshHop, compatible?: (candidate: RuntimeDescriptor) => boolean): Promise<{ handle: LayerHandle; terminal: boolean } | undefined> {
         const destId = await resolveSshIdentity(dest);
         if (!destId || destId.startsWith("unresolved:")) {
             // 解析不可达（DNS/离线）——identity 不可靠，跳过判重（建层失败由 connect 兜底）
             return undefined;
         }
+        const context = JSON.stringify(RuntimeStack.sshHopContext(dest));
         for (const h of this.namedLayers.values()) {
             if (h.descriptor.driver !== "ssh") continue; // 候选也须 ssh（Astra 二十七期 #1：
             // 发起者限 ssh 了但候选没限——ssh localhost 可命中自定义 driver 的同 target
             // 层，拿到别人的 driver 实例冒 reused。identity 语义只在 ssh 层间成立）
             if (enterStepsOf((h.descriptor.config ?? {}) as Record<string, unknown>).length > 0) continue; // 候选也须纯落点层
+            if (compatible && !compatible(h.descriptor)) continue;
             const path = layerPathIdentities(h.descriptor);
             for (let i = 0; i < path.length; i++) {
-                if ((await resolveSshIdentity(path[i]!)) === destId) {
+                const candidate = path[i]!;
+                if (JSON.stringify(RuntimeStack.sshHopContext(candidate)) !== context) continue;
+                if ((await resolveSshIdentity(candidate)) === destId) {
                     return { handle: h, terminal: i === path.length - 1 };
                 }
             }
@@ -704,11 +734,13 @@ export class RuntimeStack {
 
     /** 落点校验（宁重连不错主机）：命中层实测 hostname vs 期望 host——不符=identity 撞途经节点 */
     private async verifyLanding(hit: LayerHandle, expectedHost: string): Promise<boolean> {
-        if (!expectedHost) return true;
-        const d = hit.driver as unknown as { exec?: (cmd: string) => Promise<{ stdout: string }> };
-        if (typeof d.exec !== "function") return true;
+        if (!expectedHost) return false;
         try {
-            hit.actualHostname ??= ((await d.exec("hostname")).stdout || "").trim().split("\n").pop() || "";
+            if (!hit.actualHostname) {
+                const result = await hit.driver.exec("hostname");
+                if (result.exitCode !== 0) return false;
+                hit.actualHostname = result.stdout.trim().split("\n").pop() || "";
+            }
         } catch {
             return false; // 探测失败=不可核实——拒绝复用
         }

@@ -16,6 +16,19 @@ import type { LayerHandle } from "../src/runtime-stack.js";
 
 type Ev = { type: "a" | "b"; v: number };
 
+test("EventBus iterator return closes an already pending next", async () => {
+    const bus = new EventBus<Ev>();
+    const stream = bus.iterable();
+    const it = stream[Symbol.asyncIterator]();
+    const next = it.next();
+    try {
+        expect((await it.return!()).done).toBe(true);
+        expect((await next).done).toBe(true);
+        bus.emit({ type: "a", v: 1 });
+        expect((await it.next()).done).toBe(true);
+    } finally { stream.cancel(); }
+});
+
 describe("EventBus（AC-10）", () => {
     test("on 订阅 + 退订；* 通配收到全部", () => {
         const bus = new EventBus<Ev>();
@@ -612,7 +625,7 @@ describe("二十八期", () => {
     // #2 共享连接的双 stack 各自收到会话事件（修前第二个 stack 0 次）
     test("缓存命中的第二个 stack 事件照收（多订阅者登记）", async () => {
         // 独立指纹防测试间缓存污染（target 注入 capabilities 不可行——用 cwd 微差）
-        const shared = { driver: "local", cwd: `${process.cwd()}#m28` } as unknown as RuntimeDescriptor;
+        const shared: RuntimeDescriptor = { driver: "local", config: { testFixture: "m28" } };
         const s1 = new RuntimeStack();
         const s2 = new RuntimeStack();
         const got1: string[] = [];
@@ -635,7 +648,7 @@ describe("二十八期", () => {
 // 1 个事件收 3 遍）。per-stack 稳定订阅闭包（引用固定 → Set 去重）。
 describe("重复 connect 订阅幂等（二十九期）", () => {
     test("A 连 3 次 B 连 1 次 → 一次退出事件 A 收 1 次 B 收 1 次", async () => {
-        const shared = { driver: "local", cwd: `${process.cwd()}#m29` } as unknown as RuntimeDescriptor;
+        const shared: RuntimeDescriptor = { driver: "local", config: { testFixture: "m29" } };
         const a = new RuntimeStack();
         const b = new RuntimeStack();
         const gotA: string[] = [];
@@ -831,7 +844,7 @@ describe("三十七期", () => {
             verifySession: async () => { verifyCalled = true; return { status: "exited", exitCode: 3 }; },
         } as unknown as import("../src/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: drv });
-        const r = await tk.handlers.stop_and_verify({ session_id: "s34" });
+        const r = await tk.handlers.stop_and_verify({ session_id: "s34", layer: "__initial__" });
         expect(verifyCalled).toBe(true); // 修前：stop 抛错后 verify 根本不执行
         expect(r.status).toBe("exited"); // verify 采纳真实退出码
         expect((r as { exit_code?: number }).exit_code).toBe(3);
@@ -996,8 +1009,9 @@ describe("Sol 69：connect 归还点 claim", () => {
         };
         const adding = stack.addLayer("b", { driver: "mockssh", target: "race69" }); // 缓存命中后挂起
         await new Promise((r) => setTimeout(r, 30));
-        await stack.removeLayer("a", { destroy: true }); // 修前：引用数只见 a=1→0 销毁
+        const removal = stack.removeLayer("a", { destroy: true });
         release();
+        await removal;
         const r2 = await adding;
         const out = await r2.handle.driver.exec("echo hi"); // 修前：driver 已销毁
         expect(out.exitCode).toBe(0);
@@ -1057,10 +1071,10 @@ describe("Sol 71：销毁窗口三缝", () => {
         const stack = mkStack();
         await stack.addLayer("a", { driver: "mockssh", target: "dedup71" });
         const drv = stack.layer("a").driver as unknown as CountingDriver;
-        await stack.removeLayer("a", { destroy: true }); // 调度 T1（未触发）
-        await stack.addLayer("re", drv as unknown as RuntimeDriver); // driver 直传：同实例重新登记
-        await stack.removeLayer("re", { destroy: true }); // 再移除（refs 0 → 重新调度）
-        await new Promise((r) => setTimeout(r, 30));
+        const first = stack.removeLayer("a", { destroy: true });
+        await stack.addLayer("re", drv as unknown as RuntimeDriver);
+        const second = stack.removeLayer("re", { destroy: true });
+        await Promise.all([first, second]);
         expect(drv.destroyCount).toBe(1); // 修前：两次
         RuntimeStack.evictDriver({ driver: "mockssh", target: "dedup71" } as RuntimeDescriptor);
     }, 15_000);
@@ -1297,4 +1311,74 @@ describe("Sol 77：索引销毁中跳过/嵌套不互覆", () => {
         await (a as unknown as MockLayerDriver).destroy();
         await (b as unknown as MockLayerDriver).destroy();
     }, 15_000);
+});
+
+test("sshInto only reuses a landing with matching connection settings", async () => {
+    const stack = new RuntimeStack();
+    let pushed = 0;
+    const landing = {
+        descriptor: { driver: "ssh", target: "localhost" },
+        init: async () => undefined,
+        exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    } as unknown as RuntimeDriver;
+    const child = {
+        descriptor: { driver: "ssh", target: "localhost", config: { sshHops: [
+            { host: "localhost", conn: { hostKeyPolicy: "strict", knownHostsFile: "fixture" } },
+        ] } },
+        init: async () => undefined,
+    } as unknown as RuntimeDriver;
+    const source = Object.assign({}, landing, {
+        descriptor: { driver: "ssh", target: "127.0.0.1" },
+        pushChild: async () => { pushed++; return child; },
+    });
+    await stack.addLayer("landing", landing);
+    await stack.addLayer("source", source);
+    // Resolve aliases using the same ssh -G path as production.
+    const same = await stack.sshInto("source", "same", "localhost");
+    expect(same.handle.driver).toBe(landing);
+    const strict = await stack.sshInto("source", "strict", "localhost", {
+        hostKeyPolicy: "strict", knownHostsFile: "fixture",
+    });
+    expect(strict.reused).toBe(false);
+    expect(strict.handle.driver).toBe(child);
+    expect(pushed).toBe(1);
+});
+
+test("removeLayer awaits disposal and propagates unresolved session evidence", async () => {
+    const stack = new RuntimeStack();
+    const disposal = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const driver = new MockLayerDriver({ driver: "mockssh" });
+    driver.destroy = () => { entered.resolve(); return disposal.promise; };
+    await stack.addLayer("owned", driver as unknown as RuntimeDriver);
+    const removal = stack.removeLayer("owned", { destroy: true });
+    const expected = Object.assign(new Error("cleanup unknown"), {
+        outcome: "unknown",
+        sessions: [{ sessionId: "fixture", logBase: "/tmp/fixture" }],
+    });
+    const result = removal.catch((error: unknown) => error);
+    await entered.promise;
+    expect(stack.layers.has("owned")).toBe(false);
+    await expect(stack.addLayer("new", driver as unknown as RuntimeDriver)).rejects.toThrow(/正在销毁/);
+    disposal.reject(expected);
+    expect(await result).toBe(expected);
+});
+
+test("driver exit events remain forwarded through named-layer disposal", async () => {
+    const stack = new RuntimeStack();
+    const seen: string[] = [];
+    stack.events.on("exit", (event) => { if (event.type === "exit") seen.push(event.sessionId); });
+    const sessions = { onEvent: async (_event: import("../src/session-types.js").SessionEvent) => {
+        throw new Error("driver callback rejected");
+    } };
+    const driver = Object.assign(new MockLayerDriver({ driver: "fixture" }), {
+        sessions,
+        destroy: async () => { sessions.onEvent({ type: "exit", sessionId: "during-destroy", exitCode: 0, lastLines: [] }); },
+    });
+    await stack.addLayer("fixture", driver as unknown as RuntimeDriver);
+    sessions.onEvent({ type: "exit", sessionId: "direct", exitCode: 0, lastLines: [] });
+    await stack.removeLayer("fixture", { destroy: true });
+    await expect(sessions.onEvent({ type: "exit", sessionId: "after-destroy", exitCode: 0, lastLines: [] }))
+        .rejects.toThrow("driver callback rejected");
+    expect(seen).toEqual(["direct", "during-destroy"]);
 });

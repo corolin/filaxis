@@ -10,16 +10,76 @@ import { SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { StreamSessionManager } from "../src/stream-session-manager.js";
 import { putFile, getFile } from "../src/file-transfer.js";
 import { probeDialect } from "../src/dialect.js";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { shellQuote } from "../src/ssh-helpers.js";
 
 const IT = process.env.FILAXIS_IT === "1";
 const TARGET = process.env.FILAXIS_IT_SSH || "localhost";
+const integration = IT ? test : test.skip;
+const jumpIntegration = IT && (TARGET === "localhost" || process.env.FILAXIS_IT_JUMP) ? test : test.skip;
+const dockerIntegration = IT && (TARGET === "localhost" || process.env.FILAXIS_IT_DOCKER === "1") ? test : test.skip;
+
+integration("SSH rejects a broken PTY cwd and distinguishes an empty directory from a failed listing", async () => {
+    const path = `/tmp/fx-session-cwd-${randomUUID()}`;
+    const bad = new SshPtyDriver({ driver: "ssh", target: TARGET, cwd: path });
+    try { await expect(bad.init()).rejects.toThrow(/无法进入工作目录/); }
+    finally { await bad.destroy(); }
+    const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
+    try {
+        await drv.init();
+        await expect(drv.fs.readdir(path)).rejects.toThrow(/readdir/);
+        await drv.fs.mkdir(path);
+        expect(await drv.fs.readdir(path)).toEqual([]);
+        const name = "one\nentry";
+        expect((await drv.exec(`touch ${shellQuote(`${path}/${name}`)}`)).exitCode).toBe(0);
+        expect((await drv.exec(`cd ${shellQuote(path)} && mkdir .nested || exit 1; i=0; ` +
+            `while [ "$i" -lt 32 ]; do touch "entry-$i" || exit 1; i=$((i+1)); done`)).exitCode).toBe(0);
+        const entries = await drv.fs.readdir(path);
+        expect(entries).toHaveLength(34);
+        expect(entries.find((entry) => entry.name === name)).toMatchObject({ isDirectory: false, size: 0 });
+        expect(entries.find((entry) => entry.name === ".nested")).toMatchObject({ isDirectory: true });
+    } finally {
+        await drv.fs.rm(path, { recursive: true, force: true });
+        await drv.destroy();
+    }
+}, 25_000);
+
+integration("SSH recovery and stop keep a background child in the session after its shell exits", async () => {
+    const first = new SshPtyDriver({ driver: "ssh", target: TARGET });
+    const second = new SshPtyDriver({ driver: "ssh", target: TARGET });
+    let handle: Awaited<ReturnType<typeof first.execSession>> | undefined;
+    try {
+        await first.init();
+        await second.init();
+        handle = await first.execSession("sleep 20 >/dev/null 2>&1 & echo $!; exit 37");
+        let pid = 0;
+        const deadline = Date.now() + 4000;
+        while (!pid && Date.now() < deadline) {
+            pid = Number((await first.tailSession(handle.sessionId))[0]);
+            if (!pid) await Bun.sleep(25);
+        }
+        expect(pid).toBeGreaterThan(0);
+        expect((await second.recoverSession(handle.sessionId)).status).toBe("running");
+        expect(await second.stopSession(handle.sessionId)).toEqual({ status: "exited", exitCode: 37 });
+        const state = await second.exec(`ps -o stat= -p ${pid}`);
+        expect(state.stdout.trim()).toMatch(/^(?:Z.*)?$/);
+    } finally {
+        if (handle) {
+            const { sessionId, logBase } = handle;
+            await first.stopSession(sessionId).catch(() => undefined);
+            const paths = ["pid", "pgid", "st", "code", "claim", "out", "err", "members"].map((ext) => shellQuote(`${logBase}.${ext}`));
+            await first.exec(`rm -f ${paths.join(" ")}`).catch(() => undefined);
+        }
+        await Promise.all([first.destroy(), second.destroy()]);
+    }
+}, 35_000);
 
 describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
-    test("exec 通道：stderr 物理分离 + marker effectiveUser + 退出码", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
+    integration("exec 通道：stderr 物理分离 + marker effectiveUser + 退出码", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
         try {
@@ -33,8 +93,7 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
         }
     }, 60_000);
 
-    test("pty 通道：层内交互语义（exec marker 协议）", async () => {
-        if (!IT) return;
+    integration("pty 通道：层内交互语义（exec marker 协议）", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
         try {
@@ -47,54 +106,203 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
         }
     }, 60_000);
 
-    test("远端会话：nohup .code 终态 + 双文件", async () => {
-        if (!IT) return;
+    integration("远端会话：nohup .code 终态 + 双文件", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
+        let logBase: string | undefined;
         try {
             const h = await drv.execSession("echo s-out; echo s-err 1>&2; exit 9");
+            logBase = h.logBase;
             await new Promise((r) => setTimeout(r, 2500)); // 等 .code 落盘（轮询 1.5s 周期）
             const out = await drv.readSessionLog(h.sessionId, { stream: "stdout" });
             const err = await drv.readSessionLog(h.sessionId, { stream: "stderr" });
             expect(out).toBe("s-out");
             expect(err).toBe("s-err");
+            expect(await drv.verifySession(h.sessionId)).toEqual({ status: "exited", exitCode: 9 });
         } finally {
+            if (logBase) await drv.exec(`rm -f ${["claim", "out", "err", "pid", "pgid", "code", "st"].map((ext) => logBase + "." + ext).join(" ")}`);
             await drv.destroy();
         }
     }, 60_000);
 
-    test("观察流：真流式 + 双流标记 + 衰减回收", async () => {
-        if (!IT) return;
+    integration("SSH 新连接可从落盘证据核实旧会话并补读日志", async () => {
+        const descriptor = { driver: "ssh", target: TARGET };
+        const original = new SshPtyDriver(descriptor);
+        const reconnected = new SshPtyDriver(descriptor);
+        const gate = `/tmp/fx-recover-${randomUUID()}`;
+        let session: Awaited<ReturnType<SshPtyDriver["execSession"]>> | undefined;
+        try {
+            await original.init();
+            session = await original.execSession(
+                `echo RECOVERED; i=0; while [ ! -f ${gate} ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i+1)); done; exit 17`,
+            );
+            expect(session.pid).toBeGreaterThan(0);
+            await original.destroy();
+            await reconnected.init();
+            expect(reconnected.listSessions()).toEqual([]);
+            expect(await reconnected.verifySession(session.sessionId)).toEqual({ status: "running" });
+            expect(await reconnected.readSessionLog(session.sessionId)).toBe("RECOVERED");
+            const stamp = `${session.logBase}.st`;
+            await reconnected.exec(`cp ${stamp} ${stamp}.backup && printf '0\\n' > ${stamp}`);
+            expect(await reconnected.verifySession(session.sessionId)).toEqual({ status: "unknown" });
+            await reconnected.exec(`mv ${stamp}.backup ${stamp}`);
+            await reconnected.exec(`touch ${gate}`);
+            const deadline = Date.now() + 5000;
+            let status = await reconnected.verifySession(session.sessionId);
+            while (status.status !== "exited" && Date.now() < deadline) {
+                await Bun.sleep(100);
+                status = await reconnected.verifySession(session.sessionId);
+            }
+            expect(status).toEqual({ status: "exited", exitCode: 17 });
+        } finally {
+            try {
+                if (session) {
+                    await reconnected.exec(`touch ${gate}`);
+                    const base = session.logBase;
+                    await reconnected.exec(`i=0; while [ ! -f ${base}.code ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i+1)); done`);
+                    const paths = ["claim", "out", "err", "pid", "pid.tmp", "pgid", "code", "st", "st.backup"].map((suffix) => base + "." + suffix);
+                    await reconnected.exec(`rm -f ${gate} ${paths.join(" ")}`);
+                }
+            } finally {
+                await original.destroy();
+                await reconnected.destroy();
+            }
+        }
+    }, 60_000);
+
+    integration("SSH 接管后 watcher 只看新输出，重新核实身份后停止", async () => {
+        const descriptor = { driver: "ssh", target: TARGET };
+        const original = new SshPtyDriver(descriptor);
+        const reconnected = new SshPtyDriver(descriptor);
+        const gate = `/tmp/fx-adopt-${randomUUID()}`;
+        let session: Awaited<ReturnType<SshPtyDriver["execSession"]>> | undefined;
+        try {
+            await original.init();
+            session = await original.execSession(
+                `echo EVENT_OLD; i=0; while [ ! -f ${gate} ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i+1)); done; echo EVENT_NEW >&2; sleep 10`,
+            );
+            await original.destroy();
+            await reconnected.init();
+            const id = session.sessionId;
+            const stamp = session.logBase + ".st";
+            const stampValue = (await reconnected.exec(`cat ${stamp}`)).stdout.trim();
+            expect(stampValue).toMatch(/^\d+$/);
+            expect(await reconnected.readSessionLog(id)).toBe("EVENT_OLD");
+            await reconnected.exec(`cp ${stamp} ${stamp}.backup && printf '0\\n' > ${stamp}`);
+            expect((await reconnected.recoverSession(id)).status).toBe("unknown");
+            expect((await reconnected.stopSession(id)).status).toBe("unknown");
+            expect(reconnected.listSessions()).toEqual([]);
+            await reconnected.exec(`mv ${stamp}.backup ${stamp}`);
+
+            const matches: string[] = [];
+            reconnected.sessions.onEvent = (event) => {
+                if (event.type === "match") matches.push(`${event.stream}:${event.matchedLine}`);
+            };
+            const adopted = await Promise.all([reconnected.recoverSession(id), reconnected.recoverSession(id)]);
+            const expected = { status: "running" as const, sessionId: id, logBase: session.logBase, pid: session.pid! };
+            expect(adopted).toEqual([expected, expected]);
+            expect(reconnected.listSessions()).toHaveLength(1);
+            reconnected.watchSession(id, { pattern: /EVENT_/, once: false });
+            await reconnected.exec(`touch ${gate}`);
+            const deadline = Date.now() + 6500;
+            while (!matches.length && Date.now() < deadline) await Bun.sleep(100);
+            expect(matches).toEqual(["stderr:EVENT_NEW"]);
+            expect(await reconnected.stopSession(id)).toMatchObject({ status: "stopped" });
+        } finally {
+            try {
+                if (session) {
+                    await reconnected.exec(`touch ${gate}`);
+                    const final = await reconnected.stopSession(session.sessionId);
+                    if (final.status === "unknown") {
+                        await reconnected.exec(`i=0; while [ ! -f ${session.logBase}.code ] && [ "$i" -lt 48 ]; do sleep 0.25; i=$((i+1)); done`);
+                    }
+                    const paths = ["claim", "out", "err", "pid", "pid.tmp", "pgid", "code", "st", "st.backup"].map((suffix) => session!.logBase + "." + suffix);
+                    await reconnected.exec(`rm -f ${gate} ${paths.join(" ")}`);
+                }
+            } finally {
+                await original.destroy();
+                await reconnected.destroy();
+            }
+        }
+    }, 60_000);
+
+    integration("Agent 持续观察窗在 SSH 进入管线中继承 cwd 并回看双流", async () => {
+        const { RuntimeStack } = await import("../src/runtime-stack.js");
+        const { createAgentToolkit } = await import("../src/agent-toolkit.js");
+        const stack = new RuntimeStack();
+        const descriptor = { driver: "ssh", target: TARGET, cwd: "/tmp", config: { enterPipeline: [{ cmd: "sh" }] } };
+        await stack.addLayer("remote-window", descriptor);
+        const toolkit = createAgentToolkit(stack);
+        try {
+            const { window_id } = await toolkit.handlers.observe_stream({
+                command: "pwd; echo REMOTE_ERR >&2; sleep 1; echo REMOTE_LATE",
+                layer: "remote-window",
+            });
+            let cursor = 0;
+            const frames: Array<{ text: string; stream?: string }> = [];
+            while (frames.length < 3) {
+                const page = await toolkit.handlers.read_stream({ window_id, since_seq: cursor, wait_ms: 5000 });
+                if (!page.frames.length) break;
+                frames.push(...page.frames);
+                cursor = page.last_delivered_seq!;
+            }
+            expect(frames).toHaveLength(3);
+            expect(frames).toContainEqual(expect.objectContaining({ text: "/tmp", stream: "stdout" }));
+            expect(frames).toContainEqual(expect.objectContaining({ text: "REMOTE_ERR", stream: "stderr" }));
+            expect(frames.at(-1)?.text).toBe("REMOTE_LATE");
+            const history = await toolkit.handlers.read_stream({ window_id, before_seq: cursor });
+            expect(history.frames.map(({ text }) => text).sort()).toEqual(["/tmp", "REMOTE_ERR"]);
+            const done = await toolkit.handlers.read_stream({ window_id, since_seq: cursor, wait_ms: 5000 });
+            expect(done).toMatchObject({ stale: true, exit_code: 0 });
+            await toolkit.handlers.close_stream({ window_id });
+
+            const failed = await toolkit.handlers.observe_stream({ command: "printf '\\342\\202'; exit 37", layer: "remote-window" });
+            const terminal = await toolkit.handlers.read_stream({ window_id: failed.window_id, since_seq: 0, wait_ms: 5000 });
+            expect(terminal).toMatchObject({ stale: true, exit_code: 37, frames: [{ text: "�", stream: "stdout" }] });
+            await toolkit.handlers.close_stream({ window_id: failed.window_id });
+        } finally {
+            toolkit.dispose?.();
+            await stack.removeLayer("remote-window", { destroy: true });
+        }
+    }, 30_000);
+
+    integration("观察流：真流式 + 双流标记 + 衰减回收", async () => {
         const m = new StreamSessionManager([TARGET]);
         const events: Array<{ type: string; stream?: string }> = [];
         m.onEvent = (e) => events.push(e as never);
-        const { sessionId } = await m.start("echo L1; echo E1 1>&2; sleep 2");
+        const { sessionId } = await m.start("echo L1; echo E1 1>&2; sleep 10");
         await new Promise((r) => setTimeout(r, 1500));
         const lines = m.tailLines(sessionId);
         expect(lines.some((l) => l.stream === "stdout" && l.text === "L1")).toBe(true);
         expect(lines.some((l) => l.stream === "stderr" && l.text === "E1")).toBe(true);
         m.reapIdle(Date.now() + 60_000, 1); // 强制回收
+        const deadline = Date.now() + 3000;
+        while (m.list().length && Date.now() < deadline) await Bun.sleep(25);
+        expect(m.list()).toHaveLength(0);
         expect(events.some((e) => e.type === "exit")).toBe(true);
     }, 60_000);
 
-    test("文件传输：方言探测（真机）+ put/get 双校验 roundtrip", async () => {
-        if (!IT) return;
+    integration("文件传输：方言探测（真机）+ put/get 双校验 roundtrip", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
+        const remote = `/tmp/fx-it-${randomUUID()}.bin`;
+        const dir = mkdtempSync(join(tmpdir(), "fx-it-"));
         try {
             const dialect = await probeDialect((cmd) => drv.exec(cmd));
             expect(["gnu", "bsd", "busybox", "openssl-fallback"]).toContain(dialect.family);
-            const dir = mkdtempSync(join(tmpdir(), "fx-it-"));
             const payload = Buffer.alloc(150 * 1024); // >128KB 触发多分块
             for (let i = 0; i < payload.length; i++) payload[i] = (i * 7) % 251;
             const local = join(dir, "p.bin");
             writeFileSync(local, payload);
-            await putFile((cmd) => drv.exec(cmd), dialect, local, "/tmp/fx-it-dst.bin");
+            await putFile((cmd) => drv.exec(cmd), dialect, local, remote);
             const back = join(dir, "b.bin");
-            await getFile((cmd) => drv.exec(cmd), dialect, "/tmp/fx-it-dst.bin", back);
+            writeFileSync(back, "old contents", { mode: 0o600 });
+            await getFile((cmd) => drv.exec(cmd), dialect, remote, back);
+            if (process.platform !== "win32") expect(statSync(back).mode & 0o777).toBe(0o600);
             expect(Buffer.compare(readFileSync(back), payload)).toBe(0);
-            rmSync(dir, { recursive: true, force: true });
         } finally {
+            rmSync(dir, { recursive: true, force: true });
+            await drv.exec(`rm -f ${remote}`);
             await drv.destroy();
         }
     }, 120_000);
@@ -103,8 +311,7 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
     // - cwd 是远端语义：远端专属目录（本地不存在）不得让本地 ssh spawn ENOENT
     // - getEnv 返回真实变量值（非 $KEY 字面量）；不存在 → undefined
     // - options.env 在远端生效（export 前缀——本地 ssh 进程灌 env 远端看不见）
-    test("exec cwd/env/getEnv 语义（真机）：远端目录 + env 远端生效 + printenv 真值", async () => {
-        if (!IT) return;
+    integration("exec cwd/env/getEnv 语义（真机）：远端目录 + env 远端生效 + printenv 真值", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
         try {
@@ -133,8 +340,7 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
     // 直接拒绝（jumphost loop via localhost），127.0.0.1 与 localhost 字串不同绕开
     // 检测、物理仍同机中转。非标 sshd 端口的机器传 FILAXIS_IT_JUMP='[127.0.0.1]:2222'；
     // 真机跨跳板传 FILAXIS_IT_JUMP=<跳板别名>。
-    test("-J 单层（ProxyJump）：exec 通道可用 + 双流分离 + 认证发起端直通", async () => {
-        if (!IT) return;
+    jumpIntegration("-J 单层（ProxyJump）：exec 通道可用 + 双流分离 + 认证发起端直通", async () => {
         const jump = process.env.FILAXIS_IT_JUMP
             ?? (TARGET === "localhost" ? "127.0.0.1" : TARGET);
         const drv = new SshPtyDriver({
@@ -156,8 +362,7 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
 
 // ── 故障注入回归（第三轮实验 1A/1B——完成哨兵原则）──
 describe("故障注入回归（哨兵原则，CI 真机）", () => {
-    test("1B: abort 中断长命令 → AbortError reject（绝不 resolve 伪 exitCode:0）", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
+    integration("1B: abort 中断长命令 → AbortError reject（绝不 resolve 伪 exitCode:0）", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
         try {
@@ -165,37 +370,46 @@ describe("故障注入回归（哨兵原则，CI 真机）", () => {
             const p = drv.exec("echo STEP_1_DONE; sleep 10", { signal: ac.signal, timeoutMs: 60_000 });
             await new Promise((r) => setTimeout(r, 1500));
             ac.abort();
-            await expect(p).rejects.toMatchObject({ name: "AbortError" });
+            await expect(p).rejects.toMatchObject({ name: "AbortError", outcome: "unknown" });
         } finally { await drv.destroy(); }
     }, 90_000);
 
-    // TODO(第四轮故障注入): 外部死亡构造（杀 sshd/$PPID/断 TCP）在 CI 难稳定——
-    // 交还 Gemini 沙箱（其手法已实证）；本仓 CI 覆盖 1B（abort 无哨兵 reject）路径
-    test.skip("1A: 外部强杀本地 ssh 进程等价——无哨兵 → reject 附半截现场（不伪码）", async () => {
-        if (!IT) return;
-        const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
-        await drv.init();
+    integration("1A: 外部关闭本测试的 SSH 子进程，未完成请求返回 unknown 和部分输出", async () => {
+        const driver = new SshPtyDriver({ driver: "ssh", target: TARGET });
+        await driver.init();
         try {
-            const p = drv.exec("echo HALF_OUT; sleep 10", { timeoutMs: 60_000 });
-            await new Promise((r) => setTimeout(r, 1500));
-            // 等价外部强杀：再开一条 exec 用 pkill 杀同会话的 sleep（制造半途死亡）
-            await drv.exec("pkill -9 -f 'sleep 10' 2>/dev/null; true", { timeoutMs: 15_000 });
-            await expect(p).rejects.toThrow(/未完成|哨兵/);
-        } finally { await drv.destroy(); }
-    }, 90_000);
+            // Hold this driver's own SSH child. No process lookup or host-wide signal.
+            const { link } = driver as unknown as {
+                link: { proc: import("node:child_process").ChildProcess; lineBuffer: string[] };
+            };
+            const child = link.proc;
+            const outcome = driver.exec("printf '%s%s\\n' HALF_ OUTPUT; sleep 8", {
+                channel: "pty", timeoutMs: 15_000,
+            }).catch((error: unknown) => error);
+            const deadline = Date.now() + 5000;
+            while (!link.lineBuffer.includes("HALF_OUTPUT") && Date.now() < deadline) await Bun.sleep(25);
+            expect(link.lineBuffer).toContain("HALF_OUTPUT");
+            expect(child.kill("SIGKILL")).toBe(true);
+            expect(await outcome).toMatchObject({
+                outcome: "unknown",
+                partialOutput: expect.stringContaining("HALF_OUTPUT"),
+            });
+        } finally {
+            await driver.destroy();
+        }
+    }, 30_000);
 });
 
 // ── 第四季回归：PTY 跨任务残影串台（temporal isolation）──
 describe("第四季：PTY 残影串台回归（CI 真机）", () => {
-    test("2B: A 超时 ^C 后紧跟 B——B 的 stdout 零串台（A 遗言与 A 的 130 trap 不入 B）", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
+    integration("2B: A 超时 ^C 后紧跟 B——B 的 stdout 零串台（A 遗言与 A 的 130 trap 不入 B）", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
         try {
-            const a = drv.exec("echo A_LAST_WORDS; sleep 30", { timeoutMs: 1200 });
+            const a = drv.exec("echo A_LAST_WORDS; sleep 5", { timeoutMs: 1200, channel: "pty" });
             await expect(a).rejects.toMatchObject({ outcome: "unknown" });
             // 紧跟 B：上一周期必须先 DRAINING 完成才放行（等 A 的 trap/?$ 终态）
-            const b = await drv.exec("echo B_OK; exit 0", { timeoutMs: 30_000 });
+            const b = await drv.exec("echo B_OK", { timeoutMs: 30_000, channel: "pty" });
             expect(b.stdout).not.toContain("A_LAST_WORDS");
             expect(b.stdout).not.toContain("_130_"); // A 的 ^C trap 遗言不进 B
             expect(b.stdout.trim()).toBe("B_OK");
@@ -206,43 +420,39 @@ describe("第四季：PTY 残影串台回归（CI 真机）", () => {
 
 // ── 第九季：CLI 路径描述透传（--enter 重放 / --docker 糖全链路 / --hop 拒绝）──
 describe("第九季：CLI 路径描述（CI 真机）", () => {
-    test("--enter sh：exec 通道进入管线重放（stdin 管道零嵌套引用）", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
-        const { execSync } = await import("node:child_process");
-        const out = execSync('bun bin/filaxis.ts exec --host localhost --enter sh -- "echo ENTER_OK"', { encoding: "utf-8" });
+    integration("--enter sh：exec 通道进入管线重放（stdin 管道零嵌套引用）", async () => {
+        const out = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--host", TARGET, "--enter", "sh", "--", "echo ENTER_OK"], { encoding: "utf-8" });
         expect(out).toContain("ENTER_OK");
     }, 60_000);
 
-    test("--docker 糖：alpine 容器全链路（盲测场景复刻：exec + edit 免 Shell 通道）", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
-        const { execSync } = await import("node:child_process");
-        execSync("docker rm -f fx-cli-it 2>/dev/null; docker run -d --name fx-cli-it alpine:latest sleep 300", { encoding: "utf-8" });
+    dockerIntegration("--docker 糖：alpine 容器全链路（盲测场景复刻：exec + edit 免 Shell 通道）", async () => {
+        const driver = new SshPtyDriver({ driver: "ssh", target: TARGET });
+        const container = `fx-cli-it-${randomUUID()}`;
         try {
-            const out = execSync(
-                'bun bin/filaxis.ts exec --host localhost --docker fx-cli-it -- "echo DOCKER_OK; cat /etc/alpine-release"',
-                { encoding: "utf-8" },
-            );
+            const started = await driver.exec(`docker run -d --name ${container} alpine:latest sleep 300`);
+            if (started.exitCode !== 0) throw new Error(started.stderr);
+            const args = ["bin/filaxis.ts"];
+            const layer = ["--host", TARGET, "--docker", container];
+            const out = execFileSync(process.execPath, [...args, "exec", ...layer, "--", "echo DOCKER_OK; cat /etc/alpine-release"], { encoding: "utf-8" });
             expect(out).toContain("DOCKER_OK");
-            expect(out).toMatch(/\d+\.\d+\.\d+/); // alpine 版本行 = 命令真在容器里跑
-            // edit 免 Shell 通道 × docker 组合（第九季主场景：容器内无 python/jq 也能受控编辑）
-            const p = "/tmp/fx-cli-edit.json";
-            execSync(`bun bin/filaxis.ts exec --host localhost --docker fx-cli-it -- "echo '{\\"k\\": 1}' > ${p}"`, { encoding: "utf-8" });
-            const o2 = execSync(`bun bin/filaxis.ts edit --host localhost --docker fx-cli-it ${p} --stdin-json`, {
+            expect(out).toMatch(/\d+\.\d+\.\d+/);
+            const path = "/tmp/fx-cli-edit.json";
+            execFileSync(process.execPath, [...args, "exec", ...layer, "--", `printf '{"k": 1}' > ${path}`]);
+            const edited = execFileSync(process.execPath, [...args, "edit", ...layer, path, "--stdin-json"], {
                 input: JSON.stringify({ old: "1", new: "2" }),
                 encoding: "utf-8",
             });
-            expect(o2).toContain("1 处");
+            expect(edited).toContain("1 处");
         } finally {
-            execSync("docker rm -f fx-cli-it 2>/dev/null", { encoding: "utf-8" });
+            await driver.exec(`docker rm -f ${container}`);
+            await driver.destroy();
         }
     }, 180_000);
 
-    test("--hop 链 exec 通道拒绝（不可直达语义自守——指引收敛 -J 或 pty 通道）", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
-        const { execSync } = await import("node:child_process");
+    integration("--hop 链 exec 通道拒绝（不可直达语义自守——指引收敛 -J 或 pty 通道）", async () => {
         let errText = "";
         try {
-            execSync('bun bin/filaxis.ts exec --host localhost --hop user@bastion:2222 -- "echo X"', { encoding: "utf-8", stdio: "pipe" });
+            execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--host", TARGET, "--hop", "user@bastion:2222", "--", "echo X"], { encoding: "utf-8", stdio: "pipe" });
         } catch (e) {
             errText = String((e as { stderr?: string }).stderr ?? (e as Error).message);
         }
@@ -254,8 +464,7 @@ describe("第九季：CLI 路径描述（CI 真机）", () => {
 
 // ── 第十季：命名层注册表真机链（回环幂等 + 派生 + snapshot/restore）──
 describe("第十季：命名层注册表（CI 真机）", () => {
-    test("addLayer 回环幂等（末节点命中免探测复用）+ layerInto 派生 + snapshot/restore", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
+    integration("addLayer 回环幂等（末节点命中免探测复用）+ layerInto 派生 + snapshot/restore", async () => {
         const { RuntimeStack } = await import("../src/runtime-stack.js");
         const { enterStepsOf } = await import("../src/ssh-helpers.js");
         const stack = new RuntimeStack();
@@ -266,6 +475,10 @@ describe("第十季：命名层注册表（CI 真机）", () => {
         expect(b.reused).toBe(true);
         expect(b.handle).toBe(a.handle);
         expect(b.reusedFrom).toBe("lo");
+        const otherCwd = await stack.addLayer("other-cwd", { driver: "ssh", target: TARGET, cwd: "/tmp" });
+        expect(otherCwd.reused).toBe(false);
+        expect((await otherCwd.handle.driver.exec("pwd")).stdout.trim()).toBe("/tmp");
+        await stack.removeLayer("other-cwd", { destroy: true });
         // 派生：enter sh 管线继承追加
         const c = await stack.layerInto("lo", "inner", "sh");
         expect(enterStepsOf(c.descriptor.config as Record<string, unknown>).length).toBe(1);
@@ -288,13 +501,12 @@ describe("第十季：命名层注册表（CI 真机）", () => {
 
 // ── 第十一季：批量组合真机（ssh 层 DAG + fail-fast + CM 复用下的并行 exec）──
 describe("第十一季：批量组合（CI 真机）", () => {
-    test("runBatch ssh 层：改配置→验证（真 CAS+CM）→ fail-fast", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
+    integration("runBatch ssh 层：改配置→验证（真 CAS+CM）→ fail-fast", async () => {
         const { runBatch } = await import("../src/batch.js");
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
+        const p = `/tmp/fx-batch-it-${randomUUID()}.conf`;
         try {
-            const p = "/tmp/fx-batch-it.conf";
             await drv.exec(`echo 'port=8080' > ${p}`);
             const ok = await runBatch(drv, {
                 steps: [
@@ -315,25 +527,24 @@ describe("第十一季：批量组合（CI 真机）", () => {
             expect(bad.status).toBe("fail");
             expect(bad.steps.find((s) => s.id === "reload")!.status).toBe("skipped");
         } finally {
+            await drv.exec(`rm -f ${p} ${p}.fx-lock ${p}.fx-tmp ${p}.never`);
             await drv.destroy();
         }
     }, 120_000);
 });
 describe("第十一季：CLI 层快照（CI 真机）", () => {
-    test("layer save → exec --layer 一行直达（CM master 跨命令复用）", async () => {
-        if (!IT) return console.log("[skip] FILAXIS_IT≠1——CI 矩阵专用");
-        const { execSync } = await import("node:child_process");
+    integration("layer save → exec --layer 一行直达（CM master 跨命令复用）", async () => {
         const { tmpdir } = await import("node:os");
         const { join: j } = await import("node:path");
         const { mkdtempSync, rmSync } = await import("node:fs");
         const d = mkdtempSync(j(tmpdir(), "fx-cli-layer-"));
         const env = { ...process.env, FILAXIS_LAYERS: j(d, "layers.json") };
         try {
-            execSync(`bun bin/filaxis.ts layer save lo --host ${TARGET}`, { encoding: "utf-8", env });
+            execFileSync(process.execPath, ["bin/filaxis.ts", "layer", "save", "lo", "--host", TARGET], { encoding: "utf-8", env });
             // 第一条：建 master（一次握手）；第二条：CM 复用毫秒级
-            const o1 = execSync('bun bin/filaxis.ts exec --layer lo -- "echo L1_OK"', { encoding: "utf-8", env });
+            const o1 = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--layer", "lo", "--", "echo L1_OK"], { encoding: "utf-8", env });
             expect(o1).toContain("L1_OK");
-            const o2 = execSync('bun bin/filaxis.ts exec --layer lo -- "echo L2_OK"', { encoding: "utf-8", env });
+            const o2 = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--layer", "lo", "--", "echo L2_OK"], { encoding: "utf-8", env });
             expect(o2).toContain("L2_OK");
         } finally {
             rmSync(d, { recursive: true, force: true });

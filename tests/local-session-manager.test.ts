@@ -4,7 +4,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { LocalSessionManager } from "../src/local-session-manager.js";
 import type { SessionEvent } from "../src/session-types.js";
 
@@ -22,6 +22,24 @@ function collect(m: LocalSessionManager): SessionEvent[] {
     m.onEvent = (ev) => events.push(ev);
     return events;
 }
+
+test.skipIf(process.platform !== "linux")("local stop reaps a redirected background child after its shell exits", async () => {
+    const m = new LocalSessionManager();
+    const h = await m.start("sleep 15 >/dev/null 2>&1 & echo $!; exit 37");
+    await waitFor(() => m.tail(h.sessionId).length > 0);
+    await Bun.sleep(200);
+    const pid = Number(m.tail(h.sessionId)[0]);
+    const alive = () => {
+        try { return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    };
+    try {
+        expect(alive()).toBe(true);
+        expect(m.verify(h.sessionId).status).toBe("running");
+        expect((await m.stop(h.sessionId)).status).toBe("exited");
+        expect(alive()).toBe(false);
+    } finally { if (alive()) process.kill(pid, "SIGKILL"); }
+}, 20_000);
 
 describe("LocalSessionManager", () => {
     test("spawn 即返 + 双文件创建 + exit 事件 exitCode", async () => {
@@ -242,29 +260,29 @@ describe("孪生对齐审计（async 隔离 + exit 兜底 + 终态 watcher 封�
         expect(m.tail(h.sessionId)).toContain("ALIVE_OK");
     }, 20_000);
 
-    test("孙进程持 stdio 管道：exit 2s 兜底先于 close finalize（close 永不按时来）", async () => {
+    test("孙进程持有输出管道时，会话等进程组退出才进入终态", async () => {
         const m = new LocalSessionManager();
         const exits: Array<number | null | undefined> = [];
         m.onEvent = (ev) => { if (ev.type === "exit") exits.push(ev.exitCode); };
         // 主 shell 即退（exit 事件立即到），孙 sleep 3 持管道写端 → close ≈3s 后
         await m.start("echo MAIN_DONE; (sleep 3) & exit 0");
-        // 2.6s = 兜底（主退+2s）已触发、close（3s）未到——兜底生效的直接证明窗
         await new Promise((r) => setTimeout(r, 2600));
-        expect(exits.length).toBe(1); // 修前：0（close 永不按时来，finalize 悬置）
-        expect(m.list()[0]!.running).toBe(false); // 修前：true（孙进程还握着管道）
+        expect(exits).toEqual([]);
+        expect(m.list()[0]!.running).toBe(true);
+        await waitFor(() => !m.list()[0]!.running);
+        expect(exits).toEqual([0]);
         expect(m.tail(m.list()[0]!.sessionId)).toContain("MAIN_DONE");
     }, 15_000);
 
-    test("终态后孙进程尾数据不触发 watcher（watchers.clear 对齐 + late data 拦截）", async () => {
+    test("启动 shell 退出后仍交付后台子进程的日志给 watcher", async () => {
         const m = new LocalSessionManager();
         const matches: string[] = [];
         m.onEvent = (ev) => { if (ev.type === "match") matches.push(ev.matchedLine); };
-        // 主 shell 即退 → 兜底 ≈2s finalize；孙进程 3s 才输出（终态**之后**到达）
         await m.start("(sleep 3; echo LATE_LINE) & exit 0");
         const id = m.list()[0]!.sessionId;
         m.watch(id, { pattern: "LATE_LINE", once: true }); // 终态前注册
-        await new Promise((r) => setTimeout(r, 4200));
-        expect(matches.length).toBe(0); // 修前风险：终态后 watcher 复活误触 + write-after-end 崩流
+        await waitFor(() => !m.list()[0]!.running);
+        expect(matches).toEqual(["LATE_LINE"]);
     }, 15_000);
 });
 

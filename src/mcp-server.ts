@@ -67,6 +67,7 @@ export class McpServer {
         this.rl.on("line", (line) => this.onLine(line));
         this.rl.on("close", () => {
             // 连接断开=客户端退出：进程内 toolkit 状态（会话句柄）交还内核 TTL 回收
+            this.tk.dispose?.();
             this.log.info("[mcp] stdin 关闭——server 退出");
         });
     }
@@ -130,7 +131,7 @@ export class McpServer {
                     // 在任何 schema 读取之前必达，是唯一可靠的发现面）
                     instructions: [
                         "【先看这行】多文件读取/多命令巡检/定位排查 → 优先 run_batch（一次调用并行打包，不要逐个工具循环）；读工具 schema 时同轮并发读取（逐个读每步一趟 LLM）；",
-                        "长跑/挂起/日志尾随 → observe_stream 或 spawn_and_observe（exec 会阻塞超时）；",
+                        "持续查看日志 → observe_stream 开窗、read_stream 回看或续读、close_stream 关闭；等就绪或错误模式 → spawn_and_observe；",
                         "edit_file 支持 write_mode:'inplace'（bind mount 保 inode 免重启）；",
                         "契约：退出码是数据（非零不是异常）；终态三态 exited/stopped/unknown；unknown 后用 stop_and_verify 核实。",
                     ].join("\n"),
@@ -170,21 +171,29 @@ export class McpServer {
                 } catch (e) {
                     // 错误透传（FEAT-03）：isError + 消息原样（EditConflictError/
                     // 未命中/unknown 终态可程序化分支，不吞成泛化字符串）
-                    const err = e as Error & { outcome?: string; sessionId?: string; logBase?: string };
+                    const err = (e !== null && typeof e === "object" ? e : {}) as {
+                        outcome?: string;
+                        terminalId?: string;
+                        sessionId?: string;
+                        logBase?: string;
+                        sessions?: Array<{ sessionId: string; logBase: string }>;
+                        exitCode?: number | null;
+                    };
+                    const message = e instanceof Error ? e.message : String(e);
+                    const details = {
+                        outcome: err.outcome,
+                        terminalId: err.terminalId,
+                        sessionId: err.sessionId,
+                        logBase: err.logBase,
+                        sessions: err.sessions,
+                        exitCode: err.exitCode,
+                    };
                     this.reply(id, {
-                        content: [{
-                            type: "text",
-                            text: err.message,
-                        }],
+                        content: [{ type: "text", text: message }],
                         isError: true,
-                        ...(err.outcome !== undefined || err.sessionId !== undefined ? {
-                            structuredContent: {
-                                error: err.message,
-                                ...(err.outcome !== undefined ? { outcome: err.outcome } : {}),
-                                ...(err.sessionId !== undefined ? { sessionId: err.sessionId } : {}),
-                                ...(err.logBase !== undefined ? { logBase: err.logBase } : {}),
-                            },
-                        } : {}),
+                        ...(Object.values(details).some((value) => value !== undefined)
+                            ? { structuredContent: { error: message, ...details } }
+                            : {}),
                     });
                 }
                 return;
@@ -213,6 +222,8 @@ function summarize(r: unknown): string {
         const bits: string[] = [];
         if (o.exit_code !== undefined) bits.push(`exit=${o.exit_code}`);
         if (o.occurrences !== undefined) bits.push(`replaced=${o.occurrences}`);
+        if (o.window_id !== undefined) bits.push(`window=${o.window_id}`);
+        if (Array.isArray(o.frames)) bits.push(`frames=${o.frames.length}`);
         if (o.session_id !== undefined) bits.push(`session=${String(o.session_id).slice(0, 24)}`);
         if (o.status !== undefined) bits.push(`status=${o.status}`);
         if (Array.isArray(o.lines)) bits.push(`lines=${o.lines.length}`);

@@ -344,9 +344,9 @@ export function muxPathUsable(path: string): boolean {
  * 源自 stream-session-manager 的观察流实现（第十一季下沉共享——此前 exec/编辑
  * 通道未接 CM，CLI 每条命令白握手）。
  */
-export function muxFlagsFor(destArgs: string[], opts: { disable?: boolean; dir?: string } = {}): string[] {
+export function muxFlagsFor(destArgs: string[], opts: { disable?: boolean; dir?: string; sshOptions?: string[] } = {}): string[] {
     if (opts.disable || process.platform === "win32" || process.env.FILAXIS_NO_MUX === "1") return [];
-    const sock = muxSocketPath(destArgs, opts.dir);
+    const sock = muxSocketPath([...(opts.sshOptions ?? autonomousSshOpts()), ...destArgs], opts.dir);
     if (!muxPathUsable(sock)) return []; // 超长降级直连（Hydrogen R6 #6——sun_path 上限）
     return [
         "-o", `ControlPath=${sock}`,

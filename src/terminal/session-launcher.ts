@@ -7,7 +7,7 @@
  * FR-9 第一道防线：launchCmd 前置 env_hardening_prefix 关交互 Prompt。
  */
 import { SessionRegistry, type TerminalProfile } from "./session-registry.js";
-import { TmuxInvoker } from "./tmux-invoker.js";
+import { FILAXIS_PANE_OPTION, TmuxInvoker } from "./tmux-invoker.js";
 import { DEFAULT_TERMINAL_CONFIG, type TerminalConfig } from "./types.js";
 import { noopLogger, type FilaxisLogger } from "../logger.js";
 import { shellQuote } from "../ssh-helpers.js";
@@ -57,7 +57,11 @@ export class SessionLauncher {
             : launchCmd;
         this.log.info(`启动持久会话 [${id}] (driver: ${driver})`);
         // -x 220：pane 宽列——输出长行不被 80 列折断（marker 解析/stout 纯净度契约依赖整行）
-        await TmuxInvoker.invoke(["new-session", "-d", "-x", "220", "-s", id, finalCmd]);
+        await TmuxInvoker.invoke([
+            "new-session", "-d", "-x", "220", "-s", id, finalCmd,
+            ";", "select-pane", "-d", "-t", id,
+            ";", "set-option", "-p", "-t", id, FILAXIS_PANE_OPTION, "1",
+        ]);
 
         const ok = await this.waitForAlive(id, driver);
         if (!ok) {

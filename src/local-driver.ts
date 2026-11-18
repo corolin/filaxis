@@ -49,6 +49,8 @@ export interface LocalDriverOptions {
     logger?: FilaxisLogger;
 }
 
+import type { ObservationWindowOptions, StreamWindowRegistry } from "./stream-window.js";
+
 /** 本地 Transport：进程内执行 + 原生 fs */
 export class LocalRuntimeDriver implements RuntimeDriver {
     descriptor: RuntimeDescriptor = { driver: "local", target: "localhost" };
@@ -90,6 +92,10 @@ export class LocalRuntimeDriver implements RuntimeDriver {
         // 会话引擎句柄保留 TTL 自回收；此处无强制清理面（processMgr 属后续批次）
     }
 
+    openStreamWindow(registry: StreamWindowRegistry, opts: ObservationWindowOptions) {
+        return registry.open({ ...opts, shell: this.shell, cwd: this.defaultCwd });
+    }
+
     async getCwd(): Promise<string> {
         return this.defaultCwd || process.cwd();
     }
@@ -100,7 +106,7 @@ export class LocalRuntimeDriver implements RuntimeDriver {
 
     // ── 会话式 exec（委托 LocalSessionManager）──
     async execSession(command: string, opts?: SessionStartOptions): Promise<SessionHandleInfo> {
-        return this.sessions.start(command, opts);
+        return this.sessions.start(command, { ...opts, cwd: opts?.cwd ?? this.defaultCwd });
     }
     async tailSession(sessionId: string, lines = 50): Promise<string[]> {
         return this.sessions.tail(sessionId, lines);
@@ -179,17 +185,28 @@ export class LocalRuntimeDriver implements RuntimeDriver {
             }
 
             const startTime = Date.now();
-            const writeStatus = async (status: string, extra: Record<string, unknown> = {}) => {
-                try {
-                    await fs.writeFile(statusPath, JSON.stringify({
-                        pid: p.pid,
-                        command,
-                        status,
-                        startTime,
-                        endTime: Date.now(),
-                        ...extra,
-                    }, null, 2), "utf-8");
-                } catch { /* 状态文件写入失败不影响主流程 */ }
+            const statusTemp = `${statusPath}.tmp`;
+            let statusWrite = Promise.resolve();
+            const writeStatus = (status: string, extra: Record<string, unknown> = {}) => {
+                const payload = JSON.stringify({
+                    pid: p.pid,
+                    command,
+                    status,
+                    startTime,
+                    endTime: Date.now(),
+                    ...extra,
+                }, null, 2);
+                // Readers see whole snapshots, and the initial snapshot always
+                // publishes before the terminal status.
+                statusWrite = statusWrite.then(async () => {
+                    try {
+                        await fs.writeFile(statusTemp, payload, "utf-8");
+                        await fs.rename(statusTemp, statusPath);
+                    } catch {
+                        await fs.unlink(statusTemp).catch(() => undefined);
+                    }
+                });
+                return statusWrite;
             };
             void writeStatus("running");
 
@@ -287,8 +304,8 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                         reject(e);
                         return;
                     }
-                    void writeStatus("completed", { exitCode: sentinelCode });
-                    resolve({ stdout: out, stderr, exitCode: sentinelCode, effectiveUser });
+                    const result = { stdout: out, stderr, exitCode: sentinelCode, effectiveUser };
+                    void writeStatus("completed", { exitCode: sentinelCode }).then(() => resolve(result));
                 };
                 finish();
             });
@@ -347,9 +364,10 @@ class LocalFileSystem implements FileSystemDriver {
     }
 
     async readdir(dirPath: string): Promise<FileEntry[]> {
-        const dirents = await fs.readdir(dirPath, { withFileTypes: true });
+        const resolved = this.resolve(dirPath);
+        const dirents = await fs.readdir(resolved, { withFileTypes: true });
         return await Promise.all(dirents.map(async (d) => {
-            const stats = await fs.stat(path.join(dirPath, d.name)).catch(() => null);
+            const stats = await fs.stat(path.join(resolved, d.name)).catch(() => null);
             return {
                 name: d.name,
                 isDirectory: d.isDirectory(),
