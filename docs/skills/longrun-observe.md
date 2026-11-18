@@ -25,6 +25,14 @@
 4. **结束的两种形态**：自然退出拿退出码（`exited`）；你主动停 → **核实终态**（`stopped`=确认死了；`unknown`=停止瞬间核实不可达——用 `verifySession(sessionId)` 核实原语实测：`running`/`exited(真实码)`/`unknown`；核实仍不可达才上报，严禁当已停）。
 5. **无人值守的流要能自愈**：观察流无人消费且无 armed watcher 超时会被自动回收（并广播事件）——长期值守请保持 armed watcher 或定期 tail。
 
+本地会话以及具备独立进程组的 SSH 和 tmux 会话，启动 shell 退出后会继续跟踪组内后台任务。后台输出仍可读取，组清空后才确认终态。旧会话的 `.code` 可能早于后台进程退出，无法核实其归属或终止时，停止结果为 `unknown`。
+
+### SSH 重连后接管
+
+在原目标层建立新连接，保留启动时的 `sessionId`。SDK 可用 `await driver.recoverSession?.(sessionId)` 恢复会话。返回 `running` 后可调用 `watchSession` 或 `stopSession`。新的 watcher 从接管时记录的 stdout 和 stderr 字节位置继续观察，历史输出可用 `readSessionLog` 补读。已结束的会话返回 `exited` 和原退出码。
+
+接管运行中的任务需要 Linux `/proc` 启动身份及独立进程组的证据。证据缺失或身份不符时返回 `unknown`。`stopSession` 收到新连接中未登记的会话 ID 时执行同样的核实，每次发信号前再次比对身份。关闭连接会取消本地轮询和 watcher，已启动的远端任务可继续运行。
+
 ## 陷阱清单
 
 - **流设备日志陷阱（Linux 实锤）**：容器/服务里的日志路径可能是 `/dev/stderr`、`/dev/stdout` 的软链或挂载（如 nginx 容器的 `error.log -> /dev/stderr`）——`tail -f` 流设备不会正常跟随，轻则空转重则挂死。先 `ls -l <log>` 或 `readlink -f <log>` 确认是真实文件再 tail；是流设备就改从进程 stderr 观察（`observe --stream stderr` / `docker logs`），别跟设备文件较劲。

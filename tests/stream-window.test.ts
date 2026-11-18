@@ -65,7 +65,7 @@ describe("StreamWindow（帧/peek/游标/stale）", () => {
         const w = new StreamWindow("t3", "local", "t3", "x", 10, 20);
         w.push("x".repeat(100));
         expect(w.peekLast(1).frames[0]!.text.endsWith("…[truncated]")).toBe(true);
-        expect(w.peekLast(1).frames[0]!.text.length).toBe(20);
+        expect(Buffer.byteLength(w.peekLast(1).frames[0]!.text, "utf-8")).toBe(20); // 字节口径（Sol 55 P2-G——「…」3 字节后缀实测 20B 上限精确）
     });
 });
 
@@ -101,7 +101,8 @@ describe("StreamWindowRegistry", () => {
         await new Promise((r) => setTimeout(r, 50));
         expect(w.stale).toBe(true);
         reg.stop("vm:log");
-        expect(procs[0]!.killed).toBe(true); // 关窗收割流进程
+        expect(procs[0]!.killed).toBe(false); // 流已经自然退出
+        expect(reg.get("vm:log")).toBeUndefined();
         reg.dispose();
     });
 });
@@ -216,7 +217,7 @@ describe("三十九期", () => {
         const stopped: string[] = [];
         const manager = {
             start: async () => { await new Promise((r) => setTimeout(r, 80)); return { sessionId: "s-disp" }; },
-            stop: (sid: string) => { stopped.push(sid); },
+            stopAndWait: async (sid: string) => { stopped.push(sid); },
         } as unknown as StreamSessionManager;
         const reg = new StreamWindowRegistry();
         const p = reg.open({ name: "vm:disp", layerAlias: "vm", command: "x", manager });
@@ -282,6 +283,7 @@ describe("五十期：续编/翻页/快照隔离", () => {
 // 归零覆盖已存帧号+空窗 peekSince 误报 gap；#2 本地窗 LineSplitter 未完成行随输出无限涨
 // （32MiB 无换行堆涨 32MiB——maxLineBytes 只在成行后截）。
 const NL51 = "\n";
+const CR55 = "\r";
 describe("五十一期：空窗续锚 + 未完成行封顶", () => {
     test("#1 空窗不归零续锚：重开空窗 peekSince 不误报 gap，再关再开首帧续编", () => {
         const w1 = new StreamWindow("t:chain", "local", "t", "x", 10, 1024);
@@ -317,7 +319,7 @@ describe("五十一期：空窗续锚 + 未完成行封顶", () => {
         await new Promise((r) => setTimeout(r, 30));
         const frames = win.peekLast(5).frames;
         expect(frames.length).toBe(1);
-        expect(frames[0]!.text.length).toBe(64);        // 封顶 ≤ maxLineBytes（修前：8MiB 堆涨）
+        expect(Buffer.byteLength(frames[0]!.text, "utf-8")).toBe(64);   // 封顶 ≤ maxLineBytes 字节口径（Sol 55 P2-G；修前 8MiB 堆涨）
         expect(frames[0]!.text.endsWith("…[truncated]")).toBe(true);
         // 一致性：整行一次喂（同字节）→ 输出逐字节同
         const procs2: FakeChild[] = [];
@@ -373,4 +375,300 @@ describe("五十二期：迭代扫描 + 逐行截断 + 零容量", () => {
         expect(w2.peekLast(0).frames).toEqual([]); // 修前：全部 10 帧
         expect(w2.peekLast(-3).frames).toEqual([]); // 负数同样空
     });
+});
+
+// GPT Sol 五十五期：跨块 CRLF 仍截断（buf 尾 CR 留块未剥）+ 字节口径（UTF-16 码元曾当字节）。
+describe("五十五期：跨块 CRLF + 字节口径", () => {
+    test("P2-F abcdefghijkl<CR> 与 <LF> 分块到达——正文完整不截断", async () => {
+        const procs: FakeChild[] = [];
+        const reg = new StreamWindowRegistry({
+            shell: BASH,
+            spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+        });
+        const win = await reg.open({ name: "t:crlf55", command: "x", maxLineBytes: 12 });
+        const c = procs[0]!;
+        c.emitOut("abcdefghijkl" + CR55); // 上块：正文+CR（无换行）
+        c.emitOut(NL51);                 // 下块：只有换行——成行
+        await new Promise((r) => setTimeout(r, 30));
+        expect(win.peekLast(5).frames.map((f) => f.text)).toEqual(["abcdefghijkl"]); // 修前截断标记
+        reg.dispose();
+    }, 15_000);
+
+    test("P2-G 字节口径：10 个「中」30 字节超 13 上限必截断（UTF-16 码元曾透传）", () => {
+        const w = new StreamWindow("t56", "local", "t", "x", 10, 25); // 后缀 14B——上限须大于后缀
+        w.push("中".repeat(10)); // 30B
+        const t = w.peekLast(1).frames[0]!.text;
+        expect(Buffer.byteLength(t, "utf-8")).toBeLessThanOrEqual(25); // 修前 30B 透传
+        expect(t.endsWith("…[truncated]")).toBe(true);
+    });
+});
+
+// GPT Sol 五十六期：export 分号分隔（曾吞首命令）/ 正文 CR 不随分块消失 / 后缀超上限硬切。
+describe("五十六期", () => {
+    test("#3 正文 CR 跨块保留（abc<CR> + XYZ<LF> 分块 → abcCRXYZ 不丢 CR）", async () => {
+        const procs: FakeChild[] = [];
+        const reg = new StreamWindowRegistry({
+            shell: BASH,
+            spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+        });
+        const win = await reg.open({ name: "t:cr56", command: "x", maxLineBytes: 64 });
+        procs[0]!.emitOut("abc\r");
+        procs[0]!.emitOut("XYZ\n");
+        await new Promise((r) => setTimeout(r, 30));
+        expect(win.peekLast(5).frames.map((f) => f.text)).toEqual(["abc\rXYZ"]); // 修前 abcXYZ（CR 被剥）
+        reg.dispose();
+    }, 15_000);
+    test("#4 maxLineBytes 12 < 后缀 14B → 硬切 12B 无后缀（不超限）", () => {
+        const w = new StreamWindow("t57", "local", "t", "x", 10, 12);
+        w.push("X".repeat(40));
+        const t = w.peekLast(1).frames[0]!.text;
+        expect(Buffer.byteLength(t, "utf-8")).toBeLessThanOrEqual(12); // 修前 14B（后缀本身超限）
+        expect(t.endsWith("…[truncated]")).toBe(false); // 放不进即放弃后缀
+    });
+});
+
+// GPT Sol 五十九期 P2-2：封顶保留段末尾正文 CR 随分块消失——上限 4B 时
+// "abc\rXYZ\n" 整行送达得 "abc\r"（硬切含 CR），"abc\rXYZ"+"\n" 分块送达却得
+// "abc"（emitCapped 一律剥尾 \r）。修：封顶切留段以 \r 收尾且被丢首字节非 \n
+// → 判定正文保留（capKeepCr）；恰为 \n 才按真 CRLF 剥（与整行送达同辙）。
+describe("五十九期：封顶末尾 CR 分治", () => {
+    test("P2 上限 4B——整行/分块同为 abc<CR>；真 CRLF 封顶后仍剥", async () => {
+        // 封顶/CRLF 语义住在 LineSplitter——经 FakeChild→registry 正径驱动
+        let seq = 0;
+        const run = async (chunks: string[]): Promise<string[]> => {
+            const procs: FakeChild[] = [];
+            const reg = new StreamWindowRegistry({
+                shell: BASH,
+                spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+            });
+            const win = await reg.open({ name: `t:59-${seq++}`, command: "x", maxLineBytes: 4 });
+            for (const ch of chunks) procs[0]!.emitOut(ch);
+            await new Promise((r) => setTimeout(r, 30));
+            const texts = win.peekLast(5).frames.map((f) => f.text);
+            reg.dispose();
+            return texts;
+        };
+        expect(await run(["abc\rXYZ\n"])).toEqual(["abc\r"]); // 整行一次：硬切 4B（后缀 14B 放不进）
+        expect(await run(["abc\rXYZ", "\n"])).toEqual(["abc\r"]); // 修前 "abc"（emitCapped 剥正文 CR）
+        // 对照：真 CRLF 整对到达走正常分辙（无封顶）——仍剥。封顶尾 \r 则必是正文：
+        // 封顶只在无换行尾段触发，被丢字节里不可能是 \n（\n 在块内即走正常路径）
+        expect(await run(["abc\r\n"])).toEqual(["abc"]);
+    }, 15_000);
+});
+
+// GPT Sol 六十期 P2-6：完整行路径双重剥 CR——seg 已剥 CRLF 的 \r，clean 再剥一次
+// 把「正文 CR+CRLF」叠字符的正文 CR 吃掉（abc\r\r\n 实测得 "abc"，应为 "abc\r"）。
+describe("六十期：正文 CR+CRLF 叠字符", () => {
+    test("abc<CR><CR><LF> → abc<CR>（正文 CR 保留）", async () => {
+        const procs: FakeChild[] = [];
+        const reg = new StreamWindowRegistry({
+            shell: BASH,
+            spawnImpl: (() => { const c = new FakeChild(); procs.push(c); return c as unknown as ChildProcess; }) as unknown as typeof import("node:child_process").spawn,
+        });
+        const win = await reg.open({ name: "t:cr60", command: "x", maxLineBytes: 64 });
+        procs[0]!.emitOut("abc\r\r\n");
+        await new Promise((r) => setTimeout(r, 30));
+        expect(win.peekLast(2).frames.map((f) => f.text)).toEqual(["abc\r"]); // 修前 "abc"
+        reg.dispose();
+    }, 15_000);
+});
+
+test.skipIf(process.platform !== "linux")("关闭观察窗会终止忽略 SIGTERM 的进程", async () => {
+    const registry = new StreamWindowRegistry();
+    try {
+        const window = await registry.open({ name: "ignore-term", command: "trap '' TERM; echo READY; while :; do sleep 1; done" });
+        const deadline = Date.now() + 3000;
+        while (!window.peekLast().frames.some(({ text }) => text === "READY") && Date.now() < deadline) {
+            await Bun.sleep(20);
+        }
+        expect(window.peekLast().frames.some(({ text }) => text === "READY")).toBe(true);
+        const transport = (window as unknown as { transport: { child: ChildProcess } }).transport;
+        const exited = new Promise<string | null>((resolve) => transport.child.once("exit", (_, signal) => resolve(signal)));
+        await registry.stopConfirmed("ignore-term");
+        expect(transport.child.signalCode).toBe("SIGKILL");
+        expect(await exited).toBe("SIGKILL");
+    } finally {
+        registry.dispose();
+    }
+}, 5000);
+
+test("backward pages report gaps and preserve retained frames", () => {
+    const window = new StreamWindow("history", "local", "history", "", 3);
+    for (let i = 1; i <= 6; i++) window.push(String(i), "stdout");
+    expect(window.peekBefore(7, 2).frames.map((frame) => frame.seq)).toEqual([5, 6]);
+    const older = window.peekBefore(5, 2);
+    expect(older.frames.map((frame) => frame.seq)).toEqual([4]);
+    expect(older.gap).toBe(true);
+    expect(window.peekBefore(4, 2)).toMatchObject({ frames: [], gap: true });
+    expect(window.peekLast(3).frames.map((frame) => frame.seq)).toEqual([4, 5, 6]);
+});
+
+test.skipIf(process.platform !== "linux")("关窗可回收启动 shell 退出后仍存活的后台子进程", async () => {
+    const { readFileSync } = await import("node:fs");
+    const registry = new StreamWindowRegistry();
+    try {
+        const window = await registry.open({ name: "child-after-shell", command: "sleep 8 >/dev/null 2>&1 & echo $!; exit 37" });
+        const readyBy = Date.now() + 3000;
+        while (!window.stale && Date.now() < readyBy) await Bun.sleep(20);
+        const result = window.peekLast();
+        expect(result).toMatchObject({ stale: true, exitCode: 37 });
+        const pid = Number(result.frames[0]?.text);
+        expect(pid).toBeGreaterThan(0);
+        const alive = () => {
+            try { return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+                throw error;
+            }
+        };
+        expect(alive()).toBe(true);
+        await registry.stopConfirmed("child-after-shell");
+        expect(alive()).toBe(false);
+    } finally {
+        registry.dispose();
+    }
+}, 5000);
+
+test.skipIf(process.platform !== "win32")("Windows 关窗会回收祖先进程已退出的 Job 子进程", async () => {
+    const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { shellQuote } = await import("../src/ssh-helpers.js");
+    const dir = await mkdtemp(join(tmpdir(), "fx-window-job-"));
+    const fixture = join(dir, "fixture.mjs");
+    const pidFile = join(dir, "fixture.pid");
+    const shellPath = (path: string) => shellQuote(path.replaceAll("\\", "/"));
+    const registry = new StreamWindowRegistry();
+    try {
+        await writeFile(fixture, 'import {writeFileSync} from "node:fs"; writeFileSync(process.argv[2], String(process.pid)); setTimeout(() => {}, 10000);');
+        const window = await registry.open({
+            name: "windows-job",
+            command: `${shellPath(process.execPath)} ${shellPath(fixture)} ${shellPath(pidFile)} >/dev/null 2>&1 & exit 37`,
+        });
+        const deadline = Date.now() + 6000;
+        let pid = 0;
+        while (Date.now() < deadline && (!pid || !window.stale)) {
+            pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
+            if (!pid || !window.stale) await Bun.sleep(30);
+        }
+        expect(pid).toBeGreaterThan(0);
+        expect(window.peekLast()).toMatchObject({ stale: true, exitCode: 37 });
+        const alive = () => {
+            try { process.kill(pid, 0); return true; }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+                throw error;
+            }
+        };
+        expect(alive()).toBe(true);
+        await registry.stopConfirmed("windows-job");
+        expect(alive()).toBe(false);
+    } finally {
+        registry.dispose();
+        await rm(dir, { recursive: true, force: true });
+    }
+}, 20000);
+
+test("自然退出后释放本地监管进程，同时保留历史窗口", async () => {
+    const registry = new StreamWindowRegistry();
+    try {
+        const window = await registry.open({ name: "retire-owner", command: "printf RETAINED; exit 37" });
+        const transport = (window as unknown as { transport: { child: ChildProcess } }).transport;
+        const owner = transport.child;
+        const deadline = Date.now() + 5000;
+        while (owner.exitCode === null && owner.signalCode === null && Date.now() < deadline) {
+            await Bun.sleep(25);
+        }
+        expect(owner.exitCode !== null || owner.signalCode !== null).toBe(true);
+        expect(registry.get("retire-owner")?.peekLast()).toMatchObject({
+            stale: true, exitCode: 37, frames: [{ text: "RETAINED" }],
+        });
+    } finally {
+        registry.dispose();
+    }
+}, 15000);
+
+test("SSH 窗口在停止失败后保留窗口和内容，可重试关闭", async () => {
+    const { impl, procs } = fakeSpawn();
+    const registry = new StreamWindowRegistry();
+    try {
+        const manager = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
+        const window = await registry.open({ name: "try-close", layerAlias: "host", command: "fixture", manager });
+        const child = procs[0]!;
+        child.emitOut("KEEP\n");
+        child.kill = () => false;
+        await expect(registry.stopConfirmed(window.name)).rejects.toMatchObject({ outcome: "unknown" });
+        expect(registry.get(window.name)?.peekLast().frames.map(({ text }) => text)).toEqual(["KEEP"]);
+        child.kill = () => true;
+        const closed = registry.stopConfirmed(window.name);
+        expect(registry.get(window.name)).toBe(window);
+        child.exit();
+        await closed;
+        expect(registry.get(window.name)).toBeUndefined();
+    } finally {
+        registry.dispose();
+    }
+});
+
+test("本地窗口在停止失败或超时后保留历史，并等待重试的真实退出", async () => {
+    const child = new FakeChild();
+    const registry = new StreamWindowRegistry({ spawnImpl: (() => child) as unknown as typeof import("node:child_process").spawn });
+    try {
+        const window = await registry.open({ name: "local-retry", command: "fixture" });
+        child.emitOut("KEEP\n");
+        child.kill = () => false;
+        await expect(registry.stopConfirmed(window.name)).rejects.toMatchObject({ outcome: "unknown" });
+        let requests = 0;
+        child.kill = () => { requests++; return true; };
+        await expect(registry.stopConfirmed(window.name)).rejects.toMatchObject({ outcome: "unknown" });
+        expect(registry.get(window.name)?.peekLast().frames.map(({ text }) => text)).toEqual(["KEEP"]);
+        const one = registry.stopConfirmed(window.name);
+        const two = registry.stopConfirmed(window.name);
+        expect(registry.get(window.name)).toBe(window);
+        expect(requests).toBe(2);
+        child.exit();
+        await Promise.all([one, two]);
+        expect(registry.get(window.name)).toBeUndefined();
+    } finally {
+        child.exit();
+        registry.dispose();
+    }
+}, 8000);
+
+test.skipIf(process.platform !== "linux")("shell 退出后，继承输出管道的子进程仍能写入观察窗", async () => {
+    const registry = new StreamWindowRegistry({ shell: BASH });
+    try {
+        const window = await registry.open({
+            name: "inherited-output", command: "(sleep 2.3; printf LATE) & exit 17",
+        });
+        const deadline = Date.now() + 4500;
+        while (!window.stale && Date.now() < deadline) await Bun.sleep(25);
+        expect(window.peekLast()).toMatchObject({ stale: true, exitCode: 17, frames: [{ text: "LATE" }] });
+    } finally {
+        registry.dispose();
+    }
+}, 6000);
+
+test("销毁期间迟到的 SSH 窗口若关闭失败，注册表保留重试句柄", async () => {
+    const { procs, impl } = fakeSpawn();
+    const manager = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
+    const registry = new StreamWindowRegistry();
+    try {
+        const opened = registry.open({ name: "late-failed", layerAlias: "host", command: "fixture", manager });
+        const child = procs[0]!;
+        child.kill = () => false;
+        registry.dispose();
+        await expect(opened).rejects.toThrow(/已 dispose/);
+        expect(registry.get("late-failed")).toBeDefined();
+        expect(manager.list()).toHaveLength(1);
+        child.kill = () => true;
+        registry.dispose();
+        expect(registry.get("late-failed")).toBeDefined();
+        child.exit();
+        await Bun.sleep(0);
+        expect(registry.get("late-failed")).toBeUndefined();
+        expect(manager.list()).toHaveLength(0);
+    } finally {
+        registry.dispose();
+    }
 });

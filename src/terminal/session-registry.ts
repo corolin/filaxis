@@ -3,6 +3,7 @@
  * （净室平移；logger 换注入）
  */
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { TmuxInvoker } from "./tmux-invoker.js";
 import { noopLogger, type FilaxisLogger } from "../logger.js";
 
@@ -38,7 +39,14 @@ export class SessionRegistry {
     }
 
     async save(profile: TerminalProfile): Promise<void> {
-        await fs.writeFile(`${this.dirResolver()}/${profile.id}.json`, JSON.stringify(profile, null, 2));
+        const path = `${this.dirResolver()}/${profile.id}.json`;
+        const temporary = `${path}.${randomUUID()}.tmp`;
+        try {
+            await fs.writeFile(temporary, JSON.stringify(profile, null, 2), { flag: "wx", mode: 0o600 });
+            await fs.rename(temporary, path);
+        } finally {
+            await fs.unlink(temporary).catch(() => undefined);
+        }
     }
 
     /** 缺失返回 null（不抛） */
@@ -74,8 +82,8 @@ export class SessionRegistry {
             const id = file.slice(0, -5);
             const profile = await this.load(id);
             if (!profile || profile.id !== id) {
-                await this.remove(id);
-                removed++;
+                kept++;
+                this.log.warn(`[reconcile] 无法读取会话档案 [${id}]，保留档案`);
                 return;
             }
             try {
@@ -83,10 +91,24 @@ export class SessionRegistry {
                 if (r.exitCode === 0) {
                     kept++;
                     this.log.info(`[reconcile] 会话 [${id}] 仍存活，保留（已重连）`);
+                } else if (r.exitCode === 1) {
+                    // exit 1 双义（Sol 74 #5 → Sol 75 P2-6）：会话不存在 **或** 服务端
+                    // 不可用/单次探测抽风。二次甄别（Sol 76 P2-5）：list-sessions
+                    // **通且真列出该会话** → has-session 的 1 是探测失败（会话明明
+                    // 在）→保留；通但列表无此会话 → 真不存在可删；不通 → 环境异常保留
+                    const ls = await TmuxInvoker.tryInvoke(["list-sessions"]);
+                    const listed = ls.exitCode === 0 && ls.stdout.split("\n").some((l) => l.startsWith(`${id}:`));
+                    if (ls.exitCode === 0 && !listed) {
+                        await this.remove(id);
+                        removed++;
+                        this.log.warn(`[reconcile] 僵尸会话 [${id}] 已清理`);
+                    } else {
+                        kept++;
+                        this.log.warn(`[reconcile] 会话 [${id}] 探测 exit 1 但服务端不可用（list-sessions exit=${ls.exitCode}——保守保留）`);
+                    }
                 } else {
-                    await this.remove(id);
-                    removed++;
-                    this.log.warn(`[reconcile] 僵尸会话 [${id}] 已清理`);
+                    kept++;
+                    this.log.warn(`[reconcile] 会话 [${id}] 探测异常（exit=${r.exitCode}——非「不存在」语义，保守保留）`);
                 }
             } catch {
                 // tmux 未安装：无法核实——保留 profile（保守，不误删）

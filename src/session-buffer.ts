@@ -97,7 +97,12 @@ export class OutputRingBuffer {
             text = text.slice(0, keep) + TRUNC_SUFFIX;
         }
         this.lines.push({ stream: line.stream, text });
-        if (this.lines.length > this.maxLines) {
+        // maxLines<=0 零容量（Sol 57 P2-6）：slice(-0) 曾复制全数组=缓冲无限增长
+        // + evictedLines 跳变。0 视为「无缓冲」——每行即弃
+        if (this.maxLines <= 0) {
+            this.evictedLines += 1;
+            this.lines = [];
+        } else if (this.lines.length > this.maxLines) {
             const overflow = this.lines.length - this.maxLines;
             this.lines = this.lines.slice(-this.maxLines);
             this.evictedLines += overflow;
@@ -106,12 +111,14 @@ export class OutputRingBuffer {
 
     /** 最近 n 行的 text 投影（简洁消费） */
     tail(n: number): string[] {
-        return this.lines.slice(-Math.max(0, n)).map((l) => l.text);
+        if (n <= 0) return []; // slice(-0) 曾返回全部（Sol 57 P2-6）
+        return this.lines.slice(-n).map((l) => l.text);
     }
 
     /** 最近 n 行对象（带 stream 标记——FEAT-05 按流过滤迭代用） */
     tailLines(n: number): SessionLine[] {
-        return this.lines.slice(-Math.max(0, n));
+        if (n <= 0) return []; // 同 tail（Sol 57 P2-6）
+        return this.lines.slice(-n);
     }
 
     /**

@@ -24,6 +24,12 @@ export interface SessionHandleInfo {
     pid?: number;
 }
 
+export type SessionRecoveryResult = { sessionId: string; logBase: string } & (
+    | { status: "running"; pid: number }
+    | { status: "exited"; exitCode: number }
+    | { status: "stopped" | "unknown" }
+);
+
 /**
  * 会话终态三态（FEAT-04 / REQ §3.2 细则 6）：
  * - exited   收到进程退出码（自然退出或终止后的确认退出）

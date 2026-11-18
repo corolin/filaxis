@@ -13,7 +13,7 @@
  */
 import { createHash } from "node:crypto";
 import { rename, stat, mkdir, writeFile, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { RuntimeDescriptor } from "./driver.js";
 import { enterStepsOf, type SshConnParams } from "./ssh-helpers.js";
 
@@ -199,61 +199,746 @@ function looksLikeGpuModel(val: string): boolean {
     return /^[A-Za-z0-9 ()+.-]+$/.test(val);
 }
 
-// ════════════════ 持久化（JSON + 原子写 + mtime 缓存） ════════════════
+// ════════════════ 持久化（JSON + link-CAS 落位 + mtime 缓存） ════════════════
+
+/** 旁路文件后缀：<path>.<uniq>.fx-old（link 舞步的移开态/中止残留——load 并入恢复） */
+const ASIDE_SUFFIX = ".fx-old";
+
+interface AsideFile {
+    p: string;
+    mtimeMs: number;
+    rejectedRevision?: string;
+}
+
+/** 层条目并入（dst 被 src 覆盖同键——后并入者新） */
+function mergeLayers(dst: LayerEnvConfigFile, src: unknown): void {
+    const layers = (src as LayerEnvConfigFile | null)?.layers;
+    if (!layers || typeof layers !== "object") return;
+    // 无效条目跳过（Sol 74 P1-3 → Sol 76 P1-2）：null/非对象/数组/**缺必填
+    // connection 的空对象**——曾原样并入随压实写进主档
+    for (const [k, v] of Object.entries(layers)) {
+        // 最小完整契约（Sol 82 P1-2 定版）：残缺条目不并入（driver+target-or-local
+        //+environment+fingerprint 四要素——缺任一跳过）
+        if (v != null && typeof v === "object" && !Array.isArray(v)) {
+            const conn = (v as LayerEnvEntry).connection as { driver?: unknown; target?: unknown } | null | undefined;
+        const scalarsOk = (env: unknown): boolean => {
+            const e = env as Record<string, unknown> | null | undefined;
+            if (e == null) return true;
+            for (const k of ["os", "python", "node", "bun", "java", "cuda"]) {
+                const v = e[k];
+                if (v != null && typeof v !== "string") return false; // 版本标量须字符串（Sol 86 P1-3）：python:42 曾通过校验、matchLayers .split 崩
+            }
+            return true;
+        };
+            const env = (v as LayerEnvEntry).environment as { packages?: unknown } | null | undefined;
+            const pkgsM = env?.packages;
+            const pkgsOkM = pkgsM == null || (Array.isArray(pkgsM) && pkgsM.every((x) => typeof x === "string"));
+            const envOk = env != null && typeof env === "object" && !Array.isArray(env) && pkgsOkM && scalarsOk(env);
+            if (conn != null && typeof conn === "object" && typeof conn.driver === "string"
+                && envOk
+                && typeof (v as LayerEnvEntry).fingerprint === "string") {
+                dst.layers[k] = v as LayerEnvEntry;
+            }
+        }
+    }
+}
+
+/** 盘面档位（Sol 62 P2-4 序戳 + Sol 66 #3 血统 → Sol 67 集合血统）：rev=文档
+ *  内嵌 _fx_rev（提交时刻），seen=写入时盘面全部 rev 的集合（作者确切见过的
+ *  状态——集合成员判定免疫时钟回拨；上界 base 保留作旧档回落）。坏档
+ *  parsed=null（mergeLayers 自验证跳过） */
+interface FxDoc {
+    mtimeMs: number;
+    aside: boolean;
+    rev: string | null;
+    base: string | null;
+    seen: string[] | null;
+    parsed: unknown;
+}
+
+function makeDoc(mtimeMs: number, aside: boolean, text: string): FxDoc {
+    try {
+        const d = JSON.parse(text) as { _fx_rev?: unknown; _fx_base?: unknown; _fx_seen?: unknown };
+        return {
+            mtimeMs,
+            aside,
+            rev: typeof d._fx_rev === "string" ? d._fx_rev : null,
+            base: typeof d._fx_base === "string" ? d._fx_base : null,
+            seen: Array.isArray(d._fx_seen) ? d._fx_seen.filter((x): x is string => typeof x === "string") : null,
+            parsed: d,
+        };
+    } catch {
+        return { mtimeMs, aside, rev: null, base: null, seen: null, parsed: null };
+    }
+}
 
 export class LayerEnvStore {
-    private cache: { mtimeMs: number; cfg: LayerEnvConfigFile } | null = null;
     /** 写链串行（自挖 S2：load-modify-save 无锁——并发 upsert 后者以旧 cfg 覆盖
      *  前者写入，丢更新；实例级 promise 链保证读-改-写原子序） */
     private writeChain: Promise<unknown> = Promise.resolve();
+    /** 本实例当前持锁深度（acquireLock++/finalize--）——load 的压实须跳过
+     *  自己持锁的窗口（锁内再抢锁=自旋等自己的锁） */
+    private selfLockDepth = 0;
 
     constructor(public readonly path: string) {}
 
-    async load(force = false): Promise<LayerEnvConfigFile> {
-        let mtimeMs = 0;
-        try {
-            mtimeMs = (await stat(this.path)).mtimeMs;
-        } catch {
-            const cfg: LayerEnvConfigFile = { layers: {} };
-            this.cache = { mtimeMs: 0, cfg };
+    /** 列旁路文件（mtime 升序——线性历史态，旧→新逐个并入；mtime 是被移开文件
+     *  的原写时间非移开时间，清理阈值按此保守理解）。
+     *  归属按 uniq 形态全匹配（Sol 63 P1-1）：前后缀判定曾把同目录他档
+     *  （env.json.other.<uniq>.fx-old）误认自家旁路——合并错档+舞步收尾连删
+     *  他档恢复锚。剥前缀后必须恰为 <pid>-<ms>-<rand> 形态才算自己的。
+     *  大小写随平台（Sol 66 #4）：Windows/macOS 文件系统大小写不敏感——
+     *  case.json 移开旁路后 CASE.JSON 实例曾认不到自己的恢复锚（前缀匹配
+     *  大小写敏感）。此类平台前缀与 uniq 段按小写比对（返回路径仍用盘面实名） */
+    /** 列旁路（mtime 升序）。故障透传（Sol 87 P1-1）：readdir/单档 stat 的
+     *  EIO 等真故障曾静默吞成空列表——压实把本轮未成功读取的恢复文件照删。
+     *  非 ENOENT 故障直接抛（collectDocs 归入 readFailures） */
+    private async listAsides(): Promise<AsideFile[]> {
+        const { readdir } = await import("node:fs/promises");
+        const dir = dirname(this.path);
+        const ci = process.platform === "win32" || process.platform === "darwin";
+        const pre = `${basename(this.path)}.`;
+        const preCmp = ci ? pre.toLowerCase() : pre;
+        const uniqTail = /^\d+-\d+-[a-z0-9]{1,12}(?:\.(\d+-\d+-[a-z0-9]{1,12}))?\.fx-old$/;
+        const out: AsideFile[] = [];
+        const names = await readdir(dir).catch((e: unknown) => {
+            const code = (e as { code?: string }).code;
+            if (code === "ENOENT" || code === "ENOTDIR") return []; // 目录缺席=无旁路
+            throw new Error(`listAsides readdir 故障（${code ?? (e as Error).message}）: ${dir}`);
+        });
+        for (const n of names) {
+            const nCmp = ci ? n.toLowerCase() : n;
+            if (!nCmp.startsWith(preCmp)) continue;
+            const artifact = uniqTail.exec(nCmp.slice(preCmp.length));
+            if (!artifact) continue;
+            const p = join(dir, n); // 盘面实名（大小写不敏感平台按实名开档最稳）
+            try { out.push({ p, mtimeMs: (await stat(p)).mtimeMs, rejectedRevision: artifact[1] }); } catch (e) {
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") throw new Error(`listAsides stat 故障（${code ?? (e as Error).message}）: ${p}`);
+                /* ENOENT=竞态消失（他方舞步收尾）——跳过 */
+            }
+        }
+        return out.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    }
+
+    async load(_force = false): Promise<LayerEnvConfigFile> {
+        // 旁路恢复（Sol 59 P2-1 link 舞步）：移开态/中止残留并入读取——data 缺席
+        // 时旁路是唯一状态源（崩溃于移开与落位之间）。
+        // mtime 缓存已退役（Sol 64 #4）：同刻写入下缓存失明（A 预热+B 同刻保存
+        // →A 的 load 仍旧值）——env 档案小、读取廉，正确性优先于省一次读
+        const { docs, asides, hasData, readFailures } = await this.collectDocs();
+        if (readFailures.length > 0) {
+            // 不返回可被 save 当作全量快照的部分配置，也保留恢复旁路。
+            throw new Error(`LayerEnvStore 无法读取完整配置：${readFailures[0]}`);
+        }
+        if (!hasData && docs.length === 0) return { layers: {} };
+        const cfg = LayerEnvStore.mergeDocs(docs);
+        // 老化旁路压实（Sol 60 P2-3）：先持久后清理——只删不写曾使恢复出的条目
+        // 读一次即蒸发。锁内重读再写（本快照可能落后他方新提交）。data 缺席时
+        // 旁路是唯一状态源不清（等下次成功提交带出 data 再压）
+        const aged = hasData ? asides.filter((a) => Date.now() - a.mtimeMs > 600_000) : [];
+        if (aged.length > 0 && this.selfLockDepth === 0) {
+            try {
+                await this.compact(aged);
+            } catch { /* 锁竞争等——留待下次 load */ }
+            return LayerEnvStore.snapshot(cfg);
+        }
+        return LayerEnvStore.snapshot(cfg);
+    }
+
+    /** 并入（Sol 64 门控 → Sol 66/67 血统 → Sol 68 锚点 → Sol 69 传递闭包）：
+     *  血统集合 _fx_seen 成员判定——见过=知悉后删除、没见过=踩踏残留（救回，
+     *  免疫时钟回拨）。**锚点**：主档在场用它；缺席取「无人见过者」（其 rev 不
+     *  出现在任何档的 seen=因果最新——seen 收录链传递：A∈B.seen、B∈C.seen ⇒
+     *  C 最新，回拨下墙钟序会说谎、收录关系不会）。**血统按传递闭包**判定：
+     *  锚点经 seen 链继承对更早各代的知悉（C 直接只记 B，但 B 见过 A ⇒ C 对
+     *  A 的删除同样成立）。并发多锚（互相没见过）退回 docOrder 末位；无戳锚点
+     *  保持全并入+docOrder（恢复偏置）。救回的旁路在锚点之后并入 */
+    private static mergeDocs(allDocs: FxDoc[]): LayerEnvConfigFile {
+        // 无效档全流程惰化（Sol 71 P1 → Sol 72 P1 → Sol 73 P1）：截断 JSON、
+        // `[]`、`{"layers":[]}`（数组层表）都视同坏档——不作锚、不参与统摄
+        // 竞选与辈分门控（缺 layers 的带版本旁路曾压过有效旁路返回空配置），
+        // 锚点落统摄旁路（回拨下旧 A 不再覆盖见过它的 B）
+        const docs = allDocs.filter((d) => LayerEnvStore.docHasLayers(d));
+        const dataDoc = docs.find((d) => !d.aside);
+        let anchor: FxDoc | null = dataDoc ?? null;
+        if (!anchor) {
+            const stamped = docs.filter((d) => d.rev != null);
+            if (stamped.length > 0) {
+                // 无人见过者（被任何档 seen 收录的都不是最新）——传递成立：中间代
+                // 必被其后代收录（A∈B、B∈C ⇒ A 被 B 见过）✓
+                const unseen = stamped.filter(
+                    (cand) => !stamped.some((x) => x !== cand && (x.seen?.includes(cand.rev!) ?? false)));
+                const pool = unseen.length > 0 ? unseen : stamped; // 并发互未见/环——墙钟兜底
+                const sorted = [...pool].sort(LayerEnvStore.docOrder);
+                anchor = sorted[sorted.length - 1]!;
+            }
+        }
+        const cfg: LayerEnvConfigFile = { layers: {} };
+        if (anchor?.rev) {
+            const anchorRev = anchor.rev; // 闭包内窄化保留
+            const anchorBase = anchor.base;
+            // 锚点有效 seen = 自身 ∪ seen 链上各代的并（传递闭包——Sol 69 #2）
+            const seen = LayerEnvStore.seenClosure(anchor, docs);
+            const kept = docs.filter((d) => {
+                if (d === anchor) return false;
+                if (!d.rev) return false; // 带戳锚点+无戳旁路：作者 load 过全盘（Sol 65 #5）
+                // 集合血统（Sol 67 #2）：见过（含传递）=删/没见过=救——先于戳序
+                //（回拨下已见旧档的戳可 numeric 上大于锚点戳）
+                if (seen) return !seen.has(d.rev);
+                if (d.rev > anchorRev) return true; // 新于锚点=踩踏恢复（无集合回落）
+                if (anchorBase != null) return d.rev > anchorBase; // 旧档回落：超上界=没见过
+                return true; // 无血统=首写见空盘——全救（Sol 67 #1）
+            });
+            // kept 内部辈分门控（Sol 70 #2）：被另一 kept 档**见过**（∈其闭包）=
+            // 后继作者已知悉并做出取舍（含删除）——整档由后继承继，不再并入
+            //（主档在场时曾只按墙钟序合并 kept——回拨下后继戳反小，旧值覆盖
+            // 新值+已删条目复活）。后继闭包经 seen 链传递覆盖全部前代
+            const keptMeta = kept.map((d) => ({ d, closure: LayerEnvStore.seenClosure(d, docs) }));
+            const heirs = keptMeta.filter(({ d }) =>
+                !keptMeta.some(({ d: k, closure: kc }) => k !== d && (kc?.has(d.rev!) ?? false)));
+            heirs.sort((a, b) => (a.closure?.size ?? 0) - (b.closure?.size ?? 0) || LayerEnvStore.docOrder(a.d, b.d));
+            mergeLayers(cfg, anchor.parsed); // 锚点先并入
+            for (const { d } of heirs) mergeLayers(cfg, d.parsed); // 救回的旁路随后覆盖其键（辈分深者后并入）
+            // 无效提名透传回救（Sol 77 P1-3b）：锚点/heirs 中被提名为**无效条目**
+            //（null/数组/空 connection）的键≠删除（删除=未提名，Sol 64 语义）——
+            // 键位状态不明，向被血统跳过的各代回溯取最新有效值（曾整档跳过致
+            // 前代有效条目永久丢失并压实删除旁路）
+            {
+                const mentionedInvalid = new Set<string>();
+                const layerEntries = (src: unknown): Record<string, unknown> =>
+                    ((src as LayerEnvConfigFile | null)?.layers ?? {}) as Record<string, unknown>;
+                // 最小完整契约同判（Sol 82 P1-2）：四要素缺任一=无效提名（回救触发）
+                const invalidEntry = (v: unknown): boolean => {
+                    if (v == null || typeof v !== "object" || Array.isArray(v)) return true;
+                    const e = v as LayerEnvEntry;
+                    const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
+                const scalarsOkR = (env: unknown): boolean => {
+                    const e = env as Record<string, unknown> | null | undefined;
+                    if (e == null) return true;
+                    for (const k of ["os", "python", "node", "bun", "java", "cuda"]) {
+                                const v = e[k];
+                                if (v != null && typeof v !== "string") return false; // 版本标量须字符串（Sol 86 P1-3）：python:42 曾通过校验、matchLayers .split 崩
+                    }
+                    return true;
+                };
+
+                    const envR = e.environment as { packages?: unknown } | null | undefined;
+                    const pkgsR = envR?.packages;
+                    const pkgsOkR = pkgsR == null || (Array.isArray(pkgsR) && pkgsR.every((x) => typeof x === "string"));
+                    const envOk = envR != null && typeof envR === "object" && !Array.isArray(envR) && pkgsOkR && scalarsOkR(envR);
+                    return !(conn != null && typeof conn === "object" && typeof conn.driver === "string"
+                        && envOk
+                        && typeof e.fingerprint === "string");
+                };
+                for (const src of [anchor.parsed, ...heirs.map(({ d }) => d.parsed)]) {
+                    for (const [k, v] of Object.entries(layerEntries(src))) {
+                        if (invalidEntry(v) && cfg.layers[k] == null) mentionedInvalid.add(k);
+                    }
+                }
+                if (mentionedInvalid.size > 0) {
+                    // 回救序按**因果**（Sol 78 P1-3）：闭包深度（seen 链长度）定新旧
+                    // ——墙钟序戳在回拨下会倒挂（后代戳反小，曾把旧值写回主档）；
+                    // 并列以 docOrder 兜底。
+                    // 回溯面=**全部非锚档**（Sol 80 P1-2）：删除界判定曾只扫被跳过
+                    // 的档——删除版落在 heirs（kept）时未被咨询，回救越过它复活旧值
+                    const chain = docs
+                        .filter((d) => d !== anchor && d.parsed != null)
+                        .map((d) => ({ d, depth: LayerEnvStore.seenClosure(d, docs)?.size ?? 0 }))
+                        .sort((a, b) => b.depth - a.depth || LayerEnvStore.docOrder(b.d, a.d)); // 深（新）优先
+                    // byRev 快查（删除判定的 seen 溯源用）
+                    const byRev = new Map(docs.filter((d) => d.rev).map((d) => [d.rev!, d]));
+                    for (const { d } of chain) {
+                        for (const k of [...mentionedInvalid]) {
+                            const v = layerEntries(d.parsed)[k];
+                            if (v !== undefined) {
+                                if (!invalidEntry(v)) {
+                                    cfg.layers[k] = v as LayerEnvEntry;
+                                    mentionedInvalid.delete(k);
+                                }
+                                // 无效提名（null/空壳）：状态不明——继续向更早回溯
+                                continue;
+                            }
+                            // 未提名删除界（Sol 79 P1-2）：本档**没提**该键——若它见过的
+                            // 各代里有人有效持有该键，此未提名=明知而删（Sol 64 语义），
+                            // 回救不得越界向更早取值（曾越过中间删除档复活旧值）
+                            const closure = LayerEnvStore.seenClosure(d, docs);
+                            const sawValid = closure != null && [...closure].some((r) => {
+                                const sd = byRev.get(r);
+                                const sv = sd ? layerEntries(sd.parsed)[k] : undefined;
+                                return sv !== undefined && !invalidEntry(sv);
+                            });
+                            if (sawValid) mentionedInvalid.delete(k); // 删除成立——停止回救（保持缺席）
+                        }
+                        if (mentionedInvalid.size === 0) break;
+                    }
+                }
+            }
             return cfg;
         }
-        if (!force && this.cache?.mtimeMs === mtimeMs) return this.cache.cfg;
+        // 无戳锚点（遗老/手造）或无档：全并入按 docOrder（平局 data 胜）
+        const ordered = [...docs];
+        ordered.sort(LayerEnvStore.docOrder);
+        for (const d of ordered) mergeLayers(cfg, d.parsed);
+        return cfg;
+    }
+
+    /** 档位有效性（Sol 72 P1）：layers 为对象才算可作主档——`[]` 类合法 JSON
+     *  无 layers 结构，与截断 JSON 同罪（视同坏档不作锚） */
+    private static docHasLayers(d: FxDoc): boolean {
+        const layers = (d.parsed as LayerEnvConfigFile | null | undefined)?.layers;
+        if (layers == null || typeof layers !== "object" || Array.isArray(layers)) return false;
+        // 全无效条目（非空却无一有效）=无效档（Sol 74 P1-3 → Sol 75 P1-2 →
+        // Sol 76 P1-2）：null/数组/**缺必填字段的空对象**（`{"one":{}}`）条目都曾以
+        // 有效档身份压过可恢复前代。有效条目须含对象 connection（LayerEnvEntry
+        // 最小必填）。注意空对象 `{}` 是整档替换的合法清空态（store 自写），
+        // 不在废档之列；混入无效条目的档有效，无效条目由 mergeLayers 跳过
+        const validEntry = (v: unknown): boolean => {
+            if (v == null || typeof v !== "object" || Array.isArray(v)) return false;
+            const e = v as LayerEnvEntry;
+            const conn = e.connection as { driver?: unknown; target?: unknown } | null | undefined;
+            // 最小完整契约（Sol 77→84）：driver 字符串 + environment 非空对象
+            // 且非数组（Sol 83 P1-4）+ environment.packages 在场须数组（Sol 84
+            // P1-4：字符串 packages 曾覆盖备份并让 matchLayers 崩）+ fingerprint
+            // 字符串。target **不作要求**（Sol 84 P1-3：embedded 等自定义驱动的
+            // 默认层无落点合法——白名单豁免曾漏掉第三方驱动，探测记录被过滤删除）
+        const scalarsOk = (env: unknown): boolean => {
+            const e = env as Record<string, unknown> | null | undefined;
+            if (e == null) return true;
+            for (const k of ["os", "python", "node", "bun", "java", "cuda"]) {
+                const v = e[k];
+                if (v != null && typeof v !== "string") return false; // 版本标量须字符串（Sol 86 P1-3）：python:42 曾通过校验、matchLayers .split 崩
+            }
+            return true;
+        };
+            const pkgs = (e.environment as { packages?: unknown } | null | undefined)?.packages;
+            const pkgsOk = pkgs == null || (Array.isArray(pkgs) && pkgs.every((x) => typeof x === "string"));
+            const envOk = e.environment != null && typeof e.environment === "object" && !Array.isArray(e.environment) && pkgsOk && scalarsOk(e.environment);
+            return conn != null && typeof conn === "object" && typeof conn.driver === "string"
+                && envOk
+                && typeof e.fingerprint === "string";
+        };
+        const vals = Object.values(layers);
+        return vals.length === 0 || vals.some(validEntry);
+    }
+
+    /** seen 传递闭包：锚点的有效知悉=自身 seen ∪ 各被收录档的 seen（链式回收） */
+    private static seenClosure(anchor: FxDoc, docs: FxDoc[]): Set<string> | null {
+        if (!anchor.seen) return null;
+        const byRev = new Map<string, FxDoc>();
+        for (const d of docs) if (d.rev) byRev.set(d.rev, d);
+        const out = new Set<string>(anchor.seen);
+        const visited = new Set<string>(); // 走查去重按**档**（rev）——out 预置
+        // anchor.seen 后按 rev 查重曾把首层递归整个短路（首层 r 必已在 out）
+        const walk = (d: FxDoc): void => {
+            if (d.rev && visited.has(d.rev)) return;
+            if (d.rev) visited.add(d.rev);
+            for (const r of d.seen ?? []) {
+                out.add(r);
+                const next = byRev.get(r);
+                if (next) walk(next);
+            }
+        };
+        walk(anchor);
+        return out;
+    }
+
+    /** 深副本（Sol 62 P2-1）：浅副本曾漏嵌套——改 environment.os 就地污染缓存
+     *  条目并随后续 upsert 落盘。条目为 JSON 纯数据，structuredClone 深隔离 */
+    private static snapshot(cfg: LayerEnvConfigFile): LayerEnvConfigFile {
+        const layers: Record<string, LayerEnvEntry> = {};
+        for (const [k, v] of Object.entries(cfg.layers)) layers[k] = structuredClone(v);
+        return { layers };
+    }
+
+    /** 档位排序（Sol 60 P1 → Sol 62 P2-4）：内嵌序戳 _fx_rev（提交时刻 ms-pid-nonce）
+     *  优先——真提交新旧的可靠序：穿透序（A 陈 data vs B 新旁路）与崩溃清理前序
+     *  （新 data vs 旧旁路）双解，mtime 同刻平局不再靠猜。无戳（手造/遗老档）
+     *  回落 mtime；双无戳同刻=结构上不可判定，选护已落位提交（data 胜） */
+    private static docOrder(x: FxDoc, y: FxDoc): number {
+        const kx = x.rev ? parseInt(x.rev, 10) : x.mtimeMs;
+        const ky = y.rev ? parseInt(y.rev, 10) : y.mtimeMs;
+        if (kx !== ky) return kx - ky;
+        if (x.rev && y.rev) return x.rev < y.rev ? -1 : x.rev > y.rev ? 1 : 0;
+        if (x.rev) return 1; // 同刻：带戳后入（胜）——新协议档
+        if (y.rev) return -1;
+        return (y.aside ? 1 : 0) - (x.aside ? 1 : 0); // 双无戳同刻：data 后入（胜）
+    }
+
+    /** 档位收集：stat 先于列旁路（Sol 62 P2-3）——stat 失败=现行态在 stat 前已被
+     *  移开→rename 已落地→随后的列旁路必见移开态；stat 成功而读失败=stat 与读
+     *  之间被移开→重列旁路捞回。两个舞步窗口都不再读成空档 */
+    private async collectDocs(): Promise<{
+        docs: FxDoc[];
+        asides: AsideFile[];
+        dataMtimeMs: number;
+        hasData: boolean;
+        /** 读失败（EIO 等非缺席类）——在场时 load 跳过压实（Sol 84 P1-2：
+         *  曾照常压实删除唯一含恢复数据的旁路=故障窗口内永久丢失） */
+        readFailures: string[];
+    }> {
+        let dataMtimeMs = 0;
+        let hasData = false;
+        const readFailures: string[] = [];
+        const docs: FxDoc[] = [];
+        const readDoc = async (p: string, mtimeMs: number, aside: boolean, rejectedRevision?: string): Promise<void> => {
+            try {
+                const doc = makeDoc(mtimeMs, aside, await readFile(p, "utf-8"));
+                // A rollback artifact can hold a rejected local revision or a newer
+                // foreign commit. Its name identifies the only revision to suppress.
+                if (doc.rev !== rejectedRevision) docs.push(doc);
+            } catch (e) {
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") readFailures.push(`${p}: ${code ?? (e as Error).message}`); // EIO 等真故障（ENOENT=舞步竞态归缺席）
+            }
+        };
         try {
-            const parsed = JSON.parse(await readFile(this.path, "utf-8")) as LayerEnvConfigFile;
-            const cfg: LayerEnvConfigFile = parsed?.layers && typeof parsed.layers === "object"
-                ? { layers: parsed.layers }
-                : { layers: {} };
-            this.cache = { mtimeMs, cfg };
-            return cfg;
-        } catch {
-            return this.cache?.cfg ?? { layers: {} }; // 坏文件：不崩，返回空
+            dataMtimeMs = (await stat(this.path)).mtimeMs;
+            hasData = true;
+        } catch (e) {
+            // stat 分诊（Sol 87 P1-1）：EIO 曾静默当缺席——upsert 部分视图落盘
+            const code = (e as { code?: string }).code;
+            if (code !== "ENOENT") readFailures.push(`${this.path}(stat): ${code ?? (e as Error).message}`);
+        }
+        const asides = await this.listAsides().catch((e: unknown): AsideFile[] => {
+            readFailures.push((e as Error).message); // readdir/stat 真故障（Sol 87 P1-1）——旁路清单不可信
+            return [];
+        }); // stat 先于列旁路（Sol 62 P2-3）——次序是读穿舞步窗口的依据，勿动
+        for (const a of asides) {
+            await readDoc(a.p, a.mtimeMs, true, a.rejectedRevision);
+        }
+        if (hasData) {
+            try {
+                docs.push(makeDoc(dataMtimeMs, false, await readFile(this.path, "utf-8")));
+            } catch (e) {
+                // **主档读失败分诊**（Sol 86 P1-2）：EIO 等真故障必须进 readFailures
+                //（曾静默跳过——load 用旁路覆盖主档、upsert 部分态落盘，主档独有
+                // 条目永久丢失）；ENOENT=舞步移开走重列旁路恢复路径
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") {
+                    readFailures.push(`${this.path}: ${code ?? (e as Error).message}`);
+                } else {
+                    // stat 与读之间现行态被移开——重列旁路（rename 先于读失败，必见）；
+                    // 主档也重读（Sol 63 P2-3）：完整提交可能已跨过我们的读
+                    const known = new Set(asides.map((x) => x.p));
+                    for (const a of await this.listAsides()) {
+                        if (known.has(a.p)) continue;
+                        asides.push(a);
+                        await readDoc(a.p, a.mtimeMs, true, a.rejectedRevision);
+                    }
+                    await readDoc(this.path, (await stat(this.path).catch(() => ({ mtimeMs: dataMtimeMs }))).mtimeMs, false);
+                }
+            }
+        }
+        if (!hasData) {
+            // 主档重探（Sol 64 #1 → Sol 65 #4）：读取自「主档已移开」起步（stat 即
+            // 失败）后，写入方可能在任何时刻归位新档——不论旁路扫描是否已捞到旧
+            // 态（曾只在零旁路时重探：捞到旧旁路+新档落位→返回旧值）。缺席即重探。
+            // 重探读失败走 readDoc 分诊（Sol 87 P1-1）：EIO 归账非静默。
+            // **重探 stat 本身分诊**（Sol 88 P1-4）：catch-null 曾把 stat 的 EIO 也
+            // 吞成「仍缺席」——hasData 假阴性下 upsert 以旁路部分视图落盘，主档
+            // 独有条目永久蒸发。非 ENOENT 一律归 readFailures
+            let st: { mtimeMs: number } | null = null;
+            try {
+                st = await stat(this.path);
+            } catch (e) {
+                const code = (e as { code?: string }).code;
+                if (code !== "ENOENT") readFailures.push(`${this.path}(re-probe stat): ${code ?? (e as Error).message}`);
+            }
+            if (st) {
+                await readDoc(this.path, st.mtimeMs, false);
+                if (docs.some((d) => !d.aside)) {
+                    dataMtimeMs = st.mtimeMs;
+                    hasData = true;
+                }
+            }
+        }
+        return { docs, asides, dataMtimeMs, hasData, readFailures };
+    }
+
+    /** 压实：锁内重读合并态 → 舞步落位（成功即自消其旁路）→ 清 aged。
+     *  读路径 best-effort——任何失败留待下次 load 重试 */
+    private async compact(aged: Array<{ p: string; mtimeMs: number }>): Promise<void> {
+        const release = await this.acquireLock();
+        try {
+            const { cfg: fresh, readFailures, asidePaths, revs } = await this.readMergedChecked();
+            if (readFailures.length > 0) return; // 读故障中止压实（Sol 85 P1-2）：旁路留盘
+            await this.saveLocked(fresh, () => release.verifyHeld(), { asidePaths, revs });
+            const { unlink } = await import("node:fs/promises");
+            for (const a of aged) await unlink(a.p).catch(() => undefined);
+        } finally {
+            await release.finalize();
         }
     }
 
-    /** 原子写：tmp + rename */
+    /** 盘面全量读+读故障透传（Sol 85 P1-2：压实的二次读取遇 EIO 曾照删旁路
+     *  ——一次 load 返回恢复条目、二次读取时条目已永久消失） */
+    private async readMergedChecked(): Promise<{
+        cfg: LayerEnvConfigFile;
+        readFailures: string[];
+        /** 合并基线（Sol 88 P1-5）：本次读到的旁路路径与 rev 集——saveLocked
+         *  的 seen 记录与旁路消费**只认基线**：晚于基线出现的恢复旁路（他方
+         *  舞步崩溃残留）既不记「见过」也不删除，留盘待下次 load 救回 */
+        asidePaths: string[];
+        revs: string[];
+    }> {
+        const { docs, asides, readFailures } = await this.collectDocs();
+        return {
+            cfg: LayerEnvStore.mergeDocs(docs),
+            readFailures,
+            asidePaths: asides.map((a) => a.p),
+            revs: docs.map((d) => d.rev).filter((r): r is string => r != null),
+        };
+    }
+
+    private async readMergedRaw(): Promise<LayerEnvConfigFile> {
+        return (await this.readMergedChecked()).cfg;
+    }
+
+    /** 原子写（公共）：抢跨实例文件锁后走 saveLocked（含锁属复核——Sol 59 P2-1：
+     *  此前未传复核，公开 save() 是无保护覆盖通道） */
     async save(cfg: LayerEnvConfigFile): Promise<void> {
+        const release = await this.acquireLock();
+        try {
+            await this.saveLocked(cfg, () => release.verifyHeld());
+        } catch (e) {
+            if (e instanceof Error && e.message === "__FX_LOCK_LOST__") {
+                // save 是整档快照语义（不自动合并重试——重放会盖掉并发写入方的键）：
+                // 报冲突交调用方 load() 重读合并后重写
+                throw new Error(`LayerEnvStore.save 并发冲突（写入期间锁被回收——盘上是他方新档或本轮已落位）。请 load() 重读、合并你的键后重写: ${this.path}`);
+            }
+            throw e;
+        } finally {
+            await release.finalize();
+        }
+    }
+
+    /** 无锁写（调用方持锁）：tmp + link-CAS 舞步落位。
+     *  link-CAS（Sol 59 P2-1）：rename 是「无条件替换」——上轮把锁属复核内联到
+     *  rename 紧前只收窄到 syscall 间隙，复核回调内可暂停的窗口仍会被陈锁回收
+     *  穿透（A 复核过→暂停→B 回收接管提交→A 恢复 rename 直接盖掉——两个
+     *  upsert 都报成功，B 的键蒸发）。link 是「不存在才落位」：EEXIST = 落位
+     *  点已有他人提交的铁证——中止且不动盘上数据。舞步：先把现行态移开
+     *  （rename→旁路）空出落位点，再 link；崩溃/中止时旁路残留由 load 并入
+     *  恢复（自愈）。落位后二次锁属复核兜底「暂停跨越整个舞步」的持有权早失 */
+    private async saveLocked(
+        cfg: LayerEnvConfigFile,
+        verifyHeld?: () => Promise<boolean>,
+        baseline?: { asidePaths: string[]; revs: string[] },
+    ): Promise<void> {
+        const { link, unlink } = await import("node:fs/promises");
         await mkdir(dirname(this.path), { recursive: true });
-        // tmp 带进程 nonce（Hydrogen R2 #7）：固定名跨进程（多 CLI 并发 probe）互相
-        // 踩踏/触发 rename ENOENT；rename 仍原子，各自 tmp 独占互不干扰
-        const tmp = `${this.path}.${process.pid}-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 6)}.tmp`;
-        await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
-        await rename(tmp, this.path);
-        this.cache = null; // 失效缓存（下次 load 重 stat）
+        const uniq = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const tmp = `${this.path}.${uniq}.tmp`;
+        const aside = `${this.path}.${uniq}${ASIDE_SUFFIX}`;
+        // 舞步开场盘点（Sol 61 P2-2 → Sol 88 P1-5）：成功收尾时一并消费的旁路
+        // + 血统 seen 的 rev 集。**基线驱动**：upsert/compact 传入合并读的基线
+        //——基线之后才出现的恢复旁路（他方舞步崩溃残留）曾既被提交时的重新
+        // 枚举记入 _fx_seen（「作者见过」谎报）又被物理删除，其条目从未并入
+        // 任何合并=永久丢失。seen 与消费都只认基线；无基线（save 整档快照）
+        // 也只**单次**枚举（旧实现 preAsides/diskDocs 两轮枚举间隙同病）
+        let consumableAsides: string[];
+        let seenRevs: string[];
+        if (baseline) {
+            consumableAsides = baseline.asidePaths;
+            seenRevs = baseline.revs;
+        } else {
+            const opening = await this.collectDocs();
+            if (opening.readFailures.length > 0) {
+                throw new Error(`LayerEnvStore 读故障在场——save 拒绝覆盖配置：${opening.readFailures[0]}`);
+            }
+            consumableAsides = opening.asides.map((a) => a.p);
+            seenRevs = opening.docs.map((d) => d.rev).filter((r): r is string => r != null);
+        }
+        const baseRev = seenRevs.reduce<string | null>((m, r) => (!m || r > m ? r : m), null);
+        // 内嵌序戳（Sol 62 P2-4）：文档自带提交时刻——rename/link 迁移不损，
+        // 同刻 mtime 平局由戳裁决（mergeLayers 只读 layers，戳不外泄）。
+        // payloadText 单源（Sol 63 P2-4）：落位后锁失的还原比对须与写入逐字节同串
+        const rev = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        const payloadText = JSON.stringify(
+            seenRevs.length > 0
+                ? { ...cfg, _fx_rev: rev, _fx_base: baseRev, _fx_seen: seenRevs }
+                : { ...cfg, _fx_rev: rev },
+            null, 2);
+        await writeFile(tmp, payloadText, "utf-8");
+        if (verifyHeld && !(await verifyHeld())) {
+            await unlink(tmp).catch(() => undefined);
+            throw new Error("__FX_LOCK_LOST__"); // 哨兵：落位未尝试，盘上数据未动
+        }
+        let hadPriorMain = false; // 本舞步是否真的移开过主档（Sol 89 P1-1）——还原失败的分支依据
+        try {
+            await rename(this.path, aside);
+            hadPriorMain = true;
+        } catch (e) {
+            if ((e as { code?: string }).code !== "ENOENT") {
+                await unlink(tmp).catch(() => undefined); // 移开失败：tmp 不留残
+                throw e;
+            } // 缺席容忍（首次写）——hadPriorMain=false：旁路从未存在
+        }
+        try {
+            await link(tmp, this.path);
+        } catch (e) {
+            await unlink(tmp).catch(() => undefined);
+            if ((e as { code?: string }).code === "EEXIST") {
+                throw new Error("__FX_LOCK_LOST__"); // 并发已提交铁证——移开态留旁路，load 并入恢复
+            }
+            throw e;
+        }
+        await unlink(tmp).catch(() => undefined);
+        // 落位后锁属复核：EEXIST 未触发只证明落位瞬间无并发提交——暂停窗口跨越
+        // 整个舞步时持有权早失。还原优先（Sol 63 P2-4）：盘上仍是本舞步产物
+        //（无人再动过）时把移开态搬回主位——陈值不留主位；时钟回拨/同刻下
+        // 序戳不可靠，物理还原是活检测路径上最诚实的序。盘面已变则留给合并序。
+        // **无锁安全化**（Sol 90 P1-1）：旧实现「读主档比对内容→无条件 rename/
+        // unlink」——比对与破坏动作之间他方可接管陈锁完成提交，A 的回滚删掉 B
+        // 的已提交主档（load 空配置）。新不变量：**锁失后只动自己拥有的名字 +
+        // 唯一一次 absent-only 落位**——①把主档原子取到恢复旁路名（并发读方经
+        // 合并协议可见，无丢失窗口）；②内容仍是本舞步产物 → 撤下它，并用
+        // link-CAS 归位旧档（EEXIST=他人已提交→中止留锚）；不是 → CAS 放回
+        //（放不回=又有新提交——它已在恢复旁路名下，无需再动）；③主位缺席时
+        // 旧档同样 link-CAS 归位。任何路径都不可能删/盖他人的主档
+        if (verifyHeld && !(await verifyHeld())) {
+            try {
+                const uniq2 = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                const scratchAside = `${this.path}.${uniq2}.${rev}${ASIDE_SUFFIX}`;
+                let hadMain = true;
+                try { await rename(this.path, scratchAside); } catch (e) {
+                    if ((e as { code?: string }).code !== "ENOENT") throw e;
+                    hadMain = false;
+                }
+                if (hadMain) {
+                    const cur = await readFile(scratchAside, "utf-8");
+                    if (cur === payloadText) {
+                        // 仍是本舞步产物——hadPriorMain 时先归位旧档（absent-only）
+                        if (hadPriorMain) {
+                            try {
+                                await link(aside, this.path);
+                                await unlink(aside).catch(() => undefined); // link 立第二名字——消原
+                            } catch { /* 他人主档已落位（EEXIST）——我的 aside 留盘作恢复锚 */}
+                        }
+                        await unlink(scratchAside).catch(() => undefined); // 撤下自己的产物（首次写=盘面回无档原态）
+                    } else {
+                        // 他人已提交的主档——CAS 放回；放不回（又有新提交）则它已
+                        // 在恢复旁路名下（并发基线可见），留给合并协议
+                        const back = await link(scratchAside, this.path).then(() => true, () => false);
+                        if (back) await unlink(scratchAside).catch(() => undefined);
+                    }
+                } else if (hadPriorMain) {
+                    // 主位缺席（他人舞步在途/崩溃残留）——absent-only 归位旧档
+                    try {
+                        await link(aside, this.path);
+                        await unlink(aside).catch(() => undefined);
+                    } catch { /* 已有他人落位——留锚 */}
+                }
+                // 首次写且主位缺席：产物已不在主位，盘面即原态——无事可做
+            } catch { /* 回滚自身故障——全部产物留盘（恢复锚语义） */}
+            throw new Error("__FX_LOCK_LOST__");
+        }
+        // 成功收尾：消费自己移开的旁路 + 盘点在册的历史旁路（Sol 60 P2-2 +
+        // Sol 61 P2-2 → Sol 88 P1-5 基线化）——保留它们会让整档替换已删的层经
+        // 恢复协议复活；但**只消基线内的**（cfg 合并确曾看过它们）。post-check
+        // 通过=本舞步持锁期间无他方提交：upsert 的 cfg 基线（锁内 load）⊇ 基线
+        // 旁路内容；save 的整档替换语义本就覆盖删除。中止/崩溃路径不消费——
+        // 旁路是恢复锚；基线外新落者留盘待下次合并
+        await unlink(aside).catch(() => undefined);
+        for (const p of consumableAsides) await unlink(p).catch(() => undefined);
+    }
+
+    /** 跨实例文件锁（Sol 54 P2-9）：O_CREAT|O_EXCL 探针 + 陈锁回收（>5s 强占） */
+    private async acquireLock(): Promise<(() => Promise<void>) & { verifyHeld(): Promise<boolean>; finalize(): Promise<void> }> {
+        // mkdir 前置（Sol 55 P2-A）：曾先开锁文件——新目录首写 ENOENT（目录创建
+        // 在 saveLocked 的锁内执行不到）
+        await mkdir(dirname(this.path), { recursive: true });
+        const lock = `${this.path}.lock`;
+        const { open, unlink, readFile } = await import("node:fs/promises");
+        // 锁内 nonce（Sol 55 P2-B）：陈锁回收后旧 holder 释放曾误删新 holder 的锁
+        // （A>5s→B 回收接管→A 释放删 B 锁→C 闯入）——释放只删**自己的**锁
+        const myToken = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        let fh: Awaited<ReturnType<typeof open>> | null = null;
+        for (let attempt = 0; attempt < 50; attempt++) {
+            try {
+                fh = await open(lock, "wx");
+                await fh.write(myToken);
+                break;
+            } catch (e) {
+                if ((e as { code?: string }).code !== "EEXIST") throw e;
+                try {
+                    const st = await stat(lock);
+                    if (Date.now() - st.mtimeMs > 5_000) await unlink(lock).catch(() => undefined);
+                } catch { /* 锁文件刚好消失 */ }
+                await new Promise((r) => setTimeout(r, 100));
+            }
+        }
+        if (!fh) throw new Error(`LayerEnvStore 写锁超时: ${lock}`);
+        const held = fh;
+        const store = this; // 对象字面量方法内 this 不指 store——闭包捕获
+        store.selfLockDepth++;
+        return Object.assign(
+            async () => { await held.close().catch(() => undefined); },
+            {
+                /** 写前复核：锁文件 token 仍是自己的（被陈锁回收即 false） */
+                async verifyHeld(): Promise<boolean> {
+                    try {
+                        const cur = await readFile(lock, "utf-8");
+                        return cur.trim() === myToken;
+                    } catch {
+                        return false;
+                    }
+                },
+                /** 收尾：关句柄 + 只删自己的锁（nonce 比对） */
+                async finalize(): Promise<void> {
+                    store.selfLockDepth = Math.max(0, store.selfLockDepth - 1);
+
+                    await held.close().catch(() => undefined);
+                    try {
+                        const cur = await readFile(lock, "utf-8");
+                        if (cur.trim() === myToken) await unlink(lock);
+                    } catch { /* 已被回收/删除 */ }
+                },
+            },
+        );
     }
 
     /** 写入/更新一层规格；漂移检测：指纹不一致标 stale 不自动覆盖（显式 force 才覆写）。
-     *  实例内串行（写链）——并发 upsert 不丢更新。 */
+     *  **跨实例锁包裹整个读-改-写**（Sol 54 P2-9）：writeChain 只串行化本实例——
+     *  两实例并发 upsert 曾各自 load 后 save，后写覆盖前写丢 key。 */
     async upsert(key: string, entry: LayerEnvEntry, force = false): Promise<{ stale: boolean }> {
         const run = this.writeChain.then(async () => {
-            const cfg = await this.load();
-            const existing = cfg.layers[key];
-            if (existing && !force && existing.fingerprint !== entry.fingerprint) {
-                return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+            // 锁属复核重试环（Sol 56 P2-2）：暂停的旧 holder 曾在陈锁回收+新 holder
+            // 写完后恢复——saveLocked 无锁属检查直接覆盖新数据。写前复核锁 token
+            // 仍是自己的；被回收（token 不匹配）则重试整轮（重新拿锁+重读+重合并）
+            for (let round = 0; round < 3; round++) {
+                const release = await this.acquireLock();
+                try {
+                    // 锁内强制重读（Sol 63 P1-2）：mtime 缓存在同刻写入下失明——
+                    // A 缓存{a}+B 同刻写 b 后，A 持锁 upsert 曾从旧缓存取基线写
+                    // {a,c}，b 蒸发。写者不信缓存，锁内永远读盘面新鲜态。
+                    // **读故障中止**（Sol 85 P1-2）：EIO 挡住的旁路曾照常丢——
+                    // upsert 以部分态落盘并清旁路=stale:false 谎报+数据丢失
+                    const { cfg, readFailures, asidePaths, revs } = await this.readMergedChecked();
+                    if (readFailures.length > 0) {
+                        throw new Error(`LayerEnvStore 读故障在场——upsert 拒绝以部分态落盘（${readFailures[0]}）。请解除故障后重试: ${key}`);
+                    }
+                    const existing = cfg.layers[key];
+                    if (existing && !force && existing.fingerprint !== entry.fingerprint) {
+                        return { stale: true } as const; // 环境可能已漂移——不覆盖，供重探决策
+                    }
+                    cfg.layers[key] = entry;
+                    try {
+                        // rename 紧前复核（Sol 58 P2-1）：失败时 rename 未发生，盘上
+                        // 新 holder 数据完好——本轮放弃，loop 重新拿锁+重读+重合并。
+                        // 基线随行（Sol 88 P1-5）：seen/旁路消费与合并读同源
+                        await this.saveLocked(cfg, () => release.verifyHeld(), { asidePaths, revs });
+                        return { stale: false } as const;
+                    } catch (e) {
+                        if (e instanceof Error && e.message === "__FX_LOCK_LOST__") continue; // 重试
+                        throw e;
+                    }
+                } finally {
+                    await release.finalize();
+                }
             }
-            cfg.layers[key] = entry;
-            await this.save(cfg);
-            return { stale: false } as const;
+            throw new Error(`LayerEnvStore upsert 锁属复核三轮失败（持续被回收）: ${key}`);
         });
         this.writeChain = run.catch(() => undefined); // 失败不堵后续写
         return run;
@@ -310,12 +995,13 @@ export function matchLayers(cfg: LayerEnvConfigFile, needs: string[]): LayerMatc
             if (name === "cuda") return spec.cuda != null;
             if (name === "python" || name === "node" || name === "bun" || name === "java") {
                 const have = spec[name];
-                if (!have) return false;
+                if (typeof have !== "string") return false; // 防御（Sol 86 P1-3）：非字符串标量按缺席——不再 .split 崩
                 if (!op || !want) return true;
                 return compareVersion(extractVersion(have) ?? "0", want, op);
             }
             // 包名匹配（matchNames 别名 + @ 版本）
-            const pkg = (spec.packages ?? []).find((p) => {
+            const pkgList = (Array.isArray(spec.packages) ? spec.packages : []).filter((x) => typeof x === "string"); // 防御（Sol 84/85 P1-4）：损坏/非字符串元素不再崩查询
+            const pkg = pkgList.find((p) => {
                 const base = p.split("@")[0]!;
                 const def = PROBE_PACKAGES.find((d) => base === d.key || d.matchNames.includes(base));
                 return base === name || def?.matchNames.includes(name);

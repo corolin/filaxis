@@ -1,6 +1,6 @@
 /** editFile 受控编辑测试（local driver 真跑 + toolkit 新工具真跑 + CLI 冒烟） */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync, readdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
@@ -12,6 +12,43 @@ import type { RuntimeDriver } from "../src/driver.js";
 const dir = mkdtempSync(join(tmpdir(), "fx-edit-"));
 
 describe("editFile（TOCTOU+精确替换）", () => {
+    test.skipIf(process.platform !== "linux")("符号链接编辑与同目标别名共用 CAS 锁", async () => {
+        const fixture = mkdtempSync(join(tmpdir(), "fx-edit-aliases-"));
+        try {
+            const target = join(fixture, "target");
+            const a = join(fixture, "a");
+            const b = join(fixture, "b");
+            writeFileSync(target, "base-A base-B\n");
+            symlinkSync(target, a);
+            symlinkSync(target, b);
+            const drv = new LocalRuntimeDriver();
+            const exec = drv.exec.bind(drv);
+            let reads = 0;
+            let releaseReads!: () => void;
+            const bothRead = new Promise<void>((resolve) => { releaseReads = resolve; });
+            drv.exec = async (cmd, opts) => {
+                const result = await exec(cmd, opts);
+                if (cmd.includes("echo __FXS__")) {
+                    if (++reads === 2) releaseReads();
+                    await bothRead;
+                }
+                return result;
+            };
+            const results = await Promise.allSettled([
+                editFile(drv, a, "base-A", "edit-A"),
+                editFile(drv, b, "base-B", "edit-B"),
+            ]);
+            const success = results.filter((r) => r.status === "fulfilled");
+            expect(success).toHaveLength(1);
+            expect(success[0]?.value.mutex).toBe("flock");
+            expect(results.find((r) => r.status === "rejected")?.reason).toBeInstanceOf(EditConflictError);
+            expect(readFileSync(target, "utf-8")).toMatch(/^(edit-A base-B|base-A edit-B)\n$/);
+            expect(readdirSync(fixture).filter((n) => n.endsWith(".fx-lock"))).toEqual(["target.fx-lock"]);
+        } finally {
+            rmSync(fixture, { recursive: true, force: true });
+        }
+    });
+
     test("唯一命中替换成功（base64 写回保真）", async () => {
         const drv = new LocalRuntimeDriver();
         const p = join(dir, "a.env");
@@ -224,6 +261,22 @@ describe("editFile（TOCTOU+精确替换）", () => {
         rmSync(d10, { recursive: true, force: true });
     }, 20_000);
 
+    test("大文件回退可用相对路径编辑当前目录中的文件", async () => {
+        const fixture = mkdtempSync(join(tmpdir(), "fx-edit-relative-large-"));
+        try {
+            const name = "big file.conf";
+            const file = join(fixture, name);
+            const body = "x".repeat(75_000);
+            writeFileSync(file, "old=" + body);
+            const drv = new LocalRuntimeDriver({ cwd: fixture, execDir: join(fixture, "exec") });
+            const result = await editFile(drv, name, "old=", "new=");
+            expect(result.writeMode).toBe("inplace-write");
+            expect(readFileSync(file, "utf-8")).toBe("new=" + body);
+        } finally {
+            rmSync(fixture, { recursive: true, force: true });
+        }
+    }, 30_000);
+
     // GPT Astra #1：大文件回退路径曾丢弃原始读戳（读取后他人写被当新基准覆盖）——
     // 回退前核验原始 stat 戳，不符即 EditConflictError
     test("大文件回退核验：读取后他人先写 → EditConflictError（不覆盖他人内容）", async () => {
@@ -265,44 +318,66 @@ describe("toolkit 新工具（read_file/edit_file/observe_stream）", () => {
         rmSync(d2, { recursive: true, force: true });
     }, 20_000);
 
-    test("observe_stream 按流过滤", async () => {
+    test("observe_stream 持续接收，按流过滤、回看和游标续读", async () => {
         const tk = createAgentToolkit(new RuntimeStack(), {});
-        const r = await tk.handlers.observe_stream({
-            command: "echo O1; echo E1 1>&2; sleep 0.3; echo O2; echo E2 1>&2; sleep 2",
-            duration_ms: 2000,
-            stream: "stderr",
-        });
-        expect(r.lines.map((l) => l.text)).toContain("E1");
-        expect(r.lines.map((l) => l.text)).toContain("E2");
-        expect(r.lines.every((l) => l.stream === "stderr")).toBe(true);
-        expect(r.lines.map((l) => l.text)).not.toContain("O1");
-    }, 30_000);
-
-    // 第八季盲测 bug 回归：ssh 层 RemoteSessionManager.tailLines 是 async——
-    // 修复前 lines 是未 resolve 的 Promise（恒 truthy，兜底短路），lines.filter 抛
-    // TypeError。local 层 tailLines 恰是同步方法，故此前 local 测试全绿掩盖了本 bug。
-    test("observe_stream：async tailLines（ssh 形态）——Promise 必被 await", async () => {
-        const fakeRemote = {
-            descriptor: { driver: "ssh", target: "mock" },
-            execSession: async () => ({ sessionId: "s-async", logBase: "/tmp/s-async" }),
-            tailSession: async () => { throw new Error("tailLines 在场时不得走 stdout 投影兜底"); },
-            stopSession: async () => ({ exitCode: null }),
-            sessions: {
-                tailLines: async (_id: string, _n?: number) => [
-                    { stream: "stdout", text: "O_ASYNC" },
-                    { stream: "stderr", text: "E_ASYNC" },
-                ],
-            },
-        } as unknown as RuntimeDriver;
-        const tk = createAgentToolkit(new RuntimeStack(), { driver: fakeRemote });
-        const r = await tk.handlers.observe_stream({ command: "mock", duration_ms: 10, stream: "stderr" });
-        expect(r.lines).toEqual([{ stream: "stderr", text: "E_ASYNC" }]);
-        const both = await tk.handlers.observe_stream({ command: "mock", duration_ms: 10 });
-        expect(both.lines.length).toBe(2); // 无过滤全量（修前此处 Promise.filter 已炸）
-    }, 15_000);
+        const dir = mkdtempSync(join(tmpdir(), "fx-window-test-"));
+        const gate = join(dir, "gate");
+        const path = (await import("../src/ssh-helpers.js")).shellQuote(gate.replace(/\\/g, "/"));
+        try {
+            const { window_id } = await tk.handlers.observe_stream({
+                command: `echo IGNORE; printf 'E1\\nE2\\nE3\\n' >&2; while [ ! -f ${path} ]; do sleep 0.1; done; echo E4 >&2`,
+                stream: "stderr",
+            });
+            const first = await tk.handlers.read_stream({ window_id, since_seq: 0, wait_ms: 8000, limit: 1 });
+            expect(first.frames.map(({ text, stream }) => [text, stream])).toEqual([["E1", "stderr"]]);
+            const rest = await tk.handlers.read_stream({ window_id, since_seq: first.last_delivered_seq, wait_ms: 8000 });
+            expect(rest.frames.map((frame) => frame.text)).toEqual(["E2", "E3"]);
+            const backward = await tk.handlers.read_stream({ window_id, before_seq: rest.newest_seq, limit: 2 });
+            expect(backward.frames.map((frame) => frame.text)).toEqual(["E1", "E2"]);
+            const timeout = await tk.handlers.read_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 20 });
+            expect(timeout.timed_out).toBe(true);
+            writeFileSync(gate, "");
+            const late = await tk.handlers.read_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 8000 });
+            expect(late.frames.map((frame) => frame.text)).toEqual(["E4"]);
+            const history = await tk.handlers.read_stream({ window_id, window_ms: 30000 });
+            expect(history.frames.map((frame) => frame.text)).toEqual(["E1", "E2", "E3", "E4"]);
+            expect(await tk.handlers.close_stream({ window_id })).toEqual({ window_id, closed: true });
+        } finally {
+            tk.dispose?.();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 30000);
 });
 
 describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
+
+    test("layer save recovers a dead writer's claim and protects a live writer", async () => {
+        const { mkdirSync } = await import("node:fs");
+        const { spawn } = await import("node:child_process");
+        const { once } = await import("node:events");
+        const dir = mkdtempSync(join(tmpdir(), "fx-layer-claim-"));
+        const store = join(dir, "layers.json");
+        const lock = store + ".lock";
+        const generation = "00000000-0000-4000-8000-000000000001";
+        const run = () => Bun.spawnSync([process.execPath, "bin/filaxis.ts", "layer", "save", "probe", "--host", "web-01"], {
+            env: { ...process.env, FILAXIS_LAYERS: store },
+        });
+        try {
+            mkdirSync(lock);
+            const dead = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+            await once(dead, "exit");
+            expect(dead.pid).toBeDefined();
+            writeFileSync(join(lock, `${dead.pid}-${generation}`), "");
+            const active = join(lock, `${process.pid}-${generation}`);
+            writeFileSync(active, "");
+            expect(run().exitCode).not.toBe(0);
+            rmSync(active);
+            expect(run().exitCode).toBe(0);
+            expect(JSON.parse(readFileSync(store, "utf8")).probe.target).toBe("web-01");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
     test("exec + cat + edit + observe 本地真跑", async () => {
         const { execSync } = await import("node:child_process");
         const d3 = mkdtempSync(join(tmpdir(), "fx-cli-"));
@@ -399,4 +474,123 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         expect(out3).toContain("无已保存层");
         rmSync(d6, { recursive: true, force: true });
     }, 60_000);
+});
+
+// GPT Sol 五十九期 P1-1：240 字符长文件名编辑——CAS 核验已改原路径（58 P2-4），
+// 但落位目标 __fx_tgt 仍由缩短名 fxBase 解析：编辑报 atomic-replace 成功，实际
+// 写进同目录缩短名旁路文件（原文件分毫未动）。修：fxBase 只锚 tmp/lock 伴生件。
+describe("Sol 59：长文件名编辑落位原路径", () => {
+    test("240 字符 ASCII 文件名：原文件被改写 + 无旁路缩短名文件", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-long-")).replace(/\\/g, "/");
+        const name = "L".repeat(240) + ".env"; // >231 触发 fxBase 缩短（NAME_MAX 基底）
+        const p = `${d}/${name}`;
+        writeFileSync(p, "OLD=1\n");
+        const r = await editFile(drv, p, "OLD=1", "NEW=2");
+        expect(r.writeMode).toBe("atomic-replace");
+        expect(readFileSync(p, "utf-8")).toBe("NEW=2\n"); // 修前：原文件仍是 OLD=1
+        // 修前实锤形态：同目录出现「LLL…~xxxxxxxx」缩短名文件装着 NEW=2
+        //（fx-lock 残留是 fd 9 重定向的既有行为，不算旁路）
+        const lSiblings = readdirSync(d).filter((f) => f.startsWith("L") && f !== name && !f.endsWith(".fx-lock") && !f.endsWith(".fx-tmp"));
+        expect(lSiblings).toEqual([]);
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});
+
+// GPT Sol 六十期 P2-4：长文件名缩短基底的 hash 曾取随机——同一 240 字符文件的
+// 两次编辑各持各的 .fx-lock，flock 对同目标的核验/写回互斥失效。确定性摘要
+//（sha256(name) 前 8）= 同目标必同锁。
+describe("Sol 60：长文件名同锁", () => {
+    test("同一 240 字符文件两次编辑——fx-lock 路径一致", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-lock60-")).replace(/\\/g, "/");
+        const name = "K".repeat(240) + ".env";
+        const p = `${d}/${name}`;
+        writeFileSync(p, "OLD=1\n");
+        const realExec = drv.exec.bind(drv);
+        const lockPaths = new Set<string>();
+        (drv as unknown as { exec: unknown }).exec = async (cmd: string, o?: unknown) => {
+            const m = String(cmd).match(/9>(\S+)/); // 舞步命令的 fd 9 锁重定向
+            if (m) lockPaths.add(m[1]!);
+            return await realExec(cmd, o as never);
+        };
+        await editFile(drv, p, "OLD=1", "NEW=2");
+        await editFile(drv, p, "NEW=2", "NEW=3");
+        expect(lockPaths.size).toBe(1); // 修前：随机 hash → 两个不同锁路径
+        expect(readFileSync(p, "utf-8")).toBe("NEW=3\n");
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});
+
+// GPT Sol 六十一期 P1：读往返内戳-正文混版——stat/sha 戳与 base64 正文在同一
+// 命令里先后读取，其间文件被并发换版（戳=A、正文=短暂出现的 B、写回前恢复 A）
+// 时 CAS 戳写回时仍匹配，B 的正文却被当底稿写回。修：正文摘要与同次 sha 戳互核。
+describe("Sol 61：读往返内戳-正文互核", () => {
+    test("sha 戳与 base64 正文来自不同版本 → EditConflictError（B 正文不落盘）", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-mix61-")).replace(/\\/g, "/");
+        const p = `${d}/mix.env`;
+        const bFile = `${d}/version-b.env`;
+        writeFileSync(p, "KEEP=A\nMODE=0\n");
+        writeFileSync(bFile, "KEEP=B\nMODE=0\n");
+        const realExec = drv.exec.bind(drv);
+        let injected = false;
+        (drv as unknown as { exec: unknown }).exec = async (cmd: string, o?: unknown) => {
+            if (!injected && cmd.includes("__FXS__")) {
+                injected = true;
+                // 在 sha 戳（__FXS__ 前段）与 base64 正文（__FXD__ 后段）之间插入
+                // 「文件短暂变为 B」——戳=A、正文=B
+                const sabotaged = cmd.replace("echo __FXD__; base64", `echo __FXD__; cat '${bFile}' > '${p}'; base64`);
+                const r = await realExec(sabotaged, o as never);
+                writeFileSync(p, "KEEP=A\nMODE=0\n"); // 恢复原版——写回时 CAS 戳必匹配
+                return r;
+            }
+            return await realExec(cmd, o as never);
+        };
+        // 修前：CAS 匹配（盘上是 A）→ 以 B 的正文为底稿替换 MODE → KEEP=B 落盘
+        await expect(editFile(drv, p, "MODE=0", "MODE=1")).rejects.toMatchObject({ name: "EditConflictError" });
+        expect(readFileSync(p, "utf-8")).toBe("KEEP=A\nMODE=0\n"); // 未被写坏
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});
+
+// GPT Sol 六十二期 P1：CAS 写回命令 exit 1 + stdout "FX_OK …" 曾被报成
+// atomic-replace/flock——成功分支只看输出前缀。修：退出码入闸（FX_LOCK_FAIL
+// 特判外非零一律不作成功凭证）。
+describe("Sol 62：写回退出码入闸", () => {
+    test("exit 1 + FX_OK 输出 → 拒绝（不报 atomic-replace）", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-ec62-")).replace(/\\/g, "/");
+        const p = `${d}/ec.env`;
+        writeFileSync(p, "X=1\n");
+        const realExec = drv.exec.bind(drv);
+        (drv as unknown as { exec: unknown }).exec = async (cmd: string, o?: unknown) => {
+            // FX_CAS_FAIL 标记只在 CAS 写回命令里（读命令无此串）
+            if (cmd.includes("FX_CAS_FAIL")) {
+                return { stdout: "FX_OK 1794630000 4\n", exitCode: 1 }; // 异常退出+成功标记
+            }
+            return await realExec(cmd, o as never);
+        };
+        await expect(editFile(drv, p, "X=1", "X=2")).rejects.toThrow(/异常退出|exit 1/);
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
+});
+
+// GPT Sol 七十三期 #5：CAS 编辑的伴生锁基底（fxBase）曾按码元判定——250B 中文
+// 文件名不触发缩短、.filaxis-lock 后缀追上即超限（Linux ENAMETOOLONG 编辑整体
+// 失败）。字节口径（Windows 长路径下验证编辑成功+基底缩短生效）。
+describe("Sol 73：长中文名编辑", () => {
+    test("250B 中文文件名 CAS 编辑成功（fxBase 字节口径缩短）", async () => {
+        const drv = new LocalRuntimeDriver();
+        const d = mkdtempSync(join(tmpdir(), "fx-cjk73-")).replace(/\\/g, "/");
+        const p = `${d}/${"中".repeat(82)}.txt`; // 246B+4B=250B——裸名合法
+        writeFileSync(p, "OLD=1\n");
+        const r = await editFile(drv, p, "OLD=1", "NEW=2");
+        expect(r.writeMode).toBe("atomic-replace");
+        expect(readFileSync(p, "utf-8")).toBe("NEW=2\n");
+        // 伴生锁文件名（fxBase+后缀）字节不超限
+        const lockFiles = readdirSync(d).filter((f) => f.endsWith(".fx-lock"));
+        for (const f of lockFiles) expect(Buffer.byteLength(f, "utf-8")).toBeLessThanOrEqual(255);
+        rmSync(d, { recursive: true, force: true });
+    }, 30_000);
 });

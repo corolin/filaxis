@@ -8,12 +8,26 @@ import { RuntimeStack } from "../src/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import { RuntimeFactory } from "../src/factory.js";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
+import { TmuxSessionDriver } from "../src/tmux-driver.js";
 import { SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { enterStepsOf } from "../src/ssh-helpers.js";
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
 import type { LayerHandle } from "../src/runtime-stack.js";
 
 type Ev = { type: "a" | "b"; v: number };
+
+test("EventBus iterator return closes an already pending next", async () => {
+    const bus = new EventBus<Ev>();
+    const stream = bus.iterable();
+    const it = stream[Symbol.asyncIterator]();
+    const next = it.next();
+    try {
+        expect((await it.return!()).done).toBe(true);
+        expect((await next).done).toBe(true);
+        bus.emit({ type: "a", v: 1 });
+        expect((await it.next()).done).toBe(true);
+    } finally { stream.cancel(); }
+});
 
 describe("EventBus（AC-10）", () => {
     test("on 订阅 + 退订；* 通配收到全部", () => {
@@ -611,7 +625,7 @@ describe("二十八期", () => {
     // #2 共享连接的双 stack 各自收到会话事件（修前第二个 stack 0 次）
     test("缓存命中的第二个 stack 事件照收（多订阅者登记）", async () => {
         // 独立指纹防测试间缓存污染（target 注入 capabilities 不可行——用 cwd 微差）
-        const shared = { driver: "local", cwd: `${process.cwd()}#m28` } as unknown as RuntimeDescriptor;
+        const shared: RuntimeDescriptor = { driver: "local", config: { testFixture: "m28" } };
         const s1 = new RuntimeStack();
         const s2 = new RuntimeStack();
         const got1: string[] = [];
@@ -634,7 +648,7 @@ describe("二十八期", () => {
 // 1 个事件收 3 遍）。per-stack 稳定订阅闭包（引用固定 → Set 去重）。
 describe("重复 connect 订阅幂等（二十九期）", () => {
     test("A 连 3 次 B 连 1 次 → 一次退出事件 A 收 1 次 B 收 1 次", async () => {
-        const shared = { driver: "local", cwd: `${process.cwd()}#m29` } as unknown as RuntimeDescriptor;
+        const shared: RuntimeDescriptor = { driver: "local", config: { testFixture: "m29" } };
         const a = new RuntimeStack();
         const b = new RuntimeStack();
         const gotA: string[] = [];
@@ -830,7 +844,7 @@ describe("三十七期", () => {
             verifySession: async () => { verifyCalled = true; return { status: "exited", exitCode: 3 }; },
         } as unknown as import("../src/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: drv });
-        const r = await tk.handlers.stop_and_verify({ session_id: "s34" });
+        const r = await tk.handlers.stop_and_verify({ session_id: "s34", layer: "__initial__" });
         expect(verifyCalled).toBe(true); // 修前：stop 抛错后 verify 根本不执行
         expect(r.status).toBe("exited"); // verify 采纳真实退出码
         expect((r as { exit_code?: number }).exit_code).toBe(3);
@@ -888,4 +902,483 @@ describe("三十八期", () => {
         expect(syncReached).toBe(true);
         // 修前：instanceof 漏网 → 外来 rejection 无人接 → unhandledRejection 崩宿主（bun test 直接 fail）
     });
+});
+
+// GPT Sol 六十七期：#4 restore 绕过同名建层预留——addLayer 暂停在初始化时并发
+// restore 同名层，先成者被覆盖；#5 两命名层共享同一 driver（同落点复用）——
+// removeLayer(destroy) 连坐销毁仍在用的另一层。
+describe("Sol 67：restore 预留/共享销毁", () => {
+    const mockStack67 = () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        return stack;
+    };
+
+    test("#4 addLayer 建链中 restore 同名 → 拒绝（不竞争不覆盖）", async () => {
+        const stack = new RuntimeStack();
+        let releaseInit!: () => void;
+        const gate = new Promise<void>((res) => { releaseInit = res; });
+        stack.registerDriver("slowssh", (d: RuntimeDescriptor) => {
+            const drv = new MockLayerDriver(d) as unknown as RuntimeDriver & { init: () => Promise<void> };
+            drv.init = () => gate; // init 挂起——addLayer 停在建链（预留持有中）
+            return drv;
+        });
+        const adding = stack.addLayer("same", { driver: "slowssh", target: "t67" });
+        await new Promise((r) => setTimeout(r, 30)); // 预留生效
+        await expect(stack.restore({ layers: [{ name: "same", descriptor: { driver: "mockssh", target: "other" } }] }))
+            .rejects.toThrow(/建链中/); // 修前：绕过预留直接覆盖注册项
+        releaseInit();
+        const r = await adding;
+        expect(r.handle.name).toBe("same");
+        expect(stack.layer("same").descriptor.driver).toBe("slowssh"); // addLayer 的注册不被 restore 劫走
+    }, 15_000);
+
+    test("#5 共享 driver 层 destroy 不连坐——另一层照常执行", async () => {
+        const stack = mockStack67();
+        await stack.addLayer("a", { driver: "mockssh", target: "shared-t" });
+        await stack.addLayer("b", { driver: "mockssh", target: "shared-t" }); // 同落点=复用同一 driver
+        const aDriver = stack.layer("a").driver;
+        expect(stack.layer("b").driver).toBe(aDriver); // 共享实证（指纹缓存复用）
+        await stack.removeLayer("a", { destroy: true }); // 修前：连坐销毁共享 driver
+        expect((aDriver as unknown as MockLayerDriver).destroyed).toBe(false);
+        const out = await stack.layer("b").driver.exec("hostname");
+        expect(out.exitCode).toBe(0); // b 层照常干活
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "shared-t" } as RuntimeDescriptor);
+    }, 15_000);
+});
+
+// GPT Sol 六十八期 P1/P2：删除默认层的销毁暂停期，缺省命令曾落初始 driver
+//（默认层回落在异步销毁之后）；跨 stack 共享 driver 曾被单 stack 引用检查
+// 提前销毁（全局引用计数收口）。
+describe("Sol 68：默认层切换序/跨 stack 引用计数", () => {
+    test("P1 默认层销毁暂停期：缺省解析已切到存活层（不落初始 driver）", async () => {
+        const stack = new RuntimeStack();
+        let releaseDestroy!: () => void;
+        const gate = new Promise<void>((res) => { releaseDestroy = res; });
+        const mkDriver = (d: RuntimeDescriptor) => {
+            const drv = new MockLayerDriver(d) as unknown as RuntimeDriver & { destroy: () => Promise<void> };
+            drv.destroy = () => gate.then(() => { (drv as unknown as MockLayerDriver).destroyed = true; });
+            return drv;
+        };
+        stack.registerDriver("mockssh", (d) => mkDriver(d));
+        await stack.addLayer("a", { driver: "mockssh", target: "ta68" }); // 默认层
+        const b = await stack.addLayer("b", { driver: "mockssh", target: "tb68" });
+        stack.setActive("a"); // a 为默认层
+        const removing = stack.removeLayer("a", { destroy: true }); // 暂停在 destroy
+        await new Promise((r) => setTimeout(r, 30));
+        // 销毁暂停期：默认层已回落到 b（修前：activeName 仍指已删的 a——缺省解析落初始 driver）
+        expect(stack.active).toBe(b.handle.driver);
+        releaseDestroy();
+        await removing;
+        expect((stack.layer("b").driver as unknown as MockLayerDriver).destroyed).toBe(false);
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "ta68" } as RuntimeDescriptor);
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "tb68" } as RuntimeDescriptor);
+    }, 15_000);
+
+    test("P2 跨 stack 共享 driver：一 stack 销毁不连坐另一 stack", async () => {
+        // registerDriver 会配随机 cacheNs（实例隔离）——跨 stack 共享只发生在
+        // 缺省工厂路径（全局缓存键）：local driver 两 stack 同键复用同一实例
+        const s1 = new RuntimeStack();
+        const s2 = new RuntimeStack();
+        await s1.addLayer("a", { driver: "local" });
+        await s2.addLayer("b", { driver: "local" });
+        expect(s2.layer("b").driver).toBe(s1.layer("a").driver); // 跨 stack 共享实证（全局缓存）
+        await s1.removeLayer("a", { destroy: true }); // 修前：单 stack 检查通过→销毁共享 driver
+        const out = await s2.layer("b").driver.exec("echo ok");
+        expect(out.exitCode).toBe(0); // 修前：local driver 已被销毁、exec 失败
+        expect((out as { stdout?: string }).stdout?.trim()).toBe("ok");
+        RuntimeStack.evictDriver({ driver: "local" });
+    }, 20_000);
+});
+
+// GPT Sol 六十九期 #1：并发建层/销毁——新层从缓存拿到 driver 后、登记引用前，
+// 旧层删除曾把引用减到 0 销毁共享 driver（新层注册到已死连接）。claim 前移到
+// connect 归还点（原子）。
+describe("Sol 69：connect 归还点 claim", () => {
+    test("获取与登记之间的窗口：旧层销毁不追杀已认领连接", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        await stack.addLayer("a", { driver: "mockssh", target: "race69" });
+        const realConnect = (stack as unknown as { connect: (d: RuntimeDescriptor) => Promise<RuntimeDriver> }).connect.bind(stack);
+        let release!: () => void;
+        const gate = new Promise<void>((r) => { release = r; });
+        (stack as unknown as { connect: unknown }).connect = async (d: RuntimeDescriptor) => {
+            const drv = await realConnect(d); // claim 已在此原子发生（修前：拿到后未计数）
+            await gate; // 模拟获取与登记之间的任意代码
+            return drv;
+        };
+        const adding = stack.addLayer("b", { driver: "mockssh", target: "race69" }); // 缓存命中后挂起
+        await new Promise((r) => setTimeout(r, 30));
+        const removal = stack.removeLayer("a", { destroy: true });
+        release();
+        await removal;
+        const r2 = await adding;
+        const out = await r2.handle.driver.exec("echo hi"); // 修前：driver 已销毁
+        expect(out.exitCode).toBe(0);
+        await stack.removeLayer("b", { destroy: true });
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "race69" } as RuntimeDescriptor);
+    }, 15_000);
+});
+
+// GPT Sol 七十期 #1：connect 的 claim 计数无释放出口——裸 connect 永久占用，
+// 唯一命名层 removeLayer(destroy) 后 destroy 从未调用。登记计数复归 + 宏任务
+// 级延迟复核（在途登记先行落地、复核见 0 才真销毁）。
+describe("Sol 70：销毁两难正解", () => {
+    test("#1 两次 connect（一裸一成层）：最后一层 destroy 释放连接", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        await stack.connect({ driver: "mockssh", target: "rel70" } as RuntimeDescriptor); // 裸 connect
+        await stack.addLayer("a", { driver: "mockssh", target: "rel70" }); // 同落点复用 + 唯一命名层
+        const drv = stack.layer("a").driver as unknown as MockLayerDriver;
+        await stack.removeLayer("a", { destroy: true });
+        await new Promise((r) => setTimeout(r, 30)); // 延迟复核宏任务落地
+        expect(drv.destroyed).toBe(true); // 修前：claim 计数永不归零、destroy 不发
+    }, 15_000);
+});
+
+// GPT Sol 七十一期 #2/#3：destroy 同步逐出缓存（延迟窗口内 connect 曾拿到注定
+// 被杀的旧连接）+ 销毁去重（定时器前重复登记移除曾双 destroy）+ 旧定时器不再
+// 按描述符逐出（曾误杀定时器落地前建立的新一代连接）。
+describe("Sol 71：销毁窗口三缝", () => {
+    class CountingDriver extends MockLayerDriver {
+        destroyCount = 0;
+        async destroy(): Promise<void> { this.destroyCount++; this.destroyed = true; }
+    }
+    const mkStack = () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new CountingDriver(d) as unknown as RuntimeDriver);
+        return stack;
+    };
+
+    test("#2a destroy 返回后立即 connect——拿到新代（非注定被杀的旧代）", async () => {
+        const stack = mkStack();
+        await stack.addLayer("a", { driver: "mockssh", target: "doom71" });
+        const oldDrv = stack.layer("a").driver;
+        const removing = stack.removeLayer("a", { destroy: true }); // 返回时 destroy 未跑
+        const d2 = await stack.connect({ driver: "mockssh", target: "doom71" }); // 窗口内
+        await removing;
+        await new Promise((r) => setTimeout(r, 30));
+        expect(d2).not.toBe(oldDrv); // 修前：同实例（随后被定时器销毁）
+        expect((d2 as unknown as CountingDriver).destroyed).toBe(false); // 新代未被波及
+        const out = await d2.exec("echo ok");
+        expect(out.exitCode).toBe(0);
+        expect((oldDrv as unknown as CountingDriver).destroyCount).toBe(1); // 旧代恰好销毁一次
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "doom71" } as RuntimeDescriptor);
+        await (d2 as unknown as CountingDriver).destroy();
+    }, 15_000);
+
+    test("#2b 定时器前重新登记又移除——destroy 恰好一次", async () => {
+        const stack = mkStack();
+        await stack.addLayer("a", { driver: "mockssh", target: "dedup71" });
+        const drv = stack.layer("a").driver as unknown as CountingDriver;
+        const first = stack.removeLayer("a", { destroy: true });
+        await stack.addLayer("re", drv as unknown as RuntimeDriver);
+        const second = stack.removeLayer("re", { destroy: true });
+        await Promise.all([first, second]);
+        expect(drv.destroyCount).toBe(1); // 修前：两次
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "dedup71" } as RuntimeDescriptor);
+    }, 15_000);
+
+    test("#3 旧定时器不逐出新代：移除→显式 evict→connect 建二代——旧定时器落地后 connect 仍命中二代", async () => {
+        const stack = mkStack();
+        await stack.addLayer("a", { driver: "mockssh", target: "gen71" });
+        const gen1 = stack.layer("a").driver;
+        await stack.removeLayer("a", { destroy: true }); // 同步逐出+调度旧定时器
+        stack.evict({ driver: "mockssh", target: "gen71" }); // 显式再逐（幂等）
+        const gen2 = await stack.connect({ driver: "mockssh", target: "gen71" }); // 建二代
+        await new Promise((r) => setTimeout(r, 30)); // 旧定时器落地
+        const gen3 = await stack.connect({ driver: "mockssh", target: "gen71" });
+        expect(gen3).toBe(gen2); // 修前：旧定时器按描述符逐出——gen2 被清、gen3 是三代
+        expect((gen1 as unknown as CountingDriver).destroyCount).toBe(1); // 旧代销毁的是自己
+        RuntimeStack.evictDriver({ driver: "mockssh", target: "gen71" } as RuntimeDescriptor);
+        await (gen2 as unknown as CountingDriver).destroy();
+    }, 15_000);
+});
+
+// GPT Sol 七十二期 #2：removeLayer 的同步逐出曾按描述符无条件清——同描述符的
+// 下一代（先显式逐出旧代、connect 新建）被连坐逐出/中断建链；重新登记旧
+// driver 再移除同罪。实例核对：缓存里就是本代才清。
+describe("Sol 72：实例核对逐出", () => {
+    test("旧层移除不逐出新代（先 evict 旧、connect 建二代、再移除持旧代的层）", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        const desc = { driver: "mockssh", target: "inst72" } as RuntimeDescriptor;
+        await stack.addLayer("old", desc);
+        const gen1 = stack.layer("old").driver;
+        stack.evict(desc); // 显式逐出旧代
+        const gen2 = await stack.connect(desc); // 同描述符建二代（缓存）
+        await stack.removeLayer("old", { destroy: true }); // 移除持 gen1 的层——修前：连坐逐出 gen2
+        const gen3 = await stack.connect(desc);
+        expect(gen3).toBe(gen2); // 修前：gen2 被清、gen3 是三代（gen1 的销毁定时器还可能中断建链）
+        await new Promise((r) => setTimeout(r, 30)); // 延迟复核宏任务落地
+        expect((gen1 as unknown as MockLayerDriver).destroyed).toBe(true); // 销毁的只是 gen1
+        await (gen2 as unknown as MockLayerDriver).destroy();
+        RuntimeStack.evictDriver(desc);
+    }, 15_000);
+
+    test("重新登记旧 driver 再移除——已建好的二代不被逐出", async () => {
+        const stack = new RuntimeStack();
+        stack.registerDriver("mockssh", (d) => new MockLayerDriver(d) as unknown as RuntimeDriver);
+        const desc = { driver: "mockssh", target: "reg72" } as RuntimeDescriptor;
+        await stack.addLayer("a", desc);
+        const gen1 = stack.layer("a").driver;
+        stack.evict(desc);
+        const gen2 = await stack.connect(desc); // 二代已建好（在缓存）
+        await stack.addLayer("re", gen1); // 重新登记旧 driver（driver 直传）
+        await stack.removeLayer("re", { destroy: true }); // 修前：按描述符清缓存=逐出 gen2
+        const gen3 = await stack.connect(desc);
+        expect(gen3).toBe(gen2);
+        await (gen2 as unknown as MockLayerDriver).destroy();
+        RuntimeStack.evictDriver(desc);
+    }, 15_000);
+});
+
+// GPT Sol 七十四期 #6：自定义工厂让同一 driver 挂两个描述符键——homeKeys 曾只
+// 记最后一个键，销毁后另一键仍能拿到已销毁实例。集合化：全部键实例核对清。
+describe("Sol 74：homeKeys 多键", () => {
+    test("共享 driver 两键：两层移除销毁后，按任一描述符重连拿新实例", async () => {
+        const shared = new MockLayerDriver({ driver: "shared74" } as RuntimeDescriptor) as unknown as RuntimeDriver;
+        let served = 0;
+        const stack = new RuntimeStack();
+        // 前两次（初始两键）吐同一实例（模拟工厂层共享）；之后吐新件——
+        // 若缓存清理正确，重连必走工厂拿新实例
+        const factory = () => {
+            served++;
+            return (served <= 2 ? shared : new MockLayerDriver({ driver: "fresh74" } as RuntimeDescriptor)) as unknown as RuntimeDriver;
+        };
+        stack.registerDriver("dA", factory);
+        stack.registerDriver("dB", factory);
+        await stack.addLayer("a", { driver: "dA", target: "x" });
+        await stack.addLayer("b", { driver: "dB", target: "x" });
+        expect(stack.layer("a").driver).toBe(shared);
+        expect(stack.layer("b").driver).toBe(shared); // 同实例挂两键
+        await stack.removeLayer("a", { destroy: true });
+        await stack.removeLayer("b", { destroy: true });
+        await new Promise((r) => setTimeout(r, 30));
+        expect((shared as unknown as MockLayerDriver).destroyed).toBe(true);
+        // 修前：dA 键残留——按 dA 重连拿回已销毁实例
+        const again = await stack.connect({ driver: "dA", target: "x" } as RuntimeDescriptor);
+        expect(again).not.toBe(shared);
+        expect((again as unknown as MockLayerDriver).destroyed).toBe(false);
+        RuntimeStack.evictDriver({ driver: "dA", target: "x" } as RuntimeDescriptor);
+        RuntimeStack.evictDriver({ driver: "dB", target: "x" } as RuntimeDescriptor);
+        await (again as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+});
+
+// GPT Sol 七十五期 P2-1/P2-7/P2-8：terminalId 重挂曾双实例互杀（索引复用收口）；
+// homeKeys 空 Set 强引用滞留（常驻积累）；逐出一别名曾拆掉整个事件桥。
+describe("Sol 75：重挂复用/回收/事件桥", () => {
+    test("P2-1 带 terminalId 重挂：复用既有 driver（不建第二实例）", async () => {
+        let created = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("mocktmux", (d: RuntimeDescriptor) => {
+            created++;
+            const drv = new MockLayerDriver({ ...d, terminalId: "T75" }) as unknown as RuntimeDriver & { descriptor: RuntimeDescriptor };
+            return drv;
+        });
+        const a = await stack.connect({ driver: "mocktmux", target: "t75" } as RuntimeDescriptor);
+        expect(created).toBe(1);
+        // 重挂：descriptor 带 terminalId（快照形态）——修前键不匹配新建第二实例
+        const b = await stack.connect({ driver: "mocktmux", target: "t75", terminalId: "T75" } as RuntimeDescriptor);
+        expect(b).toBe(a); // 索引复用
+        expect(created).toBe(1);
+        RuntimeStack.evictDriverHome(a);
+        await (a as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+
+    test("P2-7/P2-8 别名逐出不拆桥、全逐出拆桥且无空集合滞留", async () => {
+        const shared = new MockLayerDriver({ driver: "alias75" } as RuntimeDescriptor) as unknown as RuntimeDriver;
+        const stack = new RuntimeStack();
+        let served = 0;
+        const factory = () => {
+            served++;
+            return (served <= 2 ? shared : new MockLayerDriver({ driver: "fresh75" } as RuntimeDescriptor)) as unknown as RuntimeDriver;
+        };
+        stack.registerDriver("kA", factory);
+        stack.registerDriver("kB", factory);
+        await stack.addLayer("a", { driver: "kA", target: "x" });
+        await stack.addLayer("b", { driver: "kB", target: "x" });
+        // 事件桥在场（白盒：mock 补 sessions 载体 + subs 非空）
+        const sm = (shared as unknown as { sessions: { __fxSubs?: Set<unknown> } }).sessions
+            ?? ((shared as unknown as { sessions: { __fxSubs?: Set<unknown> } }).sessions = {});
+        sm.__fxSubs = sm.__fxSubs ?? new Set();
+        sm.__fxSubs.add("fwd-75");
+        stack.evict({ driver: "kA", target: "x" } as RuntimeDescriptor); // 逐出一别名（实例方法带 cacheNs）
+        expect(sm.__fxSubs.size).toBe(1); // 修前：整桥被拆（剩余别名丢事件）
+        const still = await stack.connect({ driver: "kB", target: "x" } as RuntimeDescriptor);
+        expect(still).toBe(shared); // 另一别名仍可用
+        stack.evict({ driver: "kB", target: "x" } as RuntimeDescriptor); // 全逐出
+        expect(sm.__fxSubs.size).toBe(0); // 全逐出才拆桥
+        const homeKeys = (RuntimeStack as unknown as { driverHomeKeys: Map<unknown, Set<string>> }).driverHomeKeys;
+        expect(homeKeys.has(shared)).toBe(false); // 修前：空 Set 条目滞留（强引用积累）
+        await (shared as unknown as MockLayerDriver).destroy();
+        RuntimeStack.evictDriver({ driver: "kA", target: "x" } as RuntimeDescriptor);
+        RuntimeStack.evictDriver({ driver: "kB", target: "x" } as RuntimeDescriptor);
+    }, 15_000);
+});
+
+// GPT Sol 七十六期：P1-1 terminalId 索引裸 id 串线（不同 driver/不同 cwd 的重挂
+// 拿到第一个 driver）；#3 同 tid 多实例 destroy 连坐会话；#6 全逐出后同 driver
+// 复用事件不转发（扇出未重装）。
+describe("Sol 76：索引判别/会话引用计数/扇出重装", () => {
+    test("P1-1 不同 driver 同 tid 不串线；同 driver 不同 cwd 重挂不命中索引", async () => {
+        let madeA = 0, madeB = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("tmA", (d: RuntimeDescriptor) => { madeA++; return new MockLayerDriver({ ...d, terminalId: "TX" }) as unknown as RuntimeDriver; });
+        stack.registerDriver("tmB", (d: RuntimeDescriptor) => { madeB++; return new MockLayerDriver({ ...d, terminalId: "TX" }) as unknown as RuntimeDriver; });
+        const a = await stack.connect({ driver: "tmA", target: "t" } as RuntimeDescriptor);
+        const b = await stack.connect({ driver: "tmB", target: "t" } as RuntimeDescriptor); // 同 tid 不同 driver
+        expect(b).not.toBe(a); // 修前：索引裸 id 命中——命令送到第一个 driver
+        expect(madeA).toBe(1); expect(madeB).toBe(1);
+        // 同 driver 不同 cwd 重挂：不命中（cwd 是身份列）——新建实例（attach 计数护会话）
+        const c1 = await stack.connect({ driver: "tmA", target: "t", cwd: "/x" } as RuntimeDescriptor);
+        expect(c1).not.toBe(a); // 修前：裸 id 命中旧实例（cwd 被吞、命令落旧目录）
+        RuntimeStack.evictDriverHome(a); RuntimeStack.evictDriverHome(b); RuntimeStack.evictDriverHome(c1);
+        for (const d of [a, b, c1]) await (d as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+
+    test("#3 同 tid 两实例：destroy 一个不杀共享会话（归零才杀）", async () => {
+        const destroyedSessions: string[] = [];
+        const mkDrv = (tid: string, cwd?: string) => new TmuxSessionDriver(
+            // 无 terminalId 走 spawn 路径（stub 起"会话"）——避免 init 的真 tmux 探测
+            { driver: "tmux", cwd, config: { launchCmd: "bash" } } as never,
+            { terminalManager: {
+                spawnSession: async () => tid,
+                runCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                destroySession: async (id: string) => { destroyedSessions.push(id); },
+            } as never },
+        );
+        const d1 = mkDrv("SH76", "/tmp");
+        const d2 = mkDrv("SH76", "/"); // 不同 cwd 重挂——第二实例共指同一会话
+        await d1.init(); await d2.init();
+        await d1.destroy(); // 修前：直接杀会话——d2 报会话不存在
+        expect(destroyedSessions).toEqual([]); // 还有持有人
+        await d2.destroy(); // 归零
+        expect(destroyedSessions).toEqual(["SH76"]);
+    }, 15_000);
+
+    test("#6 全逐出后同 driver 复用：事件仍转发（扇出重装）", async () => {
+        const shared = new MockLayerDriver({ driver: "reb76" } as RuntimeDescriptor) as unknown as RuntimeDriver & {
+            sessions: { onEvent?: (e: unknown) => void; __fxSubs?: Set<(e: unknown) => void>; __fxOrig?: (e: unknown) => void };
+        };
+        shared.sessions = { onEvent: () => undefined }; // 桥守卫要求 onEvent 是函数（driver 自有消费方）
+        const stack = new RuntimeStack();
+        stack.registerDriver("reb76", () => shared); // 工厂恒返同实例（复用场景）
+        await stack.addLayer("a", { driver: "reb76", target: "x" });
+        const got: unknown[] = [];
+        stack.events.on("*", (e) => got.push(e));
+        stack.evict({ driver: "reb76", target: "x" } as RuntimeDescriptor); // 全逐出（onEvent 还原）
+        await stack.connect({ driver: "reb76", target: "x" } as RuntimeDescriptor); // 复用同 driver 重连
+        shared.sessions.onEvent?.({ type: "exit", sessionId: "s" }); // 会话侧发事件
+        expect(got.length).toBe(1); // 修前：0（扇出没重装——订阅进了没人遍历的集合）
+        await stack.removeLayer("a", { destroy: true });
+        await new Promise((r) => setTimeout(r, 20));
+    }, 15_000);
+});
+
+// GPT Sol 七十七期 #4/#5：销毁排程中的 driver 曾被 terminalId 索引返还（新句柄
+// 随即失效）；同 tid 多工厂曾互相覆盖索引（被覆盖方重挂出第三实例）。
+describe("Sol 77：索引销毁中跳过/嵌套不互覆", () => {
+    test("#4 销毁排程中的索引命中被跳过——重挂拿新活实例", async () => {
+        let made = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("mt77", (d: RuntimeDescriptor) => { made++; return new MockLayerDriver({ ...d, terminalId: "T77" }) as unknown as RuntimeDriver; });
+        await stack.addLayer("a", { driver: "mt77", target: "t" });
+        const old = stack.layer("a").driver;
+        const rm = stack.removeLayer("a", { destroy: true }); // 排程销毁（destroyScheduled）
+        await rm;
+        const again = await stack.connect({ driver: "mt77", target: "t", terminalId: "T77" } as RuntimeDescriptor);
+        expect(again).not.toBe(old); // 修前：索引返还排程中的死句柄
+        expect((again as unknown as MockLayerDriver).destroyed).toBe(false);
+        RuntimeStack.evictDriverHome(again);
+        await (again as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+
+    test("#5 同 tid 两工厂各占索引槽——互不覆盖", async () => {
+        let mA = 0, mB = 0;
+        const stack = new RuntimeStack();
+        stack.registerDriver("fa77", (d: RuntimeDescriptor) => { mA++; return new MockLayerDriver({ ...d, terminalId: "TZ" }) as unknown as RuntimeDriver; });
+        stack.registerDriver("fb77", (d: RuntimeDescriptor) => { mB++; return new MockLayerDriver({ ...d, terminalId: "TZ" }) as unknown as RuntimeDriver; });
+        const a = await stack.connect({ driver: "fa77", target: "t" } as RuntimeDescriptor);
+        const b = await stack.connect({ driver: "fb77", target: "t" } as RuntimeDescriptor);
+        expect(a).not.toBe(b);
+        // A 方重挂（同描述符+tid）：拿到 A 的实例——修前：被 B 覆盖 → miss 出第三实例
+        const a2 = await stack.connect({ driver: "fa77", target: "t", terminalId: "TZ" } as RuntimeDescriptor);
+        expect(a2).toBe(a);
+        expect(mA).toBe(1); expect(mB).toBe(1);
+        RuntimeStack.evictDriverHome(a); RuntimeStack.evictDriverHome(b);
+        await (a as unknown as MockLayerDriver).destroy();
+        await (b as unknown as MockLayerDriver).destroy();
+    }, 15_000);
+});
+
+test("sshInto only reuses a landing with matching connection settings", async () => {
+    const stack = new RuntimeStack();
+    let pushed = 0;
+    const landing = {
+        descriptor: { driver: "ssh", target: "localhost" },
+        init: async () => undefined,
+        exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    } as unknown as RuntimeDriver;
+    const child = {
+        descriptor: { driver: "ssh", target: "localhost", config: { sshHops: [
+            { host: "localhost", conn: { hostKeyPolicy: "strict", knownHostsFile: "fixture" } },
+        ] } },
+        init: async () => undefined,
+    } as unknown as RuntimeDriver;
+    const source = Object.assign({}, landing, {
+        descriptor: { driver: "ssh", target: "127.0.0.1" },
+        pushChild: async () => { pushed++; return child; },
+    });
+    await stack.addLayer("landing", landing);
+    await stack.addLayer("source", source);
+    // Resolve aliases using the same ssh -G path as production.
+    const same = await stack.sshInto("source", "same", "localhost");
+    expect(same.handle.driver).toBe(landing);
+    const strict = await stack.sshInto("source", "strict", "localhost", {
+        hostKeyPolicy: "strict", knownHostsFile: "fixture",
+    });
+    expect(strict.reused).toBe(false);
+    expect(strict.handle.driver).toBe(child);
+    expect(pushed).toBe(1);
+});
+
+test("removeLayer awaits disposal and propagates unresolved session evidence", async () => {
+    const stack = new RuntimeStack();
+    const disposal = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const driver = new MockLayerDriver({ driver: "mockssh" });
+    driver.destroy = () => { entered.resolve(); return disposal.promise; };
+    await stack.addLayer("owned", driver as unknown as RuntimeDriver);
+    const removal = stack.removeLayer("owned", { destroy: true });
+    const expected = Object.assign(new Error("cleanup unknown"), {
+        outcome: "unknown",
+        sessions: [{ sessionId: "fixture", logBase: "/tmp/fixture" }],
+    });
+    const result = removal.catch((error: unknown) => error);
+    await entered.promise;
+    expect(stack.layers.has("owned")).toBe(false);
+    await expect(stack.addLayer("new", driver as unknown as RuntimeDriver)).rejects.toThrow(/正在销毁/);
+    disposal.reject(expected);
+    expect(await result).toBe(expected);
+});
+
+test("driver exit events remain forwarded through named-layer disposal", async () => {
+    const stack = new RuntimeStack();
+    const seen: string[] = [];
+    stack.events.on("exit", (event) => { if (event.type === "exit") seen.push(event.sessionId); });
+    const sessions = { onEvent: async (_event: import("../src/session-types.js").SessionEvent) => {
+        throw new Error("driver callback rejected");
+    } };
+    const driver = Object.assign(new MockLayerDriver({ driver: "fixture" }), {
+        sessions,
+        destroy: async () => { sessions.onEvent({ type: "exit", sessionId: "during-destroy", exitCode: 0, lastLines: [] }); },
+    });
+    await stack.addLayer("fixture", driver as unknown as RuntimeDriver);
+    sessions.onEvent({ type: "exit", sessionId: "direct", exitCode: 0, lastLines: [] });
+    await stack.removeLayer("fixture", { destroy: true });
+    await expect(sessions.onEvent({ type: "exit", sessionId: "after-destroy", exitCode: 0, lastLines: [] }))
+        .rejects.toThrow("driver callback rejected");
+    expect(seen).toEqual(["direct", "during-destroy"]);
 });

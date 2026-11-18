@@ -109,6 +109,11 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
     for (const s of plan.steps) {
         if (!s.id) throw new Error(`批次计划非法：存在无 id 步骤`);
         if (byId.has(s.id)) throw new Error(`批次计划非法：id 重复 '${s.id}'`);
+        // kind 前置校验（Sol 55 P2-E）：未知 kind 曾在 runStep 执行中才抛——计划里
+        // 合法步骤已跑过（exec 已执行）才报未知类型。零副作用阶段拦死
+        if (s.kind !== "exec" && s.kind !== "edit" && s.kind !== "read") {
+            throw new Error(`批次计划非法：未知 kind '${(s as { kind: string }).kind}'（合法: exec|edit|read）——校验先行，合法步骤零执行`);
+        }
         byId.set(s.id, s);
     }
     for (const s of plan.steps) {
@@ -131,7 +136,13 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
     // ── 执行（就绪并行 + fail-fast）──
     const reports = new Map<string, BatchStepReport>();
     const stopOnFail = plan.stopOnFail !== false;
-    const maxParallel = Math.max(1, plan.maxParallel ?? 3);
+    // maxParallel 守卫（Sol 五十四期 P1-5）：NaN 曾被 Math.max(1, NaN)=NaN——
+    // 池 while(NaN < N) 恒假=零执行，唯一步骤被标 skipped 而批次报 ok
+    const rawP = plan.maxParallel ?? 3;
+    if (!Number.isFinite(rawP) || rawP < 1) {
+        throw new Error(`maxParallel 非法（${plan.maxParallel}）——须为 ≥1 的数字`);
+    }
+    const maxParallel = Math.floor(rawP);
     let failedStep: string | undefined;
 
     const done = (id: string): boolean => reports.get(id)?.status === "ok";
@@ -224,9 +235,13 @@ async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps): Promise<BatchS
                 },
             };
         }
-        // read
-        const content = await drv.fs.readFile(s.path);
-        return { ...base, status: "ok", durationMs: Date.now() - startedAt, stdout: content };
+        if (s.kind === "read") {
+            const content = await drv.fs.readFile(s.path);
+            return { ...base, status: "ok", durationMs: Date.now() - startedAt, stdout: content };
+        }
+        // 未知 kind 显式拒绝（Sol 五十四期 P2-6）：read 曾是兜底分支——kind:"typo"
+        // 被当 read 执行还报成功（拼写错误静默降级成读文件）
+        throw new Error(`未知步骤 kind '${(s as { kind: string }).kind}'（合法: exec|edit|read）`);
     } catch (raw) {
         // 判空优先（GPT Astra 四轮 #3）：自定义 driver 可能 throw null/undefined——
         // 直接读 (err as {outcome}).outcome 会再抛 TypeError，catch 块崩掉整份 runBatch

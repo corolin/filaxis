@@ -2,11 +2,11 @@
  * 文件传输单测（AC-15：mock 远端 bash 语义——真机 sftp/OPNsense/Alpine 属 CI 矩阵）
  */
 import { describe, expect, test, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, readdirSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readlinkSync, rmSync, existsSync, statSync, readdirSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { putFile, getFile, sftpPutFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
+import { putFile, putContent, getFile, sftpPutFile, sftpGetFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
 import { probeDialect, NULL_DIALECT, type RemoteDialect } from "../src/dialect.js";
 
 const GNU: RemoteDialect = {
@@ -47,21 +47,23 @@ function mockRemote() {
         }
         // 落位三态形态（十八轮 #2 + 审计 H5 前缀）：test ! -d … || …;
         // { __fx_tgt=$(readlink -f …); chmod/chown --reference…; if mv src …; }——
-        // mock 无挂载无写入失败，mv 恒成功（落点取 test ! -d 的目标=真身）
-        // R8 #2 数字模式权限保持后形态：__fx_pm=$(stat -c …)+[ -n ]&&chmod …; chown …; if mv …
-        mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; __fx_pm=[^;]*; \[ -n "[^"]*" \] && chmod[^;]*; (?:chown)[^;]*; if mv '(.+?)' /);
-        if (!mm) { // 兼容旧形态（无 __fx_pm 段）
-            mm = cmd.match(/^(?:test ! -d '(.+?)' \|\| \{ echo FX_IS_DIR; exit 1; \}; )?\{ ?__fx_tgt=[^;]*; (?:chmod|chown)[^;]*; (?:chmod|chown)[^;]*; if mv '(.+?)' /);
-        }
-        if (mm) {
-            const b = files.get(mm[2]!);
+        // mock 无挂载无写入失败，mv 恒成功。Sol 87→89 前缀渐长（权限保持/目录
+        // 四防/设备分流）——不再锚定全前缀：目标取外层 test ! -d 捕获、源取
+        // `if mv …` 捕获；mock 无设备概念恒走同设备 rename 链
+        const tgtM = cmd.match(/^\( test ! -d '(.+?)' \|\|/);
+        const movePrefix = ["if mv -T '", "if mv '"].find((prefix) => cmd.includes(prefix));
+        const moveStart = movePrefix ? cmd.indexOf(movePrefix) + movePrefix.length : -1;
+        const moveEnd = moveStart >= 0 ? cmd.indexOf("' \"$__fx_tgt\"", moveStart) : -1;
+        if (moveEnd > moveStart) {
+            const from = cmd.slice(moveStart, moveEnd);
+            const b = files.get(from);
             if (!b) return { stdout: "", exitCode: 1 }; // 源不存在 → 真实 mv 报错
-            files.set(mm[1]!, b);
-            files.delete(mm[2]!);
+            files.set(tgtM?.[1] ?? "", b);
+            files.delete(from);
             return { stdout: "FX_MV_OK", exitCode: 0 };
         }
         // forceInplace 形态（显式请求保留 inode 写）——cat src > "$tgt" && rm src
-        mm = cmd.match(/^cat '([^']+)' > [^&]+ && rm -f '([^']+)' && echo FX_MV_CAT$/);
+        mm = cmd.match(/^cat < '([^']+)' > [^&]+ && rm -f '([^']+)' && echo FX_MV_CAT$/); // < src > tgt（Sol 90 P1-3 重定向排序）
         if (mm) {
             const b = files.get(mm[1]!);
             if (!b) return { stdout: "", exitCode: 1 };
@@ -69,12 +71,11 @@ function mockRemote() {
             files.delete(mm[1]!);
             return { stdout: "FX_MV_CAT", exitCode: 0 };
         }
-        mm = cmd.match(/^base64 -d < '([^']*)' > '([^']*)'(?: && rm -f '([^']*)')?$/);
+        mm = cmd.match(/^\(umask 077; base64 -d < '([^']*)' > '([^']*)'\)$/);
         if (mm) {
             const src = files.get(mm[1]!);
             if (!src) return { stdout: "", exitCode: 1 }; // 真实 shell：源不存在 decode 失败（Astra 六轮 #2 mock 失真根因）
             files.set(mm[2]!, Buffer.from(src.toString("utf-8"), "base64"));
-            if (mm[3]) files.delete(mm[3]);
             return { stdout: "", exitCode: 0 };
         }
         mm = cmd.match(/^base64 -w 0 < '(.+)'$/);
@@ -178,10 +179,9 @@ describe("putFile/getFile（AC-15）", () => {
         const remote = mockRemote();
         // 扩 mock：BSD 命令形态
         const bsdExec: TransferExec = async (cmd) => {
-            let m = cmd.match(/^base64 -D < '([^']*)' > '([^']*)'(?: && rm -f '([^']*)')?$/);
+            let m = cmd.match(/^\(umask 077; base64 -D < '([^']*)' > '([^']*)'\)$/);
             if (m) {
                 files2.set(m[2]!, Buffer.from(files2.get(m[1]!)?.toString("utf-8") ?? "", "base64"));
-                if (m[3]) files2.delete(m[3]);
                 return { stdout: "", exitCode: 0 };
             }
             m = cmd.match(/^base64 < '(.+)'$/);
@@ -207,6 +207,32 @@ describe("putFile/getFile（AC-15）", () => {
 describe("sftp 快路径（FEAT-14 ②）", () => {
     const dir2 = mkdtempSync(join(tmpdir(), "fx-sftp-"));
 
+    test("SFTP 上传和下载都以校验 shell 的目录解析相对路径", async () => {
+        const remote = mockRemote();
+        const dir = mkdtempSync(join(tmpdir(), "fx-sftp-cwd-"));
+        const local = join(dir, "input");
+        const output = join(dir, "output");
+        const exec: TransferExec = (cmd) => cmd === "pwd -P"
+            ? Promise.resolve({ stdout: "/shell-cwd\n", exitCode: 0 })
+            : remote.exec(cmd);
+        const spawnImpl: SftpSpawnImpl = async (_argv, batch) => {
+            const [, action, source, target] = /^(put|get) '(.+)' '(.+)'\n$/.exec(batch)!;
+            const fromSftp = (path: string) => path.startsWith("/") ? path : `/sftp-home/${path}`;
+            if (action === "put") remote.files.set(fromSftp(target!), readFileSync(source!));
+            else writeFileSync(target!, remote.files.get(fromSftp(source!))!);
+            return { exitCode: 0, stderr: "" };
+        };
+        try {
+            writeFileSync(local, "different working directories");
+            await sftpPutFile(exec, GNU, local, "notes", { connArgs: [], spawnImpl });
+            expect([...remote.files.keys()]).toEqual(["/shell-cwd/notes"]);
+            await sftpGetFile(exec, GNU, "notes", output, { connArgs: [], spawnImpl });
+            expect(readFileSync(output, "utf-8")).toBe("different working directories");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("sftpPutFile：batch 命令形态正确 + 同一双校验标准 + spawn 注入", async () => {
         const remote = mockRemote();
         let gotArgv: string[] = [];
@@ -229,11 +255,36 @@ describe("sftp 快路径（FEAT-14 ②）", () => {
             spawnImpl: fakeSftp,
         });
         expect(gotArgv).toEqual(["-o", "ConnectTimeout=10", "user@host", "-b", "-"]);
-        expect(gotBatch).toMatch(/^put '.+' '\/r\/big\.bin'$/m);
+        expect(gotBatch).toMatch(/^put '.+' '\/r\/big\.bin\.filaxis-out-[a-f0-9]{12}'$/m);
         expect(r.verified).toBe(true); // 与 base64 路径同一校验标准
         expect(r.verification).toBe("sha256");
         expect(r.bytes).toBe(64 * 1024);
+        expect(r.writeMode).toBe("atomic-replace");
+        expect(remote.files.get("/r/big.bin")).toEqual(Buffer.alloc(64 * 1024, 7));
+        expect([...remote.files.keys()]).toEqual(["/r/big.bin"]);
         rmSync(dir2, { recursive: true, force: true });
+    });
+
+    test("sftpPutFile 校验失败时保留目标并清理暂存文件", async () => {
+        const remote = mockRemote();
+        const dir = mkdtempSync(join(tmpdir(), "fx-sftp-verify-"));
+        try {
+            const local = join(dir, "input");
+            const target = "/r/file";
+            writeFileSync(local, "expected");
+            remote.files.set(target, Buffer.from("original"));
+            const spawnImpl: SftpSpawnImpl = async (_argv, batch) => {
+                const staged = batch.match(/^put '.+' '(.+)'$/m)![1]!;
+                remote.files.set(staged, Buffer.from("modified"));
+                return { exitCode: 0, stderr: "" };
+            };
+            await expect(sftpPutFile(remote.exec, GNU, local, target, { connArgs: [], spawnImpl }))
+                .rejects.toBeInstanceOf(TransferVerificationError);
+            expect(remote.files.get(target)?.toString()).toBe("original");
+            expect([...remote.files.keys()]).toEqual([target]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     test("sftp 失败：退出码非零显式报错（降级提示），不静默", async () => {
@@ -252,6 +303,34 @@ describe("sftp 快路径（FEAT-14 ②）", () => {
  * sh -c，走与远端一致的物理行为。
  */
 describe("putFile（真实 shell 回归）", () => {
+    test.skipIf(process.platform !== "linux")("上传无法解析目标时保留符号链接", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-put-dangling-"));
+        try {
+            const target = join(dir, "missing-parent", "target");
+            const link = join(dir, "link");
+            symlinkSync(target, link);
+            await expect(putContent(realExec, GNU, Buffer.from("new"), link)).rejects.toThrow(/无法解析目标符号链接/);
+            expect(readlinkSync(link)).toBe(target);
+            expect(readdirSync(dir)).toEqual(["link"]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test.skipIf(process.platform !== "linux")("编辑和上传保留文件名末尾的换行", async () => {
+        const { editFile } = await import("../src/file-edit.js");
+        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const driver = new LocalRuntimeDriver();
+        const neighbor = fwd(join(dirR, "newline-name"));
+        const target = neighbor + "\n";
+        writeFileSync(neighbor, "old neighbor");
+        writeFileSync(target, "old target");
+        await editFile(driver, target, "old", "new");
+        expect(readFileSync(target, "utf-8")).toBe("new target");
+        await putContent(realExec, GNU, Buffer.from("uploaded"), target);
+        expect(readFileSync(target, "utf-8")).toBe("uploaded");
+        expect(readFileSync(neighbor, "utf-8")).toBe("old neighbor");
+    }, 20_000);
     const hasSh = Boolean(Bun.which("sh") && Bun.which("base64") && Bun.which("sha256sum") && Bun.which("mv"));
     const dirR = mkdtempSync(join(tmpdir(), "fx-ft-real-"));
     const fwd = (p: string) => p.replace(/\\/g, "/");
@@ -439,6 +518,102 @@ describe("putFile（真实 shell 回归）", () => {
         await expect(getFile(realExec, GNU, fwd(remoteSrc), dirLocal)).rejects.toThrow(/现存目录/);
     }, 20_000);
 
+
+    // GPT Sol 八十九期 P1-4/P1-5：目录回搬分支曾不核实「本次是否真搬过」——mv
+    // 全败时目录里恰同名无关文件被搬出后删除/误当载荷；跨文件系统落位（载荷临时
+    // 在原路径一侧、符号链接真身在另一 fs）mv 退化为复制仍报 atomic-replace。
+    test.skipIf(!hasSh)("Sol 89 P1-4/P1-5 同设备形状：__fx_mv 证据闸 + 设备分流在场，atomic-replace 保持", async () => {
+        const cmds: string[] = [];
+        const recExec: TransferExec = async (cmd) => { cmds.push(cmd); return realExec(cmd); };
+        const dst = fwd(join(dirR, "shape89.bin"));
+        const r = await putContent(recExec, GNU, Buffer.from("hello-shape"), dst);
+        expect(r.verified).toBe(true);
+        expect(r.writeMode).toBe("atomic-replace"); // 同设备（本地 tmp 一侧）→ rename 链
+        expect(readFileSync(join(dirR, "shape89.bin"), "utf-8")).toBe("hello-shape");
+        const place = cmds.find((c) => c.includes("__fx_mv=0"));
+        expect(place).toBeTruthy(); // 五防 place 在场
+        // 证据序：__fx_mv=1 紧跟裸 mv 成功（&& 短路链内）；回搬守卫查 __fx_mv=1
+        //（曾无条件按 basename 回搬目录里恰同名的无关文件）
+        expect(place).toMatch(/mv [^;]* && __fx_mv=1 && \[ ! -d "\$__fx_tgt" \]/);
+        expect(place).toMatch(/\[ "\$__fx_mv" = "1" \] && \[ -d "\$__fx_tgt" \]/);
+        // 设备分流在场（stat %d 同设备才走 rename 链；跨设备/不可判走 cat）
+        expect(place).toContain("stat -c %d");
+    }, 20_000);
+
+    test.skipIf(!hasSh || !existsSync("/dev/shm"))("Sol 89 P1-5 跨设备上传（/tmp→/dev/shm 符号链接）：writeMode=inplace-write（不谎报原子）", async () => {
+        const shmDir = `/dev/shm/fx-xdev-${process.pid}`;
+        mkdirSync(shmDir, { recursive: true });
+        try {
+            const linkPath = fwd(join(dirR, "xdev-link.bin"));
+            symlinkSync(`${shmDir}/real.bin`, linkPath); // 原路径一侧的符号链接 → 真身跨设备
+            const r = await putContent(realExec, GNU, Buffer.from("cross-device-payload"), linkPath);
+            expect(r.verified).toBe(true);
+            expect(r.writeMode).toBe("inplace-write"); // 修前：mv 跨设备复制仍报 atomic-replace
+            expect(readFileSync(`${shmDir}/real.bin`, "utf-8")).toBe("cross-device-payload");
+        } finally {
+            rmSync(shmDir, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+
+    // GPT Sol 九十期 P1-3：载荷（已校验的 out/fx-tmp）在落位开始时被移除——
+    // `cat src > tgt` 由 cat 自己开源、shell 先截断目标：原文件被截成 0 字节且
+    // 错误所称恢复路径无存。修后 `cat < src > tgt`：shell 从左到右处理重定向，
+    // 源打开失败时目标尚未被截断。
+    test.skipIf(!hasSh)("Sol 90 P1-3 载荷丢失：mv 失败回落 cat——目标零接触（不再截空）", async () => {
+        const dst = fwd(join(dirR, "p3-target.bin"));
+        writeFileSync(join(dirR, "p3-target.bin"), "PRECIOUS-CONTENT");
+        let outPath = "";
+        const evil: TransferExec = async (cmd) => {
+            const dm = cmd.match(/base64 -d < '([^']+)' > '([^']+)'/);
+            if (dm) outPath = dm[2]!;
+            if (cmd.includes("__fx_mv=0")) {
+                // 落位开始：移除已校验载荷（模拟丢失/外部清理）
+                if (outPath) rmSync(outPath, { force: true });
+            }
+            return realExec(cmd);
+        };
+        await expect(putContent(evil, GNU, Buffer.from("new-payload"), dst)).rejects.toThrow(/载荷在落位前消失/);
+        expect(readFileSync(join(dirR, "p3-target.bin"), "utf-8")).toBe("PRECIOUS-CONTENT"); // 修前：0 字节+谎称恢复路径在场
+    }, 20_000);
+
+    // Sol 90 P1-2（受控编辑侧同款防御的形状锚）：CAS 核验与落位同锚解析后真身
+    test.skipIf(!hasSh)("原地写入已经开始时，载荷消失仍报告目标可能被改写", async () => {
+        const target = fwd(join(dirR, "partial-payload-missing.bin"));
+        writeFileSync(target, "previous");
+        const exec: TransferExec = (command) => realExec(command.includes("FX_INPLACE_PAYLOAD_MISSING")
+            ? `cat() { rm -f '${target}'.filaxis-out-*; head -c 1; return 1; }; ${command}`
+            : command);
+        await expect(putContent(exec, GNU, Buffer.from("new"), target, { forceInplace: true }))
+            .rejects.toThrow(/目标可能已被部分改写，恢复载荷已不在/);
+        expect(readFileSync(target, "utf-8")).toBe("n");
+    }, 20_000);
+
+    test.skipIf(!hasSh)("Sol 90 P1-2 editFile 命令形状：真身解析先于核验（同锚 __fx_tgt）", async () => {
+        const { editFile } = await import("../src/file-edit.js");
+        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const drv = new LocalRuntimeDriver();
+        const target = fwd(join(dirR, "p2-real.bin"));
+        writeFileSync(join(dirR, "p2-real.bin"), "V=1\n");
+        const cmds: string[] = [];
+        const rec = Object.create(drv) as typeof drv;
+        (rec as unknown as { exec(c: string, o?: unknown): Promise<unknown> }).exec = async (c: string, o?: unknown) => {
+            cmds.push(c);
+            return (drv.exec as (c: string, o?: unknown) => Promise<unknown>)(c, o);
+        };
+        await editFile(rec, target, "V=1", "V=2");
+        const cas = cmds.find((c) => c.includes("FX_CAS_FAIL") || c.includes("flock"));
+        expect(cas).toBeTruthy();
+        const iResolve = cas!.indexOf("readlink -f");
+        const iStat = cas!.indexOf("stat -c '%Y %s'");
+        const iSha = cas!.indexOf("sha256sum");
+        expect(iResolve).toBeGreaterThanOrEqual(0);
+        expect(iResolve).toBeLessThan(iStat); // 修前：核验在前、真身解析在落位段
+        expect(cas).toContain("stat -c '%Y %s' \"$__fx_tgt\""); // 核验锚**真身**（修前：原路径）
+        expect(cas).toContain('sha256sum "$__fx_tgt"');
+        expect(readFileSync(join(dirR, "p2-real.bin"), "utf-8")).toBe("V=2\n"); // 编辑本身仍成功
+    }, 20_000);
+
     afterAll(() => {
         rmSync(dirR, { recursive: true, force: true });
     });
@@ -470,4 +645,126 @@ describe("方言探测通道崩溃（审计 M6）", () => {
         await expect(cache.get("k1", flaky)).rejects.toThrow(/channel reset/);
         expect((cache as unknown as { cache: Map<string, unknown> }).cache.size).toBe(0); // 未固化
     });
+});
+
+// GPT Sol 六十三期 P2-5：sftp get 直写目标+事后校验——校验失败时目标已被坏
+// 内容覆盖。修：临时落位→双校验→rename 归位；失败清临时，目标分毫未动。
+describe("Sol 63：sftpGetFile 校验失败不覆盖目标", () => {
+    test("下载内容损坏（size 不符）→ 抛校验错 + 目标保持 original + 无临时残留", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-get63-"));
+        try {
+            const localPath = join(dir, "target.bin");
+            writeFileSync(localPath, "original");
+            const files = new Map<string, Buffer>([["/remote/src.bin", Buffer.from("good")]]);
+            const exec: TransferExec = async (cmd) => {
+                const m = cmd.match(/^(?:wc -c|sha256sum) < '([^']+)'$/);
+                if (!m) return { stdout: "", exitCode: 0 };
+                const buf = files.get(m[1]!) ?? Buffer.alloc(0);
+                if (cmd.startsWith("wc")) return { stdout: String(buf.length), exitCode: 0 };
+                return { stdout: createHash("sha256").update(buf).digest("hex"), exitCode: 0 };
+            };
+            const spawnImpl: SftpSpawnImpl = async (_args: string[], batch: string) => {
+                const m = batch.trim().match(/^get '([^']+)' '([^']+)'$/);
+                if (m) writeFileSync(m[2]!, "bad"); // 模拟损坏下载（远端是 good）
+                return { stdout: "", stderr: "", exitCode: 0 };
+            };
+            await expect(sftpGetFile(exec, GNU, "/remote/src.bin", localPath, { connArgs: [], spawnImpl }))
+                .rejects.toBeInstanceOf(TransferVerificationError);
+            expect(readFileSync(localPath, "utf-8")).toBe("original"); // 修前：bad 已覆盖
+            expect(readdirSync(dir).filter((f) => f.includes("fx-dl"))).toEqual([]); // 临时已清
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 六十四期 P2-5：sftp 执行器半途抛错——spawn 调用曾在清理 try 之外，
+// .fx-dl-* 半截临时残留在盘。
+describe("Sol 64：sftpGetFile 执行器抛错清临时", () => {
+    test("spawn 写入部分内容后抛错 → 透传异常 + 目标保持 + 无临时残留", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-get64-"));
+        try {
+            const localPath = join(dir, "target.bin");
+            writeFileSync(localPath, "original");
+            const spawnImpl: SftpSpawnImpl = async (_args: string[], batch: string) => {
+                const m = batch.trim().match(/^get '([^']+)' '([^']+)'$/);
+                if (m) writeFileSync(m[2]!, "partial"); // 半途已写
+                throw new Error("channel died");
+            };
+            const exec: TransferExec = async () => ({ stdout: "", exitCode: 0 });
+            await expect(sftpGetFile(exec, GNU, "/remote/x.bin", localPath, { connArgs: [], spawnImpl }))
+                .rejects.toThrow(/channel died/);
+            expect(readFileSync(localPath, "utf-8")).toBe("original");
+            expect(readdirSync(dir).filter((f) => f.includes("fx-dl"))).toEqual([]); // 修前：半截临时残留
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 七十二期 #5：NAME_MAX 按字节计——250B 中文文件名（83 码元）+临时后缀
+// 曾按码元判定「放得进」→ 追后缀即超限（上传 tmp/普通下载 out/sftp 下载本地
+// 临时全中）。字节口径截断。
+describe("Sol 72：多字节长名字节口径", () => {
+    test("sftpGetFile 本地临时名：82 个「中」（250B）+ 后缀 ≤255B", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-cjk72-"));
+        try {
+            const name = "中".repeat(82) + ".bin"; // 246B + 4B=250B 裸名合法（<255B）、追后缀必超（>255B）
+            const localPath = join(dir, name);
+            writeFileSync(localPath, "original");
+            const files = new Map<string, Buffer>([["/remote/x.bin", Buffer.from("good")]]);
+            const exec: TransferExec = async (cmd) => {
+                const m = cmd.match(/^(?:wc -c|sha256sum) < '([^']+)'$/);
+                if (!m) return { stdout: "", exitCode: 0 };
+                const buf = files.get(m[1]!) ?? Buffer.alloc(0);
+                if (cmd.startsWith("wc")) return { stdout: String(buf.length), exitCode: 0 };
+                return { stdout: createHash("sha256").update(buf).digest("hex"), exitCode: 0 };
+            };
+            let tmpSeen = "";
+            const spawnImpl: SftpSpawnImpl = async (_args: string[], batch: string) => {
+                const m = batch.trim().match(/^get '([^']+)' '([^']+)'$/);
+                if (m) { tmpSeen = m[2]!; writeFileSync(m[2]!, "good"); } // 落真实文件（名字超限会当场 ENAMETOOLONG）
+                return { stdout: "", stderr: "", exitCode: 0 };
+            };
+            const r = await sftpGetFile(exec, GNU, "/remote/x.bin", localPath, { connArgs: [], spawnImpl });
+            expect(r.verified).toBe(true);
+            expect(readFileSync(localPath, "utf-8")).toBe("good"); // 归位成功（修前：临时名超限写不进）
+            const tmpBase = tmpSeen.split(/[\\/]/).pop()!;
+            expect(Buffer.byteLength(tmpBase, "utf-8")).toBeLessThanOrEqual(255); // 字节口径（修前码元口径必超）
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 七十三期 #5：长中文名修复漏了普通下载（getFile 内联临时名仍按码元
+// 计）与 CAS 编辑伴生锁（fxBase 码元判定）。两入口字节口径补齐。
+describe("Sol 73：长名漏网入口", () => {
+    test("getFile（普通下载）：250B 中文名归位成功", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-get73-"));
+        try {
+            const localPath = join(dir, "中".repeat(82) + ".bin"); // 250B 裸名合法
+            const remote = mockRemoteForGet();
+            remote.files.set("/remote/cjk.bin", Buffer.from("content-73"));
+            const dialect = { family: "gnu", base64Encode: ["base64", "-w", "0"], base64Decode: ["base64", "-d"], sha256: ["sha256sum"] } as never;
+            const r = await getFile(remote.exec, dialect, "/remote/cjk.bin", localPath);
+            expect(r.verified).toBe(true);
+            expect(readFileSync(localPath, "utf-8")).toBe("content-73"); // 修前：临时名 ENAMETOOLONG
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    function mockRemoteForGet() {
+        const files = new Map<string, Buffer>();
+        const exec: TransferExec = async (cmd) => {
+            const m = cmd.match(/^(?:base64 -w 0|wc -c|sha256sum) < '([^']+)'$/);
+            if (!m) return { stdout: "", exitCode: 0 };
+            const buf = files.get(m[1]!) ?? Buffer.alloc(0);
+            if (cmd.startsWith("wc")) return { stdout: String(buf.length), exitCode: 0 };
+            if (cmd.startsWith("sha256")) return { stdout: createHash("sha256").update(buf).digest("hex"), exitCode: 0 };
+            return { stdout: buf.toString("base64"), exitCode: 0 };
+        };
+        return { files, exec };
+    }
 });

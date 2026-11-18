@@ -149,36 +149,31 @@ export class EventBus<E extends { type: string }> {
             entry.notify = undefined;
         };
         const iterables = this.iterables;
-        const handle = {
-            [Symbol.asyncIterator]: async function* (): AsyncGenerator<E> {
-                try {
-                    while (entry.active) {
-                        if (entry.queue.length === 0) {
-                            // 等待唤醒（事件到达或取消）——不再轮询：return() 可即时打断
-                            await new Promise<void>((resolve) => {
-                                entry.notify = resolve;
-                            });
-                            continue;
-                        }
-                        const ev = entry.queue.shift()!;
-                        yield ev; // 已在入队口过滤（三十二期 #2）——取出即订阅类型
+        const cancel = () => {
+            entry.active = false;
+            entry.queue.length = 0;
+            iterables.delete(entry);
+            wake();
+        };
+        const iterator = (async function* (): AsyncGenerator<E> {
+            try {
+                while (entry.active) {
+                    if (entry.queue.length === 0) {
+                        await new Promise<void>((resolve) => { entry.notify = resolve; });
+                        continue;
                     }
-                } finally {
-                    entry.active = false;
-                    iterables.delete(entry); // 消费结束自然移除
-                    wake(); // 唤醒可能挂起的 return()/next() 链
+                    yield entry.queue.shift()!;
                 }
-            },
+            } finally {
+                cancel();
+            }
+        })();
+        const closeIterator = iterator.return.bind(iterator);
+        iterator.return = (value) => { cancel(); return closeIterator(value); };
+        const handle = {
+            [Symbol.asyncIterator]: () => iterator,
             dropped: () => entry.dropped,
-            cancel: () => {
-                // **同步收尾**（Astra 三十三期 #2）：移除记录+清空队列不依赖 generator
-                // finally——未启动迭代的订阅 cancel 后 finally 永不执行，总线持有
-                // 记录+带载荷事件累积成泄漏（20 份订阅 = 20 条记录 + 20 个事件）
-                entry.active = false;
-                entry.queue.length = 0;
-                iterables.delete(entry);
-                wake();
-            },
+            cancel,
         } as AsyncIterable<E> & { dropped(): number; cancel(): void };
         (handle as unknown as { __entry: typeof entry }).__entry = entry;
         return handle;

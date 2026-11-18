@@ -369,3 +369,60 @@ describe("四十九期：回调内停止与跨块一致性", () => {
         expect(linesAfterExit.join(" ")).not.toContain("LATE"); // 修前：LATE 幽灵交付
     }, 15_000);
 });
+
+test("流退出时把不完整 UTF-8 的替换字符作为尾部交付", async () => {
+    const { impl, procs } = fakeSpawn();
+    const manager = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
+    const events: Array<SessionLine | { exitCode: number | null }> = [];
+    await manager.start("fixture", {
+        onLine: (line) => events.push(line),
+        onExit: (exitCode) => events.push({ exitCode }),
+    });
+    const child = procs[0]!;
+    child.stdout.emit("data", Buffer.from([0xe2, 0x82]));
+    child.stderr.emit("data", Buffer.concat([Buffer.from("tail="), Buffer.from([0xe2, 0x82])]));
+    child.exitWith(37);
+    expect(events).toEqual([{ stream: "stdout", text: "�" }, { stream: "stderr", text: "tail=�" }, { exitCode: 37 }]);
+});
+
+test("failed SSH stop keeps the handle; retry waits for a real close", async () => {
+    const { impl, procs } = fakeSpawn();
+    const manager = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
+    const events = collect(manager);
+    const { sessionId } = await manager.start("fixture");
+    const child = procs[0]!;
+    child.kill = () => {
+        child.emit("error", new Error("could not send signal"));
+        return false;
+    };
+    await expect(manager.stopAndWait(sessionId)).rejects.toMatchObject({ outcome: "unknown" });
+    expect(events).toEqual([]);
+    expect(manager.list()).toMatchObject([{ sessionId, running: true }]);
+    child.kill = () => true;
+    const closed = manager.stopAndWait(sessionId);
+    expect(events).toEqual([]);
+    expect(manager.list()).toHaveLength(1);
+    child.exitWith(null);
+    await closed;
+    expect(events).toMatchObject([{ type: "exit", sessionId, exitCode: null }]);
+    expect(manager.list()).toEqual([]);
+});
+
+test("truncation count and Unicode boundaries stay stable across input chunks", async () => {
+    const line = "a".repeat(32767) + "🚀" + "x".repeat(34464) + "🚀" + "z".repeat(32767);
+    const read = async (split?: number) => {
+        const { impl, procs } = fakeSpawn();
+        const manager = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
+        const lines: string[] = [];
+        await manager.start("fixture", { onLine: ({ text }) => lines.push(text) });
+        const child = procs[0]!;
+        if (split) child.emitOut(line.slice(0, split));
+        child.emitOut(line.slice(split ?? 0) + "\n");
+        child.exitWith(0);
+        return lines[0]!;
+    };
+    const whole = await read();
+    expect(await read(75000)).toBe(whole);
+    expect(whole.match(/filaxis-truncated \d+ chars/)?.[0]).toBe("filaxis-truncated 34468 chars");
+    expect(whole).not.toMatch(/[\uD800-\uDBFF]…/);
+});

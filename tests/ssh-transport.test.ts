@@ -2,15 +2,45 @@
  * ssh-helpers / 层状态机 / 远端会话引擎 单测（纯逻辑 + mock 远端，真机面属 CI sshd 矩阵）
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     sshArgsFor, hopLabel, enterStepsOf, renderExecChannel, envPrefixOf, parseJumpSpec,
 } from "../src/ssh-helpers.js";
-import { resolveLayerState } from "../src/ssh-pty-driver.js";
+import { resolveLayerState, SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { RemoteSessionManager } from "../src/remote-session-manager.js";
 import type { SessionEvent } from "../src/session-types.js";
+
+test.skipIf(process.platform !== "linux")("SSH writeFile 解码器写出一部分再失败时保留原文件", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fx-ssh-write-"));
+    const target = join(dir, "target");
+    const driver = new SshPtyDriver({ driver: "ssh", target: "unused" });
+    const failDecode = `base64() { if [ "$1" = -d ] && [ -f /dev/stdin ]; then printf partial; return 42; fi; command base64 "$@"; }; `;
+    let fail = true;
+    Object.assign(driver, {
+        async execChannel(command: string) {
+            const result = Bun.spawnSync(["sh", "-c", (fail ? failDecode : "") + command]);
+            return { stdout: result.stdout.toString(), stderr: result.stderr.toString(), exitCode: result.exitCode };
+        },
+    });
+    try {
+        writeFileSync(target, "original");
+        await expect(driver.fs.writeFile(target, "replacement")).rejects.toThrow(/解码失败/);
+        expect(readFileSync(target, "utf-8")).toBe("original");
+        expect(readdirSync(dir)).toEqual(["target"]);
+        fail = false;
+        chmodSync(target, 0o200);
+        chmodSync(dir, 0o500);
+        await driver.fs.writeFile(target, "replacement");
+        chmodSync(target, 0o600);
+        expect(readFileSync(target, "utf-8")).toBe("replacement");
+    } finally {
+        chmodSync(dir, 0o700);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
 
 describe("ssh-helpers", () => {
     test("sshArgsFor：结构化参数渲染（ProxyJump/-i/-p/-L）", () => {
@@ -146,7 +176,7 @@ describe("ssh-helpers", () => {
         expect(r.kind).toBe("ok");
         if (r.kind !== "ok") return;
         // 单引号包裹：$()/反引号保持字面（双引号形态必须绝迹）
-        expect(r.stdinCmd).toContain(`cd '${evil}' ||`);
+        expect(r.stdinCmd).toContain(`cd './${evil}' ||`); // 相对形态强制 ./（Sol 89 P1-7——单引号字面化不受影响）
         expect(r.stdinCmd).not.toContain('cd "');
         // fail-closed：cd 失败 → 哨兵带 126 + exit 126（业务命令不执行——退出码是数据）
         expect(r.stdinCmd).toContain(`printf '\\nM:126:%s\\n' "$(id -un 2>/dev/null)"; exit 126`);
@@ -382,9 +412,34 @@ function fakeRemote() {
         }
         if (cmd.startsWith("tail -n ")) {
             const n = parseInt(cmd.match(/tail -n (\d+)/)![1]!, 10);
+            // tailLines 双 rc 复合形态（Sol 69 #3）：两流各自缺席=非零
+            if (cmd.includes("__fx_r1")) {
+                const sep = cmd.match(/echo (__FX_TL_\w+__)/)![1]!;
+                const base = unq(cmd.match(/tail -n \d+ (\S+)\.out/)?.[1] ?? "");
+                const o = files.get(`${base}.out`);
+                const er = files.get(`${base}.err`);
+                if (o == null || er == null) return { stdout: "", exitCode: 9 };
+                const t = (b: string) => b.split("\n").filter(Boolean).slice(-n).join("\n");
+                return { stdout: `${t(o)}\n${sep}\n${t(er)}`, exitCode: 0 };
+            }
             const f = unq(cmd.match(/(\S+)\.out/)?.[1] ?? "");
+            if (!files.has(`${f}.out`)) return { stdout: "", exitCode: 1 }; // 无 || true（Sol 69 #3）
             const all = (files.get(`${f}.out`) ?? "").split("\n").filter(Boolean);
             return { stdout: all.slice(-n).join("\n"), exitCode: 0 };
+        }
+        // readLog 可读性门形态（Sol 69 #3）：test -r 'X' || exit 9; cat/tail 'X'
+        if (cmd.startsWith("test -r ")) {
+            const m = cmd.match(/test -r (\S+) \|\| exit 9; (cat|tail -n \+\d+) (\S+)/);
+            if (m) {
+                const f = unq(m[1]!);
+                if (!files.has(f)) return { stdout: "", exitCode: 9 }; // 不可读——整体失败
+                let text = files.get(f) ?? "";
+                if (m[2]!.startsWith("tail")) {
+                    const from = parseInt(m[2]!.match(/\+(\d+)/)![1]!, 10) - 1;
+                    text = text.split("\n").slice(from).join("\n");
+                }
+                return { stdout: text, exitCode: 0 };
+            }
         }
         if (cmd.startsWith("cat ")) {
             const f = unq(cmd.match(/cat (\S+)/)![1]!);
@@ -405,6 +460,59 @@ function fakeRemote() {
 }
 
 describe("RemoteSessionManager（mock 远端）", () => {
+    test("stop 采纳 TERM 期间写入的退出码", async () => {
+        let code = "";
+        const manager = new RemoteSessionManager({
+            pollMs: 60_000,
+            exec: async (cmd) => {
+                if (cmd.includes(".pid.tmp")) return { stdout: "4242", exitCode: 0 };
+                if (cmd.startsWith("cat ") && cmd.includes(".code 2>")) return { stdout: code, exitCode: 0 };
+                if (cmd.includes("kill -TERM")) code = "23";
+                if (cmd.includes("echo ALIVE")) return { stdout: "DEAD", exitCode: 0 };
+                return { stdout: "", exitCode: 0 };
+            },
+        });
+        const h = await manager.start("fixture");
+        const expected = { status: "exited", exitCode: 23 } as const;
+        expect(await manager.stop(h.sessionId)).toEqual(expected);
+        expect(await manager.verify(h.sessionId)).toEqual(expected);
+    });
+
+    test.each([
+        ["PID 复用", "22222", ["TERM"], "unknown"],
+        ["身份未变化", "11111", ["TERM", "KILL"], "stopped"],
+        ["未记录身份戳", "", ["TERM"], "unknown"],
+    ])("stop 在 %s 时按身份核验限制 KILL", async (label, afterTerm, expectedSignals, status) => {
+        const signals: string[] = [];
+        const initialStamp = label === "未记录身份戳" ? "" : "11111";
+        let stamp = initialStamp;
+        const m = new RemoteSessionManager({
+            pollMs: 60_000,
+            exec: async (cmd) => {
+                if (cmd.includes(".pid.tmp")) return { stdout: "4242", exitCode: 0 };
+                if (cmd.startsWith("cat ") && cmd.includes(".st 2>")) return { stdout: initialStamp, exitCode: 0 };
+                if (cmd.includes("echo ALIVE")) {
+                    return { stdout: signals.includes("KILL") ? "DEAD" : "ALIVE", exitCode: 0 };
+                }
+                if (/kill -(?:TERM|KILL)/.test(cmd)) {
+                    // Execute the generated guard with shell functions standing in for process I/O.
+                    const r = Bun.spawnSync(["bash", "-c",
+                        `cat() { :; }; awk() { printf '%s\\n' "$FX_TEST_STAMP"; }; ` +
+                        `pkill() { :; }; kill() { printf '%s\\n' "$1"; }; sleep() { :; }; ${cmd}`,
+                    ], { env: { ...process.env, FX_TEST_STAMP: stamp } });
+                    const signal = r.stdout.toString().trim().replace(/^-/, "");
+                    if (signal) signals.push(signal);
+                    if (signal === "TERM") stamp = afterTerm as string;
+                    return { stdout: "", exitCode: r.exitCode };
+                }
+                return { stdout: "", exitCode: 0 };
+            },
+        });
+        const { sessionId } = await m.start("fixture");
+        expect(await m.stop(sessionId)).toMatchObject({ status });
+        expect(signals).toEqual(expectedSignals);
+    }, 15_000);
+
     test("start→轮询发现终态→exited 事件带退出码（.code 文件核实）", async () => {
         const remote = fakeRemote();
         const m = new RemoteSessionManager({ exec: remote.exec, pollMs: 30 });
@@ -608,9 +716,7 @@ describe("host key 策略可配（AC-12）", () => {
 });
 
 describe("RemoteSessionManager.reapIdle（衰减回收）", () => {
-    // TODO(interval 竞态): 手动 poll 链已验证 reap→TERM→核实→finalize 逻辑正确
-    // （探查实证），但 interval 驱动路径在快速 mock 时钟下存在未定竞态——待查后启用
-    test.skip("无人消费超 TTL 收摊+广播；armed 不收", async () => {
+    test("无人消费超 TTL 收摊+广播；armed 不收", async () => {
         // 永活远端：nohup 不落盘（.code 永不出现——会话长跑才走 reap 路径）
         const procs = new Set<number>();
         let pid = 5000;
@@ -619,24 +725,24 @@ describe("RemoteSessionManager.reapIdle（衰减回收）", () => {
             if (cmd.startsWith("cat ")) return { stdout: "", exitCode: 0 };
             if (cmd.startsWith("tail -n +")) return { stdout: "", exitCode: 0 };
             const k0 = /kill -0 (\d+)/.exec(cmd);
-            if (k0) return { stdout: procs.has(parseInt(k0[1]!, 10)) ? "Y" : "N", exitCode: 0 };
+            if (k0) return { stdout: procs.has(parseInt(k0[1]!, 10)) ? "ALIVE" : "DEAD", exitCode: 0 };
             const kv = /kill -(?:TERM|KILL) (\d+)/.exec(cmd);
             if (kv) { procs.delete(parseInt(kv[1]!, 10)); return { stdout: "", exitCode: 0 }; }
             return { stdout: "", exitCode: 0 };
         };
-        const m = new (await import("../src/remote-session-manager.js")).RemoteSessionManager({ exec: aliveExec, pollMs: 50, idleReapMs: 1000 });
-        const events: unknown[] = [];
+        const m = new RemoteSessionManager({ exec: aliveExec, pollMs: 50, idleReapMs: 1000 });
+        const events: SessionEvent[] = [];
         m.onEvent = (e) => events.push(e);
         const { sessionId: s1 } = await m.start("idle");
         const { sessionId: s2 } = await m.start("armed");
         m.watch(s2, { pattern: "NEVER", once: false });
         m.reapIdle(Date.now() + 2000, 1000);
-        await new Promise((r) => setTimeout(r, 400)); // stop 核实链 + poll 轮落地
+        await waitFor(() => m.list().some((session) => session.sessionId === s1 && !session.running));
         const e1 = m.list().find((s) => s.sessionId === s1);
         const e2 = m.list().find((s) => s.sessionId === s2);
         expect(e1?.running).toBe(false); // 收摊：终态（句柄按语义保留）
         expect(e2?.running).toBe(true);  // armed = 常驻注意力不收
-        expect(events.length).toBeGreaterThan(0); // 回收广播
+        expect(events.filter((e) => e.type === "exit").map((e) => e.sessionId)).toEqual([s1]);
     });
 });
 
@@ -757,9 +863,11 @@ describe("reapIdle 事件单发（自审）", () => {
         const events: Array<{ type?: string; exitCode?: number | null }> = [];
         m.onEvent = (e) => events.push(e as never);
         const h = await m.start("echo done");
-        await new Promise((r) => setTimeout(r, 900)); // 自然退出 + 轮询发现
+        // flake 治理补漏（Sol 71 环境实锤）：固定 900ms 在慢环境（sh 冷启/杀软
+        // 扫描拖慢每次 exec 的 spawn）内 poll 发现不了 .code → 0 exit——改谓词
+        // 等待（waitFor 已有），慢环境给足余量
+        await waitFor(() => events.some((e) => e.type === "exit"), 15_000);
         m.reapIdle(Date.now() + 60_000, 1); // 强制回收（已 running=false → 跳过 ✓ 无声）
-        await new Promise((r) => setTimeout(r, 300));
         const exits = events.filter((e) => e.type === "exit");
         expect(exits.length).toBe(1); // 修前风险：预发 null + finalize 真实码=双发
         expect(exits[0]!.exitCode).toBe(0); // 真实码（非 null 错值）
@@ -826,4 +934,573 @@ describe("Gemini 审查批回归", () => {
         expect(tokenizeArgv("docker exec -i ctr sh -c 'echo hi'")).toEqual(["docker", "exec", "-i", "ctr", "sh", "-c", "echo hi"]);
         expect(tokenizeArgv("a '' b")).toEqual(["a", "", "b"]); // 空串参数保留
     });
+});
+
+// GPT Sol 五十九期 P1-2：poll 探针凭证纪律——includes("N") 子串匹配曾把两类脏
+// 结果当死讯终结会话：①探针命令自身失败（exitCode 1 + stdout "N"——通道失灵
+// 的输出不是死亡凭证，与 .code 读同一纪律）②输出非精确标记（"NOT DEAD" 含 N）。
+// 修：exitCode=0 且 trim 后恰为 "N" 才判死（与 stop/verify 的精确匹配同口径）。
+describe("Sol 59：poll 探针脏结果不判死", () => {
+    test("exit 1+‘N’ 与 exit 0+‘NOT DEAD’ 均不终结；精确 ‘DEAD’ 才判死（null 退出码）", async () => {
+        const remote = fakeRemote();
+        let probe: { stdout: string; exitCode: number } | null = null;
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("g=$(cat ") && cmd.includes("kill -0") && probe) return probe;
+            if (/^cat \S+\.code/.test(cmd)) return { stdout: "", exitCode: 0 }; // .code 恒缺席（走 pid 探针分支）
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 25 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("sleep 60");
+        remote.procs.delete(h.pid!); // 进程已死但无 .code——探针分支
+        probe = { stdout: "N", exitCode: 1 }; // 探针命令失败：输出不作死亡凭证
+        await new Promise((r) => setTimeout(r, 150));
+        expect(events.some((e) => e.type === "exit")).toBe(false); // 修前：includes("N") 判死
+        probe = { stdout: "NOT DEAD", exitCode: 0 }; // 输出非精确标记（含 N 子串）
+        await new Promise((r) => setTimeout(r, 150));
+        expect(events.some((e) => e.type === "exit")).toBe(false); // 修前：同判死
+        probe = { stdout: "UNKNOWN", exitCode: 0 };
+        await new Promise((r) => setTimeout(r, 150));
+        expect(events.some((e) => e.type === "exit")).toBe(false);
+        probe = { stdout: "DEAD\n", exitCode: 0 }; // 精确 N（trim 后）→ 判死
+        await new Promise((r) => setTimeout(r, 150));
+        const exit = events.find((e) => e.type === "exit") as Extract<SessionEvent, { type: "exit" }>;
+        expect(exit).toBeTruthy();
+        expect(exit.exitCode).toBeNull(); // 无 .code 的外部死亡 → unknown 退出码
+    }, 15_000);
+});
+
+// GPT Sol 六十期 P2-5：verify() 存活探针 includes("Y") 子串匹配——"NOT Y" 等
+// 非标准输出曾判 running。改精确单标记（与 Sol 59 P1-2 的 poll 探针同口径）。
+describe("Sol 60：verify 探针精确匹配", () => {
+    test("stdout ‘NOT Y’ exit 0 → unknown；精确 ‘ALIVE’ → running", async () => {
+        const remote = fakeRemote();
+        let probe: { stdout: string; exitCode: number } | null = null;
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("g=$(cat ") && cmd.includes("kill -0") && probe) return probe;
+            if (/^cat \S+\.code/.test(cmd)) return { stdout: "", exitCode: 0 }; // .code 恒缺席
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("sleep 60");
+        probe = { stdout: "NOT Y", exitCode: 0 };
+        expect((await m.verify(h.sessionId)).status).toBe("unknown"); // 修前：running
+        probe = { stdout: "ALIVE\n", exitCode: 0 };
+        expect((await m.verify(h.sessionId)).status).toBe("running");
+    }, 15_000);
+});
+
+// GPT Sol 六十四期 P2-6：stderr 无换行尾行漏 watcher——终态冲刷曾只读 .out。
+describe("Sol 64：stderr 尾行冲刷", () => {
+    test("stderr 最后输出无换行尾行 → exit 前冲刷喂 watcher 命中", async () => {
+        const remote = fakeRemote();
+        const m = new RemoteSessionManager({ exec: remote.exec, pollMs: 30 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("err tail");
+        m.watch(h.sessionId, { pattern: "STDERR_TAIL", once: true });
+        // 自动完成（60ms 落 .code）前注入 stderr 尾行（无换行——轮询只交付完整行）
+        setTimeout(() => { remote.files.set(`${h.logBase}.err`, "STDERR_TAIL"); }, 25);
+        await new Promise((r) => setTimeout(r, 400));
+        expect(events.some((e) => e.type === "exit")).toBe(true);
+        expect(events.some((e) => e.type === "match" && e.matchedLine.includes("STDERR_TAIL"))).toBe(true); // 修前：只有 exit
+    }, 15_000);
+});
+
+// GPT Sol 六十五期：#1 match 事件 stream 写死 stdout（stderr 行命中的事件流标错）；
+// #2 flushTail 两路共用 try（stdout 读抛错连坐跳过 stderr 尾行）；#3 读命令失败
+//（exit≠0）的输出不作行凭证（曾据错误输出发 match、thenStop 还误触停止）。
+describe("Sol 65：冲刷凭证与事件流", () => {
+    test("#1+#2 stdout 读抛错不断 stderr 冲刷——match 事件 stream 如实标 stderr", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.out/.test(cmd)) throw new Error("out channel gone"); // stdout 末读抛错
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "STDERR_TAIL", once: true });
+        setTimeout(() => { remote.files.set(`${h.logBase}.err`, "STDERR_TAIL"); }, 25);
+        await new Promise((r) => setTimeout(r, 100)); // 自动完成（60ms 落 .code）
+        const v = await m.verify(h.sessionId); // verify 路径触终态冲刷（poll 长周期免干扰）
+        expect(v.status).toBe("exited");
+        await new Promise((r) => setTimeout(r, 50));
+        const match = events.find((e) => e.type === "match") as Extract<SessionEvent, { type: "match" }> | undefined;
+        expect(match?.matchedLine).toContain("STDERR_TAIL"); // 修前 #2：out 抛错连坐、无 match
+        expect(match?.stream).toBe("stderr"); // 修前 #1：写死 stdout
+    }, 15_000);
+
+    test("#3 读命令失败（exit 1+匹配文本在输出里）不作行凭证——无 match", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.err/.test(cmd)) {
+                return { stdout: "STDERR_TAIL", exitCode: 1 }; // 失败命令的输出含匹配文本
+            }
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "STDERR_TAIL", once: true });
+        await new Promise((r) => setTimeout(r, 100));
+        await m.verify(h.sessionId);
+        await new Promise((r) => setTimeout(r, 50));
+        expect(events.some((e) => e.type === "match")).toBe(false); // 修前：match 照发
+    }, 15_000);
+});
+
+// GPT Sol 六十六期：#1 常规轮询读命令失败（exit≠0）输出不作行凭证（终态冲刷
+// 已查、轮询漏查——曾据错误输出发 match 还推进游标）；#2 轮询单流抛错不连坐
+// 另一流（stdout 持续抛错曾堵死 stderr 读取）。
+describe("Sol 66：轮询凭证与分流隔离", () => {
+    test("#1 poll stderr 读 exit 1+MATCH 输出 → 无 match", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.err/.test(cmd)) return { stdout: "MATCH\n", exitCode: 1 }; // 失败命令的输出含匹配文本
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 30 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "MATCH", once: true });
+        await new Promise((r) => setTimeout(r, 400));
+        expect(events.some((e) => e.type === "match")).toBe(false); // 修前：poll 照喂
+    }, 15_000);
+
+    test("#2 poll stdout 读持续抛错——stderr 完整行照喂 watcher", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (/tail -c \+\d+ \S+\.out/.test(cmd)) throw new Error("out channel gone");
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 30 });
+        const events: SessionEvent[] = [];
+        m.onEvent = (e) => events.push(e);
+        const h = await m.start("x");
+        m.watch(h.sessionId, { pattern: "ERRLINE", once: true });
+        setTimeout(() => { remote.files.set(`${h.logBase}.err`, "ERRLINE\n"); }, 25);
+        await new Promise((r) => setTimeout(r, 400));
+        expect(events.some((e) => e.type === "match" && e.matchedLine.includes("ERRLINE"))).toBe(true); // 修前：out 抛错连坐
+    }, 15_000);
+});
+
+// GPT Sol 六十七期 P2-3：tail()/readLog() 直接读取入口缺退出码检查——失败
+// 命令（exit 1）的输出曾当正常日志返回（轮询/冲刷已查、此处漏查）。
+describe("Sol 67：直接读取凭证纪律", () => {
+    test("tail/readLog 读命令 exit 1+PARTIAL → 拒绝（不作日志凭证）", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("tail -n ") || cmd.startsWith("test -r ") || cmd.startsWith("cat ")) return { stdout: "PARTIAL", exitCode: 1 };
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100)); // 自动完成落 .code/.out
+        await expect(m.tail(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 ["PARTIAL"]
+        await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 "PARTIAL"
+    }, 15_000);
+});
+
+// GPT Sol 六十八期 #5：tailLines()（双流行对象读取入口）补凭证纪律——
+// exit≠0 的输出不作日志凭证（tail/readLog 上轮已查、此处漏查）。
+describe("Sol 68：tailLines 凭证", () => {
+    test("读命令 exit 1+partial → 拒绝（不作日志凭证）", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("tail -n ")) return { stdout: "partial", exitCode: 1 };
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100));
+        await expect(m.tailLines(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：返回 partial 行
+    }, 15_000);
+});
+
+// GPT Sol 六十九期 #3：真实 shell 语义——readLog 的 || true 吞错、tailLines
+// 只拿末个 tail 的退出码（stdout 缺失+stderr 正常曾当正常返回）。
+describe("Sol 69：读取失败不被掩盖", () => {
+    test("stdout 日志缺失（stderr 仍在）→ tail/readLog/tailLines 全拒绝", async () => {
+        const remote = fakeRemote();
+        const m = new RemoteSessionManager({ exec: remote.exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100)); // 自动完成（.out/.code 落盘）
+        remote.files.set(`${h.logBase}.err`, "OK\n");
+        remote.files.delete(`${h.logBase}.out`); // stdout 日志缺失
+        await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：""（|| true 吞错）
+        await expect(m.tail(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：[]（|| true 吞错）
+        await expect(m.tailLines(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 修前：stderr 行照常返回
+    }, 15_000);
+});
+
+// GPT Sol 七十期 #3：readLog({lines}) 的 `cat f | tail -n N` 管道整体 rc 只反映
+// 末命令——日志路径是可读目录时 test -r 通过而 cat 失败，曾当空日志返回。
+// lines 截断改命令替换中转（cat 失败经 || exit 9 直达整体退出码）。
+describe("Sol 70：readLog lines 管道掩码", () => {
+    test("日志路径为可读目录：lines 截断与全量读取都拒绝", async () => {
+        const remote = fakeRemote();
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("test -r ")) return { stdout: "", exitCode: 9 }; // 门过后读取即败（目录态）
+            return remote.exec(cmd);
+        };
+        const m = new RemoteSessionManager({ exec, pollMs: 10_000 });
+        const h = await m.start("x");
+        await new Promise((r) => setTimeout(r, 100));
+        await expect(m.readLog(h.sessionId, { lines: 5 })).rejects.toThrow(/不作日志凭证/); // 修前：""（管道尾 tail rc=0）
+        await expect(m.readLog(h.sessionId)).rejects.toThrow(/不作日志凭证/); // 对照（Sol 69 已修）
+    }, 15_000);
+});
+
+// GPT Sol 七十一期 #4：readLog({lines}) 的命令替换中转曾吞尾换行+剥 NUL
+//（first\n\n 取末行得 first 而非空行）。临时文件中转保字节保真——真 shell 验证。
+describe("Sol 71：readLog lines 字节保真", () => {
+    test.skipIf(!Bun.which("sh"))("尾空行保留 + NUL 不丢", async () => {
+        const remote = fakeRemote();
+        const shPath = Bun.which("sh")!;
+        const realSh = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            p.stdin.write(cmd);
+            await p.stdin.end();
+            const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            return { stdout, exitCode: code };
+        };
+        const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            if (cmd.startsWith("test -r ")) return realSh(cmd); // readLog 形态走真 shell
+            return remote.exec(cmd);
+        };
+        const d = mkdtempSync(join(tmpdir(), "fx-rl71-"));
+        try {
+            const m = new RemoteSessionManager({ exec, pollMs: 10_000, logDir: d.replace(/\\/g, "/") });
+            const h = await m.start("x");
+            // 尾空行：last line of "first\n\n" 是空行（readLog 返回剥一个尾换行 → ""）
+            writeFileSync(`${h.logBase}.out`, "first\n\n"); // 真文件（真 shell 读真盘）
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe(""); // 修前："first"（$() 吞尾换行）
+            expect(await m.readLog(h.sessionId, { lines: 2 })).toBe("first\n"); // 两行=first+空行（尾剥一个换行后留 first\n）
+            // NUL 字节不丢
+            writeFileSync(`${h.logBase}.out`, "a\0b\n");
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("a\0b"); // 修前：NUL 被 $() 剥
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
+
+// GPT Sol 七十二期 #3：readLog({lines}) 的临时副本曾落日志目录——只读目录下
+// lines 读报错而全量读正常。临时文件改落远端 $TMPDIR（命令形态断言 + 真 shell
+// 落点断言双验）。
+describe("Sol 72：lines 临时副本落 TMPDIR", () => {
+    test("命令的临时路径在 ${TMPDIR:-/tmp} 下（真 shell 可执行且不在日志目录）", async () => {
+        const remote = fakeRemote();
+        const shPath = Bun.which("sh")!;
+        let sawCmd = "";
+        const realSh = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            p.stdin.write(cmd);
+            await p.stdin.end();
+            const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            return { stdout, exitCode: code };
+        };
+        const d = mkdtempSync(join(tmpdir(), "fx-tmp72-"));
+        try {
+            const logDir = d.replace(/\\/g, "/");
+            const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+                if (cmd.startsWith("test -r ")) { sawCmd = cmd; return realSh(cmd); }
+                return remote.exec(cmd);
+            };
+            const m = new RemoteSessionManager({ exec, pollMs: 10_000, logDir });
+            const h = await m.start("x");
+            writeFileSync(`${h.logBase}.out`, "first\nsecond\n"); // 真文件（真 shell）
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("second");
+            expect(sawCmd).toContain('__fx_d="${TMPDIR:-/tmp}"'); // 临时副本根在 TMPDIR（Sol 73 #6 起带失效回落）
+            expect(sawCmd).toContain('$__fx_d/fx-rl-');
+            expect(sawCmd).not.toContain(`${logDir}/fx-rl-`); // 不落日志目录（只读目录也可读）
+            // 副本清场：TMPDIR 下无残留
+            const clean = Bun.spawnSync([shPath, "-c", 'ls "${TMPDIR:-/tmp}" | grep -c "fx-rl-" || true']);
+            expect(clean.stdout.toString().trim()).toBe("0");
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
+    }, 20_000);
+});
+
+// GPT Sol 七十三期 #6：TMPDIR 指向不存在目录时，readLog({lines}) 曾 exit 9
+//（全量读正常）——临时盘依赖。TMPDIR 失效回落 /tmp（真 shell 实证）。
+describe("Sol 73：TMPDIR 失效回落", () => {
+    test.skipIf(!Bun.which("sh"))("TMPDIR=/nonexistent-fx-73 下 lines 读正常", async () => {
+        const remote = fakeRemote();
+        const shPath = Bun.which("sh")!;
+        const realSh = async (cmd: string, env?: Record<string, string>): Promise<{ stdout: string; exitCode: number }> => {
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, ...env } });
+            p.stdin.write(cmd);
+            await p.stdin.end();
+            const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            return { stdout, exitCode: code };
+        };
+        const d = mkdtempSync(join(tmpdir(), "fx-td73-"));
+        try {
+            const logDir = d.replace(/\\/g, "/");
+            const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
+                if (cmd.startsWith("test -r ")) return realSh(cmd, { TMPDIR: "/nonexistent-fx-73" }); // TMPDIR 失效注入
+                return remote.exec(cmd);
+            };
+            const m = new RemoteSessionManager({ exec, pollMs: 10_000, logDir });
+            const h = await m.start("x");
+            writeFileSync(`${h.logBase}.out`, "first\nsecond\n");
+            expect(await m.readLog(h.sessionId)).toBe("first\nsecond"); // 全量（对照）
+            expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("second"); // 修前：抛 exit 9
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
+    }, 20_000);
+});
+
+// DeepSeek Harness 反馈：沙箱拦截匿名管道——stdio:'pipe' spawn 的 ssh 秒退 255
+// 零输出。filaxis 三件：快速判定指纹（255+零输出+<500ms）、自动文件中转降级、
+// FILAXIS_SSH_STDIO_MODE=inherit 显式覆盖。
+describe("DS 反馈：沙箱 stdio 管道损坏", () => {
+    test("isBrokenStdioExit 指纹判定：255+零输出+快退；任一不满足不判", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const probe = (SshPtyDriver as unknown as { __testBrokenStdioExit?: (c: number | null, o: string, e: string, ms: number) => boolean });
+        if (!probe.__testBrokenStdioExit) return; // 导出面缺席——跳过（实现细节测试）
+        expect(probe.__testBrokenStdioExit(255, "", "", 100)).toBe(true);   // 指纹成立
+        expect(probe.__testBrokenStdioExit(255, "x", "", 100)).toBe(false); // 有输出=真失败有话可说
+        expect(probe.__testBrokenStdioExit(1, "", "", 100)).toBe(false);    // 非 255
+        expect(probe.__testBrokenStdioExit(255, "", "", 2000)).toBe(false); // 慢退=网络/认证
+        expect(probe.__testBrokenStdioExit(null, "", "", 100)).toBe(false); // 信号杀
+    }, 10_000);
+});
+
+// GPT Sol 七十八期：P1-1 文件中转曾漏 ssh 本体（选项直交 shell）；P1-2 自动
+// 重放撤除（首轮结果未知=可能已执行副作用——非幂等命令重试违宪）；#6 abort
+// 信号贯通；#7 中转文件 0600。
+describe("Sol 78：文件中转三缝", () => {
+    test.skipIf(!Bun.which("sh"))("P1-1 中转命令含 ssh 本体：ssh -V 真跑通（修前 /bin/sh: -o not found）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
+        if (!run) return; // 导出面缺席
+        const r = await run(["-V"], ""); // ssh -V：版本打到 stderr
+        expect(r.stderr).toMatch(/OpenSSH|OpenSSH_for_Windows/i); // 修前：'-o/-V: not found'（无 ssh 本体）
+    }, 15_000);
+});
+
+// GPT Sol 七十九期 P1-1：Windows cmd 单串直传（spawn 的 args 数组会被 Node 再
+// 包引号→「文件名语法错误」被中转吞掉）；#4 取消竞态+AbortError 带 outcome；
+// #6 准备失败清理 .in。真 shell 跑 -V 验证双流+退出码往返。
+describe("Sol 79：中转 Windows 形态/取消纪律", () => {
+    test.skipIf(!Bun.which("ssh"))("P1-1 中转 ssh -V 双流/退出码往返（全平台真跑）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
+        if (!run) return;
+        const r = await run(["-V"], "");
+        expect(r.stderr).toMatch(/OpenSSH|OpenSSH_for_Windows/i); // 修前（win）：exit 1 双流空
+        expect(r.exitCode).not.toBe(1); // -V 退出 0（GNU）或 0——只要不是启动失败
+    }, 15_000);
+
+    test("#4 预先取消：AbortError+outcome=unknown；准备期取消不跑 ssh", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string, opts?: { signal?: AbortSignal }) => Promise<unknown> }).__testFileRedirect;
+        if (!run) return;
+        const ac = new AbortController();
+        ac.abort();
+        await expect(run(["-V"], "", { signal: ac.signal })).rejects.toMatchObject({ name: "AbortError", outcome: "unknown" });
+    }, 10_000);
+});
+
+// GPT Sol 八十期：P1-1 Windows 中转 %VAR% 展开改写参数字面量（ssh -G -i 对比
+// 实测）；P2-5 取消只杀外层 shell、ssh 替身照跑。直 spawn 文件 fd 两症同根同治
+//（无 shell=无展开、kill 直达 ssh 本体）。
+describe("Sol 80：中转直 spawn", () => {
+    test.skipIf(!Bun.which("ssh"))("P1-1 %FX80% 字面量经中转原样保留（ssh -G 实测）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
+        if (!run) return;
+        const literal = "%FX80_LITERAL%";
+        const r = await run(["-G", `-i ${literal}`], "");
+        expect(r.exitCode).toBe(0);
+        expect(r.stdout).toContain(literal); // 修前（win）：被 cmd 展开成环境变量值
+    }, 15_000);
+});
+
+// GPT Sol 八十一期：P2-5 spawn 同步抛错（argv 含 NUL）泄漏中转文件与描述符。
+describe("Sol 81：中转 spawn 清场", () => {
+    test("P2-5 argv 含 NUL：spawn 拒启即清场（.in/.out/.err 不留盘）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<unknown> }).__testFileRedirect;
+        if (!run) return;
+        const os = await import("node:os");
+        const before = (await import("node:fs")).readdirSync(os.tmpdir()).filter((f) => f.includes("fx-ssh-io"));
+        const NUL = String.fromCharCode(0);
+        await expect(run(["-V", "bad" + NUL + "arg"], "x")).rejects.toThrow(); // 含 NUL 由 Node 拒
+        const after = (await import("node:fs")).readdirSync(os.tmpdir()).filter((f) => f.includes("fx-ssh-io"));
+        expect(after.length).toBe(before.length); // 修前：+3（.in/.out/.err 滞留）
+    }, 15_000);
+});
+
+// GPT Sol 八十五期 P2：上轮 spawnErr 补丁因 python 断言失败未落盘（重复 bug
+// 根因）——本轮重落。本地拒启（ENOENT）直报。
+describe("Sol 85：中转本地拒启直报", () => {
+    test("ssh 不存在形态：直报本地启动失败（非「无哨兵」）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<unknown> }).__testFileRedirect;
+        if (!run) return;
+        // argv 含 NUL——spawn 同步抛（Node 拒启），非异步 error 事件
+        const NUL = String.fromCharCode(0);
+        await expect(run(["-V", "bad" + NUL], "x")).rejects.toThrow(/bad|NUL|null/i);
+    }, 15_000);
+});
+
+// GPT Sol 八十七期 P1-4：PTY attach 的 spawn ssh ENOENT 曾是 unhandled error
+// 事件——崩宿主（调用方 try/catch 收不到）。归 readyRejecter。
+describe("Sol 87：attach spawn error", () => {
+    test.skipIf(!Bun.which("ssh"))("PATH 置空真 ENOENT：握手拒绝带 code，不崩宿主", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { attach(args: string[]): void; handshake(w: string): Promise<void> };
+        // 真实 ENOENT：env.PATH 置空让 spawn("ssh") 拒启——error 事件异步到达
+        //（node:fs/promises 不可 monkey-patch 同理——用环境真实故障，不做 stub）
+        const link = new Link();
+        const savedPath = process.env.PATH;
+        process.env.PATH = "";
+        try {
+            link.attach(["-G"]);
+            await expect(link.handshake("probe")).rejects.toMatchObject({ name: "Error" }); // 修前：uncaught 崩宿主
+        } finally {
+            process.env.PATH = savedPath;
+        }
+    }, 15_000);
+});
+
+// GPT Sol 八十八期：P1-7 PTY 链 stdin 写入 EPIPE 无监听=uncaughtException 崩
+// 宿主（execChannel 早有同款防护，PTY 链漏挂）；P1-8 预触发 AbortSignal 不再
+// 派发事件——发送前须显式核验（命令曾照发+exitCode:0 谎报）；P1-9 PTY exec
+// 静默丢弃 cwd；P1-10 销毁后排程中的重连到期曾照样新建链拉起 ssh 进程。
+describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
+    test.skipIf(!Bun.which("ssh"))("P1-7 stdin 断裂写 EPIPE：归链失败语义，不崩宿主", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { attach(a: string[]): void; send(s: string): void; handshake(w: string): Promise<void> };
+        // 真实 EPIPE：ssh -V 立即退出（读端关闭）→ 对已死管道 write
+        const link = new Link();
+        link.attach(["-V"]);
+        await new Promise((r) => setTimeout(r, 1_200)); // 等进程退出
+        link.send("anything\n"); // 修前：stdin Socket 无 error 监听——EPIPE 崩宿主
+        await new Promise((r) => setTimeout(r, 500)); // 错误事件异步到达
+        // Sol 89 P1-6 语义：stdin error 监听**主要保护 Node 宿主**（SDK dist 也
+        // 跑在 node 下——EPIPE 事件曾崩宿主）；Bun 双平台实测不向 stdin Socket
+        // 投递 EPIPE（写入静默缓冲/丢弃，真机 Linux 实证 proc 不清空）——Bun 侧
+        // 的防御由 markerCycle 发送同步抛路径承担（同 describe 单测）。此处不
+        // 断言 proc 状态
+        // 活着=通过；且失败已归账——下一次握手拿到明确拒绝（不悬空等待）
+        await expect(link.handshake("probe")).rejects.toThrow(/退出|stdin/);
+    }, 15_000);
+
+    test("P1-8 预触发 AbortSignal：命令零发送（未执行，可安全重试）", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        const link = new Link() as unknown as { ready: boolean; send(s: string): void; execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        link.ready = true;
+        const sent: string[] = [];
+        link.send = (s: string) => { sent.push(s); };
+        const ac = new AbortController();
+        ac.abort(); // 已触发——不再派发 abort 事件
+        let e: (Error & { name?: string }) | undefined;
+        try { await link.execMarker("touch /tmp/fx88-should-not-exist", 5_000, ac.signal); } catch (err) { e = err as Error & { name?: string }; }
+        expect(e?.name).toBe("AbortError");
+        expect(sent).toEqual([]); // 修前：命令照发+exitCode:0
+    }, 10_000);
+
+    test("P1-9 PTY exec cwd 单次覆盖：子 shell+上下换行包裹；无 cwd 不包裹", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const drv = new SshPtyDriver({ driver: "ssh", target: "t88" } as never);
+        const cmds: string[] = [];
+        (drv as unknown as { link: unknown }).link = {
+            execMarker: async (c: string) => { cmds.push(c); return { stdout: "", stderr: "", exitCode: 0 }; },
+            kill() { /* no-op */ },
+        };
+        try {
+            await drv.exec("printf 'done\\n' # trailing comment", { channel: "pty", cwd: "/opt/x" });
+            expect(cmds[0]).toBe("( cd '/opt/x' && {\nprintf 'done\\n' # trailing comment\n} )"); // 修前：cwd 被静默丢弃
+            await drv.exec("pwd", { channel: "pty" });
+            expect(cmds[1]).toBe("pwd"); // 无 cwd：层内持久状态直跑
+        } finally {
+            await drv.destroy();
+        }
+    }, 10_000);
+
+    test("P1-10 销毁后排程中的重连不拉新进程（到期复查+定时器清理）", async () => {
+        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const realDelays = (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS;
+        (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS = [80];
+        const drv = new SshPtyDriver({ driver: "ssh", target: "t88r" } as never);
+        let inits = 0;
+        (drv as unknown as { init: () => Promise<void> }).init = async () => { inits++; };
+        try {
+            (drv as unknown as { scheduleReconnect(): void }).scheduleReconnect();
+            await drv.destroy(); // 退避到期前销毁
+            await new Promise((r) => setTimeout(r, 400));
+            expect(inits).toBe(0); // 修前：80ms 回调照样新建链+init（新 ssh PID 存活）
+        } finally {
+            (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS = realDelays;
+            await drv.destroy();
+        }
+    }, 15_000);
+});
+
+// GPT Sol 八十九期 P1-6/P1-7：markerCycle 发送同步抛（write 对断管道可同步
+// EPIPE）曾逃出 Promise executor 被 queue 链吞掉——调用方永不 settle 直到自身
+// 超时；cd 落点 CDPATH 防改写（相对路径强制 ./，含斜杠操作数不搜 CDPATH）。
+describe("Sol 89：发送同步抛归 caller/cdTargetArg", () => {
+    test("P1-6 markerCycle 发送同步抛：caller 收 outcome unknown（不悬空到自身超时）", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => { execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        const link = new Link() as unknown as { ready: boolean; send(s: string): void; execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
+        link.ready = true;
+        link.send = () => { throw new Error("write EPIPE (sync)"); };
+        let e: (Error & { outcome?: string }) | undefined;
+        try { await link.execMarker("touch /tmp/fx89-sync", 5_000); } catch (err) { e = err as Error & { outcome?: string }; }
+        expect(e?.outcome).toBe("unknown"); // 修前：异常被 queue 链吞——调用方等到自身超时
+        expect(e?.message).toMatch(/发送失败/);
+    }, 10_000);
+
+    test("P1-7 cdTargetArg：相对路径强制 ./（CDPATH 不搜含斜杠操作数）", async () => {
+        const { cdTargetArg } = await import("../src/ssh-helpers.js");
+        expect(cdTargetArg("sub")).toBe("./sub");
+        expect(cdTargetArg("a/b")).toBe("./a/b");
+        expect(cdTargetArg("/abs/path")).toBe("/abs/path"); // 绝对路径本就不搜 CDPATH——原样
+        expect(cdTargetArg("./x")).toBe("./x");
+        expect(cdTargetArg("../y")).toBe("../y");
+    }, 10_000);
+});
+
+// GPT Sol 九十期 P2-3：PTY 子进程自然退出（非 kill、非 EPIPE）曾保持 ready=true
+//——执行中 markerCycle 的断链感知（轮询 !ready）不触发，调用方干等到自身超时。
+// 退出事件先翻 ready=false 再分发。
+describe("Sol 90：PTY 自然退出快速感知", () => {
+    test.skipIf(!Bun.which("ssh"))("P2-3 执行中自然退出：调用快速收 unknown（不等自身超时）", async () => {
+        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const Link = __testPtyLink as unknown as new () => {
+            attach(a: string[]): void;
+            execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown>;
+            proc?: { emit(ev: string, code: number | null): void };
+            ready: boolean;
+            send(s: string): void;
+        };
+        const link = new Link();
+        link.attach(["-V"]); // 真实 spawn（管线真实；-V 快退不影响——我们手动发事件）
+        (link as unknown as { ready: boolean }).ready = true; // 模拟已建链、执行中
+        (link as unknown as { send(s: string): void }).send = () => { /* noop */ };
+        const t0 = Date.now();
+        // 创建即挂 handler（reject 到 catch 之间若隔 macrotask 轮，bun 记 unhandled）
+        const p = link.execMarker("long-running-cmd", 5_000)
+            .then(() => { throw new Error("不应 resolve"); }, (err) => err as Error & { outcome?: string });
+        await new Promise((r) => setTimeout(r, 150));
+        link.proc!.emit("exit", 0); // 自然退出事件（对端关连接/超时同路径）
+        const e = await p;
+        expect(e?.outcome).toBe("unknown");
+        expect(e?.message).toMatch(/断开|断链/);
+        expect(Date.now() - t0).toBeLessThan(3_000); // 修前：ready 不翻 false——干等到 5s 超时
+    }, 15_000);
 });

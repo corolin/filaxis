@@ -18,9 +18,10 @@
  */
 import { RuntimeStack, LocalRuntimeDriver, SshPtyDriver, editFile, discoverLayer, layerDisplayName, runBatch, type BatchPlan } from "../src/index.js";
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, readdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -56,6 +57,7 @@ function parseOpts(argv: string[]): {
     forward: string[]; hostKey?: string; knownHosts?: string;
     layer?: string;
     timeout?: number; duration?: number; stream?: string; all?: boolean;
+    writeMode?: "auto" | "inplace";
     stdinJson?: boolean; requestFile?: string; pty?: boolean;
     stdinScript?: boolean; scriptFile?: string; // exec 免 Shell 通道（盲测 #4）
     positional: string[];
@@ -67,7 +69,12 @@ function parseOpts(argv: string[]): {
         if (noMoreOpts) { o.positional.push(a); continue; }
         if (a === "--") { noMoreOpts = true; continue; } // 命令分隔符：终止选项解析
         switch (a) {
-            case "--host": o.host = argv[++i]; break;
+            case "--host": {
+                const v = argv[++i];
+                if (!v) throw new Error("--host 需要目标（user@host 形态）");
+                o.host = v;
+                break;
+            }
             case "--user": o.user = argv[++i]; break;
             case "--port": o.port = numArg(argv, i); i++; break;
             case "--key": o.key = argv[++i]; break;
@@ -81,7 +88,12 @@ function parseOpts(argv: string[]): {
             case "--forward": o.forward.push(argv[++i]!); break;
             case "--host-key": o.hostKey = argv[++i]; break;
             case "--known-hosts": o.knownHosts = argv[++i]; break;
-            case "--layer": o.layer = argv[++i]; break;
+            case "--layer": {
+                const v = argv[++i];
+                if (!v) throw new Error(`--layer 需要层名（收到缺失——曾静默落本机执行）`); // Sol 57 P1-1
+                o.layer = v;
+                break;
+            }
             case "--timeout": o.timeout = numArg(argv, i, { positive: true }); i++; break; // 正数（Hydrogen R9 #4：0/负数曾静默禁用或立即杀）
             case "--duration": o.duration = numArg(argv, i, { positive: true }); i++; break;
             case "--stream": o.stream = argv[++i]; break;
@@ -112,7 +124,7 @@ function parseHopSpec(spec: string): { host: string; conn?: { user?: string; por
     // IPv6 防误拆（Hydrogen R4 #5）：裸 IPv6（2001:db8::8080）多冒号——lastIndexOf
     // 会把末段误拆成端口。与 ssh-helpers 同规：[ipv6]:port 方括号形态才带端口；
     // 无方括号且含 ≥2 冒号=纯 IPv6 字面量整段作 host
-    const br = rest.match(/^" + BS + BS + "\[(.+)" + BS + BS + "\]" + BS + BS + "(?::(\\d+))?" + BS + BS + "$/);
+    const br = rest.match(/^\[([^\]]+)\](?::(\d+))?$/);
     if (br) {
         rest = br[1]!;
         if (br[2]) port = parseInt(br[2]!, 10);
@@ -182,13 +194,52 @@ function layerStorePath(): string {
 }
 function loadLayerStore(): Record<string, RuntimeDescriptor> {
     try {
-        return JSON.parse(readFileSync(layerStorePath(), "utf-8")) as Record<string, RuntimeDescriptor>;
-    } catch { return {}; }
+        const parsed = JSON.parse(readFileSync(layerStorePath(), "utf-8"));
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("层快照必须是对象");
+        return Object.assign(Object.create(null), parsed);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return Object.create(null);
+        throw error;
+    }
 }
-function saveLayerStore(store: Record<string, RuntimeDescriptor>): void {
-    const p = layerStorePath();
-    mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, JSON.stringify(store, null, 2), "utf-8");
+function updateLayerStore<T>(update: (store: Record<string, RuntimeDescriptor>) => T): T {
+    const path = layerStorePath();
+    mkdirSync(dirname(path), { recursive: true });
+    const lock = `${path}.lock`;
+    mkdirSync(lock, { recursive: true });
+    const claim = join(lock, `${process.pid}-${randomUUID()}`);
+    // Publish a unique claim before checking for other writers. A concurrent claim
+    // must see ours or finish writing before we enter the critical section.
+    writeFileSync(claim, "", { flag: "wx", mode: 0o600 });
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+        for (const entry of readdirSync(lock)) {
+            const peer = join(lock, entry);
+            if (peer === claim) continue;
+            const owner = /^([1-9]\d*)-[0-9a-f-]{36}$/.exec(entry);
+            if (!owner) throw new Error(`层快照锁含无法识别的写入记录: ${peer}`);
+            try {
+                process.kill(Number(owner[1]), 0);
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+                    try { unlinkSync(peer); } catch (cleanup) {
+                        if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") throw cleanup;
+                    }
+                    continue;
+                }
+                if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+            }
+            throw new Error(`层快照正在写入: ${path}`);
+        }
+        const store = loadLayerStore();
+        const result = update(store);
+        writeFileSync(temporary, JSON.stringify(store, null, 2), { flag: "wx", mode: 0o600 });
+        renameSync(temporary, path);
+        return result;
+    } finally {
+        try { unlinkSync(temporary); } catch { /* rename 后临时路径已消失 */ }
+        unlinkSync(claim);
+    }
 }
 
 function handleLayerCmd(args: string[]): void {
@@ -200,10 +251,11 @@ function handleLayerCmd(args: string[]): void {
             throw new Error("用法: filaxis layer save <name> --host u@h [-J <jump>] [--hop/--enter/--docker/--forward/--host-key/--known-hosts]");
         }
         const desc = buildSshDescriptor(rest);
-        const store = loadLayerStore();
-        const existed = Boolean(store[name]);
-        store[name] = desc;
-        saveLayerStore(store);
+        const existed = updateLayerStore((store) => {
+            const existed = Boolean(store[name]);
+            store[name] = desc;
+            return existed;
+        });
         console.log(`${existed ? "layer 覆盖" : "layer 保存"}: ${name} → ${layerDisplayName(desc)}`);
         console.log(`后续一行直达: filaxis exec --layer ${name} -- "<command>"`);
     } else if (sub === "list") {
@@ -219,10 +271,10 @@ function handleLayerCmd(args: string[]): void {
     } else if (sub === "rm") {
         const [name] = rest.positional;
         if (!name) throw new Error("用法: filaxis layer rm <name>");
-        const store = loadLayerStore();
-        if (!store[name]) throw new Error(`层 '${name}' 未保存（filaxis layer list 查看）`);
-        delete store[name];
-        saveLayerStore(store);
+        updateLayerStore((store) => {
+            if (!store[name]) throw new Error(`层 '${name}' 未保存（filaxis layer list 查看）`);
+            delete store[name];
+        });
         console.log(`layer 移除: ${name}`);
     } else {
         throw new Error("用法: filaxis layer save <name> --host ... | list | rm <name>");
@@ -347,7 +399,7 @@ async function main() {
                 if (!p || old === undefined || newStr === undefined) {
                     throw new Error("用法: filaxis edit [--host ...] <path> <old> <new> [--all] [--write-mode auto|inplace] 或 <path> (--stdin-json | --request-file <file>)\n提示：old/new 含引号/多行时优先 --request-file（免 Shell 通道，宿主引号规则零影响）");
                 }
-                const r = await editFile(drv, p, old, newStr, { all, ...(o.writeMode === "inplace" ? { writeMode: "inplace-write" as const } : {}) }); // --write-mode auto|inplace → SDK 词汇（Gemini #8）
+                const r = await editFile(drv, p, old, newStr, { all, writeMode: o.writeMode }); // --write-mode auto|inplace → SDK 词汇（Gemini #8）
                 console.log(`edited: ${r.path} 替换 ${r.occurrences} 处，${r.bytesBefore}B → ${r.bytesAfter}B${r.mutex === "degraded" ? "（无锁降级）" : ""}`);
                 break;
             }
@@ -384,7 +436,21 @@ async function main() {
                 }
                 const filtered = (o.stream && o.stream !== "both") ? lines.filter((l) => l.stream === o.stream) : lines;
                 for (const l of filtered) console.log(`[${l.stream}] ${l.text}`);
-                await drv.stopSession(h.sessionId).catch(() => undefined);
+                const stopR = await drv.stopSession(h.sessionId).catch(() => ({ status: "unknown" }) as { status: "unknown" }); // 异常归 unknown（Sol 58 P2-6）
+                // stop unknown 接核实（Sol 57 P2-7 同 toolkit——吞掉改带终态警示）。
+                // 双未知不静默（Sol 59 P2-3）：修前仅核实 running 时提示——verify
+                // 也 unknown/抛错时 CLI 零输出收场，调用者拿不到会话与日志线索
+                if (stopR && stopR.status === "unknown") {
+                    let vStatus = "unknown";
+                    let vErr = "";
+                    try { vStatus = (await drv.verifySession(h.sessionId)).status; } catch (e) { vErr = (e as Error).message; }
+                    if (vStatus === "unknown" || vStatus === "running") process.exitCode = 1;
+                    if (vStatus === "running") {
+                        console.error(`[filaxis] 停止结果未知且核实显示**任务仍在运行**——会话 ${h.sessionId} 日志 ${h.logBase}，勿盲目重试`);
+                    } else if (vStatus === "unknown") {
+                        console.error(`[filaxis] 停止与核实均为未知（${vErr ? `核实失败: ${vErr}` : "通道异常或会话失联"}）——会话 ${h.sessionId} 日志 ${h.logBase}，任务可能仍在运行：核实终态后再重试`);
+                    }
+                }
                 break;
             }
             case "batch": {
@@ -461,7 +527,12 @@ Windows 无 CM 支持退化直连。每跳独立密钥等极端拓扑请用 SDK 
                 process.exit(cmd ? 1 : 0);
         }
     } finally {
-        await drv.destroy().catch(() => undefined);
+        try {
+            await drv.destroy();
+        } catch (error) {
+            console.error(`[filaxis] 连接销毁失败: ${error instanceof Error ? error.message : String(error)}`);
+            if (!process.exitCode) process.exitCode = 1;
+        }
     }
 }
 

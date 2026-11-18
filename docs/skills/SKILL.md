@@ -61,9 +61,9 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 命令会自己结束吗？
 ├─ 会（一次性：curl/nginx -t/systemctl status）→ exec（退出码是数据）
 ├─ 不会（tail -f/top/常驻服务/训练）
-│   ├─ 只想看一段输出 ────────────→ observe（限时快照，缺省 8s）
+│   ├─ 只想看一段输出 ────────────→ CLI observe（限时快照，缺省 8s）
 │   ├─ 值守等关键行/错误模式 ──────→ execSession + watcher → longrun-observe.md
-│   └─ 需要持续 TUI/多消费者游标 ──→ 流式窗（stream-window.md）
+│   └─ 需要持续读取/回看 ─────────→ observe_stream → read_stream → close_stream（stream-window.md）
 └─ 要改远端文件 ──────────────────→ editFile 受控编辑 → file-sync.md
                                     （传输 put/get 也在 file-sync.md）
 跨主机排查/抓包对照/跳板拓扑 ────────→ cross-host-diagnosis.md

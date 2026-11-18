@@ -13,7 +13,10 @@
  * - 会话族委托 RemoteSessionManager（nohup 双文件 + 终态三态）
  * - logger 注入；自动重连（3 次退避）/层状态机/退化哨兵全平移
  */
+import { StreamSessionManager } from "./stream-session-manager.js";
+import type { ObservationWindowOptions, StreamWindowRegistry } from "./stream-window.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import * as fsSync from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import * as crypto from "node:crypto";
 import type {
@@ -24,10 +27,12 @@ import type {
     SessionStartOptions, SessionHandleInfo, WatchOptions, ReadLogOptions,
 } from "./session-types.js";
 import {
-    autonomousSshOpts, SSH_INPUT_WAIT_RE, enterStepsOf, hopLabel, rootSshSpawnArgs,
-    sshArgsFor, renderExecChannel, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
+    autonomousSshOpts, SSH_INPUT_WAIT_RE, enterStepsOf, hopLabel, rootSshSpawnArgs, cdTargetArg,
+    sshArgsFor, renderExecChannel, shellQuote, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
 } from "./ssh-helpers.js";
 import { RemoteSessionManager } from "./remote-session-manager.js";
+import { probeDialect, type RemoteDialect } from "./dialect.js";
+import { writeInplaceContent } from "./file-transfer.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 const ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r(?!\n)/g;
@@ -68,16 +73,55 @@ class PtyLink {
         this.fallbackNonce = crypto.randomBytes(16).toString("hex");
         this.fallbackSteps.clear();
         this.fallbackSeen = undefined;
+        const spawnAt = Date.now();
         this.proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
+        // spawn error 监听（Sol 87 P1-4）：ssh 不在 PATH 时 ENOENT 是异步 error
+        // 事件——无监听器=uncaughtException 崩**宿主**（调用方 try/catch 收不到
+        // 拒绝）。归 readyRejecter/pendingExitFailure（建链失败语义，非超时指纹）
+        this.proc.once("error", (e: Error) => {
+            const err = new Error(`本地 ssh 启动失败（${e.message}）——检查 PATH/可执行文件: ${(e as { code?: string }).code ?? ""}`);
+            const wrap = Object.assign(err, { code: (e as { code?: string }).code, cause: e });
+            if (this.readyRejecter) this.readyRejecter(wrap);
+            else this.pendingExitFailure = wrap;
+            this.onUnexpectedExit?.();
+        });
+        // stdin 管道错误监听（Sol 88 P1-7 → Sol 89 P1-6）：对端关闭读端后继续
+        // write 抛 EPIPE——错误事件发在 **stdin Socket** 上，proc 的 error 监听
+        // 收不到；无监听器=uncaughtException 崩**宿主**。归 readyRejecter/
+        // pendingExitFailure + onUnexpectedExit（断链语义，走三层退避重连）。
+        // **并当场 kill 本链**：只排定重连不清旧链时，重连替换 this.link 后
+        // destroy() 只收得到新链——旧 ssh 进程实测仍存活（双 PID 并存泄漏）。
+        // 运行时差异（真机 Linux/Windows 双实证）：Bun **不**向 stdin Socket 投
+        // 递 EPIPE（写入静默缓冲/丢弃）——本监听主要保护 **Node 宿主**（SDK dist
+        // 同发 node 包）；Bun 侧同类故障由 markerCycle 发送同步抛路径兜底
+        this.proc.stdin.on("error", (e: Error) => {
+            const err = new Error(`ssh stdin 写入失败（${e.message}）——PTY 链已断: ${(e as { code?: string }).code ?? ""}`);
+            if (this.readyRejecter) this.readyRejecter(err);
+            else if (!this.pendingExitFailure) this.pendingExitFailure = err;
+            this.kill();
+            this.onUnexpectedExit?.();
+        });
         // 双流各自解码器（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂——两管道交替喂
         // 同一 decoder 会混流撕字，必须 per-stream
         const outDec = new StringDecoder("utf-8");
         const errDec = new StringDecoder("utf-8");
-        this.proc.stdout.on("data", (d: Buffer) => this.onData(outDec.write(d)));
-        this.proc.stderr.on("data", (d: Buffer) => this.onData(errDec.write(d)));
+        let sawAnyOutput = false;
+        this.proc.stdout.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(outDec.write(d)); });
+        this.proc.stderr.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(errDec.write(d)); });
         this.proc.on("exit", (code) => {
-            if (!this.ready) {
-                const err = new Error(this.egressError(`ssh 进程建链期间退出（code=${code}）: ${this.handshakeWhat}`));
+            // 退出即断链（Sol 90 P2-3）：ready 只在 kill() 里翻 false——自然退出
+            //（对端关连接/超时）曾保持 ready=true，执行中的 markerCycle 断链感知
+            //（轮询 !this.ready）不触发，调用方干等到自身超时。先翻 false 再分发
+            const wasReady = this.ready;
+            this.ready = false;
+            if (!wasReady) {
+                // 沙箱 stdio 管道损坏快速诊断（DeepSeek Harness 反馈）：PTY 常驻通道
+                // 无法降级重试（attach 是长连接），但给明确错误而非「建链期间退出」
+                // 的笼统话——秒退 255+零输出=管道句柄被沙箱拦截的指纹
+                const base = isBrokenStdioExit(code, sawAnyOutput ? "x" : "", sawAnyOutput ? "x" : "", Date.now() - spawnAt)
+                    ? `ssh 秒退（code=${code}，零输出）——疑似沙箱 stdio 管道损坏${BROKEN_STDIO_HINT}`
+                    : this.egressError(`ssh 进程建链期间退出（code=${code}）: ${this.handshakeWhat}`);
+                const err = new Error(base);
                 if (this.readyRejecter) this.readyRejecter(err);
                 else this.pendingExitFailure = err;
             }
@@ -183,6 +227,17 @@ ${command}
         caller: { resolve: (r: ExecResult) => void; reject: (e: unknown) => void },
     ): Promise<void> {
         return new Promise<void>((cycleDone) => {
+            // 预触发信号核验（Sol 88 P1-8）：已 abort 的信号不再派发事件——只挂
+            // listener 曾照样发命令、exitCode:0 谎报成功。出队后、发送前显式拒
+            //（命令未发出，可安全重试——不带 outcome unknown）
+            if (abortSignal?.aborted) {
+                caller.reject(new DOMException(
+                    "SshPty exec aborted by AbortSignal（命令发送前已取消——未执行，可安全重试）",
+                    "AbortError",
+                ));
+                cycleDone();
+                return;
+            }
             let notified = false; // 调用方已归（超时/abort）——INTERRUPTING 起点标志
             let drained = false; // DRAINING 兜底定时器已布
             this.lineBuffer = [];
@@ -258,15 +313,33 @@ ${command}
                     if (deadline) clearTimeout(deadline);
                     cleanupAbort();
                     notify(() => {
-                        const e = new Error(`PTY 链断开（执行期断链——远端终态未核实，outcome=unknown）: ${command.slice(0, 60)}`) as Error & { outcome: "unknown" };
-                        e.outcome = "unknown";
-                        caller.reject(e);
+                        const partialOutput = buf.join("\n").slice(-500);
+                        caller.reject(Object.assign(
+                            new Error(`PTY 链断开（远端终态未核实）: ${command.slice(0, 60)}\n部分输出:\n${partialOutput}`),
+                            { outcome: "unknown", partialOutput },
+                        ));
                     });
                     cycleDone(); // 链已由 onUnexpectedExit 重建路径接管——不 enterDraining
                 }
             }, 25);
 
-            this.send(`${wrapped}\n`);
+            // 发送同步抛防御（Sol 89 P1-6）：write 对已断管道可同步抛 EPIPE——
+            // 同步异常曾逃出 Promise executor 使 markerCycle 以原始错误 reject，
+            // 被 queue 链的 catch 吞掉——调用方永不 settle 直到自身超时
+            try {
+                this.send(`${wrapped}\n`);
+            } catch (e) {
+                notify(() => {
+                    const err = new Error(
+                        `命令文本发送失败（${e instanceof Error ? e.message : String(e)}）——PTY 链已断，远端未核实`,
+                    ) as Error & { outcome: "unknown" };
+                    err.outcome = "unknown";
+                    caller.reject(err);
+                });
+                this.kill();
+                this.onUnexpectedExit?.();
+                cycleDone();
+            }
         });
     }
 
@@ -347,6 +420,8 @@ export interface SshPtyDriverOptions {
 }
 
 /** SSH Transport driver：每层一条独立多跳 PTY + 双通道 exec + 远端会话/文件 */
+export const __testPtyLink = PtyLink; // 测试导出面（attach spawn error 验证）
+
 export class SshPtyDriver implements RuntimeDriver {
     readonly descriptor: RuntimeDescriptor;
     readonly fs: FileSystemDriver;
@@ -361,6 +436,8 @@ export class SshPtyDriver implements RuntimeDriver {
     execInFlight = false;
     reconnecting = false;
     private reconnectAttempts = 0;
+    /** 在途重连定时器（Sol 88 P1-10）：exit() 显式清——到期复查之外的双保险 */
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly log: FilaxisLogger;
 
     private static readonly MAX_RECONNECT = 3;
@@ -374,10 +451,14 @@ export class SshPtyDriver implements RuntimeDriver {
         this.log = opts.logger ?? noopLogger;
         const self = this;
         const fsExec = async (cmd: string) => self.execChannel(cmd, undefined);
+        let writeDialect: Promise<RemoteDialect> | undefined;
+        const parseStat = (output: string) => {
+            const m = output.trim().match(/^(\d+)\s+(-?\d+)$/);
+            return m ? { size: Number(m[1]), mtimeMs: Number(m[2]) * 1000 } : null;
+        };
         const statOf = async (p: string) => {
             const r = await fsExec(`stat -c '%s %Y' ${q(p)} 2>/dev/null || stat -f '%z %m' ${q(p)} 2>/dev/null || true`);
-            const m = r.stdout.trim().match(/^(\d+)\s+(\d+)$/);
-            return m ? { size: parseInt(m[1]!, 10), mtimeMs: parseInt(m[2]!, 10) * 1000 } : null;
+            return r.exitCode === 0 ? parseStat(r.stdout) : null;
         };
         this.fs = {
             async readFile(p) {
@@ -389,9 +470,11 @@ export class SshPtyDriver implements RuntimeDriver {
                 return Buffer.from(r.stdout.replace(/[^A-Za-z0-9+/=]/g, ""), "base64").toString("utf-8");
             },
             async writeFile(p, content) {
-                const b64 = Buffer.from(content, "utf-8").toString("base64");
-                const r = await fsExec(`printf %s ${q(b64)} | base64 -d > ${q(p)}`);
-                if (r.exitCode !== 0) throw new Error(`writeFile 失败（exit=${r.exitCode}）: ${p}`);
+                writeDialect ??= probeDialect(fsExec).catch((error) => {
+                    writeDialect = undefined;
+                    throw error;
+                });
+                await writeInplaceContent(fsExec, await writeDialect, Buffer.from(content, "utf-8"), p);
             },
             async exists(p) {
                 const r = await fsExec(`test -e ${q(p)} && echo Y || echo N`);
@@ -399,14 +482,23 @@ export class SshPtyDriver implements RuntimeDriver {
             },
             stat: statOf,
             async readdir(p): Promise<FileEntry[]> {
-                const r = await fsExec(`command ls -1A ${q(p)} 2>/dev/null || true`); // command 绕 alias（Hydrogen R4 #6）
-                const names = r.stdout.split("\n").filter(Boolean);
-                return Promise.all(names.map(async (name) => {
-                    const full = `${p.replace(/\/$/, "")}/${name}`;
-                    const d = await fsExec(`test -d ${q(full)} && echo Y || echo N`);
-                    const st = await statOf(full);
-                    return { name, isDirectory: d.stdout.trim() === "Y", size: st?.size, mtime: st?.mtimeMs };
-                }));
+                const r = await fsExec(`cd ${q(cdTargetArg(p))} && [ -r . ] || exit 1; ` +
+                    `for entry in .[!.]* ..?* [!.]*; do ` +
+                    `[ -e "./$entry" ] || [ -L "./$entry" ] || continue; ` +
+                    `if [ -d "./$entry" ]; then kind=d; else kind=f; fi; ` +
+                    `info=$(stat -c '%s %Y' "./$entry" 2>/dev/null || stat -f '%z %m' "./$entry" 2>/dev/null) || info=; ` +
+                    `printf '%s\\0%s\\0%s\\0' "$entry" "$kind" "$info" || exit 1; done`);
+                if (r.exitCode !== 0) throw new Error(`readdir 失败（exit=${r.exitCode}）: ${p}`);
+                const frames = r.stdout.split("\0");
+                if (frames.pop() !== "" || frames.length % 3 !== 0) throw new Error(`readdir 未收到完整目录列表: ${p}`);
+                const entries: FileEntry[] = [];
+                for (let index = 0; index < frames.length; index += 3) {
+                    const [name, kind, info] = frames.slice(index, index + 3);
+                    if (!name || (kind !== "d" && kind !== "f")) throw new Error(`readdir 收到无效目录条目: ${p}`);
+                    const stat = parseStat(info!);
+                    entries.push({ name, isDirectory: kind === "d", size: stat?.size, mtime: stat?.mtimeMs });
+                }
+                return entries;
             },
             async rm(p, options) {
                 const r = await fsExec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}${q(p)}`);
@@ -445,7 +537,8 @@ export class SshPtyDriver implements RuntimeDriver {
         };
 
         this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop), connParams));
-        await this.link.handshake(`ssh ${hopLabel(rootHop)}`);
+        try { await this.link.handshake(`ssh ${hopLabel(rootHop)}`); }
+        catch (error) { this.link.kill(); throw error; }
         for (const hop of hops) {
             const { hopSshCommand } = await import("./ssh-helpers.js");
             this.link.send(`${hopSshCommand(hop)}${this.link.registerFallbackStep()}\n`);
@@ -468,15 +561,13 @@ export class SshPtyDriver implements RuntimeDriver {
             this.assertNotFallenBack(`enter: ${step.cmd.slice(0, 40)}`);
         }
         if (this.descriptor.cwd) {
-            // best-effort 恢复（重连时目录可能已被删——不阻断建链）；引号安全化
-            // （Astra 五轮 P1：JSON.stringify 双引号不挡 $()/反引号注入）。exec 通道
-            // 每条命令另行 fail-closed 拼装 cwd（renderExecChannel）。PTY 会话目录恢复
-            // 必须走 execMarker（Hydrogen R5 #2）：曾误调 execChannel——独立一次性子进程
-            // cd 即失效（PTY 目录从未切换），且多跳/交互 enter 层上 execChannel 会抛
-            // 「不可直达」直接炸掉整层 init
             try {
-                await this.link.execMarker(`cd ${q(this.descriptor.cwd)}`, 10_000);
-            } catch { /* 目录可能已删——best-effort 语义保留（exec 通道每条命令另行 fail-closed） */ }
+                const result = await this.link.execMarker(`cd ${q(cdTargetArg(this.descriptor.cwd))}`, 10_000);
+                if (result.exitCode !== 0) throw new Error(`SSH 层无法进入工作目录 '${this.descriptor.cwd}'（exit=${result.exitCode}）`);
+            } catch (error) {
+                this.link.kill();
+                throw error;
+            }
         }
         // 登录身份：握手已顺带实测（冷启动锦囊：省一次独立 ssh 握手——建层耗时近半）；
         // 缺席（旧握手形态/极旧对端）时静默跳过——绝不回退独立 exec（回退即冷启动退化）
@@ -504,11 +595,16 @@ export class SshPtyDriver implements RuntimeDriver {
             this.reconnectAttempts++;
             const delay = SshPtyDriver.RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempts - 1, SshPtyDriver.RECONNECT_DELAYS_MS.length - 1)]!;
             const timer = setTimeout(() => {
+                this.reconnectTimer = null;
+                // 到期复查（Sol 88 P1-10）：存活检查曾只在**调度时**——destroy()
+                // 后到期的回调照样新建链拉起 ssh 子进程（销毁后冒出新 PID 且存活）
+                if (!this.alive) { this.reconnecting = false; return; }
                 void (async () => {
                     try {
                         this.link = new PtyLink();
                         this.bindLink();
                         await this.init();
+                        if (!this.alive) { this.link.kill(); this.reconnecting = false; return; } // init 在途销毁——回收新链
                         this.reconnecting = false;
                         this.reconnectAttempts = 0;
                         this.lastActivityAt = Date.now();
@@ -519,6 +615,7 @@ export class SshPtyDriver implements RuntimeDriver {
                 })();
             }, delay);
             timer.unref?.();
+            this.reconnectTimer = timer; // exit() 显式回收（到期复查的双保险）
         };
         attempt();
     }
@@ -568,8 +665,10 @@ export class SshPtyDriver implements RuntimeDriver {
     async exit(): Promise<void> {
         if (!this.alive) return;
         this.alive = false;
+        this.sessions.closePolling();
         this.reconnecting = false;
         this.layerState = "dead";
+        if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; } // 排程中的重连不再到期拉新进程（Sol 88 P1-10）
         this.link.kill();
     }
 
@@ -600,7 +699,14 @@ export class SshPtyDriver implements RuntimeDriver {
             }
             this.execInFlight = true;
             try {
-                const r = await this.link.execMarker(command, options?.timeoutMs ?? 120_000, options?.signal);
+                // cwd 单次覆盖（Sol 88 P1-9）：曾静默丢弃——pwd/相对路径全落旧位置。
+                // 子 shell 隔离（单次覆盖不得污染层内持久 cd 状态）+ 上下换行
+                //（业务尾注释吞 `; }` 同病——execSession 二十期 #2 同款双防）；
+                // cd 失败 && 短路——退出码可探测
+                const cmd = options?.cwd
+                    ? `( cd ${q(cdTargetArg(options.cwd))} && {\n${command}\n} )`
+                    : command;
+                const r = await this.link.execMarker(cmd, options?.timeoutMs ?? 120_000, options?.signal);
                 if (r.effectiveUser) this.effectiveUser = r.effectiveUser;
                 return r;
             } finally {
@@ -662,7 +768,30 @@ export class SshPtyDriver implements RuntimeDriver {
             // 的握手成本从「每条命令」降到「每 10min 窗口首条」（ControlPersist=600）；
             // 与观察流同一 socket（exec/observe 同主机共享一条主连接）
             const destArgs = sshArgsFor(rootHop);
-            const argv = [...autonomousSshOpts(connParams), ...muxFlagsFor(destArgs), ...destArgs, "--", ...render.remoteArgs];
+            const sshOptions = autonomousSshOpts(connParams);
+            const argv = [...sshOptions, ...muxFlagsFor(destArgs, { sshOptions }), ...destArgs, "--", ...render.remoteArgs];
+            // 显式 stdio 模式覆盖（DeepSeek Harness 反馈）：FILAXIS_SSH_STDIO_MODE=inherit
+            // 直接走文件中转（管道句柄在受限沙箱里被拦截——ssh 秒退 255 零输出）
+            if (process.env.FILAXIS_SSH_STDIO_MODE === "inherit") {
+                void spawnWithFileRedirect(argv, render.stdinCmd, { timeoutMs: options?.timeoutMs, signal: options?.signal }).then((r) => {
+                    const mIdx = r.stdout.lastIndexOf(`\n${marker}:`);
+                    const m = mIdx !== -1 ? r.stdout.slice(mIdx + 1).split("\n", 1)[0]?.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`)) : null;
+                    if (!m) {
+                        const e = new Error(`命令未完成（inherit 模式无完成哨兵，exit=${r.exitCode}）。stdout 尾:\n${r.stdout.slice(-500)}\nstderr 尾:\n${r.stderr.slice(-300)}`) as Error & { outcome: "unknown" };
+                        e.outcome = "unknown";
+                        reject(e);
+                        return;
+                    }
+                    resolve({
+                        stdout: r.stdout.slice(0, mIdx),
+                        stderr: r.stderr,
+                        exitCode: parseInt(m[1]!, 10),
+                        effectiveUser: m[2] === "" ? undefined : m[2],
+                    });
+                }, reject);
+                return;
+            }
+            const spawnAt = Date.now();
             const p = spawn("ssh", argv, {
                 env: { ...process.env },
                 // 本地 ssh 进程启动目录不用 options.cwd（GPT Astra 十轮 #1）：cwd 是
@@ -734,6 +863,25 @@ export class SshPtyDriver implements RuntimeDriver {
                 if (effectiveUser) this.effectiveUser = effectiveUser;
                 // 无哨兵=命令未跑完（「无法执行」语义）——reject 附半截现场（outcome=unknown）
                 if (sentinelCode === undefined) {
+                    // 沙箱 stdio 管道损坏自动降级（DeepSeek Harness 反馈）：秒退 255+
+                    // 零输出=管道句柄被拦截的指纹——一次文件中转重试（cmd/sh 的 >
+                    // 是文件句柄非管道句柄，沙箱放行）；重试仍败才报错附双模式现场
+                    if (isBrokenStdioExit(code, out, stderr, Date.now() - spawnAt)) {
+                        // 沙箱 stdio 管道损坏指纹（DeepSeek Harness 反馈）。**不自动重放**
+                        //（Sol 78 P1-2）：首轮结果未知=远端可能已执行副作用——非幂等命令
+                        // 重试违宪（tmux spawn 错误同款纪律「勿盲目重试非幂等命令」）。
+                        // 报明确指纹+出路，由调用方显式设 FILAXIS_SSH_STDIO_MODE=inherit 重发
+                        finish(() => {
+                            const e = new Error(
+                                `命令未完成（ssh 秒退 code=255、零输出——沙箱 stdio 管道损坏指纹）。` +
+                                `注意：首轮结果未知（远端可能已执行——非幂等命令请先核实再重发）。` +
+                                `重发方式：环境变量 FILAXIS_SSH_STDIO_MODE=inherit（文件中转，绕开管道句柄）${BROKEN_STDIO_HINT}`,
+                            ) as Error & { outcome: "unknown" };
+                            e.outcome = "unknown";
+                            reject(e);
+                        });
+                        return;
+                    }
                     finish(() => {
                         // 连接层失败诊断（试用反馈 #29：-J/--host 传 ssh-config 别名在沙箱/
                         // 远端环境「不认」——别名解析依赖**运行环境**的 ~/.ssh/config，本机
@@ -757,11 +905,37 @@ export class SshPtyDriver implements RuntimeDriver {
         });
     }
 
+    async openStreamWindow(registry: StreamWindowRegistry, opts: ObservationWindowOptions) {
+        if (!this.alive || this.layerShellGone || this.reconnecting) {
+            throw new Error("SSH 层当前无法打开观察窗");
+        }
+        const config = this.descriptor.config;
+        if (Array.isArray(config?.sshHops) && config.sshHops.length) {
+            throw new Error("观察窗需要可非交互重放的 SSH 层，逐跳 PTY 登录链不可用");
+        }
+        const target = this.descriptor.target ?? "";
+        const connParams = config?.connParams as SshConnParams | undefined;
+        const hop: SshHop = connParams ? { host: target, conn: connParams } : target;
+        const render = renderExecChannel(enterStepsOf(config), opts.command, {
+            marker: `__FX_STREAM_${crypto.randomBytes(12).toString("hex")}`,
+            nonceWrapped: opts.command,
+            cwd: this.descriptor.cwd,
+        });
+        if (render.kind === "unreachable") throw new Error(`观察窗无法进入目标层：${render.reason}`);
+        const manager = new StreamSessionManager(sshArgsFor(hop), { connParams, logger: this.log });
+        return registry.open({
+            ...opts, layerAlias: target, manager,
+            transportCommand: render.remoteArgs.map(shellQuote).join(" "),
+            stdinScript: render.stdinCmd + "\n",
+        });
+    }
+
     // ── 会话族（委托 RemoteSessionManager）──
     async execSession(command: string, opts?: SessionStartOptions): Promise<SessionHandleInfo> {
         if (this.layerShellGone) throw new Error("层已退化——后台任务会落在父环境，请重建层后再启动");
         return this.sessions.start(command, opts);
     }
+    async recoverSession(sessionId: string) { return this.sessions.recover(sessionId); }
     async tailSession(sessionId: string, lines?: number): Promise<string[]> { return this.sessions.tail(sessionId, lines); }
     async readSessionLog(sessionId: string, opts?: ReadLogOptions): Promise<string> { return this.sessions.readLog(sessionId, opts); }
     watchSession(sessionId: string, opts: WatchOptions): { cancel(): void } { return this.sessions.watch(sessionId, opts); }
@@ -776,4 +950,137 @@ export class SshPtyDriver implements RuntimeDriver {
 /** shell 单引号安全引用 */
 function q(s: string): string {
     return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** 沙箱 stdio 管道损坏快速判定（DeepSeek Harness 反馈）：
+ *  ssh.exe 在受限沙箱（Electron 沙箱壳的 run_code 等）里经 stdio:'pipe' spawn
+ *  时，匿名管道被拦截——ssh 检测到三个 stdio 句柄损坏后立即自杀：exit 255、
+ *  stdout/stderr 全空（连 -vv 调试日志都吐不出来）、<500ms。同一命令在
+ *  PowerShell（cmdlet 管道=进程内实现不走 Windows 管道句柄）或真终端正常。 */
+export const __testBrokenStdioExit = isBrokenStdioExit; // 测试导出面（指纹判定单测）
+function isBrokenStdioExit(code: number | null, stdout: string, stderr: string, elapsedMs: number): boolean {
+    return code === 255 && stdout === "" && stderr === "" && elapsedMs < 500;
+}
+
+const BROKEN_STDIO_HINT =
+    "\n[沙箱 stdio 管道损坏] 父进程的匿名管道被沙箱拦截（常见于 Electron 沙箱壳的 run_code/execSync 环境）——ssh 因 stdio 句柄不可用秒退。" +
+    "\n  出路：①环境变量 FILAXIS_SSH_STDIO_MODE=inherit（输出经文件中转带回，绕开管道句柄）；" +
+    "\n  ②换 PowerShell pwsh 工具跑同命令（cmdlet 管道不走 Windows 管道句柄）；" +
+    "\n  ③真实终端执行。详见 docs/known-environments.md";
+
+/** 文件中转包装（inherit 降级）：经 shell 重定向到临时文件绕开损坏的管道——
+ *  cmd/sh 的 > 是文件句柄非管道句柄，沙箱放行。产物读回拼 ExecResult。
+ *  abort（Sol 78 #6）：signal 已取消即 AbortError；在途取消杀本地 shell。
+ *  0600（Sol 78 #7）：中转文件含原始命令/env 值——umask 022 下 0644 曾可被
+ *  同机其他用户读取 */
+export const __testFileRedirect = spawnWithFileRedirect; // 测试导出面（中转命令形态验证）
+async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+    const nonce = crypto.randomBytes(6).toString("hex");
+    const outFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.out`;
+    const errFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.err`;
+    const inFile = `${os.tmpdir()}/fx-ssh-io-${nonce}.in`;
+    const cleanup = () => Promise.all([
+        fsp.unlink(outFile).catch(() => undefined),
+        fsp.unlink(errFile).catch(() => undefined),
+        fsp.unlink(inFile).catch(() => undefined),
+    ]);
+    if (opts.signal?.aborted) {
+        throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转未启动）", "AbortError"), { outcome: "unknown" });
+    }
+    try {
+        await fsp.writeFile(inFile, stdinCmd, { encoding: "utf-8", mode: 0o600 });
+        // 输出文件预创建 0600（> 重定向沿用 umask 创建——shell 无法传 mode）
+        await fsp.writeFile(outFile, "", { mode: 0o600 });
+        await fsp.writeFile(errFile, "", { mode: 0o600 });
+    } catch (e) {
+        await cleanup(); // 准备失败不留残（Sol 79 #6）：.in 含原始命令/env 值
+        throw e;
+    }
+    // 备妥后再核一次取消（Sol 79 #4）：建文件窗口内 abort 曾照跑 ssh
+    if (opts.signal?.aborted) {
+        await cleanup();
+        throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转准备完成前取消）", "AbortError"), { outcome: "unknown" });
+    }
+    // 直 spawn + 文件 fd（Sol 80 P1-1/P2-5）：无 shell——cmd 的 %VAR% 展开曾改写
+    // -i 密钥路径等参数字面量；shell 包装还使 kill 只杀到外层 shell（ssh 替身
+    // 照跑到底）。stdio 三路全部接文件句柄（沙箱拦的是**匿名管道**，文件句柄
+    // 放行）——无引用、无展开、kill 直达 ssh 本体。
+    // fsSync 静态导入（Sol 81 P2-4）：动态 import 的 await 窗口内取消曾被放过
+    let inFd = -1, outFd = -1, errFd = -1;
+    try {
+        inFd = fsSync.openSync(inFile, "r");
+        outFd = fsSync.openSync(outFile, "w");
+        errFd = fsSync.openSync(errFile, "w");
+    } catch (e) {
+        for (const fd of [inFd, outFd, errFd]) if (fd >= 0) fsSync.closeSync(fd);
+        await cleanup();
+        throw e;
+    }
+    let aborted = false;
+    let spawnErr: Error | undefined; // 本地启动错误（Sol 84 P2 上轮补丁断言失败未落盘——本轮重落+验证）
+    let p: ReturnType<typeof spawn>;
+    const closeFds = (): void => {
+        // fd 双关防线（Sol 82 P2-8）：启动前取消分支关过一次、catch 再关同编号
+        //——清理期间复用编号的他文件曾报 EBADF。关后置 -1，二次关闭自然跳过
+        for (const fd of [inFd, outFd, errFd]) if (fd >= 0) { try { fsSync.closeSync(fd); } catch { /* 已关 */ } }
+        inFd = outFd = errFd = -1;
+    };
+    try {
+        if (opts.signal?.aborted) { // spawn 前最后一核（fd 打开窗口内取消）
+            closeFds();
+            await cleanup();
+            throw Object.assign(new DOMException("exec aborted by AbortSignal（spawn 前检出）", "AbortError"), { outcome: "unknown" });
+        }
+        p = spawn("ssh", argv, { stdio: [inFd, outFd, errFd] });
+        p.once("error", (e: Error) => { spawnErr = e; }); // 本地拒启归账（ENOENT 等）——区别于远端执行结果
+    } catch (e) {
+        // spawn 同步抛错清场（Sol 81 P2-5）：argv 含 NUL 等被 Node 拒启——
+        // fd 与三个中转文件曾全部滞留
+        closeFds();
+        await cleanup();
+        throw e;
+    }
+    const exitCode = await new Promise<number | null>((resolve) => {
+        const onAbort = () => { aborted = true; p.kill("SIGTERM"); resolve(null); };
+        const t = opts.timeoutMs ? setTimeout(() => { p.kill("SIGTERM"); resolve(null); }, opts.timeoutMs) : null;
+        opts.signal?.addEventListener("abort", onAbort, { once: true });
+        const done = (c: number | null) => {
+            if (t) clearTimeout(t);
+            opts.signal?.removeEventListener("abort", onAbort);
+            resolve(c);
+        };
+        p.once("exit", (c) => done(c));
+        p.once("error", () => done(null));
+    });
+    for (const fd of [inFd, outFd, errFd]) { try { fsSync.closeSync(fd); } catch { /* 已随进程关闭 */ } }
+    // stderr 读取失败不静默（Sol 83 P2-9）：EIO 等曾吞成空串——退出码照回而
+    // 诊断内容丢失，调用方无从知晓。落诊断占位（stdout 同罪同判）
+    const readOrNote = async (f: string, what: string): Promise<string> => {
+        try {
+            return await fsp.readFile(f, "utf-8");
+        } catch (e) {
+            return `[filaxis] ${what} 读取失败（${(e as Error).message}）——诊断内容丢失`;
+        }
+    };
+    const [out, err] = await Promise.all([
+        readOrNote(outFile, "stdout"),
+        readOrNote(errFile, "stderr"),
+    ]);
+    await cleanup();
+    if (aborted) {
+        // AbortError+outcome（Sol 79 #4）：修前返回普通错误且替身照跑到底
+        throw Object.assign(new DOMException("exec aborted by AbortSignal（文件中转已终止本地 shell，远端进程状态未核实）", "AbortError"), { outcome: "unknown" });
+    }
+    if (spawnErr) {
+        // 本地启动失败直报（Sol 84 P2 → Sol 85 P2 → Sol 86 P2-5 结构化）：
+        // 修前吞成「无哨兵 exit=null」；上轮直报但包成普通 Error——code/cause
+        // 全丢（消费方按 code 分诊不可用）。code 透传 + cause 挂原错误
+        throw Object.assign(
+            new Error(`本地 ssh 启动失败（${spawnErr.message}）——检查 PATH/可执行文件。中转模式（FILAXIS_SSH_STDIO_MODE=inherit）`),
+            { code: (spawnErr as { code?: string }).code, cause: spawnErr },
+        );
+    }
+    return { stdout: out, stderr: err, exitCode };
 }

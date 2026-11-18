@@ -4,7 +4,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { LocalSessionManager } from "../src/local-session-manager.js";
 import type { SessionEvent } from "../src/session-types.js";
 
@@ -23,6 +23,24 @@ function collect(m: LocalSessionManager): SessionEvent[] {
     return events;
 }
 
+test.skipIf(process.platform !== "linux")("local stop reaps a redirected background child after its shell exits", async () => {
+    const m = new LocalSessionManager();
+    const h = await m.start("sleep 15 >/dev/null 2>&1 & echo $!; exit 37");
+    await waitFor(() => m.tail(h.sessionId).length > 0);
+    await Bun.sleep(200);
+    const pid = Number(m.tail(h.sessionId)[0]);
+    const alive = () => {
+        try { return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    };
+    try {
+        expect(alive()).toBe(true);
+        expect(m.verify(h.sessionId).status).toBe("running");
+        expect((await m.stop(h.sessionId)).status).toBe("exited");
+        expect(alive()).toBe(false);
+    } finally { if (alive()) process.kill(pid, "SIGKILL"); }
+}, 20_000);
+
 describe("LocalSessionManager", () => {
     test("spawn 即返 + 双文件创建 + exit 事件 exitCode", async () => {
         const m = new LocalSessionManager();
@@ -35,7 +53,7 @@ describe("LocalSessionManager", () => {
         expect(exit.exitCode).toBe(3);
         expect(existsSync(`${h.logBase}.out`)).toBe(true);
         expect(existsSync(`${h.logBase}.err`)).toBe(true);
-    });
+    }, 30_000); // flake 治理：waitFor 期限 20s > bun 默认 5s 预算——须显式盖过
 
     test("双流物理分离：.out/.err 各归各（FEAT-04 落盘协议）", async () => {
         const m = new LocalSessionManager();
@@ -46,7 +64,7 @@ describe("LocalSessionManager", () => {
         const err = await m.readLog(h.sessionId, { stream: "stderr" });
         expect(out).toBe("to-out");
         expect(err).toBe("to-err");
-    });
+    }, 30_000); // flake 治理：无预算撞 bun 5s 默认——全量并发下冷启动可超（Sol 65 实锤）
 
     test("watcher 命中事件带 stream 字段；thenStop 收摊", async () => {
         const m = new LocalSessionManager();
@@ -59,7 +77,7 @@ describe("LocalSessionManager", () => {
         expect(match.matchedLine).toContain("GO");
         // thenStop → 会话被终止（SIGTERM）→ exit 事件
         await waitFor(() => events.some((e) => e.type === "exit"));
-    }, 20_000); // bun 用例级默认 5s——Windows 新 shell 路径首启+Defender 扫描累计超限
+    }, 30_000); // flake 治理：预算曾与 waitFor 期限（20s）齐平——负载下零余量（Sol 69 实锤）；Windows 新 shell 首启+Defender 扫描另加余量
 
     test("stop 长跑进程：SIGTERM → exit 事件", async () => {
         const m = new LocalSessionManager();
@@ -69,7 +87,7 @@ describe("LocalSessionManager", () => {
         await waitFor(() => events.some((e) => e.type === "exit"));
         const entry = m.list().find((s) => s.sessionId === h.sessionId);
         expect(entry?.running).toBe(false);
-    });
+    }, 30_000); // 预算盖过 waitFor 期限（flake 治理）；stop 核实窗（TERM→查→KILL→查）+ Defender 扫描余量（Sol 57/58 双轮环境 flake）
 
     test("tailLines：行对象按到达序混合双流", async () => {
         const m = new LocalSessionManager();
@@ -81,7 +99,7 @@ describe("LocalSessionManager", () => {
         expect(streams).toContain("stdout:one");
         expect(streams).toContain("stderr:two");
         expect(streams).toContain("stdout:three");
-    });
+    }, 30_000); // flake 治理：无预算撞 bun 5s 默认
 
     test("不存在/已回收的会话 → 显式错误", () => {
         const m = new LocalSessionManager();
@@ -118,7 +136,7 @@ describe("ready() 就绪握手（AC-13）", () => {
         } finally {
             await m.stop(h.sessionId).catch(() => undefined);
         }
-    });
+    }, 20_000); // flake 治理：内部有界等待 4s+ready 3s+stop 核实——默认 5s 预算必不够
 
     test("增量匹配：ready 在前，标记在后", async () => {
         const m = new LocalSessionManager();
@@ -129,7 +147,7 @@ describe("ready() 就绪握手（AC-13）", () => {
         } finally {
             await m.stop(h.sessionId).catch(() => undefined);
         }
-    });
+    }, 20_000); // flake 治理：ready 5s+stop 核实——默认 5s 预算零余量（Sol 66 实锤）
 
     test("超时：自动 stop 清理（reject 且清理路径触发）", async () => {
         const m = new LocalSessionManager();
@@ -242,29 +260,29 @@ describe("孪生对齐审计（async 隔离 + exit 兜底 + 终态 watcher 封�
         expect(m.tail(h.sessionId)).toContain("ALIVE_OK");
     }, 20_000);
 
-    test("孙进程持 stdio 管道：exit 2s 兜底先于 close finalize（close 永不按时来）", async () => {
+    test("孙进程持有输出管道时，会话等进程组退出才进入终态", async () => {
         const m = new LocalSessionManager();
         const exits: Array<number | null | undefined> = [];
         m.onEvent = (ev) => { if (ev.type === "exit") exits.push(ev.exitCode); };
         // 主 shell 即退（exit 事件立即到），孙 sleep 3 持管道写端 → close ≈3s 后
         await m.start("echo MAIN_DONE; (sleep 3) & exit 0");
-        // 2.6s = 兜底（主退+2s）已触发、close（3s）未到——兜底生效的直接证明窗
         await new Promise((r) => setTimeout(r, 2600));
-        expect(exits.length).toBe(1); // 修前：0（close 永不按时来，finalize 悬置）
-        expect(m.list()[0]!.running).toBe(false); // 修前：true（孙进程还握着管道）
+        expect(exits).toEqual([]);
+        expect(m.list()[0]!.running).toBe(true);
+        await waitFor(() => !m.list()[0]!.running);
+        expect(exits).toEqual([0]);
         expect(m.tail(m.list()[0]!.sessionId)).toContain("MAIN_DONE");
     }, 15_000);
 
-    test("终态后孙进程尾数据不触发 watcher（watchers.clear 对齐 + late data 拦截）", async () => {
+    test("启动 shell 退出后仍交付后台子进程的日志给 watcher", async () => {
         const m = new LocalSessionManager();
         const matches: string[] = [];
         m.onEvent = (ev) => { if (ev.type === "match") matches.push(ev.matchedLine); };
-        // 主 shell 即退 → 兜底 ≈2s finalize；孙进程 3s 才输出（终态**之后**到达）
         await m.start("(sleep 3; echo LATE_LINE) & exit 0");
         const id = m.list()[0]!.sessionId;
         m.watch(id, { pattern: "LATE_LINE", once: true }); // 终态前注册
-        await new Promise((r) => setTimeout(r, 4200));
-        expect(matches.length).toBe(0); // 修前风险：终态后 watcher 复活误触 + write-after-end 崩流
+        await waitFor(() => !m.list()[0]!.running);
+        expect(matches).toEqual(["LATE_LINE"]);
     }, 15_000);
 });
 
@@ -282,4 +300,33 @@ describe("local verify（Gemini #7）", () => {
         expect(v.status === "unknown" || v.status === "exited").toBe(true); // 修前：恒 running（内存态谎报）
         await m.stop(h.sessionId).catch(() => undefined);
     }, 15_000);
+});
+
+// GPT Sol 七十二期 #4：本地 readLog 尾窗快路径把末尾换行算成一条空行——
+// first\nsecond\n 取 1 行曾得 ""、取 2 行曾得 "second\n"。split 尾空串先剥。
+describe("Sol 72：本地尾行纪律", () => {
+    test("尾换行不算行：取 1 行=second、取 2 行=first+second", async () => {
+        const m = new LocalSessionManager();
+        const h = await m.start("echo first; echo second");
+        await waitFor(() => m.list().find((s) => s.sessionId === h.sessionId)?.running === false);
+        expect(await m.readLog(h.sessionId, { lines: 1 })).toBe("second"); // 修前：""
+        expect(await m.readLog(h.sessionId, { lines: 2 })).toBe("first\nsecond"); // 修前："second\n"
+    }, 20_000);
+});
+
+// GPT Sol 七十三期 #4：本地 readLog 尾窗（lines*512B）装不下 2.5KB 长行时曾静默
+// 截断——取 1 行得 1023B 半行、取 2 行只剩同段。块内完整行不足且文件比块大→退全量。
+describe("Sol 73：长行回退", () => {
+    test("末行 2500B：取 1 行得完整长行、取 2 行两行齐全", async () => {
+        const m = new LocalSessionManager();
+        const longTail = "L".repeat(2500);
+        const h = await m.start(`echo first; printf %s ${JSON.stringify(longTail)}; echo`);
+        await waitFor(() => m.list().find((s) => s.sessionId === h.sessionId)?.running === false);
+        const l1 = await m.readLog(h.sessionId, { lines: 1 });
+        expect(l1.length).toBe(2500); // 修前：1023（半行）
+        expect(l1).toBe(longTail);
+        const l2 = await m.readLog(h.sessionId, { lines: 2 });
+        expect(l2.startsWith("first")).toBe(true); // 修前：前一行完全丢失
+        expect(l2.endsWith(longTail)).toBe(true);
+    }, 20_000);
 });

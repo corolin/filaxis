@@ -30,7 +30,7 @@ describe("createAgentToolkit（反馈 #3）", () => {
         expect(tk.tools.map((t) => t.function.name)).toEqual([
             "run_batch", // 置顶（第十三季黑盒：Lazy schema 按序读——run_batch 排第 7 被漏读）
             "run_command", "spawn_and_observe", "stop_and_verify",
-            "read_file", "edit_file", "observe_stream", // 第六季盲测扩三件
+            "read_file", "edit_file", "observe_stream", "read_stream", "close_stream",
             "push_ssh", "push_into", "list_layers", "remove_layer", // 第十季层族
         ]);
         const r = await tk.handlers.run_command({ command: "echo tk-out; exit 4" });
@@ -63,7 +63,7 @@ describe("createAgentToolkit（反馈 #3）", () => {
             async stopSession() { return { exitCode: null }; }, // 旧形态：发了 kill，没核实
         } as unknown as import("../src/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: fakeOldDriver });
-        const r = await tk.handlers.stop_and_verify({ session_id: "s" });
+        const r = await tk.handlers.stop_and_verify({ session_id: "s", layer: "__initial__" });
         expect(r.status).toBe("unknown"); // 修前：stopped（违宪——终止≠已核实）
         expect(r.note).toContain("verify"); // unknown 后自动接 verify（双通道不可达才保持）
     }, 15_000);
@@ -295,64 +295,8 @@ describe("三十五期", () => {
         expect(caught?.sessionId).toBe("fx-tail-err");
     }, 15_000);
 
-    // #2 observe_stream 登记归属
-    test("observe_stream 远端层停止 unknown → stop_and_verify 按归属寻层（不落初始层）", async () => {
-        const stopCalls: string[] = [];
-        const mkDrv = (tag: string) => ({
-            descriptor: { driver: "mockssh", target: tag },
-            exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
-            init: async () => undefined,
-            destroy: async () => undefined,
-            execSession: async () => ({ sessionId: `obs-${tag}`, logBase: `/tmp/${tag}`, pid: 1 }),
-            tailSession: async () => [],
-            stopSession: async () => { stopCalls.push(tag); return { status: "unknown", exitCode: null }; },
-            verifySession: async () => ({ status: "unknown" }),
-        }) as unknown as import("../src/driver.js").RuntimeDriver;
-        const remote = mkDrv("remote-layer");
-        const initial = mkDrv("initial-layer");
-        const stack = new RuntimeStack();
-        // 注册命名层让 resolveDrv("remote") → remote driver
-        await stack.addLayer("remote", remote as never);
-        const tk = createAgentToolkit(stack, { driver: initial });
-        await tk.handlers.observe_stream({ command: "x", duration_ms: 50, layer: "remote" });
-        // 停止 unknown → 归属保留 → stop_and_verify 应走 remote（不是 initial）
-        const r = await tk.handlers.stop_and_verify({ session_id: "obs-remote-layer" });
-        expect(stopCalls).toEqual(["remote-layer", "remote-layer"]); // observe 停一次 + verify 停一次，都在 remote 层
-        expect(r.status).toBe("unknown");
-        await stack.removeLayer("remote").catch(() => undefined);
-    }, 15_000);
 });
 
-// GPT Astra 三十六期 P1：observe_stream 读取失败跳过停止——共享 postLaunchFail 收口
-describe("三十六期", () => {
-    test("observe_stream tailLines 抛错 → 停止被调用 + outcome/sessionId/logBase 在场", async () => {
-        let stopCalls = 0;
-        const drv = {
-            descriptor: { driver: "local" },
-            exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
-            init: async () => undefined,
-            destroy: async () => undefined,
-            execSession: async () => ({ sessionId: "fx-obs-read", logBase: "/tmp/or", pid: 1 }),
-            tailSession: async () => { throw new Error("tail read broke"); },
-            stopSession: async () => { stopCalls++; return { status: "unknown", exitCode: null }; },
-            verifySession: async () => ({ status: "running" }),
-        } as unknown as import("../src/driver.js").RuntimeDriver;
-        const tk = createAgentToolkit(new RuntimeStack(), { driver: drv });
-        let caught: (Error & { outcome?: string; sessionId?: string; logBase?: string }) | undefined;
-        try { await tk.handlers.observe_stream({ command: "x", duration_ms: 50 }); } catch (e) { caught = e as never; }
-        expect(stopCalls).toBeGreaterThanOrEqual(1); // 修前：0（跳过停止）
-        expect(caught?.outcome).toBe("unknown"); // verify running → unknown
-        expect(caught?.sessionId).toBe("fx-obs-read");
-        expect(caught?.logBase).toBe("/tmp/or");
-        expect(caught?.message).toContain("tail read broke"); // 原因保留
-        expect(caught?.message).toContain("实测仍在运行"); // 诚实警告
-    }, 15_000);
-});
-
-// CLI observe 冒烟（四十三期如实命名：读取异常路径在 CLI 子进程内无法注入 mock——
-// 由 toolkit 侧共享 postLaunchFail 回归覆盖（上块），本测只锁「正常 observe 端到端
-// 可用」。旧名「读取异常也走停止」与内容不符〔曾致误导〕+ duration 100ms 在 bash
-// 冷启/Defender 并发扫描下 tail 常扑空=偶发空输出假失败——放宽至 800ms）
 describe("CLI observe 冒烟（正常路径）", () => {
     test("observe 端到端：启动→挂流→tail 输出报告", async () => {
         const { execSync } = await import("node:child_process");
@@ -360,3 +304,105 @@ describe("CLI observe 冒烟（正常路径）", () => {
         expect(r).toContain("SELF_AUDIT_OK");
     }, 20_000);
 });
+
+test("ready 等待期间核实未知时继续等待，且不请求停止", async () => {
+    let reads = 0;
+    let stops = 0;
+    const driver = {
+        execSession: async () => ({ sessionId: "fixture", logBase: "/tmp/fixture" }),
+        tailSession: async () => ++reads >= 11 ? ["READY"] : [],
+        verifySession: async () => ({ status: "unknown" }),
+        stopSession: async () => { stops++; return { status: "stopped" }; },
+    } as unknown as RuntimeDriver;
+    const toolkit = createAgentToolkit(new RuntimeStack(), { driver, readyTimeoutMs: 4000 });
+    const result = await toolkit.handlers.spawn_and_observe({ command: "fixture", ready_marker: "READY" });
+    expect(result.note).toBe("ready");
+    expect(stops).toBe(0);
+});
+
+test("natural exit releases Agent routing and caches the verified result for a bounded window", async () => {
+    const stack = new RuntimeStack();
+    let initialStops = 0;
+    let explicitStops = 0;
+    let finished = false;
+    const original = {
+        descriptor: { driver: "ssh", target: "fixture" },
+        exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+        execSession: async () => ({ sessionId: "short", logBase: "/tmp/short" }),
+        sessions: { sessionState: () => finished ? { status: "exited", exitCode: 9 } : { status: "running", exitCode: null } },
+        stopSession: async () => { explicitStops++; return { status: "exited", exitCode: 9 }; },
+    } as unknown as RuntimeDriver;
+    await stack.addLayer("fixture", original);
+    const toolkit = createAgentToolkit(stack, {
+        driver: { stopSession: async () => { initialStops++; return { status: "stopped" }; } } as unknown as RuntimeDriver,
+        sessionResultTtlMs: 150,
+        sessionCheckIntervalMs: 10,
+    });
+    await toolkit.handlers.spawn_and_observe({ command: "fixture" });
+    finished = true;
+    await Bun.sleep(35);
+    const stop = toolkit.handlers.stop_and_verify;
+    expect(await stop({ session_id: "short" })).toEqual({ status: "exited", exit_code: 9 });
+    expect(explicitStops).toBe(0);
+    await Bun.sleep(170);
+    expect(await stop({ session_id: "short" })).toMatchObject({ status: "unknown" });
+    expect(initialStops).toBe(0);
+    expect(explicitStops).toBe(0);
+    expect(await stop({ session_id: "short", layer: "fixture" })).toEqual({ status: "exited", exit_code: 9 });
+    expect(explicitStops).toBe(1);
+});
+
+test("drivers without a session registry are probed without issuing stop requests", async () => {
+    const probed = Promise.withResolvers<void>();
+    const driver = {
+        execSession: async () => ({ sessionId: "external", logBase: "/tmp/external" }),
+        verifySession: async () => {
+            probed.resolve();
+            return { status: "exited", exitCode: 4 };
+        },
+        stopSession: async () => { throw Error("expected cached result"); },
+    } as unknown as RuntimeDriver;
+    const toolkit = createAgentToolkit(new RuntimeStack(), { driver, sessionCheckIntervalMs: 5 });
+    await toolkit.handlers.spawn_and_observe({ command: "fixture" });
+    await probed.promise;
+    await Bun.sleep(10);
+    expect(await toolkit.handlers.stop_and_verify({ session_id: "external" })).toEqual({ status: "exited", exit_code: 4 });
+});
+
+test("toolkit rebuilds its configured initial layer after that layer is destroyed", async () => {
+    const stack = new RuntimeStack();
+    let created = 0;
+    stack.registerDriver("fixture", (descriptor) => {
+        const generation = ++created;
+        return {
+            descriptor,
+            init: async () => undefined,
+            destroy: async () => undefined,
+            exec: async () => ({ stdout: String(generation), stderr: "", exitCode: 0 }),
+        } as unknown as RuntimeDriver;
+    });
+    const toolkit = createAgentToolkit(stack, { descriptor: { driver: "fixture" } });
+    expect((await toolkit.handlers.run_command({ command: "first" })).stdout).toBe("1");
+    await toolkit.handlers.remove_layer({ name: "__initial__", destroy: true });
+    expect((await toolkit.handlers.run_command({ command: "second" })).stdout).toBe("2");
+    await toolkit.handlers.remove_layer({ name: "__initial__", destroy: true });
+});
+
+test("observe_stream opens the selected layer and rejects unsupported layers", async () => {
+    const stack = new RuntimeStack();
+    const local = new (await import("../src/local-driver.js")).LocalRuntimeDriver();
+    await stack.addLayer("selected", local);
+    const toolkit = createAgentToolkit(stack, { driver: {} as RuntimeDriver });
+    try {
+        const { window_id } = await toolkit.handlers.observe_stream({ command: "echo SELECTED", layer: "selected" });
+        const result = await toolkit.handlers.read_stream({ window_id, since_seq: 0, wait_ms: 8000 });
+        expect(result.frames.map((frame) => frame.text)).toEqual(["SELECTED"]);
+        await toolkit.handlers.close_stream({ window_id });
+        await expect(toolkit.handlers.read_stream({ window_id })).rejects.toThrow(/已关闭/);
+        await stack.removeLayer("selected");
+        await stack.addLayer("unsupported", { descriptor: { driver: "mock" }, exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }) } as unknown as RuntimeDriver);
+        await expect(toolkit.handlers.observe_stream({ command: "echo WRONG", layer: "unsupported" })).rejects.toThrow(/不支持持续观察窗/);
+    } finally {
+        toolkit.dispose?.();
+    }
+}, 15000);

@@ -45,6 +45,11 @@ export async function discoverLayer(
     const key = layerEnvKey(driver.descriptor);
 
     const r1 = await driver.exec(buildProbeStage1(), { timeoutMs: 30_000 });
+    if (r1.exitCode !== 0) {
+        // stage1 失败不落盘（Sol 54 P2-10）：曾 exit 127（命令缺失）仍把空规格
+        // 写进 store 并报 stale:false——空规格覆盖真规格=探测一次坏一次
+        throw new Error(`环境探测 stage1 失败（exit=${r1.exitCode}）——不落盘（防空规格覆盖）: ${r1.stderr.slice(0, 120)}`);
+    }
     const spec = parseProbeOutput(r1.stdout);
     let probeNote: string | undefined;
     if (!opts.skipStage2) {
@@ -52,6 +57,7 @@ export async function discoverLayer(
             const r2 = await driver.exec(buildProbeStage2(), {
                 timeoutMs: opts.stage2TimeoutMs ?? 120_000,
             });
+            if (r2.exitCode !== 0) throw new Error(`exit=${r2.exitCode}`);
             const spec2 = parseProbeOutput(r2.stdout);
             spec.packages = spec2.packages; // stage2 增量合并（包）
         } catch (err) {

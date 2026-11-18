@@ -56,6 +56,17 @@ bun add @syrkos/filaxis    # 或 npm install @syrkos/filaxis
 - npm 依赖：**零**（`dependencies` 为空是 AC 门禁项，见 `bun run check:boundaries`）
 - 系统依赖按能力分列（`stack.features()` **探测本机视角**——Agent 在容器里跑 filaxis 时探测的是容器内的 `ssh`/`tmux`/`sftp`，目标主机的能力经 `launchCmd` 层的 shell 自行确认）：`ssh`≥7.3 全功能（`-J`）、`tmux` 仅持久会话（缺席自动降级非持久）、`sftp` 仅传输快路径
 
+## 已验证的平台与连接方式
+
+| 操作系统 | 连接方式 | 验证范围 |
+|---|---|---|
+| Windows | 本地执行（Git Bash） | 本地命令、长跑会话、观察窗、Windows Job 子进程回收 |
+| Ubuntu Linux | 本地执行（WSL）、本地 tmux、CI SSH 回环 | 本地会话与观察窗、tmux 持久会话重挂与停止、SSH 集成测试。tmux 的 watcher 接管尚未实现 |
+| Debian GNU/Linux | SSH 直连 | 非交互 exec、交互 PTY、持续观察窗、重连后接管会话与 watcher、核实停止、文件操作 |
+| Debian GNU/Linux | SSH 单跳（`ProxyJump` / `-J`） | 非交互 exec、stdout 与 stderr 分离 |
+| Alpine Linux | SSH 到 Linux 宿主后经 `docker exec` 进入容器 | 容器内非交互执行与受控文件编辑 |
+| OPNsense（FreeBSD） | SSH 直连（非交互 exec） | 命令执行、目录读取、文件写入与覆盖时保留权限。默认交互登录进入设备菜单，PTY 握手在该配置下不可用 |
+
 ## 语义契约要点（使用前必读）
 
 详见包内 [AGENTS.md](./AGENTS.md)——**终止即请求、死亡须核实**（`unknown` 不是失败也不是成功）；退出码非零是数据不是异常；PTY 通道 stderr 混流是终端语义；跨流聚合序为到达序。

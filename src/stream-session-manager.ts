@@ -21,11 +21,13 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { OutputRingBuffer, WatchRegistry, sanitizeSessionName, type SessionLine } from "./session-buffer.js";
 import { settleRejection } from "./async-guard.js";
 import { Vt100Screen } from "./vt100-screen.js";
-import { muxFlagsFor, muxSocketPath, autonomousSshOpts, type SshConnParams } from "./ssh-helpers.js";
+import { muxFlagsFor, autonomousSshOpts, type SshConnParams } from "./ssh-helpers.js";
 import type { SessionEvent } from "./session-types.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 export interface StreamStartOptions {
+    /** Shell script sent to the stream process before EOF. */
+    stdinScript?: string;
     name?: string;
     ownerSessionId?: string;
     /** 建立即挂 watcher（真流式命中——无需等轮询） */
@@ -35,7 +37,7 @@ export interface StreamStartOptions {
     /** 观察窗流桥：每行对象原样回调（截断/入窗由窗侧自理） */
     onLine?: (line: SessionLine) => void;
     /** 流进程退出回调（观察窗 stale 语义） */
-    onExit?: (exitCode: number | null) => void;
+    onExit?: (exitCode: number | null, error?: string) => void;
     /**
      * TUI 屏桥（第五季灵感）：原始 chunk（含 ANSI 转义）喂 Vt100Screen 后回调
      * snapshot（每 chunk 一帧——ncurses 增量包一包一帧）。观察 watch/htop/nvtop
@@ -61,14 +63,10 @@ export interface StreamSessionManagerOptions {
     logger?: FilaxisLogger;
 }
 
-/** 主连接注册表：destKey → ControlPath socket（进程级共享） */
-const masters = new Map<string, { path: string; refCount: number }>();
-
 export class StreamSessionManager {
     onEvent: (ev: SessionEvent) => void = () => undefined;
 
     private entries = new Map<string, StreamEntry>();
-    private readonly destKey: string;
     private readonly destArgs: string[];
     private readonly muxDisabled: boolean;
     private readonly idleReapMs?: number;
@@ -82,7 +80,6 @@ export class StreamSessionManager {
 
     constructor(destArgs: string[], opts: StreamSessionManagerOptions = {}) {
         this.destArgs = destArgs;
-        this.destKey = crypto.createHash("sha256").update(destArgs.join("\x00")).digest("hex").slice(0, 16);
         // Windows OpenSSH 无 ControlMaster 支持（known limitation）——退化直连
         this.muxDisabled = opts.disableMux === true;
         this.idleReapMs = opts.idleReapMs;
@@ -93,20 +90,6 @@ export class StreamSessionManager {
         this.log = opts.logger ?? noopLogger;
     }
 
-    /** ControlMaster flags（第十一季下沉共享 ssh-helpers.muxFlagsFor——exec 通道与
-     *  观察流同一 socket：同 dest 的执行/观察共用一条主连接；auto+Persist 无独立 -MNf） */
-    private muxFlags(): string[] {
-        const flags = muxFlagsFor(this.destArgs, { disable: this.muxDisabled, dir: this.muxDir });
-        if (flags.length) {
-            let m = masters.get(this.destKey);
-            if (!m) {
-                m = { path: muxSocketPath(this.destArgs, this.muxDir), refCount: 0 };
-                masters.set(this.destKey, m);
-            }
-        }
-        return flags;
-    }
-
     /** 建立观察流：真流式子进程，stdout/stderr 双流逐行进 ring/watcher */
     async start(command: string, opts: StreamStartOptions = {}): Promise<{ sessionId: string; name?: string }> {
         // 名称规范化（四十期后卫生统一：sessionId 当前只作内存键，但与其余三后端
@@ -114,11 +97,25 @@ export class StreamSessionManager {
         const sessionId = `${opts.name ? sanitizeSessionName(opts.name) + "-" : "stream-"}${crypto.randomBytes(3).toString("hex")}`;
         // 基础选项统一走 autonomousSshOpts（策略感知：strict 传导/缺省 TOFU——
         // Astra 十三轮 #1：此前硬编码 accept-new 在最前，重复 -o 首见生效压掉调用者策略）
-        const argv = [...this.sshOpts, ...this.muxFlags(), ...this.destArgs, "--", command];
-        const child = this.spawnImpl("ssh", argv, { stdio: ["ignore", "pipe", "pipe"] });
+        // OpenSSH owns ControlPersist and the socket lifecycle.
+        const mux = muxFlagsFor(this.destArgs, { disable: this.muxDisabled, dir: this.muxDir, sshOptions: this.sshOpts });
+        const argv = [...this.sshOpts, ...mux, ...this.destArgs, "--", command];
+        const child = this.spawnImpl("ssh", argv, {
+            stdio: [opts.stdinScript === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        });
+        // spawn 启动失败前置监听（Sol 87 P2-8）：error 事件异步到达——桥到 start
+        // 的 reject（曾仅 finalizeStream→onExit→窗口 stale，open 照常返回零帧窗、
+        // 调用方收不到 ENOENT）。ready 竞速：已 resolve 则归 exit 路径
+        let startSettled = false;
+        const spawnFailure = new Promise<never>((_, reject) => {
+            child.once("error", (e: Error) => {
+                if (startSettled) return; // start 已返回——错误归流终态路径
+                reject(Object.assign(new Error(`本地 ssh 启动失败（${e.message}）——检查 PATH/可执行文件`), { code: (e as { code?: string }).code, cause: e }));
+            });
+        });
 
         const entry: StreamEntry = {
-            sessionId, name: opts.name, command, destKey: this.destKey, child,
+            sessionId, name: opts.name, command, child,
             ring: new OutputRingBuffer({ maxLines: 50, maxLineBytes: 512 }),
             watchers: new WatchRegistry(),
             watcherMeta: new Map(),
@@ -128,13 +125,12 @@ export class StreamSessionManager {
             ownerSessionId: opts.ownerSessionId,
             opts,
             decoders: { stdout: new StringDecoder("utf-8"), stderr: new StringDecoder("utf-8") },
-            pending: { stdout: "", stderr: "" },
+            pending: { stdout: new StreamLineBuffer(), stderr: new StreamLineBuffer() },
         };
         this.entries.set(sessionId, entry);
-        const m = masters.get(this.destKey);
-        if (m) m.refCount++;
 
         child.stdout?.on("data", (d: Buffer) => {
+            if (entry.finalized) return; // 终态守卫（Sol 54 P2-13：onScreen 曾漏拦——stop 后迟到 stdout 仍触发屏回调）
             const text = entry.decoders.stdout.write(d); // 跨块 UTF-8 安全解码
             if (entry.opts?.onScreen) {
                 if (!entry.screen) entry.screen = new Vt100Screen();
@@ -146,31 +142,47 @@ export class StreamSessionManager {
             this.onChunk(entry, text, "stdout");
         });
         child.stderr?.on("data", (d: Buffer) => this.onChunk(entry, entry.decoders.stderr.write(d), "stderr"));
+        let closeGuard: ReturnType<typeof setTimeout> | undefined;
         child.on("exit", (code) => {
             entry.exitCode = code;
             entry.running = false;
-            // 收尾统一到 close（GPT Astra 十六轮 #1）：exit≠stdio EOF——exit 时 drain
-            // 会把跨 exit/close 的半行**拆断成两行**（RE→exit→ADY\n→close 曾成
-            // RE/ADY 两行，READY 永不命中）。close=两路流排空，才是解码/行缓冲/
-            // 退出通知的统一收尾点；2s 兜底窗防御 close 缺席的异常流序
-            const t = setTimeout(() => this.finalizeStream(entry, code), 2_000);
-            t.unref?.();
-            child.once("close", () => { clearTimeout(t); this.finalizeStream(entry, code); });
+            // Pipes can still deliver data after the process has exited.
+            closeGuard = setTimeout(() => this.finalizeStream(entry, code), 2_000);
+            closeGuard.unref?.();
+        });
+        child.once("close", (code) => {
+            clearTimeout(closeGuard);
+            entry.running = false;
+            this.finalizeStream(entry, code ?? entry.exitCode ?? null);
         });
         child.on("error", (err) => {
+            // ChildProcess can emit error for a failed signal. Keep a spawned
+            // process registered until its exit or close is observed.
+            if (entry.stopRequested) return;
+            entry.errorMessage = err.message;
+            if (startSettled && child.pid !== undefined) return;
             entry.running = false;
-            entry.errorMessage = err.message; // 自审 1-A：error 也统一 finalizeStream
-            this.finalizeStream(entry, null); // （幂等——修前独立 emit 不设 finalized，
-            // 后续 exit/close 到达会再发一次 exit=双发）
+            this.finalizeStream(entry, null);
         });
+
+        if (opts.stdinScript !== undefined) {
+            child.stdin?.on("error", () => undefined);
+            child.stdin?.end(opts.stdinScript);
+        }
 
         if (opts.watchPattern) {
             this.watch(sessionId, {
                 pattern: opts.watchPattern, once: opts.watchOnce ?? true, contextLines: opts.contextLines,
             });
         }
-        this.log.info(`[StreamSession ${sessionId}] 流建立（mux=${this.muxFlags().length > 0}）`);
-        return { sessionId, name: opts.name };
+        this.log.info(`[StreamSession ${sessionId}] 流建立（mux=${mux.length > 0}）`);
+        // 启动失败竞速（Sol 87 P2-8）：error 在 start await 窗口内到达即 reject；
+        // 正常返回前置 settle 标记（后续 error 走流终态）
+        const handle = await Promise.race([spawnFailure, new Promise<"ok">((r) => setImmediate(() => r("ok")))]).then(
+            (r) => { if (r !== "ok") throw new Error("unreachable"); return { sessionId, name: opts.name }; },
+        );
+        startSettled = true;
+        return handle;
     }
 
     /** 流式 watcher：行到达即匹配（真流，无轮询间隔） */
@@ -202,14 +214,43 @@ export class StreamSessionManager {
     }
 
     stop(sessionId: string): void {
-        const e = this.require(sessionId);
-        e.running = false;
-        e.child.kill("SIGTERM");
-        this.entries.delete(sessionId);
-        // 主动收摊即统一收尾（kill 后真 close 仍会到，finalizeStream 幂等不双发；
-        // 残余半行照 drain——退出通知一声，reapIdle 不再预发）
-        this.finalizeStream(e, e.exitCode ?? null);
-        this.log.info(`[StreamSession ${sessionId}] 已收摊`);
+        const entry = this.require(sessionId);
+        if (entry.finalized) {
+            this.entries.delete(sessionId);
+            return;
+        }
+        if (entry.stopRequested && Date.now() < entry.stopRequested) return;
+        entry.stopRequested = Date.now() + 3000;
+        try {
+            if (entry.running && !entry.child.kill("SIGTERM") && entry.running) {
+                throw new Error("未能向本地 SSH 流进程发出停止信号");
+            }
+        } catch (cause) {
+            entry.stopRequested = undefined;
+            throw Object.assign(new Error(`SSH 观察流 '${sessionId}' 停止结果未知`, { cause }), {
+                outcome: "unknown", sessionId,
+            });
+        }
+    }
+
+    async stopAndWait(sessionId: string): Promise<void> {
+        const entry = this.require(sessionId);
+        const finished = entry.finished ??= new Promise<void>((resolve) => { entry.resolveFinished = resolve; });
+        this.stop(sessionId);
+        if (entry.finalized) return;
+        const waitMs = Math.max(0, entry.stopRequested! - Date.now());
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([finished, new Promise<never>((_, reject) => {
+                deadline = setTimeout(() => {
+                    reject(Object.assign(new Error(`SSH 观察流 '${sessionId}' 退出尚未确认`), {
+                        outcome: "unknown", sessionId,
+                    }));
+                }, waitMs);
+            })]);
+        } finally {
+            clearTimeout(deadline);
+        }
     }
 
     list(): Array<{ sessionId: string; name?: string; command: string; running: boolean; idleMs: number; armedWatchers: number }> {
@@ -224,67 +265,36 @@ export class StreamSessionManager {
     reapIdle(now: number = Date.now(), ttlMs?: number): void {
         const ttl = ttlMs ?? this.idleReapMs ?? StreamSessionManager.DEFAULT_IDLE_REAP_MS;
         for (const e of Array.from(this.entries.values())) {
-            if (!e.running) { this.entries.delete(e.sessionId); continue; } // 终态滞留条目直接回收（Gemini #3——reapIdle 曾无条件跳过=永不收）
+            if (e.finalized) { this.entries.delete(e.sessionId); continue; }
+            if (!e.running) continue;
             if (e.watcherMeta.size > 0) continue;
             if (now - e.lastAttentionAt < ttl) continue;
             this.log.warn(`[StreamSession ${e.sessionId}] 注意力衰减：自动回收`);
-            this.stop(e.sessionId); // 退出通知由 stop→finalizeStream 统一发（一声）
+            try { this.stop(e.sessionId); }
+            catch (error) { this.log.warn(String(error)); }
         }
     }
 
-    /** pending 单流上限（保尾截断——无换行长输出防内存累积） */
-    private static readonly PENDING_MAX = 64 * 1024;
-
     private onChunk(entry: StreamEntry, text: string, stream: "stdout" | "stderr"): void {
-        if (!text) return;
-        // 退出后迟到 data 不再分发（四十九期补漏 b）：finalize 已发过 exit/lastLines，
-        // 之后的回调属幽灵交付（与 local 会话终态拦 late data 同款）
-        if (entry.finalized) return;
-        // 块处理中标志（四十九期 #1）：行回调内 stop() 触发的 finalizeStream 会被
-        // 递归到本块循环中途——先记 deferred，本块按到达序交付完再收尾
+        if (!text || entry.finalized) return;
         entry.chunkBusy = true;
         try {
-            // 行缓冲（Astra 十四轮 #2）：块边界≠行边界——残余行留缓冲拼下块
-            const all = entry.pending[stream] + text;
-            const lines = all.split("\n");
-            entry.pending[stream] = lines.pop() ?? "";
-            // 未完成行上限（Astra 十六轮 #3→四十九期 #2 头尾双保）：boundLine 统一
-            // 截断语义（头 32K 保行首标记模式、尾 32K 保最新内容）——完整行与跨块
-            // 拼出的行在 pushLine 处过同一函数，watcher 匹配结果不再取决于换行符
-            // 落在哪个数据块（原保尾截断曾使行首 READY 被截掉漏报）
-            entry.pending[stream] = StreamSessionManager.boundLine(entry.pending[stream]);
-            for (const raw of lines) {
-                if (raw === "") continue; // 空行（连续 \n）不入 ring——原语义保持
-                this.pushLine(entry, stream, raw);
+            const pending = entry.pending[stream];
+            const lines = text.split("\n");
+            for (let i = 0; i < lines.length; i++) {
+                pending.append(lines[i]!);
+                if (i === lines.length - 1) break;
+                const line = pending.take();
+                if (line !== "") this.pushLine(entry, stream, line);
             }
         } finally {
             entry.chunkBusy = false;
             if (entry.deferredFinalize !== undefined) {
-                const c = entry.deferredFinalize;
+                const code = entry.deferredFinalize;
                 entry.deferredFinalize = undefined;
-                this.finalizeStream(entry, c);
+                this.finalizeStream(entry, code);
             }
         }
-    }
-
-    /** 超长行统一截断（四十九期 #2）：头尾各保半（PENDING_MAX/2），中段计数省略
-     *  标记——跨块一致：整行送达与换行分离送达的字节相同时，watcher 结果必须
-     *  相同。两端孤立低代理剥除（自审 1-B：截断边界可拆代理对） */
-    private static boundLine(line: string): string {
-        if (line.length <= StreamSessionManager.PENDING_MAX) return line;
-        const HALF = StreamSessionManager.PENDING_MAX / 2;
-        let head = line.slice(0, HALF);
-        let tail = line.slice(-HALF);
-        if (/[\uDC00-\uDFFF]$/.test(head)) head = head.slice(0, -1);
-        if (/^[\uDC00-\uDFFF]/.test(tail)) tail = tail.slice(1);
-        return head + `…[filaxis-truncated ${line.length - head.length - tail.length} chars]` + tail;
-    }
-
-    /** 残余半行收尾（进程退出时无尾换行的最后一行同样交给 watcher/ring） */
-    private flushPending(entry: StreamEntry, stream: "stdout" | "stderr"): void {
-        const rest = entry.pending[stream];
-        entry.pending[stream] = "";
-        if (rest !== "") this.pushLine(entry, stream, rest);
     }
 
     /** 流末收尾：解码器末缓冲 + 残余半行 + 退出通知（幂等——close 与 2s 兜底窗
@@ -296,8 +306,9 @@ export class StreamSessionManager {
         if (entry.chunkBusy) { entry.deferredFinalize = code; return; }
         entry.finalized = true;
         this.drainStreamEnd(entry);
+        entry.resolveFinished?.();
         // 桥接消费方异常不杀流（同步 throw + 异步 rejection——孪生对齐审计同款）
-        try { settleRejection(entry.opts?.onExit?.(code)); } catch { /* 同 */ }
+        try { settleRejection(entry.opts?.onExit?.(code, entry.errorMessage)); } catch { /* 同 */ }
         this.emit({
             type: "exit", sessionId: entry.sessionId, ownerSessionId: entry.ownerSessionId,
             exitCode: code,
@@ -306,20 +317,22 @@ export class StreamSessionManager {
         });
         // 条目 TTL 回收（Gemini Hydrogen 审查 #3）：自然退出的流只走 finalize 不经
         // stop——entries 永久滞留（ring/句柄泄漏）。终态后保留短窗供 tail 补读，随后移除
-        setTimeout(() => this.entries.delete(entry.sessionId), 60_000)?.unref?.();
-        this.releaseMaster();
+        if (entry.stopRequested) this.entries.delete(entry.sessionId);
+        else setTimeout(() => this.entries.delete(entry.sessionId), 60_000)?.unref?.();
     }
 
     private drainStreamEnd(entry: StreamEntry): void {
-        this.onChunk(entry, entry.decoders.stdout.end(), "stdout");
-        this.onChunk(entry, entry.decoders.stderr.end(), "stderr");
-        this.flushPending(entry, "stdout");
-        this.flushPending(entry, "stderr");
+        for (const stream of ["stdout", "stderr"] as const) {
+            const pending = entry.pending[stream];
+            pending.append(entry.decoders[stream].end());
+            const line = pending.take();
+            if (line !== "") this.pushLine(entry, stream, line);
+        }
     }
 
     private pushLine(entry: StreamEntry, stream: "stdout" | "stderr", raw: string): void {
         {
-            const clean = StreamSessionManager.boundLine(raw).replace(/\r$/, ""); // 超长行跨块一致（四十九期 #2）
+            const clean = raw.replace(/\r$/, ""); // 超长行跨块一致（四十九期 #2）
             entry.ring.push({ stream, text: clean });
             try { settleRejection(entry.opts?.onLine?.({ stream, text: clean })); } catch { /* 桥接异常不杀流 */ }
             const anchor = entry.ring.size - 1;
@@ -343,16 +356,6 @@ export class StreamSessionManager {
         }
     }
 
-    private releaseMaster(): void {
-        const m = masters.get(this.destKey);
-        if (!m) return;
-        m.refCount = Math.max(0, m.refCount - 1);
-        // 不删 socket 文件（Gemini Hydrogen 审查 #3）：muxSocketPath 同路径也被
-        // ssh-pty-driver 的 execChannel 复用（不计本 refCount）——单侧 rmSync 会拆掉
-        // 共享 master。ControlPersist=600 让 OpenSSH 自管过期回收；注册表条目保留
-        // （refCount 归零仅作状态，重启进程天然重建）
-    }
-
     private require(sessionId: string): StreamEntry {
         const e = this.entries.get(sessionId);
         if (!e) throw new Error(`stream 会话 '${sessionId}' 不存在`);
@@ -369,11 +372,41 @@ export class StreamSessionManager {
     }
 }
 
+/** Keep the first and last half of a line. Count input independently of display text. */
+class StreamLineBuffer {
+    private static readonly HALF = 32 * 1024;
+    private head = "";
+    private tail = "";
+    private length = 0;
+
+    append(text: string): void {
+        this.length += text.length;
+        const headSize = Math.min(text.length, StreamLineBuffer.HALF - this.head.length);
+        this.head += text.slice(0, headSize);
+        if (headSize < text.length) {
+            this.tail = (this.tail + text.slice(headSize)).slice(-StreamLineBuffer.HALF);
+        }
+    }
+
+    take(): string {
+        const { head, tail, length } = this;
+        this.head = this.tail = "";
+        this.length = 0;
+        if (head.length + tail.length === length) return head + tail;
+        const left = head.replace(/[\uD800-\uDBFF]$/, "");
+        const right = tail.replace(/^[\uDC00-\uDFFF]/, "");
+        return `${left}…[filaxis-truncated ${length - left.length - right.length} chars]${right}`;
+    }
+}
+
 interface StreamEntry {
     sessionId: string;
+    /** Timestamp when an unconfirmed signal may be retried. */
+    stopRequested?: number;
+    finished?: Promise<void>;
+    resolveFinished?: () => void;
     name?: string;
     command: string;
-    destKey: string;
     child: ChildProcess;
     ring: OutputRingBuffer;
     watchers: WatchRegistry;
@@ -397,7 +430,7 @@ interface StreamEntry {
      *  watcher 漏匹配；残余行留到下块拼接，close 时 flush）。
      *  上限 64KB 保尾截断（Astra 十六轮 #3：无换行长输出曾无限累积——4MiB
      *  pending 且窗口空；截断保最近内容，watcher 关心近期） */
-    pending: { stdout: string; stderr: string };
+    pending: { stdout: StreamLineBuffer; stderr: StreamLineBuffer };
     /** 流末收尾完成标志（close 与兜底窗幂等） */
     finalized?: boolean;
     /** spawn error 消息（error 路径统一走 finalizeStream 后由收尾携带） */

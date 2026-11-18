@@ -12,8 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /** 驱动 MCP server 的测试替身：write(line) 进请求，collect() 收响应 */
-function mcpFixture(): { write: (obj: Record<string, unknown>) => void; collect: () => Array<Record<string, unknown>>; close: () => void } {
-    const tk = createAgentToolkit(new RuntimeStack(), {});
+function mcpFixture(stack = new RuntimeStack()): { write: (obj: Record<string, unknown>) => void; collect: () => Array<Record<string, unknown>>; close: () => void } {
+    const tk = createAgentToolkit(stack, {});
     const stdin = new PassThrough();
     const stdout = new PassThrough();
     new McpServer({ toolkit: tk, stdin, stdout });
@@ -146,3 +146,46 @@ describe("MCP Server（REQ-0003）", () => {
         f.close();
     }, 20_000);
 });
+
+test("remove_layer returns all unresolved session handles via MCP", async () => {
+    const stack = new RuntimeStack();
+    const sessions = [{ sessionId: "fixture", logBase: "/tmp/fixture" }];
+    const driver = {
+        descriptor: { driver: "tmux" },
+        exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+        destroy: async () => { throw Object.assign(new Error("cleanup unknown"), { outcome: "unknown", sessions }); },
+    } as unknown as import("../src/driver.js").RuntimeDriver;
+    await stack.addLayer("owned", driver);
+    const fixture = mcpFixture(stack);
+    try {
+        fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+            name: "remove_layer", arguments: { name: "owned", destroy: true },
+        } });
+        expect(await waitId(fixture, 1)).toMatchObject({
+            result: { isError: true, structuredContent: { outcome: "unknown", sessions } },
+        });
+    } finally {
+        fixture.close();
+    }
+});
+
+test("MCP opens, reads, and closes a continuous window by ID", async () => {
+    const fixture = mcpFixture();
+    const call = async (id: number, name: string, args: Record<string, unknown>) => {
+        fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+        return (await waitId(fixture, id)).result as { isError: boolean; structuredContent: Record<string, unknown> };
+    };
+    try {
+        expect((await call(0, "observe_stream", { command: "echo LEGACY", duration_ms: 10 })).isError).toBe(true);
+        const opened = await call(1, "observe_stream", { command: "echo MCP_WINDOW" });
+        expect(opened.isError).toBe(false);
+        const window_id = opened.structuredContent.window_id;
+        const read = await call(2, "read_stream", { window_id, since_seq: 0, wait_ms: 5000 });
+        expect(read.structuredContent).toMatchObject({ frames: [{ text: "MCP_WINDOW", stream: "stdout", seq: 1 }] });
+        const closed = await call(3, "close_stream", { window_id });
+        expect(closed.structuredContent).toEqual({ window_id, closed: true });
+        expect((await call(4, "read_stream", { window_id })).isError).toBe(true);
+    } finally {
+        fixture.close();
+    }
+}, 20_000);
