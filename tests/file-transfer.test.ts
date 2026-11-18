@@ -51,12 +51,15 @@ function mockRemote() {
         // 四防/设备分流）——不再锚定全前缀：目标取外层 test ! -d 捕获、源取
         // `if mv …` 捕获；mock 无设备概念恒走同设备 rename 链
         const tgtM = cmd.match(/^\( test ! -d '(.+?)' \|\|/);
-        const mvM = cmd.match(/if mv (?:-T )?'(.+?)' "\$__fx_tgt"/);
-        if (mvM) {
-            const b = files.get(mvM[1]!);
+        const movePrefix = ["if mv -T '", "if mv '"].find((prefix) => cmd.includes(prefix));
+        const moveStart = movePrefix ? cmd.indexOf(movePrefix) + movePrefix.length : -1;
+        const moveEnd = moveStart >= 0 ? cmd.indexOf("' \"$__fx_tgt\"", moveStart) : -1;
+        if (moveEnd > moveStart) {
+            const from = cmd.slice(moveStart, moveEnd);
+            const b = files.get(from);
             if (!b) return { stdout: "", exitCode: 1 }; // 源不存在 → 真实 mv 报错
             files.set(tgtM?.[1] ?? "", b);
-            files.delete(mvM[1]!);
+            files.delete(from);
             return { stdout: "FX_MV_OK", exitCode: 0 };
         }
         // forceInplace 形态（显式请求保留 inode 写）——cat src > "$tgt" && rm src

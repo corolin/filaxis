@@ -2163,8 +2163,8 @@ describe("Sol 90：首发失败封存/跨进程锁/readdir 补全", () => {
         const lockPath = (CE as unknown as { __testSessLockPath(id: string): string }).__testSessLockPath("S90X");
         // An empty file from an older client may still be acquiring the lock.
         writeFileSync(lockPath, "");
-        const child = Bun.spawn(["bun", "-e",
-            `setTimeout(() => require("node:fs").rmSync(${JSON.stringify(lockPath)}), 1500);`,
+        const child = Bun.spawn([process.execPath, "-e",
+            'setTimeout(() => require("node:fs").rmSync(process.argv[1]), 1500);', "--", lockPath,
         ], { stdout: "ignore", stderr: "ignore" });
         const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
         const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
