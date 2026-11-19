@@ -13,6 +13,7 @@ import { TmuxInvoker } from "../src/terminal/tmux-invoker.js";
 import { compilePromptPatterns, TmuxError } from "../src/terminal/types.js";
 import { TerminalManager } from "../src/terminal-manager.js";
 import { TmuxSessionDriver } from "../src/tmux-driver.js";
+import { resolveLocalShell } from "../src/shell-discovery.js";
 
 test.skipIf(process.platform !== "linux")("tmux stop reaps a background child after its shell exits", async () => {
     if (!(await TmuxInvoker.isAvailable())) return;
@@ -498,16 +499,18 @@ test.each([
     ["", "unknown", ["TERM"]],
     ["11111", "stopped", ["TERM", "KILL"]],
 ] as const)("tmux stopSession 身份戳为 %s 时限制 KILL", async (stamp, status, expectedSignals) => {
+    const shell = resolveLocalShell();
     const driver = new TmuxSessionDriver({ driver: "tmux", terminalId: "fixture" });
     const signals: string[] = [];
     driver.exec = async (command) => {
         if (command.includes("echo ALIVE")) {
             return { stdout: signals.includes("KILL") ? "DEAD" : "ALIVE", stderr: "", exitCode: 0 };
         }
-        const run = Bun.spawnSync(["sh", "-c",
-            `cat() { case "$1" in *.pid) printf 4242;; *.st) printf '%s' "$FX_TEST_STAMP";; esac; }; ` +
-            `awk() { printf 11111; }; kill() { printf '%s\\n' "$1"; }; ${command}`,
-        ], { env: { ...process.env, FX_TEST_STAMP: stamp } });
+        const script = `cat() { case "$1" in *.pid) printf 4242;; *.st) printf '%s' "$FX_TEST_STAMP";; esac; }; ` +
+            `awk() { printf 11111; }; kill() { printf '%s\\n' "$1"; }; ${command}`;
+        const run = Bun.spawnSync([shell, "--posix", "-s"], {
+            stdin: Buffer.from(script), env: { ...process.env, FX_TEST_STAMP: stamp },
+        });
         const signal = run.stdout.toString().trim().replace(/^-/, "");
         if (signal) signals.push(signal);
         return { stdout: "", stderr: "", exitCode: run.exitCode };

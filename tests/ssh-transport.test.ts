@@ -12,6 +12,7 @@ import {
 import { resolveLayerState, SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { RemoteSessionManager } from "../src/remote-session-manager.js";
 import type { SessionEvent } from "../src/session-types.js";
+import { resolveLocalShell } from "../src/shell-discovery.js";
 
 test.skipIf(process.platform !== "linux")("SSH writeFile 解码器写出一部分再失败时保留原文件", async () => {
     const dir = mkdtempSync(join(tmpdir(), "fx-ssh-write-"));
@@ -494,6 +495,7 @@ describe("RemoteSessionManager（mock 远端）", () => {
         ["身份未变化", "11111", ["TERM", "KILL"], "stopped"],
         ["未记录身份戳", "", ["TERM"], "unknown"],
     ])("stop 在 %s 时按身份核验限制 KILL", async (label, afterTerm, expectedSignals, status) => {
+        const shell = resolveLocalShell();
         const signals: string[] = [];
         const initialStamp = label === "未记录身份戳" ? "" : "11111";
         let stamp = initialStamp;
@@ -507,10 +509,11 @@ describe("RemoteSessionManager（mock 远端）", () => {
                 }
                 if (/kill -(?:TERM|KILL)/.test(cmd)) {
                     // Execute the generated guard with shell functions standing in for process I/O.
-                    const r = Bun.spawnSync(["bash", "-c",
-                        `cat() { :; }; awk() { printf '%s\\n' "$FX_TEST_STAMP"; }; ` +
-                        `pkill() { :; }; kill() { printf '%s\\n' "$1"; }; sleep() { :; }; ${cmd}`,
-                    ], { env: { ...process.env, FX_TEST_STAMP: stamp } });
+                    const script = `cat() { :; }; awk() { printf '%s\\n' "$FX_TEST_STAMP"; }; ` +
+                        `pkill() { :; }; kill() { printf '%s\\n' "$1"; }; sleep() { :; }; ${cmd}`;
+                    const r = Bun.spawnSync([shell, "-s"], {
+                        stdin: Buffer.from(script), env: { ...process.env, FX_TEST_STAMP: stamp },
+                    });
                     const signal = r.stdout.toString().trim().replace(/^-/, "");
                     if (signal) signals.push(signal);
                     if (signal === "TERM") stamp = afterTerm as string;
@@ -1207,17 +1210,22 @@ describe("Sol 71：readLog lines 字节保真", () => {
 describe("Sol 72：lines 临时副本落 TMPDIR", () => {
     test("命令的临时路径在 ${TMPDIR:-/tmp} 下（真 shell 可执行且不在日志目录）", async () => {
         const remote = fakeRemote();
-        const shPath = Bun.which("sh")!;
+        const shell = resolveLocalShell();
+        const d = mkdtempSync(join(tmpdir(), "fx-tmp72-"));
+        const scratch = join(d, "scratch");
         let sawCmd = "";
         const realSh = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shell, "--posix", "-s"], {
+                stdin: "pipe", stdout: "pipe", stderr: "pipe",
+                env: { ...process.env, TMPDIR: scratch.replaceAll("\\", "/") },
+            });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
             return { stdout, exitCode: code };
         };
-        const d = mkdtempSync(join(tmpdir(), "fx-tmp72-"));
         try {
+            mkdirSync(scratch);
             const logDir = d.replace(/\\/g, "/");
             const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
                 if (cmd.startsWith("test -r ")) { sawCmd = cmd; return realSh(cmd); }
@@ -1231,8 +1239,7 @@ describe("Sol 72：lines 临时副本落 TMPDIR", () => {
             expect(sawCmd).toContain('$__fx_d/fx-rl-');
             expect(sawCmd).not.toContain(`${logDir}/fx-rl-`); // 不落日志目录（只读目录也可读）
             // 副本清场：TMPDIR 下无残留
-            const clean = Bun.spawnSync([shPath, "-c", 'ls "${TMPDIR:-/tmp}" | grep -c "fx-rl-" || true']);
-            expect(clean.stdout.toString().trim()).toBe("0");
+            expect(readdirSync(scratch)).toEqual([]);
         } finally {
             rmSync(d, { recursive: true, force: true });
         }

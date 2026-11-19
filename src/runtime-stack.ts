@@ -657,8 +657,9 @@ export class RuntimeStack {
 
 
     private assertNotDupName(name: string): void {
-        if (this.namedLayers.has(name) || this.pendingNames.has(name)) {
-            throw new Error(`层名 '${name}' 已占用或建链中（既有：${[...this.namedLayers.keys()].join(", ")}）——换名或先 removeLayer`);
+        if (this.pendingNames.has(name)) throw new Error(`层名 '${name}' 建链中，请等待当前建链完成`);
+        if (this.namedLayers.has(name)) {
+            throw new Error(`层名 '${name}' 已占用（既有：${[...this.namedLayers.keys()].join(", ")}）。请直接使用该层；需要更换目标时先 removeLayer`);
         }
     }
 

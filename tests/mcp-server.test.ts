@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import { McpServer } from "../src/mcp-server.js";
 import { createAgentToolkit, TOOL_DEFS } from "../src/agent-toolkit.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
+import { LocalRuntimeDriver } from "../src/local-driver.js";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,6 +48,47 @@ async function waitId(f: { collect: () => Array<Record<string, unknown>> }, id: 
 }
 
 describe("MCP Server（REQ-0003）", () => {
+    test("MCP rejects missing batch steps and window IDs with the expected parameter names", async () => {
+        const f = mcpFixture();
+        try {
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_batch", arguments: { commands: [] } } });
+            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "read_stream", arguments: { session: "demo" } } });
+            expect((await waitId(f, 1)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("steps 需为非空数组") }] });
+            expect((await waitId(f, 2)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("window_id 需为非空字符串") }] });
+        } finally { f.close(); }
+    });
+
+    test("run_batch uses the batch default and per-step override and identifies each layer", async () => {
+        const stack = new RuntimeStack();
+        const first = new LocalRuntimeDriver();
+        const second = new LocalRuntimeDriver();
+        const calls: string[] = [];
+        first.exec = async (command) => { calls.push(`first:${command}`); return { stdout: "from first", stderr: "", exitCode: 0 }; };
+        second.exec = async (command) => { calls.push(`second:${command}`); return { stdout: "from second", stderr: "", exitCode: 0 }; };
+        await stack.addLayer("first", first);
+        await stack.addLayer("second", second);
+        const f = mcpFixture(stack);
+        const steps = [
+            { id: "one", kind: "exec", command: "one" },
+            { id: "two", kind: "exec", layer: "second", command: "two", after: ["one"] },
+        ];
+        try {
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_batch", arguments: { layer: "first", steps } } });
+            expect((await waitId(f, 1)).result).toMatchObject({
+                isError: false, content: [{ text: expect.stringContaining("layer=first") }],
+                structuredContent: { status: "ok", steps: [{ layer: "first", stdout: "from first" }, { layer: "second", stdout: "from second" }] },
+            });
+            expect(calls).toEqual(["first:one", "second:two"]);
+            steps[1]!.layer = "missing";
+            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "run_batch", arguments: { layer: "first", steps } } });
+            expect((await waitId(f, 2)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("missing") }] });
+            expect(calls).toHaveLength(2);
+            const typo = { id: "typo", kind: "exec", command: "no", layre: "second" };
+            f.write({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "run_batch", arguments: { steps: [steps[0], typo] } } });
+            expect((await waitId(f, 3)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("layre") }] });
+            expect(calls).toHaveLength(2);
+        } finally { f.close(); }
+    });
     test("list_layers exposes the empty and populated layer lists in MCP text", async () => {
         const stack = new RuntimeStack();
         const f = mcpFixture(stack);

@@ -49,10 +49,12 @@ export interface BatchReadStep {
 export type BatchStep = BatchExecStep | BatchEditStep | BatchReadStep;
 
 /** 依赖边：after 列出的步骤全部 ok 后才启动；无 after = 就绪即可并行 */
-export type BatchStepWithDeps = BatchStep & { after?: string[] };
+export type BatchStepWithDeps = BatchStep & { after?: string[]; layer?: string };
 
 export interface BatchPlan {
     steps: BatchStepWithDeps[];
+    /** 默认命名层。步骤可覆盖；命名层需要传入层解析函数。 */
+    layer?: string;
     /** 失败即停（缺省 true——未启动步骤标 skipped） */
     stopOnFail?: boolean;
     /** 并行度上限（缺省 3；exec 通道每并行步一条 ssh 子进程） */
@@ -63,6 +65,7 @@ export type BatchStepStatus = "ok" | "fail" | "skipped";
 
 export interface BatchStepReport {
     id: string;
+    layer?: string;
     kind: "exec" | "edit" | "read";
     status: BatchStepStatus;
     startedAt?: number;
@@ -98,22 +101,28 @@ export interface BatchReport {
  * @throws Error 计划非法（id 重复 / after 引用未知步骤 / 依赖环）——执行前校验，
  *               非法计划零副作用
  */
-export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<BatchReport> {
+export async function runBatch(
+    target: RuntimeDriver | ((layer?: string) => RuntimeDriver | Promise<RuntimeDriver>),
+    plan: BatchPlan,
+): Promise<BatchReport> {
     // ── 计划校验（零副作用阶段）──
-    if (!Array.isArray(plan.steps) || plan.steps.length === 0) {
+    if (!Array.isArray(plan?.steps) || plan.steps.length === 0) {
         // 空计划拒绝（冷路径摸排批 4：SDK 直调曾静默 ok——CLI 有守卫而内核没有，
         // 绕过 CLI 的消费方拿到「成功执行了零个步骤」的假成功）
         throw new Error(`批次计划非法：steps 需非空数组（[{id, kind: "exec"|"edit"|"read", ..., after?: [依赖 id]}]）`);
     }
+    if (plan.layer !== undefined && !nonEmptyString(plan.layer)) throw new Error("批次计划非法：layer 需非空字符串");
+    if (plan.stopOnFail !== undefined && typeof plan.stopOnFail !== "boolean") throw new Error("stopOnFail 需为布尔值");
     const byId = new Map<string, BatchStepWithDeps>();
-    for (const s of plan.steps) {
-        if (!s.id) throw new Error(`批次计划非法：存在无 id 步骤`);
+    for (const [index, s] of plan.steps.entries()) {
+        if (!nonEmptyString(s?.id)) throw new Error(`批次计划非法：steps[${index}].id 需非空字符串`);
         if (byId.has(s.id)) throw new Error(`批次计划非法：id 重复 '${s.id}'`);
         // kind 前置校验（Sol 55 P2-E）：未知 kind 曾在 runStep 执行中才抛——计划里
         // 合法步骤已跑过（exec 已执行）才报未知类型。零副作用阶段拦死
         if (s.kind !== "exec" && s.kind !== "edit" && s.kind !== "read") {
             throw new Error(`批次计划非法：未知 kind '${(s as { kind: string }).kind}'（合法: exec|edit|read）——校验先行，合法步骤零执行`);
         }
+        validateStep(s);
         byId.set(s.id, s);
     }
     for (const s of plan.steps) {
@@ -138,11 +147,27 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
     const stopOnFail = plan.stopOnFail !== false;
     // maxParallel 守卫（Sol 五十四期 P1-5）：NaN 曾被 Math.max(1, NaN)=NaN——
     // 池 while(NaN < N) 恒假=零执行，唯一步骤被标 skipped 而批次报 ok
-    const rawP = plan.maxParallel ?? 3;
+    const rawP = plan.maxParallel === undefined ? 3 : plan.maxParallel;
     if (!Number.isFinite(rawP) || rawP < 1) {
         throw new Error(`maxParallel 非法（${plan.maxParallel}）——须为 ≥1 的数字`);
     }
     const maxParallel = Math.floor(rawP);
+    const layerFor = (step: BatchStepWithDeps) => step.layer ?? plan.layer;
+    const names = new Set(plan.steps.map(layerFor));
+    const drivers = new Map<string | undefined, RuntimeDriver>();
+    if (typeof target === "function") {
+        for (const name of names) {
+            if (name !== undefined) drivers.set(name, await target(name));
+        }
+        if (names.has(undefined)) drivers.set(undefined, await target());
+    } else {
+        if ([...names].some((name) => name !== undefined)) throw new Error("批次计划指定了 layer，需要层解析函数");
+        drivers.set(undefined, target);
+    }
+    const stepIdentity = (step: BatchStepWithDeps) => {
+        const layer = layerFor(step);
+        return { id: step.id, kind: step.kind, ...(layer !== undefined ? { layer } : {}) };
+    };
     let failedStep: string | undefined;
 
     const done = (id: string): boolean => reports.get(id)?.status === "ok";
@@ -155,7 +180,7 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
             for (const s of plan.steps) {
                 if (!reports.has(s.id)) {
                     reports.set(s.id, {
-                        id: s.id, kind: s.kind, status: "skipped",
+                        ...stepIdentity(s), status: "skipped",
                         skippedBecause: `批次失败于 '${failedStep}'（fail-fast）`,
                     });
                 }
@@ -172,8 +197,8 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
                 const next = ready().find((st) => !running.has(st.id));
                 if (!next) return;
                 running.add(next.id);
-                const t = runStep(drv, next).then((r) => {
-                    reports.set(next.id, r);
+                const t = runStep(drivers.get(layerFor(next))!, next).then((r) => {
+                    reports.set(next.id, { ...stepIdentity(next), ...r });
                     if (r.status === "fail" && !failedStep) failedStep = next.id;
                 }).finally(() => {
                     inflight.delete(t);
@@ -190,7 +215,7 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
         const stuck = plan.steps.filter((s) => !reports.has(s.id));
         for (const s of stuck) {
             reports.set(s.id, {
-                id: s.id, kind: s.kind, status: "skipped",
+                ...stepIdentity(s), status: "skipped",
                 skippedBecause: `依赖步骤未 ok（${(s.after ?? []).filter((d) => !done(d)).join(", ")}）`,
             });
         }
@@ -199,6 +224,36 @@ export async function runBatch(drv: RuntimeDriver, plan: BatchPlan): Promise<Bat
 
     const steps = plan.steps.map((s) => reports.get(s.id)!);
     return { status: failedStep ? "fail" : "ok", steps, failedStep };
+}
+
+function nonEmptyString(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0;
+}
+
+function validateStep(step: BatchStepWithDeps): void {
+    const invalid = (field: string, expected: string): never => {
+        throw new Error(`批次计划非法：步骤 '${step.id}' 的 ${field} ${expected}`);
+    };
+    if (step.layer !== undefined && !nonEmptyString(step.layer)) invalid("layer", "需非空字符串");
+    if (step.after !== undefined && (!Array.isArray(step.after) || !step.after.every(nonEmptyString))) {
+        invalid("after", "需为步骤 id 数组");
+    }
+    if (step.kind === "exec") {
+        if (!nonEmptyString(step.command)) invalid("command", "需非空字符串");
+        if (step.timeoutMs !== undefined && (!Number.isFinite(step.timeoutMs) || step.timeoutMs <= 0)) invalid("timeout_ms/timeoutMs", "需为正数");
+        if (step.expectExit !== undefined && (!Array.isArray(step.expectExit) || !step.expectExit.every(Number.isSafeInteger))) {
+            invalid("expect_exit/expectExit", "需为整数数组");
+        }
+        return;
+    }
+    if (!nonEmptyString(step.path)) invalid("path", "需非空字符串");
+    if (step.kind === "edit") {
+        if (!Array.isArray(step.hunks) || !step.hunks.length || !step.hunks.every((h) =>
+            typeof h?.old === "string" && h.old.length > 0 && typeof h.new === "string" && (h.all === undefined || typeof h.all === "boolean"))) {
+            invalid("hunks", "需为非空数组，每项须含非空字符串 old、字符串 new，以及可选布尔值 all");
+        }
+        if (step.writeMode !== undefined && step.writeMode !== "auto" && step.writeMode !== "inplace") invalid("write_mode/writeMode", "须为 auto 或 inplace");
+    }
 }
 
 async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps): Promise<BatchStepReport> {

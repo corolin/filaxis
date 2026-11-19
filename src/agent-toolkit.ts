@@ -61,7 +61,7 @@ export interface AgentToolHandlers {
     run_batch(args: { steps: Array<Record<string, unknown>>; stop_on_fail?: boolean; max_parallel?: number; layer?: string }): Promise<{
         status: "ok" | "fail"; failed_step?: string;
         steps: Array<{
-            id: string; kind: string; status: string; exit_code?: number; outcome?: "unknown"; stdout?: string; stderr?: string; error?: string; skipped_because?: string;
+            id: string; layer?: string; kind: string; status: string; exit_code?: number; outcome?: "unknown"; stdout?: string; stderr?: string; error?: string; skipped_because?: string;
             edits?: { path: string; occurrences: number; bytes_before: number; bytes_after: number; hunks: Array<{ old: string; new: string; occurrences: number }>; mutex?: "flock" | "degraded"; write_mode?: "atomic-replace" | "inplace-write" };
         }>;
     }>;
@@ -98,20 +98,24 @@ export const TOOL_DEFS: AgentToolDef[] = [
             name: "run_batch",
             description:
                 "批次组合：一次调用描述多个原子操作（exec/edit/read），按依赖边（after）拓扑执行——" +
-                "无依赖步骤并行，顺序链（改配置→验证→重载）靠 after 显式保序；任一步失败即停（未启动步骤标 " +
+                "步骤 layer 可覆盖批次 layer；after 可跨层引用步骤 id。无依赖步骤并行，顺序链靠 after 显式保序；默认任一步失败即停（未启动步骤标 " +
                 "skipped）。返回逐步骤状态与证据（退出码/输出/编辑明细）。**不做自动回滚**（配置恢复≠运行" +
                 "状态回滚——重载可能已产生外部副作用），失败现场交回调用方决策。",
             parameters: {
                 type: "object",
+                additionalProperties: false,
                 properties: {
                     steps: {
                         type: "array",
+                        minItems: 1,
                         description: "步骤数组（id 唯一）",
                         items: {
                             type: "object",
+                            additionalProperties: false,
                             properties: {
                                 id: { type: "string", description: "步骤唯一 id（after 引用用）" },
                                 kind: { type: "string", enum: ["exec", "edit", "read"] },
+                                layer: { type: "string", minLength: 1, description: "当前步骤的目标层名，覆盖批次默认层" },
                                 command: { type: "string", description: "kind=exec：shell 命令" },
                                 expect_exit: { type: "array", items: { type: "number" }, description: "kind=exec：预期退出码集合（缺省 [0]）" },
                                 timeout_ms: { type: "number", description: "kind=exec：超时毫秒" },
@@ -137,7 +141,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                     },
                     stop_on_fail: { type: "boolean", description: "失败即停（缺省 true）" },
                     max_parallel: { type: "number", description: "并行度上限（缺省 3）" },
-                    layer: { type: "string", description: "目标层名（缺省=默认层）" },
+                    layer: { type: "string", minLength: 1, description: "批次默认目标层名（缺省=调用时的默认层）" },
                 },
                 required: ["steps"],
             },
@@ -261,7 +265,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
             parameters: {
                 type: "object",
                 properties: {
-                    window_id: { type: "string" },
+                    window_id: { type: "string", minLength: 1 },
                     limit: { type: "integer", minimum: 1, maximum: 200, description: "最多返回帧数，缺省 20" },
                     since_seq: { type: "integer", minimum: 0, description: "读取此序号之后的帧" },
                     before_seq: { type: "integer", minimum: 0, description: "读取此序号之前最近的帧" },
@@ -389,6 +393,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
     let windowRegistry: StreamWindowRegistry | undefined;
     let observationDisposed = false;
     const requireWindow = (windowId: string) => {
+        if (typeof windowId !== "string" || !windowId.trim()) throw new Error("window_id 需为非空字符串，请使用 observe_stream 返回的 window_id");
         const window = windowRegistry?.get(windowId);
         if (!window || window.closed) throw new Error(`观察窗 '${windowId}' 不存在或已关闭`);
         return window;
@@ -619,50 +624,29 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 await stack.removeLayer(name, { destroy });
                 return { removed: name };
             },
-            async run_batch({ steps, stop_on_fail, max_parallel, layer: layerName }) {
-                const drv = await resolveDrv(layerName);
-                // snake_case 工具参数 → BatchPlan（按 kind 分支构造判别联合；缺字段由 runBatch 校验）
-                const plan = {
+            async run_batch({ steps, stop_on_fail, max_parallel, layer: layerName, ...unknownArgs }) {
+                if (!Array.isArray(steps) || !steps.length) throw new Error('steps 需为非空数组，每步提供 id 和 kind（exec、edit 或 read）');
+                const extra = Object.keys(unknownArgs);
+                if (extra.length) throw new Error(`run_batch 未知参数：${extra.join(", ")}（支持 steps、layer、stop_on_fail、max_parallel）`);
+                const r = await runBatch(resolveDrv, {
                     steps: steps.map((raw, stepIdx): BatchStepWithDeps => {
-                        const s = raw as Record<string, unknown>;
-                        const after = Array.isArray(s.after) ? { after: s.after.map(String) } : {};
-                        if (s.kind === "edit") {
-                            return {
-                                // id 显式守卫（Hydrogen R10 #3）：String(undefined)="undefined"
-                                // 曾绕过内核空 id 校验——模型漏传 id 必须在入口报错
-                                ...(s.id === undefined || s.id === null || s.id === "" ? (() => { throw new Error(`edit 步骤缺 id（steps[${stepIdx}]）——每步须有唯一 id`); })() : { id: String(s.id) }),
-                                kind: "edit", path: String(s.path ?? ""),
-                                hunks: (Array.isArray(s.hunks) ? s.hunks : []).map((h) => {
-                                    const hh = h as Record<string, unknown>;
-                                    return { old: String(hh.old), new: String(hh.new), ...(hh.all != null ? { all: Boolean(hh.all) } : {}) };
-                                }),
-                                ...(s.write_mode != null ? { writeMode: s.write_mode as "auto" | "inplace" } : {}),
-                                ...after,
-                            };
-                        }
-                        if (s.kind === "read") {
-                            if (s.id === undefined || s.id === null || s.id === "") {
-                                throw new Error(`read 步骤缺 id（steps[${stepIdx}]）——每步须有唯一 id`);
-                            }
-                            return { id: String(s.id), kind: "read", path: String(s.path ?? ""), ...after };
-                        }
-                        return {
-                            ...(s.id === undefined || s.id === null || s.id === "" ? (() => { throw new Error(`exec 步骤缺 id（steps[${stepIdx}]）——每步须有唯一 id`); })() : { id: String(s.id) }),
-                            kind: "exec", command: String(s.command ?? ""),
-                            ...(Array.isArray(s.expect_exit) ? { expectExit: s.expect_exit.map(Number) } : {}),
-                            ...(s.timeout_ms != null ? { timeoutMs: Number(s.timeout_ms) } : {}),
-                            ...after,
-                        };
+                        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`steps[${stepIdx}] 需为对象`);
+                        // 仅转换字段名，实际类型由 runBatch 在执行前统一校验。
+                        const { id, kind, layer, after, command, path, hunks, expect_exit, timeout_ms, write_mode, ...unknownFields } = raw;
+                        const extra = Object.keys(unknownFields);
+                        if (extra.length) throw new Error(`steps[${stepIdx}] 含未知字段：${extra.join(", ")}（目标层字段为 layer）`);
+                        return { id, kind, layer, after, command, path, hunks, expectExit: expect_exit, timeoutMs: timeout_ms, writeMode: write_mode } as BatchStepWithDeps;
                     }),
-                    ...(stop_on_fail != null ? { stopOnFail: Boolean(stop_on_fail) } : {}),
-                    ...(max_parallel != null ? { maxParallel: Number(max_parallel) } : {}),
-                };
-                const r = await runBatch(drv, plan);
+                    layer: layerName === undefined ? stack.activeLayer?.name : layerName,
+                    stopOnFail: stop_on_fail,
+                    maxParallel: max_parallel,
+                });
                 return {
                     status: r.status,
                     failed_step: r.failedStep,
                     steps: r.steps.map((s) => ({
                         id: s.id, kind: s.kind, status: s.status,
+                        ...(s.layer !== undefined ? { layer: s.layer } : {}),
                         ...(s.exitCode != null ? { exit_code: s.exitCode } : {}),
                         ...(s.outcome === "unknown" ? { outcome: "unknown" } : {}),
                         ...(s.stdout != null ? { stdout: s.stdout } : {}),

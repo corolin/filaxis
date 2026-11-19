@@ -586,7 +586,7 @@ describe("二十七期", () => {
         expect(statuses).toContain("rejected"); // 另一个撞名（修前：双成功后覆盖）
         const ok = (a.status === "fulfilled" ? a : b) as PromiseFulfilledResult<{ handle: LayerHandle }>;
         const dup = (a.status === "rejected" ? a : b) as PromiseRejectedResult;
-        expect((dup.reason as Error).message).toMatch(/已占用或建链中/);
+        expect((dup.reason as Error).message).toMatch(/建链中/);
         expect(stack.layer(ok.value.handle.name).driver).toBeTruthy();
         await stack.removeLayer("same").catch(() => undefined);
         RuntimeStack.evictDriver(mk("A") as never);
@@ -617,7 +617,7 @@ describe("二十八期", () => {
         const statuses = [a.status, b.status];
         expect(statuses).toContain("fulfilled");
         expect(statuses).toContain("rejected"); // 修前：双成功后 B 覆盖 A
-        expect(((a.status === "rejected" ? a : b) as PromiseRejectedResult).reason.message).toMatch(/已占用或建链中/);
+        expect(((a.status === "rejected" ? a : b) as PromiseRejectedResult).reason.message).toMatch(/建链中|已占用/);
         await stack.removeLayer("sameName").catch(() => undefined);
         await stack.removeLayer("deriveSrc").catch(() => undefined);
     }, 20_000);
