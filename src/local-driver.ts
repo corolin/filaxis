@@ -18,6 +18,7 @@ import { createWriteStream } from "node:fs";import { StringDecoder } from "node:
 import path from "node:path";
 import { tmpdir } from "node:os";
 import * as crypto from "node:crypto";
+import { shellQuote } from "./ssh-helpers.js";
 import type {
     RuntimeDriver,
     FileSystemDriver,
@@ -142,8 +143,8 @@ export class LocalRuntimeDriver implements RuntimeDriver {
         const nonce = crypto.randomBytes(6).toString("hex");
         const marker = `__FILAXIS_META_${nonce}__`;
         const wrapped =
-            // 命令上下强制换行（审计 M4）：尾注释吞码/显式 exit 的捕获隔离
-            `(\n${command}\n); __filaxis_ec=$?; ` +
+            // 在子 shell 解析脚本，语法错误或显式 exit 都由外层记录退出码。
+            `( eval ${shellQuote(` ${command}\n`)} ); __filaxis_ec=$?; ` +
             `printf '\\n${marker}:%d:%s\\n' "$__filaxis_ec" "$(id -un 2>/dev/null)"; ` +
             `exit $__filaxis_ec`;
 

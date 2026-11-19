@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.1
+version: 0.2.2
 description: |
   牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
 
@@ -45,6 +45,9 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 **MCP 形态实战指引**（第十二季盲测 B 组教训）：
 - **定位/巡检期用 `run_batch` 打包**——多个 read_file/run_command 一次调用并行
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
+- `run_batch` 的顶层 `layer` 和步骤 `layer` 可以同时传。顶层是批次默认值，步骤的 `layer` 只覆盖本步。两处都省略的步骤使用调用时的默认层。结果逐步标明命名层。
+- `max_parallel` 是整个批次的并发上限。无依赖的步骤可以并行，包括同层的独立巡检。需要先改配置、再验证、最后重载时，用 `after` 引用前置步骤的 `id`。依赖可以跨层，前置步骤成功后才会启动后续步骤。
+- `after` 的作用域是当前批次。多个批次可能同时修改同一资源时，由调用方按实际资源串行化，例如用「环境身份 + 配置路径」作为互斥键。同一环境可能有多个层名。`run_batch` 本身不提供跨批次资源锁。
 - MCP 文本结果中，`run_batch` 逐步骤展示状态、退出码和 stdout/stderr，各流最多预览 4 KiB。`run_command` 各流最多预览 8 KiB，完整输出在 `structuredContent`。
 - 建链后立即干活，**不要**逐个 hostname/list_layers 验证——首个 run_command
   的退出码与命令输出就是执行凭证；

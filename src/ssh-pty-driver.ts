@@ -731,7 +731,8 @@ export class SshPtyDriver implements RuntimeDriver {
         const nonce = crypto.randomBytes(6).toString("hex");
         const marker = `__FILAXIS_META_${nonce}`;
         const wrapped =
-            `( ${command} ); __filaxis_ec=$?; ` +
+            // 把脚本的语法解析隔离在子 shell，保留外层完成哨兵。
+            `( eval ${shellQuote(` ${command}\n`)} ); __filaxis_ec=$?; ` +
             `printf '\\n${marker}:%d:%s\\n' "$__filaxis_ec" "$(id -un 2>/dev/null)"; ` +
             `exit $__filaxis_ec`;
 

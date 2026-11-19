@@ -53,6 +53,12 @@ describe("LocalRuntimeDriver.exec（AC-04）", () => {
         expect(r.effectiveUser).toBeTruthy();
     }, 20_000); // flake 治理同上
 
+    test("脚本语法错误仍有完成哨兵，heredoc 和末尾注释可正常执行", async () => {
+        const drv = new LocalRuntimeDriver({ execDir });
+        expect(await drv.exec("if true; then\n  echo unfinished")).toMatchObject({ exitCode: 2, stderr: expect.stringContaining("syntax error") });
+        expect(await drv.exec("cat <<'END'\n'quoted' $HOME\nEND\n# final comment")).toMatchObject({ exitCode: 0, stdout: "'quoted' $HOME\n" });
+    }, 20_000);
+
     test("exec 审计留痕：status.json 落盘 completed", async () => {
         const drv = new LocalRuntimeDriver({ execDir });
         const before = new Set(readdirSync(execDir));

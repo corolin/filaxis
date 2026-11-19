@@ -501,6 +501,34 @@ describe("第十季：命名层注册表（CI 真机）", () => {
 
 // ── 第十一季：批量组合真机（ssh 层 DAG + fail-fast + CM 复用下的并行 exec）──
 describe("第十一季：批量组合（CI 真机）", () => {
+    integration("run_batch combines local and SSH layers and retains the SSH syntax-error exit code", async () => {
+        const { RuntimeStack, createAgentToolkit } = await import("../src/index.js");
+        const stack = new RuntimeStack();
+        const toolkit = createAgentToolkit(stack);
+        try {
+            await stack.addLayer("controller", { driver: "local" });
+            await toolkit.handlers.push_ssh({ host: TARGET, name: "remote" });
+            const result = await toolkit.handlers.run_batch({
+                layer: "controller",
+                steps: [
+                    { id: "local", kind: "exec", command: "printf controller" },
+                    { id: "syntax", kind: "exec", layer: "remote", command: "if true; then\n  echo unfinished", expect_exit: [2], after: ["local"] },
+                    { id: "script", kind: "exec", layer: "remote", command: "cat <<'END'\n'quoted' $HOME\nEND\n# final comment", after: ["syntax"] },
+                    { id: "done", kind: "exec", command: "printf done", after: ["script"] },
+                ],
+            });
+            expect(result.status).toBe("ok");
+            expect(result.steps).toMatchObject([
+                { layer: "controller", stdout: "controller" },
+                { layer: "remote", exit_code: 2, stderr: expect.stringMatching(/syntax error/i) },
+                { layer: "remote", stdout: "'quoted' $HOME\n" },
+                { layer: "controller", stdout: "done" },
+            ]);
+        } finally {
+            await Promise.all([...stack.layers.keys()].map((layer) => stack.removeLayer(layer, { destroy: true })));
+        }
+    }, 30_000);
+
     integration("runBatch ssh 层：改配置→验证（真 CAS+CM）→ fail-fast", async () => {
         const { runBatch } = await import("../src/batch.js");
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });

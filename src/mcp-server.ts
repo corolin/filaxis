@@ -156,11 +156,12 @@ export class McpServer {
                 const name = String(params.name ?? "");
                 const args = (params.arguments ?? {}) as Record<string, unknown>;
                 const handler = (this.tk.handlers as unknown as Record<string, (a: Record<string, unknown>) => Promise<unknown>>)[name];
-                if (!handler) {
+                if (!TOOL_DEFS.some((d) => d.function.name === name) || typeof handler !== "function") {
                     this.replyErr(id, -32602, `Unknown tool: ${name}`, { available: TOOL_DEFS.map((d) => d.function.name) });
                     return;
                 }
                 try {
+                    if (typeof args !== "object" || Array.isArray(args)) throw new Error(`${name} 的 arguments 需为对象`);
                     const r = await handler(args);
                     // Some clients only expose content, so include bounded command output there.
                     this.reply(id, {
@@ -228,6 +229,7 @@ function summarizeToolResult(name: string, value: unknown): string {
         const overview = `status=${result.status}${result.failed_step ? ` | failed_step=${result.failed_step}` : ""}`;
         const steps = result.steps.map((step) => {
             const header = [`${step.id} (${step.kind})`, `status=${step.status}`];
+            if (step.layer !== undefined) header.push(`layer=${step.layer}`);
             if (step.exit_code !== undefined) header.push(`exit_code=${step.exit_code}`);
             if (step.outcome) header.push(`outcome=${step.outcome}`);
             if (step.edits) header.push(`replaced=${step.edits.occurrences}`);
