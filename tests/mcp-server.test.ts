@@ -8,7 +8,7 @@ import { McpServer } from "../src/mcp-server.js";
 import { createAgentToolkit, TOOL_DEFS } from "../src/agent-toolkit.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -48,6 +48,39 @@ async function waitId(f: { collect: () => Array<Record<string, unknown>> }, id: 
 }
 
 describe("MCP Server（REQ-0003）", () => {
+    test("put_file and get_file transfer bytes on the selected layer and report verification", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-mcp-transfer-"));
+        const stack = new RuntimeStack();
+        const f = mcpFixture(stack);
+        const driver = new LocalRuntimeDriver({ cwd: dir });
+        try {
+            await stack.addLayer("fixture", driver);
+            const input = join(dir, "input.bin");
+            const output = join(dir, "output.bin");
+            const payload = Buffer.from([0, 127, 128, 255, 10]);
+            writeFileSync(input, payload);
+            const call = async (id: number, name: string, args: Record<string, unknown>) => {
+                f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+                return (await waitId(f, id, 20_000)).result;
+            };
+            const paths = { layer: "fixture", remote_path: "layer file.bin" };
+            expect(await call(1, "put_file", { ...paths, path: input })).toMatchObject({ isError: true });
+            expect(existsSync(join(dir, paths.remote_path))).toBe(false);
+            for (const [id, name, local_path] of [[2, "put_file", input], [3, "get_file", output]] as const) {
+                expect(await call(id, name, { ...paths, local_path })).toMatchObject({
+                    isError: false,
+                    content: [{ text: expect.stringContaining("verification=sha256") }],
+                    structuredContent: { bytes: payload.length, transport: "exec", verification: "sha256", write_mode: "atomic-replace" },
+                });
+            }
+            expect(readFileSync(output)).toEqual(payload);
+        } finally {
+            f.close();
+            await stack.removeLayer("fixture", { destroy: true });
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 45_000);
+
     test("MCP rejects missing batch steps and window IDs with the expected parameter names", async () => {
         const f = mcpFixture();
         try {
@@ -57,6 +90,48 @@ describe("MCP Server（REQ-0003）", () => {
             expect((await waitId(f, 2)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("window_id 需为非空字符串") }] });
         } finally { f.close(); }
     });
+
+    test("run_batch transfers files across layers with dependencies and validates paths before running", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-mcp-batch-transfer-"));
+        const stack = new RuntimeStack();
+        const f = mcpFixture(stack);
+        try {
+            for (const name of ["alpha", "beta"]) {
+                const cwd = join(dir, name);
+                mkdirSync(cwd);
+                await stack.addLayer(name, new LocalRuntimeDriver({ cwd }));
+            }
+            const source = join(dir, "source.bin");
+            const download = join(dir, "download.bin");
+            const payload = Buffer.from([0, 128, 255, 10]);
+            writeFileSync(source, payload);
+            const put = { id: "put", kind: "put", local_path: source, remote_path: "staged.bin" };
+            const get = { id: "get", kind: "get", local_path: download, remote_path: "staged.bin", after: ["put"] };
+            const fan = { id: "copy", kind: "put", layer: "beta", local_path: download, remote_path: "replica.bin", after: ["get"] };
+            const call = async (id: number, steps: unknown[]) => {
+                f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "run_batch", arguments: { layer: "alpha", steps } } });
+                return (await waitId(f, id, 30_000)).result;
+            };
+            expect(await call(1, [put, { ...get, local_path: undefined }])).toMatchObject({
+                isError: true, content: [{ text: expect.stringMatching(/get.*local_path/) }],
+            });
+            expect(existsSync(join(dir, "alpha", "staged.bin"))).toBe(false);
+            const transfer = { transport: "exec", bytes: payload.length, verification: "sha256", write_mode: "atomic-replace" };
+            expect(await call(2, [put, get, fan])).toMatchObject({
+                isError: false, content: [{ text: expect.stringContaining("verification=sha256") }],
+                structuredContent: { status: "ok", steps: [
+                    { id: "put", layer: "alpha", status: "ok", transfer },
+                    { id: "get", layer: "alpha", status: "ok", transfer },
+                    { id: "copy", layer: "beta", status: "ok", transfer },
+                ] },
+            });
+            expect(readFileSync(join(dir, "beta", "replica.bin"))).toEqual(payload);
+        } finally {
+            f.close();
+            await Promise.all([...stack.layers.keys()].map((name) => stack.removeLayer(name, { destroy: true })));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 50_000);
 
     test("run_batch uses the batch default and per-step override and identifies each layer", async () => {
         const stack = new RuntimeStack();
@@ -187,14 +262,14 @@ describe("MCP Server（REQ-0003）", () => {
         f.write({ jsonrpc: "2.0", id: 1, method: "tools/list" });
         const r = await waitId(f, 1);
         const tools = (r as { result: { tools: Array<{ name: string; description: string; inputSchema: unknown }> } }).result.tools;
-        expect(tools.length).toBe(TOOL_DEFS.length); // 全暴露（11 件）
+        expect(tools.length).toBe(TOOL_DEFS.length);
         expect(tools.map((t) => t.name)).toEqual(TOOL_DEFS.map((d) => d.function.name)); // 同序同名
         // schema 同源断言：inputSchema 即 function.parameters（漂移即红）
         for (let i = 0; i < tools.length; i++) {
             expect(tools[i]!.inputSchema).toEqual(TOOL_DEFS[i]!.function.parameters);
         }
         // 核心六工具在场
-        for (const n of ["run_command", "read_file", "edit_file", "observe_stream", "spawn_and_observe", "stop_and_verify"]) {
+        for (const n of ["run_command", "read_file", "edit_file", "put_file", "get_file", "observe_stream", "spawn_and_observe", "stop_and_verify"]) {
             expect(tools.map((t) => t.name)).toContain(n);
         }
         f.close();

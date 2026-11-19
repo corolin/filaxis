@@ -38,6 +38,6 @@ export { editFile, editFileMulti, EditConflictError } from "./file-edit.js";
 export type { EditFileOptions, EditFileResult, EditFileMultiResult, EditMultiHunk } from "./file-edit.js";
 export { runBatch } from "./batch.js";
 export type {
-    BatchPlan, BatchStep, BatchStepWithDeps, BatchExecStep, BatchEditStep, BatchReadStep,
+    BatchPlan, BatchStep, BatchStepWithDeps, BatchExecStep, BatchEditStep, BatchReadStep, BatchPutStep, BatchGetStep,
     BatchReport, BatchStepReport, BatchStepStatus,
 } from "./batch.js";

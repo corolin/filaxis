@@ -11,6 +11,12 @@
 
 ---
 
+## 0.2.3
+
+- `FILAXIS_SSH_STDIO_MODE=inherit` 覆盖 SSH 配置解析、非交互建层和命令执行，支持直连、TCP 跳板及可重放的进入步骤。逐跳 PTY 等依赖交互通道的能力会给出明确提示。
+- 新增 CLI `put/get` 和 MCP `put_file/get_file`。默认走目标层的 exec 通道，也可为可直达的 SSH 层选择 SFTP。传输结果报告校验等级和写入方式。
+- `run_batch` 支持 `put` 和 `get` 步骤，可按依赖跨层传输。Skill 补充单文件、跨层批量和文件中转模式的用法。
+
 ## 0.2.2
 
 - MCP `run_batch` 支持批次默认层和步骤级层覆盖。`after` 可跨层引用，`max_parallel` 约束整个批次，报告逐步标注命名层。

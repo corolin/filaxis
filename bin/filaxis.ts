@@ -24,6 +24,7 @@ import { homedir } from "node:os";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
+import { transferLayerFile } from "../src/layer-file-transfer.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -52,7 +53,7 @@ function numArg(argv: string[], i: number, opts: { positive?: boolean } = {}): n
     return n;
 }
 
-function parseOpts(argv: string[]): {
+function parseOpts(argv: string[], strict = false): {
     host?: string; user?: string; port?: number; key?: string;
     jump?: string; hop: string[]; enter: string[];
     docker?: string; dockerShell?: string; dockerRuntime?: string;
@@ -60,6 +61,7 @@ function parseOpts(argv: string[]): {
     layer?: string;
     timeout?: number; duration?: number; stream?: string; all?: boolean;
     writeMode?: "auto" | "inplace";
+    transport?: "exec" | "sftp";
     stdinJson?: boolean; requestFile?: string; pty?: boolean;
     stdinScript?: boolean; scriptFile?: string; // exec 免 Shell 通道（盲测 #4）
     positional: string[];
@@ -106,14 +108,28 @@ function parseOpts(argv: string[]): {
                 o.writeMode = v as "auto" | "inplace";
                 break;
             }
+            case "--transport": {
+                const value = argv[++i];
+                if (value !== "exec" && value !== "sftp") throw new Error("--transport 仅接受 exec 或 sftp");
+                o.transport = value;
+                break;
+            }
             case "--stdin-json": o.stdinJson = true; break;
             case "--stdin-script": o.stdinScript = true; break; // exec 免 Shell：命令从 stdin 读（盲测 #4）
             case "--script-file": o.scriptFile = argv[++i]; break; // exec 免 Shell：命令从文件读
             case "--request-file": o.requestFile = argv[++i]; break;
-            default: o.positional.push(a);
+            default:
+                if (strict && a.startsWith("-")) throw new Error(`未知参数 ${a}。以 - 开头的路径请放在 -- 之后`);
+                o.positional.push(a);
         }
     }
     return o;
+}
+
+function transferUsage(cmd: "put" | "get"): string {
+    const paths = cmd === "put" ? "<local-path> <layer-path>" : "<layer-path> <local-path>";
+    const writeMode = cmd === "put" ? " [--write-mode auto|inplace]" : "";
+    return `filaxis ${cmd} [--layer NAME | --host HOST] [--transport exec|sftp] [--timeout MS]${writeMode} -- ${paths}`;
 }
 
 /** 跳描述解析：user@host[:port]（任一存在→结构化跳；纯 host→纯字符串跳，旧形态逐字节不变） */
@@ -326,10 +342,35 @@ async function main() {
         handleLayerCmd(args);
         return;
     }
-    const o = parseOpts(args.slice(1));
+    const transfer = cmd === "put" || cmd === "get" ? cmd : undefined;
+    if (transfer && args.length === 2 && (args[1] === "--help" || args[1] === "-h")) {
+        console.log(transferUsage(transfer));
+        return;
+    }
+    const o = parseOpts(args.slice(1), transfer !== undefined);
+    if (transfer) {
+        if (o.pty) throw new Error(`${transfer} 需要非交互 exec 通道完成文件校验`);
+        if (transfer === "get" && o.writeMode !== undefined) throw new Error("--write-mode 仅用于 put");
+        if (o.positional.length !== 2 || o.positional.some((path) => !path || path.includes("\0"))) {
+            throw new Error(transferUsage(transfer));
+        }
+    }
     const drv = await driverFor(o, o.pty === true); // --pty 需先建 PTY link（审计 M1）
     try {
         switch (cmd) {
+            case "put":
+            case "get": {
+                const [source, destination] = o.positional as [string, string];
+                const result = await transferLayerFile(drv, cmd, {
+                    localPath: cmd === "put" ? source : destination,
+                    remotePath: cmd === "put" ? destination : source,
+                    transport: o.transport,
+                    timeoutMs: o.timeout,
+                    writeMode: o.writeMode,
+                });
+                console.log(JSON.stringify(result));
+                break;
+            }
             case "exec": {
                 // 免 Shell 命令通道（盲测痛点 #4）：复杂脚本（内嵌引号/多行/Python -c）
                 // 经宿主 Shell 转义常被拦死（PowerShell ParserError 实测）——脚本从
@@ -464,7 +505,7 @@ async function main() {
                     throw new Error(`batch 计划 JSON 解析失败: ${(e as Error).message}`);
                 }
                 if (!Array.isArray(plan.steps) || plan.steps.length === 0) {
-                    throw new Error('batch 计划需含非空 steps 数组（[{id, kind: "exec"|"edit"|"read", ..., after?: [依赖 id]}]）');
+                    throw new Error('batch 计划需含非空 steps 数组（kind 可为 exec、edit、read、put、get）');
                 }
                 const r = await runBatch(drv, plan);
                 for (const s of r.steps) {
@@ -479,6 +520,9 @@ async function main() {
                         if (s.stderr) process.stderr.write(s.stderr.endsWith("\n") ? s.stderr : s.stderr + "\n");
                     } else if (s.kind === "edit" && s.edits) {
                         console.log(`${head} ${s.edits.path} 替换 ${s.edits.occurrences} 处，${s.edits.bytesBefore}B → ${s.edits.bytesAfter}B${s.edits.mutex === "degraded" ? "（无锁降级）" : ""}`);
+                    } else if (s.transfer) {
+                        const { bytes, transport, verification, writeMode } = s.transfer;
+                        console.log(`${head} ${bytes} 字节 | transport=${transport} | verification=${verification} | writeMode=${writeMode}`);
                     } else {
                         console.log(`${head} ${((s.stdout ?? "").length)} 字符`);
                     }
@@ -502,6 +546,8 @@ async function main() {
                   # --enter 支持 "ssh <目标>"（自动非交互重放）与 "<...> bash" 结尾形态；
                   # 交互式进入（su - 类）用 --pty（stderr 与 stdout 混流=终端物理行为）
   filaxis cat     [--host ...] <path>
+  ${transferUsage("put")}
+  ${transferUsage("get")}
   filaxis edit    [--host ...] <path> <old> <new> [--all]   # 受控编辑（TOCTOU 锁+精确替换）
                   <path> --stdin-json | --request-file <f>  #   免 Shell 通道（JSON {old,new,all}——多行/引号保真）
   filaxis observe [--host ...] [--stream stderr|stdout|both] [--duration MS] -- <command>

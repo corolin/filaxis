@@ -68,6 +68,17 @@ filaxis mcp-config --format toml  # TOML，使用 mcp_servers（Codex）
 
 npm 包包含 [Skill 入口与四份子剧本](docs/skills/SKILL.md)，以及配套的 [AGENTS.md](AGENTS.md)。需要登记 Skill 时，由 Agent 按自身平台的规则处理这些文件。
 
+## CLI 文件传输
+
+```bash
+filaxis put --layer app -- ./config.yaml /app/config.yaml
+filaxis get --host user@host --transport sftp -- /var/tmp/result.bin ./result.bin
+```
+
+`put/get` 传输单个文件，支持 `--layer` 和 `--host`。默认用层的 exec 通道，可进入容器。SSH 目标的文件系统可直接访问时，可显式选择 `--transport sftp`，包括经 `-J` 跳板的连接。两条路径都先校验暂存文件再落位，JSON 结果标明校验等级和写入形态。详见 [文件同步剧本](docs/skills/file-sync.md)。
+
+MCP 对应工具是 `put_file` 和 `get_file`。`local_path` 位于 MCP 服务所在机器，`remote_path` 位于目标层。可用 `layer` 选择命名层。
+
 ## 已验证的平台与连接方式
 
 | 操作系统 | 连接方式 | 验证范围 |
@@ -78,6 +89,14 @@ npm 包包含 [Skill 入口与四份子剧本](docs/skills/SKILL.md)，以及配
 | Debian GNU/Linux | SSH 单跳（`ProxyJump` / `-J`） | 非交互 exec、stdout 与 stderr 分离 |
 | Alpine Linux | SSH 到 Linux 宿主后经 `docker exec` 进入容器 | 容器内非交互执行与受控文件编辑 |
 | OPNsense（FreeBSD） | SSH 直连（非交互 exec） | 命令执行、目录读取、文件写入与覆盖时保留权限。默认交互登录进入设备菜单，PTY 握手在该配置下不可用 |
+
+### SSH 文件中转模式
+
+运行环境限制匿名管道时，可在启动 CLI 或 MCP 服务前设置 `FILAXIS_SSH_STDIO_MODE=inherit`。使用 SDK 时，在建立 SSH 层前设置。该模式通过临时文件为 SSH 提供标准输入和双流输出。命名层使用非交互探测核实目标和工作目录，后续执行仍以完成哨兵确认退出码。
+
+支持免交互认证的直连、单跳 `connParams.jump`（CLI `-J`）及可非交互重放的进入步骤。逐跳 PTY 登录链、交互式进入、持久端口转发和持续观察窗需要可用的匿名管道。会话日志可用 `readSessionLog` 读取落盘内容。
+
+SSH 秒退 255 且双流为空只能作为排障线索。执行终态未知时，先核实远端状态再决定是否重发。
 
 ## 语义契约要点（使用前必读）
 

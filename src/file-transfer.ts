@@ -15,9 +15,11 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { RemoteDialect } from "./dialect.js";
 import { renderInplaceWrite, renderPreserveMode } from "./file-placement.js";
+import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
 
 /** 远端执行回调（通常是 driver 的 exec 通道） */
 export type TransferExec = (command: string) => Promise<{ stdout: string; exitCode: number }>;
@@ -330,28 +332,40 @@ import { spawn as defaultSpawn, type ChildProcess } from "node:child_process";
 
 export type SftpSpawnImpl = (argv: string[], batch: string) => Promise<{ exitCode: number | null; stderr: string }>;
 
-async function defaultSftpSpawn(argv: string[], batch: string): Promise<{ exitCode: number | null; stderr: string }> {
+async function defaultSftpSpawn(argv: string[], batch: string, timeoutMs?: number): Promise<{ exitCode: number | null; stderr: string }> {
+    if (sshFileStdioRequested()) return spawnWithFileRedirect(argv, batch, { executable: "sftp", timeoutMs });
     return new Promise((resolve, reject) => {
-        const p: ChildProcess = defaultSpawn("sftp", argv, { stdio: ["pipe", "pipe", "pipe"] });
+        const p: ChildProcess = defaultSpawn("sftp", argv, { stdio: ["pipe", "ignore", "pipe"] });
+        const timer = timeoutMs ? setTimeout(() => {
+            stderr += `\nsftp 超时（${timeoutMs}ms）`;
+            p.kill("SIGKILL");
+        }, timeoutMs) : undefined;
         let stderr = "";
         p.stderr?.on("data", (d: Buffer) => { stderr += d; });
         // stdin 管道错误监听（GPT Astra 九轮 P1 同病面）：sftp 秒退时写管道抛
         // write EOF——无监听器则 uncaught 崩宿主；显式 reject（close 兜底幂等）
-        p.stdin?.on("error", (e: Error) => reject(e));
+        let stdinError: Error | undefined;
+        p.stdin?.on("error", (e: Error) => { stdinError = e; });
         try {
             p.stdin?.write(batch);
             p.stdin?.end();
         } catch (e) {
-            reject(e instanceof Error ? e : new Error(String(e)));
+            stdinError = e instanceof Error ? e : new Error(String(e));
         }
-        p.on("close", (code) => resolve({ exitCode: code, stderr }));
-        p.on("error", reject);
+        p.on("close", (code) => {
+            clearTimeout(timer);
+            if (stdinError && code === 0) reject(stdinError);
+            else resolve({ exitCode: code, stderr });
+        });
+        p.on("error", (error) => { clearTimeout(timer); reject(error); });
     });
 }
 
 export interface SftpOptions {
-    /** 连接参数（host key 策略/端口/密钥——与 ssh 通道同源） */
+    /** OpenSSH SFTP 连接选项，最后一个参数为目标主机 */
     connArgs: string[];
+    timeoutMs?: number;
+    forceInplace?: boolean;
     /** spawn 注入（缺省真实 sftp 子进程 + `-b -` batch 模式）——mock 全测关键 */
     spawnImpl?: SftpSpawnImpl;
 }
@@ -387,11 +401,26 @@ function assertSftpPath(p: string, what: string): void {
     if (p.startsWith("-")) {
         throw new Error(`SFTP ${what}路径以 - 开头（会被当选项）——改用 ./ 相对形态: ${p.slice(0, 40)}`);
     }
-    // 引号/空白拒绝（Hydrogen R3 #5）：sftp batch 解析器不认 POSIX shell 引号语法
-    // （q() 的 ''' 拼接无效）且按空白分词——含引号/空白的路径直接拒绝（可走 base64 管道）
-    if (/['"\t ]/.test(p)) {
-        throw new Error(`SFTP ${what}路径含引号或空白（batch 解析器不支持，请走 base64 管道）: ${JSON.stringify(p.slice(0, 40))}`);
+    // Batch quoting preserves spaces. Reject glob syntax and characters that would
+    // require different escaping for local and remote SFTP paths.
+    if (/['"\\*?\[\]\x00-\x1f\x7f]/.test(p)) {
+        throw new Error(`SFTP ${what}路径含引号、通配符、反斜杠或控制字符，请走 exec 传输: ${JSON.stringify(p.slice(0, 40))}`);
     }
+}
+
+function sftpBatchArgs(connArgs: string[]): string[] {
+    // getopt 在部分平台会在第一个非选项参数处结束。
+    return ["-b", "-", ...connArgs];
+}
+
+async function digestFile(path: string): Promise<{ bytes: number; sha256: string }> {
+    const hash = createHash("sha256");
+    let bytes = 0;
+    for await (const chunk of createReadStream(path)) {
+        hash.update(chunk);
+        bytes += chunk.length;
+    }
+    return { bytes, sha256: hash.digest("hex") };
 }
 
 async function resolveSftpRemotePath(exec: TransferExec, path: string): Promise<string> {
@@ -412,7 +441,7 @@ async function resolveSftpRemotePath(exec: TransferExec, path: string): Promise<
 /**
  * sftp 快路径 put：`sftp -b -` batch 模式（stdin 喂 `put` 命令）。
  * 上传到独立暂存文件，校验通过后沿用普通上传的落位逻辑。
- * 缺席/失败由调用方捕获后降级 base64 管道（PRD FEAT-14 降级链）。
+ * 失败由调用方处理。无法确认落位状态时，调用方须先核实目标。
  */
 export async function sftpPutFile(
     exec: TransferExec,
@@ -422,27 +451,27 @@ export async function sftpPutFile(
     opts: SftpOptions,
 ): Promise<TransferResult> {
     const doSpawn = opts.spawnImpl ?? defaultSftpSpawn;
-    assertSftpPath(localPath, "本地");
+    const local = process.platform === "win32" ? localPath.replaceAll("\\", "/") : localPath;
+    assertSftpPath(local, "本地");
     const target = await resolveSftpRemotePath(exec, remotePath);
-    const content = await fs.readFile(localPath);
-    const localSha = createHash("sha256").update(content).digest("hex");
+    const digest = await digestFile(localPath);
     const staged = withSuffix(target, `.filaxis-out-${randomBytes(6).toString("hex")}`);
     let verification: TransferResult["verification"];
     try {
-        const batch = `put ${q(localPath)} ${q(staged)}\n`;
-        const r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
+        const batch = `put ${q(local)} ${q(staged)}\n`;
+        const r = await doSpawn(sftpBatchArgs(opts.connArgs), batch, opts.timeoutMs);
         if (r.exitCode !== 0) {
             throw new Error(`sftp put 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);
         }
-        const v = await verify(exec, dialect, staged, content.length, localSha);
+        const v = await verify(exec, dialect, staged, digest.bytes, digest.sha256);
         if (!v.verified) throw new TransferVerificationError("put", v.detail);
         verification = v.level;
     } catch (error) {
         await exec(`rm -f ${q(staged)}`).catch(() => undefined);
         throw error;
     }
-    const writeMode = await placeVerifiedUpload(exec, staged, target);
-    return { bytes: content.length, sha256: localSha, verified: true, verification, writeMode };
+    const writeMode = await placeVerifiedUpload(exec, staged, target, opts.forceInplace);
+    return { ...digest, verified: true, verification, writeMode };
 }
 
 /** 本地下载临时名（Sol 63 P2-5）：basename+后缀超 255B 截前段+短 hash（NAME_MAX 安全） */
@@ -475,18 +504,21 @@ export async function sftpGetFile(
     opts: SftpOptions,
 ): Promise<TransferResult> {
     const doSpawn = opts.spawnImpl ?? defaultSftpSpawn;
-    assertSftpPath(localPath, "本地");
+    const local = process.platform === "win32" ? localPath.replaceAll("\\", "/") : localPath;
+    assertSftpPath(local, "本地");
     const source = await resolveSftpRemotePath(exec, remotePath);
     const existing = await fs.stat(localPath).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
         return undefined;
     });
+    if (existing?.isDirectory()) throw new Error(`本地目标是现存目录（拒绝下载落位）：${localPath}`);
     const tmpLocal = localTmpFor(localPath, `.fx-dl-${process.pid}-${randomBytes(4).toString("hex")}`);
     await fs.writeFile(tmpLocal, "", { flag: "wx", mode: 0o600 });
-    const batch = `get ${q(source)} ${q(tmpLocal)}\n`;
+    const temporary = process.platform === "win32" ? tmpLocal.replaceAll("\\", "/") : tmpLocal;
+    const batch = `get ${q(source)} ${q(temporary)}\n`;
     let r: Awaited<ReturnType<typeof doSpawn>>;
     try {
-        r = await doSpawn([...opts.connArgs, "-b", "-"], batch);
+        r = await doSpawn(sftpBatchArgs(opts.connArgs), batch, opts.timeoutMs);
     } catch (e) {
         // 执行器抛错也清临时（Sol 64 #5）：spawn 调用曾在清理 try 之外——
         // 半途抛错（已写部分内容）留下 .fx-dl-* 残件
@@ -498,13 +530,12 @@ export async function sftpGetFile(
         throw new Error(`sftp get 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);
     }
     try {
-        const content = await fs.readFile(tmpLocal);
-        const localSha = createHash("sha256").update(content).digest("hex");
-        const v = await verify(exec, dialect, source, content.length, localSha);
+        const digest = await digestFile(tmpLocal);
+        const v = await verify(exec, dialect, source, digest.bytes, digest.sha256);
         if (!v.verified) throw new TransferVerificationError("get", v.detail);
         if (existing) await fs.chmod(tmpLocal, existing.mode & 0o777);
         await fs.rename(tmpLocal, localPath);
-        return { bytes: content.length, sha256: localSha, verified: true, verification: v.level, writeMode: "atomic-replace" as const };
+        return { ...digest, verified: true, verification: v.level, writeMode: "atomic-replace" as const };
     } catch (e) {
         await fs.unlink(tmpLocal).catch(() => undefined);
         throw e;

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import {
     sshArgsFor, hopLabel, enterStepsOf, renderExecChannel, envPrefixOf, parseJumpSpec,
 } from "../src/ssh-helpers.js";
-import { resolveLayerState, SshPtyDriver } from "../src/ssh-pty-driver.js";
+import { __testBrokenStdioExit, __testFileRedirect, resolveLayerState, SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { RemoteSessionManager } from "../src/remote-session-manager.js";
 import type { SessionEvent } from "../src/session-types.js";
 import { resolveLocalShell } from "../src/shell-discovery.js";
@@ -1278,18 +1278,33 @@ describe("Sol 73：TMPDIR 失效回落", () => {
 });
 
 // DeepSeek Harness 反馈：沙箱拦截匿名管道——stdio:'pipe' spawn 的 ssh 秒退 255
-// 零输出。filaxis 三件：快速判定指纹（255+零输出+<500ms）、自动文件中转降级、
-// FILAXIS_SSH_STDIO_MODE=inherit 显式覆盖。
+// 零输出。快速诊断指纹（255+零输出+<500ms），文件中转由环境变量显式选择。
 describe("DS 反馈：沙箱 stdio 管道损坏", () => {
-    test("isBrokenStdioExit 指纹判定：255+零输出+快退；任一不满足不判", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const probe = (SshPtyDriver as unknown as { __testBrokenStdioExit?: (c: number | null, o: string, e: string, ms: number) => boolean });
-        if (!probe.__testBrokenStdioExit) return; // 导出面缺席——跳过（实现细节测试）
-        expect(probe.__testBrokenStdioExit(255, "", "", 100)).toBe(true);   // 指纹成立
-        expect(probe.__testBrokenStdioExit(255, "x", "", 100)).toBe(false); // 有输出=真失败有话可说
-        expect(probe.__testBrokenStdioExit(1, "", "", 100)).toBe(false);    // 非 255
-        expect(probe.__testBrokenStdioExit(255, "", "", 2000)).toBe(false); // 慢退=网络/认证
-        expect(probe.__testBrokenStdioExit(null, "", "", 100)).toBe(false); // 信号杀
+    test("file stdio rejects PTY hops and persistent forwards before attempting a connection", async () => {
+        const original = process.env.FILAXIS_SSH_STDIO_MODE;
+        process.env.FILAXIS_SSH_STDIO_MODE = "inherit";
+        try {
+            for (const [config, message] of [
+                [{ sshHops: ["destination.invalid"] }, /inherit.*逐跳 PTY.*-J/],
+                [{ connParams: { forwards: [{ kind: "D", port: 1080 }] } }, /inherit.*持久端口转发/],
+                [{ enterPipeline: [{ cmd: "su -" }] }, /inherit.*交互进入/],
+            ] as const) {
+                const driver = new SshPtyDriver({ driver: "ssh", target: "root.invalid", config });
+                try { await expect(driver.init()).rejects.toThrow(message); }
+                finally { await driver.destroy(); }
+            }
+        } finally {
+            if (original === undefined) delete process.env.FILAXIS_SSH_STDIO_MODE;
+            else process.env.FILAXIS_SSH_STDIO_MODE = original;
+        }
+    });
+
+    test("isBrokenStdioExit 指纹判定：255+零输出+快退；任一不满足不判", () => {
+        expect(__testBrokenStdioExit(255, "", "", 100)).toBe(true);
+        expect(__testBrokenStdioExit(255, "x", "", 100)).toBe(false);
+        expect(__testBrokenStdioExit(1, "", "", 100)).toBe(false);
+        expect(__testBrokenStdioExit(255, "", "", 2000)).toBe(false);
+        expect(__testBrokenStdioExit(null, "", "", 100)).toBe(false);
     }, 10_000);
 });
 
@@ -1297,11 +1312,8 @@ describe("DS 反馈：沙箱 stdio 管道损坏", () => {
 // 重放撤除（首轮结果未知=可能已执行副作用——非幂等命令重试违宪）；#6 abort
 // 信号贯通；#7 中转文件 0600。
 describe("Sol 78：文件中转三缝", () => {
-    test.skipIf(!Bun.which("sh"))("P1-1 中转命令含 ssh 本体：ssh -V 真跑通（修前 /bin/sh: -o not found）", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
-        if (!run) return; // 导出面缺席
-        const r = await run(["-V"], ""); // ssh -V：版本打到 stderr
+    test.skipIf(!Bun.which("ssh"))("P1-1 中转命令含 ssh 本体：ssh -V 真跑通（修前 /bin/sh: -o not found）", async () => {
+        const r = await __testFileRedirect(["-V"], ""); // ssh -V：版本打到 stderr
         expect(r.stderr).toMatch(/OpenSSH|OpenSSH_for_Windows/i); // 修前：'-o/-V: not found'（无 ssh 本体）
     }, 15_000);
 });
@@ -1311,21 +1323,15 @@ describe("Sol 78：文件中转三缝", () => {
 // #6 准备失败清理 .in。真 shell 跑 -V 验证双流+退出码往返。
 describe("Sol 79：中转 Windows 形态/取消纪律", () => {
     test.skipIf(!Bun.which("ssh"))("P1-1 中转 ssh -V 双流/退出码往返（全平台真跑）", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
-        if (!run) return;
-        const r = await run(["-V"], "");
+        const r = await __testFileRedirect(["-V"], "");
         expect(r.stderr).toMatch(/OpenSSH|OpenSSH_for_Windows/i); // 修前（win）：exit 1 双流空
         expect(r.exitCode).not.toBe(1); // -V 退出 0（GNU）或 0——只要不是启动失败
     }, 15_000);
 
     test("#4 预先取消：AbortError+outcome=unknown；准备期取消不跑 ssh", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string, opts?: { signal?: AbortSignal }) => Promise<unknown> }).__testFileRedirect;
-        if (!run) return;
         const ac = new AbortController();
         ac.abort();
-        await expect(run(["-V"], "", { signal: ac.signal })).rejects.toMatchObject({ name: "AbortError", outcome: "unknown" });
+        await expect(__testFileRedirect(["-V"], "", { signal: ac.signal })).rejects.toMatchObject({ name: "AbortError", outcome: "unknown" });
     }, 10_000);
 });
 
@@ -1334,26 +1340,32 @@ describe("Sol 79：中转 Windows 形态/取消纪律", () => {
 //（无 shell=无展开、kill 直达 ssh 本体）。
 describe("Sol 80：中转直 spawn", () => {
     test.skipIf(!Bun.which("ssh"))("P1-1 %FX80% 字面量经中转原样保留（ssh -G 实测）", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }> }).__testFileRedirect;
-        if (!run) return;
-        const literal = "%FX80_LITERAL%";
-        const r = await run(["-G", `-i ${literal}`], "");
-        expect(r.exitCode).toBe(0);
-        expect(r.stdout).toContain(literal); // 修前（win）：被 cmd 展开成环境变量值
+        const literal = "%FX80_LITERAL% file";
+        const dir = mkdtempSync(join(tmpdir(), "fx-ssh-literal-"));
+        const path = join(dir, literal);
+        const original = process.env.FX80_LITERAL;
+        try {
+            // OpenSSH 只在身份文件存在时保留 -i 的参数。
+            writeFileSync(path, "fixture");
+            process.env.FX80_LITERAL = "expanded-by-shell";
+            const r = await __testFileRedirect(["-G", "-i", path, "localhost"], "");
+            expect(r.exitCode).toBe(0);
+            expect(r.stdout).toContain(literal);
+        } finally {
+            if (original === undefined) delete process.env.FX80_LITERAL;
+            else process.env.FX80_LITERAL = original;
+            rmSync(dir, { recursive: true, force: true });
+        }
     }, 15_000);
 });
 
 // GPT Sol 八十一期：P2-5 spawn 同步抛错（argv 含 NUL）泄漏中转文件与描述符。
 describe("Sol 81：中转 spawn 清场", () => {
     test("P2-5 argv 含 NUL：spawn 拒启即清场（.in/.out/.err 不留盘）", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<unknown> }).__testFileRedirect;
-        if (!run) return;
         const os = await import("node:os");
         const before = (await import("node:fs")).readdirSync(os.tmpdir()).filter((f) => f.includes("fx-ssh-io"));
         const NUL = String.fromCharCode(0);
-        await expect(run(["-V", "bad" + NUL + "arg"], "x")).rejects.toThrow(); // 含 NUL 由 Node 拒
+        await expect(__testFileRedirect(["-V", "bad" + NUL + "arg"], "x")).rejects.toThrow(); // 含 NUL 由 Node 拒
         const after = (await import("node:fs")).readdirSync(os.tmpdir()).filter((f) => f.includes("fx-ssh-io"));
         expect(after.length).toBe(before.length); // 修前：+3（.in/.out/.err 滞留）
     }, 15_000);
@@ -1363,12 +1375,9 @@ describe("Sol 81：中转 spawn 清场", () => {
 // 根因）——本轮重落。本地拒启（ENOENT）直报。
 describe("Sol 85：中转本地拒启直报", () => {
     test("ssh 不存在形态：直报本地启动失败（非「无哨兵」）", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const run = (SshPtyDriver as unknown as { __testFileRedirect?: (argv: string[], stdin: string) => Promise<unknown> }).__testFileRedirect;
-        if (!run) return;
         // argv 含 NUL——spawn 同步抛（Node 拒启），非异步 error 事件
         const NUL = String.fromCharCode(0);
-        await expect(run(["-V", "bad" + NUL], "x")).rejects.toThrow(/bad|NUL|null/i);
+        await expect(__testFileRedirect(["-V", "bad" + NUL], "x")).rejects.toThrow(/bad|NUL|null/i);
     }, 15_000);
 });
 

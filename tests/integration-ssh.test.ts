@@ -16,12 +16,43 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { shellQuote } from "../src/ssh-helpers.js";
+import { RuntimeStack } from "../src/runtime-stack.js";
+import { StreamWindowRegistry } from "../src/stream-window.js";
 
 const IT = process.env.FILAXIS_IT === "1";
 const TARGET = process.env.FILAXIS_IT_SSH || "localhost";
 const integration = IT ? test : test.skip;
 const jumpIntegration = IT && (TARGET === "localhost" || process.env.FILAXIS_IT_JUMP) ? test : test.skip;
 const dockerIntegration = IT && (TARGET === "localhost" || process.env.FILAXIS_IT_DOCKER === "1") ? test : test.skip;
+
+async function verifyFileStdioLayer(jump?: string): Promise<void> {
+    const original = process.env.FILAXIS_SSH_STDIO_MODE;
+    process.env.FILAXIS_SSH_STDIO_MODE = "inherit";
+    const stack = new RuntimeStack();
+    const name = "file-stdio";
+    try {
+        const { handle } = await stack.addLayer(name, {
+            driver: "ssh", target: TARGET, cwd: "/tmp",
+            ...(jump ? { config: { connParams: { jump } } } : {}),
+        });
+        const { driver } = handle;
+        expect(await driver.exec("pwd; printf diagnostic >&2; exit 7", { timeoutMs: 15_000 })).toMatchObject({
+            stdout: "/tmp\n", stderr: "diagnostic", exitCode: 7, effectiveUser: expect.any(String),
+        });
+        await expect(driver.exec(":", { channel: "pty" })).rejects.toThrow(/inherit.*交互 PTY/);
+        await expect(driver.openStreamWindow!(new StreamWindowRegistry(), { name: "fixture", command: "pwd" })).rejects.toThrow(/inherit.*持续观察窗/);
+    } finally {
+        try { if (stack.layers.has(name)) await stack.removeLayer(name, { destroy: true }); }
+        finally {
+            if (original === undefined) delete process.env.FILAXIS_SSH_STDIO_MODE;
+            else process.env.FILAXIS_SSH_STDIO_MODE = original;
+        }
+    }
+}
+
+integration("file stdio registers a direct named layer and executes without a PTY", () => verifyFileStdioLayer(), 30_000);
+jumpIntegration("file stdio registers a named layer through a TCP jump", () =>
+    verifyFileStdioLayer(process.env.FILAXIS_IT_JUMP ?? "127.0.0.1"), 60_000);
 
 integration("SSH rejects a broken PTY cwd and distinguishes an empty directory from a failed listing", async () => {
     const path = `/tmp/fx-session-cwd-${randomUUID()}`;
@@ -311,6 +342,61 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
     // - cwd 是远端语义：远端专属目录（本地不存在）不得让本地 ssh spawn ENOENT
     // - getEnv 返回真实变量值（非 $KEY 字面量）；不存在 → undefined
     // - options.env 在远端生效（export 前缀——本地 ssh 进程灌 env 远端看不见）
+    async function verifyCliTransfer(jump?: string): Promise<void> {
+        const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
+        const local = mkdtempSync(join(tmpdir(), "fx-cli-transfer-"));
+        const cases = jump ? [
+            { name: "jump", transport: "sftp", config: { connParams: { jump } } },
+        ] : [
+            { name: "exec", transport: "exec", config: { enterPipeline: [{ cmd: "sh" }] } },
+            { name: "sftp", transport: "sftp", config: undefined },
+        ];
+        let remoteDir: string | undefined;
+        try {
+            const created = await drv.exec("mktemp -d /tmp/filaxis-cli-transfer.XXXXXXXXXX");
+            const stage = created.stdout.trim();
+            expect(created.exitCode).toBe(0);
+            expect(stage).toMatch(/^\/tmp\/filaxis-cli-transfer\.[A-Za-z0-9]{10}$/);
+            remoteDir = stage;
+            const input = join(local, "input data.bin");
+            const payload = Buffer.from([0, 1, 127, 128, 195, 255, 10, 0]);
+            writeFileSync(input, payload);
+            const layers = join(local, "layers.json");
+            writeFileSync(layers, JSON.stringify(Object.fromEntries(cases.map(({ name, config }) => [
+                name, { driver: "ssh", target: TARGET, cwd: remoteDir, config },
+            ]))));
+            for (const { name, transport } of cases) {
+                const output = join(local, `${name} output.bin`);
+                const options = ["--layer", name, "--timeout", "15000"];
+                if (transport === "sftp") options.push("--transport", "sftp");
+                const env = {
+                    ...process.env, FILAXIS_LAYERS: layers,
+                    ...(transport === "sftp" ? { FILAXIS_SSH_STDIO_MODE: "inherit" } : {}),
+                };
+                const cli = (command: "put" | "get", from: string, to: string) => JSON.parse(execFileSync(
+                    process.execPath, ["bin/filaxis.ts", command, ...options, "--", from, to], { encoding: "utf8", env },
+                ));
+                expect(cli("put", input, `${name} file.bin`)).toMatchObject({ transport, bytes: payload.length, verification: "sha256", writeMode: "atomic-replace" });
+                expect(cli("get", `${name} file.bin`, output)).toMatchObject({ transport, bytes: payload.length, verification: "sha256" });
+                expect(readFileSync(output)).toEqual(payload);
+            }
+        } finally {
+            try {
+                if (remoteDir) {
+                    const files = cases.map(({ name }) => shellQuote(`${remoteDir}/${name} file.bin`)).join(" ");
+                    await drv.exec(`rm -f ${files}; rmdir ${shellQuote(remoteDir)}`);
+                }
+            } finally {
+                await drv.destroy();
+                rmSync(local, { recursive: true, force: true });
+            }
+        }
+    }
+
+    integration("CLI put/get transfers binary files with spaces over exec and SFTP", () => verifyCliTransfer(), 120_000);
+    jumpIntegration("CLI put/get transfers binary files over SFTP through a TCP jump", () =>
+        verifyCliTransfer(process.env.FILAXIS_IT_JUMP ?? "127.0.0.1"), 120_000);
+
     integration("exec cwd/env/getEnv 语义（真机）：远端目录 + env 远端生效 + printenv 真值", async () => {
         const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
         await drv.init();
@@ -398,6 +484,8 @@ describe("故障注入回归（哨兵原则，CI 真机）", () => {
             await driver.destroy();
         }
     }, 30_000);
+
+
 });
 
 // ── 第四季回归：PTY 跨任务残影串台（temporal isolation）──

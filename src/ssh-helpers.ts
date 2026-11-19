@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import * as crypto from "node:crypto";
 import type { RuntimeDescriptor } from "./driver.js";
+import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
 
 /** 端口透传（随层连接生命周期——层在隧道在，层断即撤） */
 export interface SshPortForward {
@@ -400,10 +401,17 @@ export async function resolveSshIdentity(hop: SshHop): Promise<string> {
     const cached = identityCache.get(cacheKey);
     if (cached) return cached;
     try {
-        const { execFile } = await import("node:child_process");
-        const { promisify } = await import("node:util");
-        const X = promisify(execFile);
-        const { stdout } = await X("ssh", ["-G", ...sshArgsFor(hop)], { timeout: 8000 });
+        const argv = ["-G", ...sshArgsFor(hop)];
+        let stdout: string;
+        if (sshFileStdioRequested()) {
+            const result = await spawnWithFileRedirect(argv, "", { timeoutMs: 8000 });
+            if (result.exitCode !== 0) return `unresolved:${hopHost(hop)}`;
+            stdout = result.stdout;
+        } else {
+            const { execFile } = await import("node:child_process");
+            const { promisify } = await import("node:util");
+            ({ stdout } = await promisify(execFile)("ssh", argv, { timeout: 8000 }));
+        }
         const h = stdout.match(/^hostname (\S+)$/m)?.[1] ?? hopHost(hop);
         const p = stdout.match(/^port (\d+)$/m)?.[1] ?? "22";
         const u = stdout.match(/^user (\S+)$/m)?.[1] ?? "";

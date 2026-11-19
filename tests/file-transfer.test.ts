@@ -254,7 +254,7 @@ describe("sftp 快路径（FEAT-14 ②）", () => {
             connArgs: ["-o", "ConnectTimeout=10", "user@host"],
             spawnImpl: fakeSftp,
         });
-        expect(gotArgv).toEqual(["-o", "ConnectTimeout=10", "user@host", "-b", "-"]);
+        expect(gotArgv).toEqual(["-b", "-", "-o", "ConnectTimeout=10", "user@host"]);
         expect(gotBatch).toMatch(/^put '.+' '\/r\/big\.bin\.filaxis-out-[a-f0-9]{12}'$/m);
         expect(r.verified).toBe(true); // 与 base64 路径同一校验标准
         expect(r.verification).toBe("sha256");
@@ -627,6 +627,7 @@ describe("SFTP 路径防线（审计 M5）", () => {
         await expect(sftpPutFile({} as never, GNU, "a\nrm /x", "/r/p", opts)).rejects.toThrow(/含换行/);
         await expect(sftpPutFile({} as never, GNU, "/tmp/ok", "/r/p\nrename a b", opts)).rejects.toThrow(/含换行/);
         await expect(sftpPutFile({} as never, GNU, "-weird", "/r/p", opts)).rejects.toThrow(/以 - 开头/);
+        await expect(sftpGetFile({} as never, GNU, "/r/*.txt", "/tmp/out", opts)).rejects.toThrow(/通配符/);
     });
 });
 
