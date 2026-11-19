@@ -11,6 +11,12 @@
 
 ---
 
+## 0.2.1
+
+- MCP 文本块展示 `run_batch` 的逐步结果、`run_command` 的多行输出和 `list_layers` 的层清单。
+- 修复 Windows 原生 OpenSSH 使用跳板时的参数引用，支持跳板别名和 `user@host:port`。
+- 新增 `filaxis mcp-config`，输出 JSON 或 TOML 格式的 MCP 配置片段。由 Agent 选择配置位置并合并。npm 包包含完整 Skill 与配套文档。
+
 ## 0.2.0
 
 - `observe_stream` 持续开窗，返回窗口 ID。使用 `read_stream` 回看或续读，使用 `close_stream` 核实关闭。一次读取的等待时间由 `read_stream.wait_ms` 控制。

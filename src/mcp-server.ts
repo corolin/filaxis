@@ -16,11 +16,14 @@
  */
 
 import * as readline from "node:readline";
-import { TOOL_DEFS, type AgentToolkit } from "./agent-toolkit.js";
+import { version } from "../package.json" with { type: "json" };
+import { TOOL_DEFS, type AgentToolHandlers, type AgentToolkit } from "./agent-toolkit.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const JSONRPC_VERSION = "2.0";
+const COMMAND_PREVIEW_BYTES = 8 * 1024;
+const BATCH_STEP_PREVIEW_BYTES = 4 * 1024;
 
 interface JsonRpcRequest {
     jsonrpc: string;
@@ -59,7 +62,7 @@ export class McpServer {
     constructor(opts: McpServerOptions) {
         this.tk = opts.toolkit;
         this.name = opts.serverName ?? "@syrkos/filaxis";
-        this.version = opts.serverVersion ?? "0.1.0";
+        this.version = opts.serverVersion ?? version;
         this.log = opts.logger ?? noopLogger;
         this.out = opts.stdout ?? process.stdout;
         const input = opts.stdin ?? process.stdin;
@@ -159,12 +162,9 @@ export class McpServer {
                 }
                 try {
                     const r = await handler(args);
-                    // 成功：structuredContent（结构化语义完整保留）+ text 精简摘要。
-                    // **不做 JSON.stringify(r) 双序列化**（第十二季盲测定性：同一数据
-                    // 发两遍直接推高 output 与下轮 input——响应体积约砍半）；text 是
-                    // 规范要求的人类展示面，给关键读数一行摘要即可
+                    // Some clients only expose content, so include bounded command output there.
                     this.reply(id, {
-                        content: [{ type: "text", text: summarize(r) }],
+                        content: [{ type: "text", text: summarizeToolResult(name, r) }],
                         structuredContent: r,
                         isError: false,
                     });
@@ -214,7 +214,50 @@ export class McpServer {
 
 }
 
-/** 工具结果一行摘要（content[].text 展示面——structuredContent 才是数据面） */
+function summarizeToolResult(name: string, value: unknown): string {
+    if (name === "list_layers") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["list_layers"]>>;
+        return result.text;
+    }
+    if (name === "run_command") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["run_command"]>>;
+        return [`exit=${result.exit_code}`, ...outputPreviews(result, COMMAND_PREVIEW_BYTES)].join("\n");
+    }
+    if (name === "run_batch") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["run_batch"]>>;
+        const overview = `status=${result.status}${result.failed_step ? ` | failed_step=${result.failed_step}` : ""}`;
+        const steps = result.steps.map((step) => {
+            const header = [`${step.id} (${step.kind})`, `status=${step.status}`];
+            if (step.exit_code !== undefined) header.push(`exit_code=${step.exit_code}`);
+            if (step.outcome) header.push(`outcome=${step.outcome}`);
+            if (step.edits) header.push(`replaced=${step.edits.occurrences}`);
+            const details = outputPreviews(step, BATCH_STEP_PREVIEW_BYTES);
+            if (step.error) details.push(`error: ${preview(step.error, BATCH_STEP_PREVIEW_BYTES)}`);
+            if (step.skipped_because) details.push(`skipped_because: ${preview(step.skipped_because, BATCH_STEP_PREVIEW_BYTES)}`);
+            return [header.join(" | "), ...details].join("\n");
+        });
+        return [overview, ...steps].join("\n\n");
+    }
+    return summarize(value);
+}
+
+function outputPreviews(output: { stdout?: string; stderr?: string }, limit: number): string[] {
+    const blocks: string[] = [];
+    if (output.stdout) blocks.push(`stdout:\n${preview(output.stdout, limit)}`);
+    if (output.stderr) blocks.push(`stderr:\n${preview(output.stderr, limit)}`);
+    return blocks;
+}
+
+function preview(text: string, limit: number): string {
+    const total = Buffer.byteLength(text, "utf8");
+    if (total <= limit) return text;
+    const bytes = Buffer.from(text.slice(0, limit + 1), "utf8");
+    let end = limit;
+    while ((bytes[end]! & 0xc0) === 0x80) end--;
+    return `${bytes.subarray(0, end).toString("utf8")}\n[已截断 ${total - end} 字节，完整输出见 structuredContent]`;
+}
+
+/** 其他工具保留一行摘要。 */
 function summarize(r: unknown): string {
     if (r && typeof r === "object") {
         const o = r as Record<string, unknown>;
@@ -233,5 +276,5 @@ function summarize(r: unknown): string {
         }
         if (bits.length > 0) return bits.join(" | ");
     }
-    return "ok"; // 无关键读数（list_layers 等）——数据面在 structuredContent
+    return "ok";
 }

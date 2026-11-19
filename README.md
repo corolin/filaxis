@@ -56,6 +56,18 @@ bun add @syrkos/filaxis    # 或 npm install @syrkos/filaxis
 - npm 依赖：**零**（`dependencies` 为空是 AC 门禁项，见 `bun run check:boundaries`）
 - 系统依赖按能力分列（`stack.features()` **探测本机视角**——Agent 在容器里跑 filaxis 时探测的是容器内的 `ssh`/`tmux`/`sftp`，目标主机的能力经 `launchCmd` 层的 shell 自行确认）：`ssh`≥7.3 全功能（`-J`）、`tmux` 仅持久会话（缺席自动降级非持久）、`sftp` 仅传输快路径
 
+## MCP 配置与 Agent Skill
+
+```bash
+npm i -g @syrkos/filaxis
+filaxis mcp-config                # JSON，使用 mcpServers
+filaxis mcp-config --format toml  # TOML，使用 mcp_servers（Codex）
+```
+
+命令把 MCP 配置片段写到标准输出，包含当前运行时和 `filaxis-mcp` 入口的绝对路径。Agent 根据自身平台和所需作用域选择配置位置，再将片段合并到现有配置。
+
+npm 包包含 [Skill 入口与四份子剧本](docs/skills/SKILL.md)，以及配套的 [AGENTS.md](AGENTS.md)。需要登记 Skill 时，由 Agent 按自身平台的规则处理这些文件。
+
 ## 已验证的平台与连接方式
 
 | 操作系统 | 连接方式 | 验证范围 |

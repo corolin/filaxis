@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.1.0
+version: 0.2.1
 description: |
   牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
 
@@ -45,15 +45,56 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 **MCP 形态实战指引**（第十二季盲测 B 组教训）：
 - **定位/巡检期用 `run_batch` 打包**——多个 read_file/run_command 一次调用并行
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
+- MCP 文本结果中，`run_batch` 逐步骤展示状态、退出码和 stdout/stderr，各流最多预览 4 KiB。`run_command` 各流最多预览 8 KiB，完整输出在 `structuredContent`。
 - 建链后立即干活，**不要**逐个 hostname/list_layers 验证——首个 run_command
-  的 `[exit=N user=X]` 就是活链证明；
+  的退出码与命令输出就是执行凭证；
 - 大输出（日志/配置全文）用 `read_file` 而非 `run_command cat`——结构化返回
   不占对话输出面。
 
-**Agent 形态升级路径**：CLI 每条命令独立进程（连接不复用）。高频操作时换 SDK/
-`createAgentToolkit` 常驻形态——连接/PTY 复用 + 结构化参数（edit 直接传对象免
-临时 JSON 文件 + batch 直接传数组免 plan 文件），步数与 Token 双降（盲测实证
-阶段二 non_cache 省 17.7%）。
+**Agent 形态升级路径**：CLI 每条命令独立进程（连接不复用）。高频操作或脚本编排时换 SDK / `createAgentToolkit` 常驻形态——连接/PTY 复用 + 结构化参数（`editFile` 直接传字符串免临时 JSON 文件 + `runBatch` 直接传数组免 plan 文件），步数与 Token 双降（盲测实证阶段二 non_cache 省 17.7%）。
+
+### SDK 最小配方（Bun / Node 编码接入）
+
+```ts
+import { RuntimeStack, editFile, runBatch, createAgentToolkit } from "@syrkos/filaxis";
+
+const stack = new RuntimeStack();
+
+// ① 建命名层（直连或 -J 跳板；同拓扑自动复用；可再 layerInto 进容器）
+const { handle: host } = await stack.addLayer("prod", {
+  driver: "ssh",
+  target: "host.example.com",
+  config: {
+    connParams: { user: "root", port: 22, keyFile: "~/.ssh/id_ed25519", jump: "bastion" },
+  },
+});
+const ctr = await stack.layerInto("prod", "web", "docker exec -i nginx sh");
+
+// ② 一次性执行（退出码是数据，stdout/stderr 物理分离）
+const r = await host.driver.exec("uptime", { timeoutMs: 10_000 });
+console.log(r.exitCode, r.stdout, r.stderr);
+
+// ③ 受控编辑（CAS 原子写回；Docker 单文件 bind mount 传 writeMode: "inplace"）
+const ed = await editFile(ctr.driver, "/etc/nginx/nginx.conf", "worker_processes 1;", "worker_processes auto;", {
+  writeMode: "auto",
+});
+
+// ④ 批次组合（无 after 并行，有 after 保序；fail-fast 不自动回滚）
+const report = await runBatch(ctr.driver, {
+  maxParallel: 3,
+  steps: [
+    { id: "test", kind: "exec", command: "nginx -t" },
+    { id: "reload", kind: "exec", command: "nginx -s reload", after: ["test"] },
+  ],
+});
+
+// ⑤ 嵌入自定义 Agent：一行生成 OpenAI/Anthropic/Vercel AI SDK 通吃工具面
+const { tools, handlers } = createAgentToolkit(stack);
+
+// ⑥ 收尾释放（移除层并销毁底层连接）
+await stack.removeLayer("web", { destroy: true });
+await stack.removeLayer("prod", { destroy: true });
+```
 
 ## 30 秒选型：你面对的是什么？
 

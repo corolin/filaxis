@@ -148,6 +148,20 @@ function assertBareHost(target: string): void {
 
 /** ssh 命令行参数（spawn 数组与 ssh -G 解析共用） */
 export function sshArgsFor(hop: SshHop): string[] {
+    return renderSshArgs(hop, process.platform === "win32");
+}
+
+function quoteWindowsProxyArg(value: string): string {
+    if (value && !/[\s"]/.test(value)) return value;
+    const escaped = value.replace(/\\+|"/g, (part, offset: number) => {
+        if (part === '"') return '\\"';
+        const next = value[offset + part.length];
+        return next === '"' || next === undefined ? part + part : part;
+    });
+    return `"${escaped}"`;
+}
+
+function renderSshArgs(hop: SshHop, windowsProxy: boolean): string[] {
     if (!isHopObj(hop) || !hop.conn) {
         assertBareHost(hopHost(hop));
         return [hopHost(hop)];
@@ -158,15 +172,23 @@ export function sshArgsFor(hop: SshHop): string[] {
         // 不用 -J 简写：ProxyJump 跳板子连接**不继承**主连接的 -o 选项（CI 实锤：
         // -J 下跳板 host key 检查走缺省 strict，首连即 Host key verification
         // failed——「host key 缺省 TOFU」承诺对跳板不成立）。改用 ProxyJump 的
-        // 底层等价形态 ProxyCommand（值是命令，经 shell 执行）：
-        // - 跳板经 parseJumpSpec 白名单校验 + sh 单引号引用（Astra 十一轮 #1：原文
-        //   拼接即注入入口）；多跳逗号链显式拒绝（#3——层模型 sshInto 是多跳正门）
+        // 底层等价形态 ProxyCommand。POSIX 经 shell，Win32 OpenSSH 直接启动进程。
+        // 跳板仍经 parseJumpSpec 白名单校验，多跳逗号链显式拒绝。
         // - host key 策略随主连接传导（#2：strict+knownHostsFile 不在跳板静默降级）
         const js = parseJumpSpec(jump);
-        const hk = `-o StrictHostKeyChecking=${hop.conn.hostKeyPolicy === "strict" ? "yes" : "accept-new"}${hop.conn.knownHostsFile ? ` -o UserKnownHostsFile=${shellQuote(expandHomePath(hop.conn.knownHostsFile))}` : ""} `;
-        const keyOpt = js.keyFile ? `-i ${shellQuote(js.keyFile)} ` : "";
+        const proxyQuote = windowsProxy ? quoteWindowsProxyArg : shellQuote;
+        const policy = hop.conn.hostKeyPolicy === "strict" ? "yes" : "accept-new";
+        let hk = `-o StrictHostKeyChecking=${policy} `;
+        if (hop.conn.knownHostsFile) {
+            const file = expandHomePath(hop.conn.knownHostsFile);
+            // -o is parsed again as an ssh_config option, including its path quoting.
+            const fileArg = windowsProxy && /\s/.test(file) ? `"${file.replaceAll("\\", "/")}"` : file;
+            const option = windowsProxy ? proxyQuote(`UserKnownHostsFile=${fileArg}`) : `UserKnownHostsFile=${proxyQuote(file)}`;
+            hk += `-o ${option} `;
+        }
+        const keyOpt = js.keyFile ? `-i ${proxyQuote(js.keyFile)} ` : "";
         const portOpt = js.port ? `-p ${js.port} ` : "";
-        const target = shellQuote(js.user ? `${js.user}@${js.host}` : js.host);
+        const target = proxyQuote(js.user ? `${js.user}@${js.host}` : js.host);
         args.push("-o", `ProxyCommand=ssh ${hk}${keyOpt}${portOpt}-W %h:%p ${target}`);
     }
     if (keyFile) args.push("-i", expandHomePath(keyFile));
@@ -184,7 +206,8 @@ export function sshArgsFor(hop: SshHop): string[] {
  *  内 $()/反引号照常展开——且会让内层 ProxyCommand 的单引号防护失效，结构化
  *  jump.keyFile 的命令替换实测经此通道执行）；白名单裸串零引用开销。 */
 export function sshArgsQuoted(hop: SshHop): string {
-    return sshArgsFor(hop)
+    // This command is sent to a remote POSIX shell, independent of the local host.
+    return renderSshArgs(hop, false)
         .map((a) => (/^[A-Za-z0-9_@:./%=-]+$/.test(a) ? a : `'${a.replace(/'/g, "'\\''")}'`))
         .join(" ");
 }

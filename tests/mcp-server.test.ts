@@ -10,6 +10,7 @@ import { RuntimeStack } from "../src/runtime-stack.js";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:net";
 
 /** 驱动 MCP server 的测试替身：write(line) 进请求，collect() 收响应 */
 function mcpFixture(stack = new RuntimeStack()): { write: (obj: Record<string, unknown>) => void; collect: () => Array<Record<string, unknown>>; close: () => void } {
@@ -46,6 +47,84 @@ async function waitId(f: { collect: () => Array<Record<string, unknown>> }, id: 
 }
 
 describe("MCP Server（REQ-0003）", () => {
+    test("list_layers exposes the empty and populated layer lists in MCP text", async () => {
+        const stack = new RuntimeStack();
+        const f = mcpFixture(stack);
+        async function listLayers(id: number) {
+            f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "list_layers" } });
+            const response = await waitId(f, id);
+            return response.result as { content: Array<{ type: string; text: string }>; structuredContent: { layers: Array<{ name: string }> } };
+        }
+        try {
+            const empty = await listLayers(1);
+            expect(empty.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("（空") });
+            await stack.addLayer("build", { driver: "local" });
+            const populated = await listLayers(2);
+            expect(populated.content[0]).toEqual({ type: "text", text: stack.layerText() });
+            expect(populated.content[0]!.text).toMatch(/build:.*◀ 默认/);
+            expect(populated.structuredContent.layers).toMatchObject([{ name: "build" }]);
+        } finally { f.close(); }
+    });
+
+    test("run_batch text exposes stdout, stderr and exit codes for every step", async () => {
+        const f = mcpFixture();
+        try {
+            const steps = [
+                { id: "sys", kind: "exec", command: "printf SYS_READY" },
+                { id: "docker", kind: "exec", command: `printf '%s' '${"x".repeat(4093)}🧵DOCKER_TAIL'` },
+                { id: "net", kind: "exec", command: "printf NET_CHECK >&2; exit 7", expect_exit: [7] },
+            ];
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_batch", arguments: { steps } } });
+            const { result } = (await waitId(f, 1)) as { result: { content: Array<{ text: string }>; structuredContent: { steps: Array<{ stdout: string }> } } };
+            const text = result.content[0]!.text;
+            expect(text).toContain("sys (exec) | status=ok | exit_code=0\nstdout:\nSYS_READY");
+            expect(text).toContain("docker (exec) | status=ok | exit_code=0");
+            expect(text).toContain("net (exec) | status=ok | exit_code=7\nstderr:\nNET_CHECK");
+            expect(text).toContain("已截断 15 字节");
+            expect(text).not.toContain("�");
+            expect(result.structuredContent.steps[1]!.stdout).toEndWith("🧵DOCKER_TAIL");
+        } finally { f.close(); }
+    }, 15_000);
+
+    test("run_command text preserves multiline stdout within 8 KiB and provides stderr", async () => {
+        const f = mcpFixture();
+        try {
+            const stdout = `FIRST\n${"x".repeat(7000)}\nLAST\n`;
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_command", arguments: {
+                command: `printf '%s' '${stdout}'; printf 'ERR_LINE\\n' >&2; exit 3`,
+            } } });
+            const { result } = (await waitId(f, 1)) as { result: { content: Array<{ text: string }>; structuredContent: { stdout: string } } };
+            expect(result.content[0]!.text).toContain(`exit=3\nstdout:\n${stdout}\nstderr:\nERR_LINE`);
+            expect(result.structuredContent.stdout).toBe(stdout);
+        } finally { f.close(); }
+    }, 15_000);
+
+    test.skipIf(process.platform !== "win32")("push_ssh reaches the jump port through native Windows OpenSSH", async () => {
+        let connections = 0;
+        const proxy = createServer((socket) => { connections++; socket.destroy(); });
+        await new Promise<void>((resolve, reject) => {
+            proxy.once("error", reject);
+            proxy.listen(0, "127.0.0.1", resolve);
+        });
+        const f = mcpFixture();
+        try {
+            const address = proxy.address();
+            if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
+            const jumps = [`localhost:${address.port}`, `probe@127.0.0.1:${address.port}`];
+            for (const [index, jump] of jumps.entries()) {
+                const id = index + 1;
+                f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "push_ssh", arguments: { host: "127.0.0.1", jump } } });
+                const response = await waitId(f, id);
+                // Reaching the listener proves the native client parsed the jump address.
+                expect(response.result).toMatchObject({ isError: true });
+                expect(connections).toBe(id);
+            }
+        } finally {
+            f.close();
+            await new Promise<void>((resolve) => proxy.close(() => resolve()));
+        }
+    }, 25_000);
+
     test("AC-01 initialize 握手：协议版本+capabilities+serverInfo", async () => {
         const f = mcpFixture();
         f.write({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
