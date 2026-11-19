@@ -482,7 +482,7 @@ async function main() {
             default:
                 console.error(`filaxis CLI — 千里一线，执行有迹
 用法:
-  filaxis install [--agent antigravity|claude|cursor|codex|all] [--project] [--mcp]
+  filaxis install --agent <antigravity|claude|cursor|codex|all> [--project] [--mcp]
   filaxis exec    [--host u@h [--port N] [--key F]] [-J jump] [--enter CMD]... [--docker CTR]
                   [--timeout MS] [--pty] -- <command>
                   # --enter 支持 "ssh <目标>"（自动非交互重放）与 "<...> bash" 结尾形态；

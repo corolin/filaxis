@@ -26,18 +26,21 @@ function fixture() {
     return { home, project, run };
 }
 
-test("install auto-detects existing Agent directories and falls back to the shared location", () => {
+test("install requires an explicit Agent and only installs to its selected destination", () => {
     const { home, run } = fixture();
     expect(run("--agent", "unknown").code).toBe(1);
     expect(run("--help").code).toBe(0);
     expect(existsSync(join(home, ".agents"))).toBe(false);
-    expect(run().code).toBe(0);
-    expect(existsSync(join(home, ".agents", "skills", "filaxis", "SKILL.md"))).toBe(true);
     mkdirSync(join(home, ".gemini", "config"), { recursive: true });
     mkdirSync(join(home, ".claude"));
-    expect(run().code).toBe(0);
-    expect(existsSync(join(home, ".gemini", "config", "skills", "filaxis", "SKILL.md"))).toBe(true);
+    const missingAgent = run();
+    expect(missingAgent.code).toBe(1);
+    expect(missingAgent.stderr).toContain("请用 --agent 指定安装目标");
+    expect(existsSync(join(home, ".claude", "skills"))).toBe(false);
+    expect(run("--agent", "claude").code).toBe(0);
     expect(existsSync(join(home, ".claude", "skills", "filaxis", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(home, ".gemini", "config", "skills"))).toBe(false);
+    expect(existsSync(join(home, ".agents"))).toBe(false);
     expect(existsSync(join(home, ".cursor"))).toBe(false);
 });
 

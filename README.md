@@ -59,12 +59,12 @@ bun add @syrkos/filaxis    # 或 npm install @syrkos/filaxis
 ## 安装 Agent Skill
 
 ```bash
-npm i -g @syrkos/filaxis && filaxis install
-filaxis install --agent antigravity --mcp
-filaxis install --agent all --project
+npm i -g @syrkos/filaxis
+filaxis install --agent codex
+filaxis install --agent claude --project --mcp
 ```
 
-缺省检测本机已有的 Agent 配置目录。没有检测到时，安装到 `~/.agents/skills/filaxis`。`--agent` 可显式选择 `antigravity`、`claude`、`cursor`、`codex` 或 `all`。`--project` 以当前工作目录为项目根，多个 Agent 使用相同路径时只安装一次。
+由执行安装的 Agent 根据自身平台传入 `--agent`，可选 `antigravity`、`claude`、`cursor` 或 `codex`。默认安装到该平台的全局目录，传入 `--project` 则以当前工作目录为项目根。需要给所有平台安装时，显式传入 `--agent all`。共用的目录只安装一次。
 
 | Agent | 全局 Skill 目录 | 项目 Skill 目录 |
 |---|---|---|

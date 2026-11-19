@@ -64,8 +64,8 @@ function installAt(target: string, files: Map<string, string>): boolean {
 }
 
 export function installSkill(argv: string[], cliUrl: string): void {
-    const usage = "用法: filaxis install [--agent antigravity|claude|cursor|codex|all] [--project] [--mcp]";
-    let selected: string | undefined;
+    const usage = "用法: filaxis install --agent <antigravity|claude|cursor|codex|all> [--project] [--mcp]";
+    let selected: Agent | "all" | undefined;
     let project = false;
     let mcp = false;
     for (let i = 0; i < argv.length; i++) {
@@ -74,10 +74,12 @@ export function installSkill(argv: string[], cliUrl: string): void {
         if (arg === "--project") project = true;
         else if (arg === "--mcp") mcp = true;
         else if (arg === "--agent" || arg.startsWith("--agent=")) {
-            selected = arg === "--agent" ? argv[++i] : arg.slice("--agent=".length);
-            if (selected !== "all" && !agents.some((agent) => agent === selected)) throw new Error(usage);
+            const name = arg === "--agent" ? argv[++i] : arg.slice("--agent=".length);
+            selected = name === "all" ? name : agents.find((agent) => agent === name);
+            if (!selected) throw new Error(usage);
         } else throw new Error(`未知安装参数 ${arg}\n${usage}`);
     }
+    if (!selected) throw new Error(`请用 --agent 指定安装目标。\n${usage}`);
 
     const home = homedir();
     const cwd = process.cwd();
@@ -91,17 +93,9 @@ export function installSkill(argv: string[], cliUrl: string): void {
         cursor: join(cwd, ".cursor"), codex: join(cwd, ".codex"),
     };
     const common = join(project ? cwd : home, ".agents", "skills", "filaxis");
-    const targets = selected === "all" ? agents : selected ? [selected as Agent] : agents.filter((agent) => {
-        const candidates = [globalConfig[agent]];
-        if (agent === "antigravity") candidates.push(join(home, ".gemini", "antigravity"), join(home, ".gemini", "antigravity-cli"));
-        if (project) candidates.push(projectConfig[agent]);
-        return candidates.some((path) => statSync(path, { throwIfNoEntry: false })?.isDirectory());
-    });
+    const targets = selected === "all" ? agents : [selected];
     const scope = project ? projectConfig : globalConfig;
     const destinations = new Set(targets.map((agent) => agent === "codex" ? common : join(scope[agent], "skills", "filaxis")));
-    if (destinations.size === 0 || (!selected && statSync(dirname(common), { throwIfNoEntry: false })?.isDirectory())) {
-        destinations.add(common);
-    }
 
     const cli = fileURLToPath(cliUrl);
     const extension = extname(cli);
@@ -135,14 +129,13 @@ export function installSkill(argv: string[], cliUrl: string): void {
             cursor: join(scope.cursor, "mcp.json"),
             codex: join(scope.codex, "config.toml"),
         };
-        const mcpAgents = targets.length ? targets : agents;
         const command = process.execPath;
         const args = [join(dirname(cli), `filaxis-mcp${extension}`)];
-        for (const agent of mcpAgents) console.error(`将 ${agent} 的 MCP 配置片段合并到 ${configPaths[agent]}`);
+        for (const agent of targets) console.error(`将 ${agent} 的 MCP 配置片段合并到 ${configPaths[agent]}`);
         const json = JSON.stringify({ mcpServers: { filaxis: { command, args } } }, null, 2);
         const toml = `[mcp_servers.filaxis]\ncommand = ${JSON.stringify(command)}\nargs = ${JSON.stringify(args)}`;
-        const hasCodex = mcpAgents.includes("codex");
-        const hasJson = mcpAgents.some((agent) => agent !== "codex");
+        const hasCodex = targets.includes("codex");
+        const hasJson = targets.some((agent) => agent !== "codex");
         if (hasJson && hasCodex) console.log(`JSON\n${json}\n\nCodex TOML\n${toml}`);
         else console.log(hasCodex ? toml : json);
     }
