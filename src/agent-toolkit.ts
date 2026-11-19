@@ -13,7 +13,9 @@ import { randomUUID } from "node:crypto";
 import { StreamWindowRegistry, type StreamFrame } from "./stream-window.js";
 import type { RuntimeStack } from "./runtime-stack.js";
 import { editFile } from "./file-edit.js";
-import { runBatch, type BatchStepWithDeps } from "./batch.js";
+import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
+import type { TransferResult } from "./file-transfer.js";
+import { BATCH_STEP_KINDS, runBatch, type BatchStepWithDeps } from "./batch.js";
 import type { RuntimeDriver } from "./driver.js";
 import { SessionOwnership, type StopResult } from "./session-ownership.js";
 
@@ -26,11 +28,31 @@ export interface AgentToolDef {
     };
 }
 
+interface AgentFileTransferArgs {
+    local_path: string;
+    remote_path: string;
+    layer?: string;
+    transport?: FileTransferTransport;
+    timeout_ms?: number;
+}
+
+type AgentFilePutArgs = AgentFileTransferArgs & { write_mode?: "auto" | "inplace" };
+type AgentFileTransferResult = Omit<TransferResult, "writeMode"> & {
+    transport: FileTransferTransport;
+    write_mode: TransferResult["writeMode"];
+};
+
+function agentTransferResult({ writeMode, ...result }: LayerFileTransferResult): AgentFileTransferResult {
+    return { ...result, write_mode: writeMode };
+}
+
 export interface AgentToolHandlers {
     run_command(args: { command: string; timeout_ms?: number; layer?: string }): Promise<{
         stdout: string; stderr: string; exit_code: number; effective_user?: string;
     }>;
     read_file(args: { path: string; layer?: string }): Promise<{ path: string; content: string; size: number; mtime_ms: number }>;
+    put_file(args: AgentFilePutArgs): Promise<AgentFileTransferResult>;
+    get_file(args: AgentFileTransferArgs): Promise<AgentFileTransferResult>;
     edit_file(args: { path: string; old: string; new: string; all?: boolean; write_mode?: "auto" | "inplace"; layer?: string }): Promise<{
         path: string; occurrences: number; bytes_before: number; bytes_after: number; mutex?: "flock" | "degraded"; write_mode?: "atomic-replace" | "inplace-write";
     }>;
@@ -62,6 +84,7 @@ export interface AgentToolHandlers {
         status: "ok" | "fail"; failed_step?: string;
         steps: Array<{
             id: string; layer?: string; kind: string; status: string; exit_code?: number; outcome?: "unknown"; stdout?: string; stderr?: string; error?: string; skipped_because?: string;
+            transfer?: AgentFileTransferResult;
             edits?: { path: string; occurrences: number; bytes_before: number; bytes_after: number; hunks: Array<{ old: string; new: string; occurrences: number }>; mutex?: "flock" | "degraded"; write_mode?: "atomic-replace" | "inplace-write" };
         }>;
     }>;
@@ -87,6 +110,14 @@ export interface AgentToolkitOptions {
     sessionCheckIntervalMs?: number;
 }
 
+const fileTransferProperties = {
+    local_path: { type: "string", minLength: 1, description: "MCP 服务进程所在机器的文件路径" },
+    remote_path: { type: "string", minLength: 1, description: "目标层内的文件路径" },
+    layer: { type: "string", minLength: 1, description: "目标层名（缺省=默认层）" },
+    transport: { type: "string", enum: ["exec", "sftp"], description: "缺省 exec。SFTP 适用于可直达的 SSH 文件系统" },
+    timeout_ms: { type: "integer", minimum: 1, maximum: 2147483647, description: "每次 SSH 命令或 SFTP 进程的超时毫秒数，缺省 120000" },
+};
+
 /** 工具定义单一来源（REQ-0003 MCP tools/list 同源序列化——零漂移） */
 export const TOOL_DEFS: AgentToolDef[] = [
     // run_batch 置顶（第十三季黑盒实测：Lazy schema 按序读 6 个基础
@@ -97,7 +128,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "run_batch",
             description:
-                "批次组合：一次调用描述多个原子操作（exec/edit/read），按依赖边（after）拓扑执行——" +
+                "批次组合：一次调用描述多个文件或命令操作（exec/edit/read/put/get），按依赖边（after）拓扑执行——" +
                 "步骤 layer 可覆盖批次 layer；after 可跨层引用步骤 id。无依赖步骤并行，顺序链靠 after 显式保序；默认任一步失败即停（未启动步骤标 " +
                 "skipped）。返回逐步骤状态与证据（退出码/输出/编辑明细）。**不做自动回滚**（配置恢复≠运行" +
                 "状态回滚——重载可能已产生外部副作用），失败现场交回调用方决策。",
@@ -113,14 +144,15 @@ export const TOOL_DEFS: AgentToolDef[] = [
                             type: "object",
                             additionalProperties: false,
                             properties: {
+                                ...fileTransferProperties,
                                 id: { type: "string", description: "步骤唯一 id（after 引用用）" },
-                                kind: { type: "string", enum: ["exec", "edit", "read"] },
+                                kind: { type: "string", enum: BATCH_STEP_KINDS },
                                 layer: { type: "string", minLength: 1, description: "当前步骤的目标层名，覆盖批次默认层" },
                                 command: { type: "string", description: "kind=exec：shell 命令" },
                                 expect_exit: { type: "array", items: { type: "number" }, description: "kind=exec：预期退出码集合（缺省 [0]）" },
                                 timeout_ms: { type: "number", description: "kind=exec：超时毫秒" },
                                 path: { type: "string", description: "kind=edit/read：文件路径" },
-                                write_mode: { type: "string", enum: ["auto", "inplace"], description: "kind=edit：inplace=bind mount 显式请求保留 inode 写（R10 #3 补透传）" },
+                                write_mode: { type: "string", enum: ["auto", "inplace"], description: "kind=edit/put：inplace 保留目标 inode" },
                                 hunks: {
                                     type: "array",
                                     description: "kind=edit：替换对（一次 CAS 原子应用——任一未命中整批拒绝不写）",
@@ -237,6 +269,35 @@ export const TOOL_DEFS: AgentToolDef[] = [
                     layer: { type: "string", description: "目标层名（缺省=默认层）" },
                 },
                 required: ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "put_file",
+            description: "从 MCP 服务所在机器上传一个文件到目标层。支持二进制，校验后落位，可能覆盖目标文件。返回校验等级和写入形态。",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    ...fileTransferProperties,
+                    write_mode: { type: "string", enum: ["auto", "inplace"], description: "缺省 auto。inplace 保留目标 inode" },
+                },
+                required: ["local_path", "remote_path"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_file",
+            description: "从目标层下载一个文件到 MCP 服务所在机器。支持二进制，校验后落位，可能覆盖目标文件。返回传输元数据。",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: fileTransferProperties,
+                required: ["local_path", "remote_path"],
             },
         },
     },
@@ -390,6 +451,15 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         if (layerName) return stack.layer(layerName).driver;
         return stack.active ?? await layer();
     };
+    const transferFile = async (operation: "put" | "get", args: AgentFilePutArgs): Promise<AgentFileTransferResult> => {
+        const { local_path, remote_path, layer: layerName, transport, timeout_ms, write_mode, ...unknownFields } = args;
+        const extra = Object.keys(unknownFields);
+        if (extra.length) throw new Error(`${operation}_file 未知参数：${extra.join(", ")}`);
+        if (layerName !== undefined && (typeof layerName !== "string" || !layerName.trim())) throw new Error("layer 需为非空字符串");
+        const fields = { localPath: local_path, remotePath: remote_path, transport, timeoutMs: timeout_ms, writeMode: write_mode };
+        validateFileTransferFields(operation, fields);
+        return agentTransferResult(await transferLayerFile(await resolveDrv(layerName), operation, fields));
+    };
     let windowRegistry: StreamWindowRegistry | undefined;
     let observationDisposed = false;
     const requireWindow = (windowId: string) => {
@@ -524,6 +594,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const r = await editFile(drv, path, old, newStr, { all, writeMode });
                 return { path: r.path, occurrences: r.occurrences, bytes_before: r.bytesBefore, bytes_after: r.bytesAfter, mutex: r.mutex, write_mode: r.writeMode };
             },
+            put_file: (args) => transferFile("put", args),
+            get_file: (args) => transferFile("get", args),
             async observe_stream(args) {
                 if ("duration_ms" in args) throw new Error("observe_stream 持续开窗，请用 read_stream 的 wait_ms 限制单次等待");
                 const { command, stream, name, layer: layerName } = args;
@@ -625,17 +697,21 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 return { removed: name };
             },
             async run_batch({ steps, stop_on_fail, max_parallel, layer: layerName, ...unknownArgs }) {
-                if (!Array.isArray(steps) || !steps.length) throw new Error('steps 需为非空数组，每步提供 id 和 kind（exec、edit 或 read）');
+                if (!Array.isArray(steps) || !steps.length) throw new Error(`steps 需为非空数组，每步提供 id 和 kind（${BATCH_STEP_KINDS.join("、")}）`);
                 const extra = Object.keys(unknownArgs);
                 if (extra.length) throw new Error(`run_batch 未知参数：${extra.join(", ")}（支持 steps、layer、stop_on_fail、max_parallel）`);
                 const r = await runBatch(resolveDrv, {
                     steps: steps.map((raw, stepIdx): BatchStepWithDeps => {
                         if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`steps[${stepIdx}] 需为对象`);
                         // 仅转换字段名，实际类型由 runBatch 在执行前统一校验。
-                        const { id, kind, layer, after, command, path, hunks, expect_exit, timeout_ms, write_mode, ...unknownFields } = raw;
+                        const { id, kind, layer, after, command, path, hunks, expect_exit, timeout_ms, write_mode, local_path, remote_path, transport, ...unknownFields } = raw;
                         const extra = Object.keys(unknownFields);
                         if (extra.length) throw new Error(`steps[${stepIdx}] 含未知字段：${extra.join(", ")}（目标层字段为 layer）`);
-                        return { id, kind, layer, after, command, path, hunks, expectExit: expect_exit, timeoutMs: timeout_ms, writeMode: write_mode } as BatchStepWithDeps;
+                        return {
+                            id, kind, layer, after, command, path, hunks, transport,
+                            expectExit: expect_exit, timeoutMs: timeout_ms, writeMode: write_mode,
+                            localPath: local_path, remotePath: remote_path,
+                        } as BatchStepWithDeps;
                     }),
                     layer: layerName === undefined ? stack.activeLayer?.name : layerName,
                     stopOnFail: stop_on_fail,
@@ -653,6 +729,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                         ...(s.stderr != null ? { stderr: s.stderr } : {}),
                         ...(s.error != null ? { error: s.error } : {}),
                         ...(s.skippedBecause != null ? { skipped_because: s.skippedBecause } : {}),
+                        ...(s.transfer ? { transfer: agentTransferResult(s.transfer) } : {}),
                         // 编辑保护信息完整透传（Astra 十九轮：成功用的无锁/非原子写入方式
                         // 须让 Agent 可感知——hunks 预览 + mutex + write_mode）
                         ...(s.edits != null ? {

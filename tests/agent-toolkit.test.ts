@@ -30,7 +30,7 @@ describe("createAgentToolkit（反馈 #3）", () => {
         expect(tk.tools.map((t) => t.function.name)).toEqual([
             "run_batch", // 置顶（第十三季黑盒：Lazy schema 按序读——run_batch 排第 7 被漏读）
             "run_command", "spawn_and_observe", "stop_and_verify",
-            "read_file", "edit_file", "observe_stream", "read_stream", "close_stream",
+            "read_file", "edit_file", "put_file", "get_file", "observe_stream", "read_stream", "close_stream",
             "push_ssh", "push_into", "list_layers", "remove_layer", // 第十季层族
         ]);
         const r = await tk.handlers.run_command({ command: "echo tk-out; exit 4" });

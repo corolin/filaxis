@@ -18,6 +18,7 @@
  */
 import type { RuntimeDriver } from "./driver.js";
 import { editFileMulti, type EditMultiHunk } from "./file-edit.js";
+import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
 
 /** exec 步骤（命令 + 预期退出码集合——非零预期显式声明） */
 export interface BatchExecStep {
@@ -46,7 +47,26 @@ export interface BatchReadStep {
     path: string;
 }
 
-export type BatchStep = BatchExecStep | BatchEditStep | BatchReadStep;
+interface BatchFileTransferStep {
+    id: string;
+    localPath: string;
+    remotePath: string;
+    transport?: FileTransferTransport;
+    timeoutMs?: number;
+}
+
+export interface BatchPutStep extends BatchFileTransferStep {
+    kind: "put";
+    writeMode?: "auto" | "inplace";
+}
+
+export interface BatchGetStep extends BatchFileTransferStep {
+    kind: "get";
+    writeMode?: never;
+}
+
+export type BatchStep = BatchExecStep | BatchEditStep | BatchReadStep | BatchPutStep | BatchGetStep;
+export const BATCH_STEP_KINDS = ["exec", "edit", "read", "put", "get"] as const satisfies readonly BatchStep["kind"][];
 
 /** 依赖边：after 列出的步骤全部 ok 后才启动；无 after = 就绪即可并行 */
 export type BatchStepWithDeps = BatchStep & { after?: string[]; layer?: string };
@@ -66,7 +86,7 @@ export type BatchStepStatus = "ok" | "fail" | "skipped";
 export interface BatchStepReport {
     id: string;
     layer?: string;
-    kind: "exec" | "edit" | "read";
+    kind: BatchStep["kind"];
     status: BatchStepStatus;
     startedAt?: number;
     durationMs?: number;
@@ -83,6 +103,7 @@ export interface BatchStepReport {
     outcome?: "unknown";
     /** edit：多 hunk 明细（old/new 文本即编辑预览） */
     edits?: { path: string; occurrences: number; bytesBefore: number; bytesAfter: number; hunks: EditMultiHunk[]; mutex?: "flock" | "degraded"; writeMode?: "atomic-replace" | "inplace-write" };
+    transfer?: LayerFileTransferResult;
     /** skipped 原因（依赖失败 / 批次失败于某步） */
     skippedBecause?: string;
     error?: string;
@@ -109,7 +130,7 @@ export async function runBatch(
     if (!Array.isArray(plan?.steps) || plan.steps.length === 0) {
         // 空计划拒绝（冷路径摸排批 4：SDK 直调曾静默 ok——CLI 有守卫而内核没有，
         // 绕过 CLI 的消费方拿到「成功执行了零个步骤」的假成功）
-        throw new Error(`批次计划非法：steps 需非空数组（[{id, kind: "exec"|"edit"|"read", ..., after?: [依赖 id]}]）`);
+        throw new Error(`批次计划非法：steps 需非空数组（kind 可为 ${BATCH_STEP_KINDS.join("、")}）`);
     }
     if (plan.layer !== undefined && !nonEmptyString(plan.layer)) throw new Error("批次计划非法：layer 需非空字符串");
     if (plan.stopOnFail !== undefined && typeof plan.stopOnFail !== "boolean") throw new Error("stopOnFail 需为布尔值");
@@ -119,8 +140,8 @@ export async function runBatch(
         if (byId.has(s.id)) throw new Error(`批次计划非法：id 重复 '${s.id}'`);
         // kind 前置校验（Sol 55 P2-E）：未知 kind 曾在 runStep 执行中才抛——计划里
         // 合法步骤已跑过（exec 已执行）才报未知类型。零副作用阶段拦死
-        if (s.kind !== "exec" && s.kind !== "edit" && s.kind !== "read") {
-            throw new Error(`批次计划非法：未知 kind '${(s as { kind: string }).kind}'（合法: exec|edit|read）——校验先行，合法步骤零执行`);
+        if (!BATCH_STEP_KINDS.includes(s.kind)) {
+            throw new Error(`批次计划非法：未知 kind '${s.kind}'（合法: ${BATCH_STEP_KINDS.join("、")}）`);
         }
         validateStep(s);
         byId.set(s.id, s);
@@ -246,6 +267,11 @@ function validateStep(step: BatchStepWithDeps): void {
         }
         return;
     }
+    if (step.kind === "put" || step.kind === "get") {
+        try { validateFileTransferFields(step.kind, step); }
+        catch (error) { invalid("传输参数", (error as Error).message); }
+        return;
+    }
     if (!nonEmptyString(step.path)) invalid("path", "需非空字符串");
     if (step.kind === "edit") {
         if (!Array.isArray(step.hunks) || !step.hunks.length || !step.hunks.every((h) =>
@@ -294,9 +320,13 @@ async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps): Promise<BatchS
             const content = await drv.fs.readFile(s.path);
             return { ...base, status: "ok", durationMs: Date.now() - startedAt, stdout: content };
         }
+        if (s.kind === "put" || s.kind === "get") {
+            const transfer = await transferLayerFile(drv, s.kind, s);
+            return { ...base, status: "ok", durationMs: Date.now() - startedAt, transfer };
+        }
         // 未知 kind 显式拒绝（Sol 五十四期 P2-6）：read 曾是兜底分支——kind:"typo"
         // 被当 read 执行还报成功（拼写错误静默降级成读文件）
-        throw new Error(`未知步骤 kind '${(s as { kind: string }).kind}'（合法: exec|edit|read）`);
+        throw new Error(`未知步骤 kind '${(s as { kind: string }).kind}'（合法: ${BATCH_STEP_KINDS.join("、")}）`);
     } catch (raw) {
         // 判空优先（GPT Astra 四轮 #3）：自定义 driver 可能 throw null/undefined——
         // 直接读 (err as {outcome}).outcome 会再抛 TypeError，catch 块崩掉整份 runBatch

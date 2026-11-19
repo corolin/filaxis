@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.2
+version: 0.2.3
 description: |
   牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
 
@@ -28,6 +28,8 @@ filaxis layer save <名> --host <user@主机>                          # 单层�
 # ② 执行 / 读文件（之后所有子命令都吃 --layer）
 filaxis exec --layer <名> -- "nginx -t"
 filaxis cat --layer <名> /etc/nginx/nginx.conf
+filaxis put --layer <名> -- ./config.yaml /tmp/config.yaml
+filaxis get --layer <名> --transport sftp -- /tmp/result.bin ./result.bin
 
 # ③ 复杂脚本免宿主 Shell 转义（引号/多行/Python -c 直达）
 cat script.sh | filaxis exec --layer <名> --stdin-script
@@ -53,6 +55,9 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
   的退出码与命令输出就是执行凭证；
 - 大输出（日志/配置全文）用 `read_file` 而非 `run_command cat`——结构化返回
   不占对话输出面。
+- 二进制或整文件传输用 `put_file` / `get_file`。`local_path` 位于 MCP 服务进程所在机器，`remote_path` 位于目标层。传 `layer` 指定目标，`transport: "sftp"` 可选用于文件系统可直达的 SSH 层。完整示例见 [文件同步剧本](./file-sync.md)。
+- 批量上传和下载用 `run_batch` 的 `kind: "put"` / `kind: "get"`，字段与单文件工具一致。多个步骤写同一个 `local_path` 或同一目标层文件时，用 `after` 排序，或为每个下载指定不同的本地路径。
+- 宿主拦截 SSH 匿名管道时，在建层前设 `FILAXIS_SSH_STDIO_MODE=inherit`。它支持直连、单跳 `-J` 和可非交互重放的进入步骤。逐跳 PTY、交互进入、持久转发和持续观察窗需要可用的匿名管道。若首轮已发出且终态未知，先核实远端状态再决定是否重发。
 
 **Agent 形态升级路径**：CLI 每条命令独立进程（连接不复用）。高频操作或脚本编排时换 SDK / `createAgentToolkit` 常驻形态——连接/PTY 复用 + 结构化参数（`editFile` 直接传字符串免临时 JSON 文件 + `runBatch` 直接传数组免 plan 文件），步数与 Token 双降（盲测实证阶段二 non_cache 省 17.7%）。
 

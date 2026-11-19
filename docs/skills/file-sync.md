@@ -5,11 +5,47 @@
 
 ## 剧本
 
-1. **选路径**：默认走 base64 管道（跨 Transport 一致——容器/K8s 层没有 sftp）；仅当两端都是 SSH 且文件很大（百 MB 级）才值得 sftp 快路径（探测可用性后启用）。
+1. **选路径**：CLI 默认走层的 exec 通道，适合进入容器后的文件传输。SSH 层的文件系统可直达时可加 `--transport sftp`，包括经 TCP 跳板访问的 SSH 层。SFTP 需要本机 `sftp`、服务端 SFTP 子系统及用于校验和落位的 SSH exec 通道。
 2. **信任校验，不信过程**：传输 API 自带 size + sha256 双校验——**校验失败必须当失败处理**（重传或上报），不要「文件在了就算成功」；篡改/截断在弱网上是真实会发生的事。
 3. **二进制安全**：文本读取 API 会破坏二进制字节——拉回 pcap/模型/图片必须走传输 API 或 base64 读取，全程不进 UTF-8 字符串。
 4. **批量分发的顺序**：先传一台 → 校验 → 远端执行一次启动验证 → 再扇面铺开。别裸扇出 20 台再发现路径错了。
 5. **远端原语**：编解码/校验命令的参数存在方言差异（GNU/BSD/busybox）——SDK 内部已按连接探测适配；你自己拼的远端脚本若用到这些原语，同样先探测再渲染。
+
+```bash
+filaxis put --layer app -- ./config.yaml /app/config.yaml
+filaxis get --layer host --transport sftp -- /var/tmp/result.bin ./result.bin
+```
+
+两个命令都传单个文件。`put` 的参数顺序是本地源、层内目标，`get` 反过来。查看 JSON 结果的 `verification` 和 `writeMode`。SFTP 失败时命令直接报错，由调用方核实后决定是否改用 exec。含通配符、引号或控制字符的文件名使用 exec。
+
+## MCP 上传和下载
+
+调用 `put_file` 上传，下例向 `app` 层写入文件。
+
+```json
+{"layer":"app","local_path":"./config.yaml","remote_path":"/app/config.yaml"}
+```
+
+调用 `get_file` 下载，下例用 SFTP 把二进制文件写到 MCP 服务所在机器。
+
+```json
+{"layer":"host","remote_path":"/var/tmp/result.bin","local_path":"./result.bin","transport":"sftp"}
+```
+
+`local_path` 由 MCP 服务进程解析，相对路径以其工作目录为准。两个工具都可能覆盖目标文件，成功后返回字节数、摘要、校验等级和 `write_mode`。文件内容直接写入目标路径。传输层和校验规则与 CLI 一致。
+
+多个文件可以放进同一次 `run_batch`。下例先从 `source` 层取回文件，再上传到 `target` 层。每步结果的 `transfer` 包含校验信息。
+
+```json
+{
+  "steps": [
+    {"id":"fetch","kind":"get","layer":"source","remote_path":"/tmp/data.bin","local_path":"./data.bin"},
+    {"id":"send","kind":"put","layer":"target","local_path":"./data.bin","remote_path":"/tmp/data.bin","after":["fetch"]}
+  ]
+}
+```
+
+独立传输可以并行。使用不同的本地目标路径下载到同一台 MCP 服务机器，或用 `after` 串行写入同一路径。
 
 ## 受控编辑 editFile（一行替代 20 行样板 / 免 sed -i 写坏）
 

@@ -136,6 +136,7 @@ export class McpServer {
                         "【先看这行】多文件读取/多命令巡检/定位排查 → 优先 run_batch（一次调用并行打包，不要逐个工具循环）；读工具 schema 时同轮并发读取（逐个读每步一趟 LLM）；",
                         "持续查看日志 → observe_stream 开窗、read_stream 回看或续读、close_stream 关闭；等就绪或错误模式 → spawn_and_observe；",
                         "edit_file 支持 write_mode:'inplace'（bind mount 保 inode 免重启）；",
+                        "在 MCP 服务主机与目标层之间传输文件用 put_file 和 get_file。",
                         "契约：退出码是数据（非零不是异常）；终态三态 exited/stopped/unknown；unknown 后用 stop_and_verify 核实。",
                     ].join("\n"),
                 });
@@ -233,6 +234,7 @@ function summarizeToolResult(name: string, value: unknown): string {
             if (step.exit_code !== undefined) header.push(`exit_code=${step.exit_code}`);
             if (step.outcome) header.push(`outcome=${step.outcome}`);
             if (step.edits) header.push(`replaced=${step.edits.occurrences}`);
+            if (step.transfer) header.push(transferSummary(step.transfer));
             const details = outputPreviews(step, BATCH_STEP_PREVIEW_BYTES);
             if (step.error) details.push(`error: ${preview(step.error, BATCH_STEP_PREVIEW_BYTES)}`);
             if (step.skipped_because) details.push(`skipped_because: ${preview(step.skipped_because, BATCH_STEP_PREVIEW_BYTES)}`);
@@ -240,7 +242,15 @@ function summarizeToolResult(name: string, value: unknown): string {
         });
         return [overview, ...steps].join("\n\n");
     }
+    if (name === "put_file" || name === "get_file") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["put_file"]>>;
+        return transferSummary(result);
+    }
     return summarize(value);
+}
+
+function transferSummary(result: Awaited<ReturnType<AgentToolHandlers["put_file"]>>): string {
+    return `bytes=${result.bytes} | transport=${result.transport} | verification=${result.verification} | write_mode=${result.write_mode}`;
 }
 
 function outputPreviews(output: { stdout?: string; stderr?: string }, limit: number): string[] {
