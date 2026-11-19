@@ -55,7 +55,10 @@ jobs:
       - name: Pack acceptance（断言 dist 产物与入口在包内）
         run: |
           npm pack --dry-run 2>&1 | tee /tmp/pack.txt
-          for f in dist/index.js dist/index.d.ts src/index.ts package.json README.md LICENSE NOTICE AGENTS.md; do
+          for f in dist/index.js dist/index.d.ts dist/bin/filaxis.js dist/bin/filaxis-mcp.js \
+            src/index.ts package.json README.md LICENSE NOTICE AGENTS.md \
+            docs/skills/SKILL.md docs/skills/longrun-observe.md docs/skills/file-sync.md \
+            docs/skills/cross-host-diagnosis.md docs/skills/stream-window.md; do
             grep -q "$f$" /tmp/pack.txt || { echo "PACK-MISSING: $f"; exit 1; }
           done
           echo "pack acceptance OK"

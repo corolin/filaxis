@@ -22,6 +22,8 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, readdir
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { installSkill } from "./install.js";
+import { withLocalWriteLock } from "./local-write-lock.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -205,41 +207,18 @@ function loadLayerStore(): Record<string, RuntimeDescriptor> {
 function updateLayerStore<T>(update: (store: Record<string, RuntimeDescriptor>) => T): T {
     const path = layerStorePath();
     mkdirSync(dirname(path), { recursive: true });
-    const lock = `${path}.lock`;
-    mkdirSync(lock, { recursive: true });
-    const claim = join(lock, `${process.pid}-${randomUUID()}`);
-    // Publish a unique claim before checking for other writers. A concurrent claim
-    // must see ours or finish writing before we enter the critical section.
-    writeFileSync(claim, "", { flag: "wx", mode: 0o600 });
-    const temporary = `${path}.${randomUUID()}.tmp`;
-    try {
-        for (const entry of readdirSync(lock)) {
-            const peer = join(lock, entry);
-            if (peer === claim) continue;
-            const owner = /^([1-9]\d*)-[0-9a-f-]{36}$/.exec(entry);
-            if (!owner) throw new Error(`层快照锁含无法识别的写入记录: ${peer}`);
-            try {
-                process.kill(Number(owner[1]), 0);
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-                    try { unlinkSync(peer); } catch (cleanup) {
-                        if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") throw cleanup;
-                    }
-                    continue;
-                }
-                if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
-            }
-            throw new Error(`层快照正在写入: ${path}`);
-        }
+    return withLocalWriteLock(path, "层快照", () => {
         const store = loadLayerStore();
         const result = update(store);
-        writeFileSync(temporary, JSON.stringify(store, null, 2), { flag: "wx", mode: 0o600 });
-        renameSync(temporary, path);
+        const temporary = `${path}.${randomUUID()}.tmp`;
+        try {
+            writeFileSync(temporary, JSON.stringify(store, null, 2), { flag: "wx", mode: 0o600 });
+            renameSync(temporary, path);
+        } finally {
+            try { unlinkSync(temporary); } catch { /* rename 后临时路径已消失 */ }
+        }
         return result;
-    } finally {
-        try { unlinkSync(temporary); } catch { /* rename 后临时路径已消失 */ }
-        unlinkSync(claim);
-    }
+    });
 }
 
 function handleLayerCmd(args: string[]): void {
@@ -324,6 +303,10 @@ async function readStdinAll(): Promise<string> {
 }
 
 async function main() {
+    if (cmd === "install") {
+        installSkill(args.slice(1), import.meta.url);
+        return;
+    }
     // 层快照管理组（不建 driver——纯本地 descriptor 读写）
     if (cmd === "layer") {
         handleLayerCmd(args);
@@ -499,6 +482,7 @@ async function main() {
             default:
                 console.error(`filaxis CLI — 千里一线，执行有迹
 用法:
+  filaxis install [--agent antigravity|claude|cursor|codex|all] [--project] [--mcp]
   filaxis exec    [--host u@h [--port N] [--key F]] [-J jump] [--enter CMD]... [--docker CTR]
                   [--timeout MS] [--pty] -- <command>
                   # --enter 支持 "ssh <目标>"（自动非交互重放）与 "<...> bash" 结尾形态；

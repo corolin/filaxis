@@ -43,24 +43,26 @@ test.skipIf(process.platform !== "linux")("SSH writeFile 解码器写出一部�
 });
 
 describe("ssh-helpers", () => {
+    const proxyHost = (host: string) => process.platform === "win32" ? host : `'${host}'`;
+
     test("sshArgsFor：结构化参数渲染（ProxyJump/-i/-p/-L）", () => {
         expect(sshArgsFor("vm")).toEqual(["vm"]);
         expect(sshArgsFor({ host: "192.0.2.10", conn: { user: "root", port: 2222, jump: "jump", keyFile: "~/id_ed", forwards: [{ kind: "L", port: 8080, target: "localhost:80" }] } }))
             .toEqual([
                 // ProxyCommand 等价形态（跳板白名单+sh 引用+策略随主连接——Astra 十一轮 #1/#2）
-                "-o", "ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -W %h:%p 'jump'",
+                "-o", `ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -W %h:%p ${proxyHost("jump")}`,
                 "-i", expect.any(String), "-p", "2222", "-L", "8080:localhost:80", "root@192.0.2.10",
             ]);
         // 跳板串 [host]:port / host:port / user@[host]:port → 命令行 -p 展开（引用包裹）
         expect(sshArgsFor({ host: "t", conn: { jump: "[127.0.0.1]:2222" } })[1])
-            .toBe("ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p '127.0.0.1'");
+            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("127.0.0.1")}`);
         expect(sshArgsFor({ host: "t", conn: { jump: "root@h:2222" } })[1])
-            .toBe("ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p 'root@h'");
+            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("root@h")}`);
         expect(sshArgsFor({ host: "t", conn: { jump: "u@[198.51.100.9]:2200" } })[1])
-            .toBe("ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p 'u@198.51.100.9'");
+            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("u@198.51.100.9")}`);
         // IPv6 字面量
         expect(sshArgsFor({ host: "t", conn: { jump: "[::1]:2200" } })[1])
-            .toBe("ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p '::1'");
+            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("::1")}`);
     });
 
     // GPT Astra 十一轮 #1：jump 原文拼入经 shell 执行的 ProxyCommand = 命令注入入口。
@@ -95,9 +97,18 @@ describe("ssh-helpers", () => {
             },
         });
         expect(args[1]).toContain("StrictHostKeyChecking=yes"); // 跳板不再降级
-        expect(args[1]).toMatch(/UserKnownHostsFile='[^']*known_jumps'/); // 路径引用在场
-        expect(args[1]).toContain("-p 2222 -W %h:%p 'ops@jump.example'");
-        expect(args[1]).toContain("-i '"); // 结构化 keyFile 引用
+        expect(args[1]).toMatch(/UserKnownHostsFile=.*known_jumps/);
+        expect(args[1]).toContain(`-p 2222 -W %h:%p ${proxyHost("ops@jump.example")}`);
+        expect(args[1]).toMatch(/-i .*id_jump/);
+    });
+
+    test.skipIf(process.platform !== "win32")("Windows proxy paths with spaces use native argv quoting", () => {
+        const args = sshArgsFor({ host: "target.example", conn: {
+            jump: { host: "jump.example", keyFile: "C:\\SSH data\\id_jump" },
+            hostKeyPolicy: "strict",
+            knownHostsFile: "C:\\SSH data\\known_hosts",
+        } });
+        expect(args[1]).toBe('ProxyCommand=ssh -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=\\"C:/SSH data/known_hosts\\"" -i "C:\\SSH data\\id_jump" -W %h:%p jump.example');
     });
 
     // GPT Astra 十一轮 #3：多跳逗号链显式拒绝（旧 -J 直传时跳板策略裸奔）——指引 sshInto

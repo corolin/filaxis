@@ -56,6 +56,25 @@ bun add @syrkos/filaxis    # 或 npm install @syrkos/filaxis
 - npm 依赖：**零**（`dependencies` 为空是 AC 门禁项，见 `bun run check:boundaries`）
 - 系统依赖按能力分列（`stack.features()` **探测本机视角**——Agent 在容器里跑 filaxis 时探测的是容器内的 `ssh`/`tmux`/`sftp`，目标主机的能力经 `launchCmd` 层的 shell 自行确认）：`ssh`≥7.3 全功能（`-J`）、`tmux` 仅持久会话（缺席自动降级非持久）、`sftp` 仅传输快路径
 
+## 安装 Agent Skill
+
+```bash
+npm i -g @syrkos/filaxis && filaxis install
+filaxis install --agent antigravity --mcp
+filaxis install --agent all --project
+```
+
+缺省检测本机已有的 Agent 配置目录。没有检测到时，安装到 `~/.agents/skills/filaxis`。`--agent` 可显式选择 `antigravity`、`claude`、`cursor`、`codex` 或 `all`。`--project` 以当前工作目录为项目根，多个 Agent 使用相同路径时只安装一次。
+
+| Agent | 全局 Skill 目录 | 项目 Skill 目录 |
+|---|---|---|
+| Antigravity | `~/.gemini/config/skills/filaxis` | `.agents/skills/filaxis` |
+| Claude Code | `~/.claude/skills/filaxis` | `.claude/skills/filaxis` |
+| Cursor | `~/.cursor/skills/filaxis` | `.cursor/skills/filaxis` |
+| Codex | `~/.agents/skills/filaxis` | `.agents/skills/filaxis` |
+
+安装目录包含入口、四份子剧本和配套的 `AGENTS.md`。重复执行会跳过相同文件并更新未手改的已安装文件。遇到内容冲突时，CLI 会报告路径并保留现有文件。`--mcp` 打印适用的 JSON 或 Codex TOML 片段及配置路径，片段使用本机运行时和 MCP 入口路径，便于合并到现有配置。
+
 ## 已验证的平台与连接方式
 
 | 操作系统 | 连接方式 | 验证范围 |

@@ -76,7 +76,6 @@ async function main(): Promise<void> {
     const tk = createAgentToolkit(stack, opts);
     new McpServer({
         toolkit: tk,
-        serverVersion: "0.1.0",
         // stdout 归 JSON-RPC——任何意外日志走 stderr
         logger: { debug: () => undefined, info: () => undefined, warn: (m: string) => console.error(`[mcp] ${m}`), error: (m: string) => console.error(`[mcp] ${m}`) },
     });
