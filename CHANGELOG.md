@@ -15,7 +15,7 @@
 
 - MCP 文本块展示 `run_batch` 的逐步结果、`run_command` 的多行输出和 `list_layers` 的层清单。
 - 修复 Windows 原生 OpenSSH 使用跳板时的参数引用，支持跳板别名和 `user@host:port`。
-- 新增 `filaxis install --agent`。由 Agent 显式选择平台，支持全局或项目级安装完整 Skill，以及输出 MCP 配置片段。
+- 新增 `filaxis mcp-config`，输出 JSON 或 TOML 格式的 MCP 配置片段。由 Agent 选择配置位置并合并。npm 包包含完整 Skill 与配套文档。
 
 ## 0.2.0
 

@@ -21,8 +21,8 @@ import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { installSkill } from "./install.js";
+import { dirname, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
 
 const args = process.argv.slice(2);
@@ -303,8 +303,22 @@ async function readStdinAll(): Promise<string> {
 }
 
 async function main() {
-    if (cmd === "install") {
-        installSkill(args.slice(1), import.meta.url);
+    if (cmd === "mcp-config") {
+        const usage = "用法: filaxis mcp-config [--format json|toml]";
+        const options = args.slice(1);
+        if (options.length === 1 && (options[0] === "--help" || options[0] === "-h")) {
+            console.log(usage);
+            return;
+        }
+        const format = options.length === 0 ? "json" : options[1];
+        if (options.length !== 0 && (options.length !== 2 || options[0] !== "--format"
+            || (format !== "json" && format !== "toml"))) throw new Error(usage);
+
+        const cli = fileURLToPath(import.meta.url);
+        const server = { command: process.execPath, args: [join(dirname(cli), `filaxis-mcp${extname(cli)}`)] };
+        console.log(format === "toml"
+            ? `[mcp_servers.filaxis]\ncommand = ${JSON.stringify(server.command)}\nargs = ${JSON.stringify(server.args)}`
+            : JSON.stringify({ mcpServers: { filaxis: server } }, null, 2));
         return;
     }
     // 层快照管理组（不建 driver——纯本地 descriptor 读写）
@@ -482,7 +496,7 @@ async function main() {
             default:
                 console.error(`filaxis CLI — 千里一线，执行有迹
 用法:
-  filaxis install --agent <antigravity|claude|cursor|codex|all> [--project] [--mcp]
+  filaxis mcp-config [--format json|toml]  # 输出 MCP 配置片段
   filaxis exec    [--host u@h [--port N] [--key F]] [-J jump] [--enter CMD]... [--docker CTR]
                   [--timeout MS] [--pty] -- <command>
                   # --enter 支持 "ssh <目标>"（自动非交互重放）与 "<...> bash" 结尾形态；
