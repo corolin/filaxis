@@ -5,7 +5,7 @@ import { autonomousSshOpts, enterStepsOf, sshArgsFor, type SshConnParams } from 
 
 export type FileTransferTransport = "exec" | "sftp";
 
-interface LayerFileTransferOptions {
+export interface LayerFileTransferOptions {
     localPath: string;
     remotePath: string;
     transport?: FileTransferTransport;
@@ -42,7 +42,8 @@ export async function transferLayerFile(
     if (driver.descriptor.driver === "local" && process.platform === "win32") layerPath = layerPath.replaceAll("\\", "/");
     if (layerPath.startsWith("-")) layerPath = `./${layerPath}`;
     const sftp = transport === "sftp" ? sftpOptions(driver.descriptor, timeoutMs, forceInplace) : undefined;
-    const exec = (command: string) => driver.exec(command, { timeoutMs });
+    const auditLabel = operation === "put" ? "file upload" : "file download";
+    const exec = (command: string) => driver.exec(command, { timeoutMs, auditLabel });
     const dialect = await probeDialect(exec);
     const result = operation === "put"
         ? (sftp ? await sftpPutFile(exec, dialect, localPath, layerPath, sftp)

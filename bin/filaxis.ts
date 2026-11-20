@@ -54,7 +54,13 @@ function numArg(argv: string[], i: number, opts: { positive?: boolean } = {}): n
     return n;
 }
 
-function parseOpts(argv: string[], strict = false): {
+const batchValueOptions = new Set([
+    "--host", "--user", "--port", "--key", "-J", "--jump", "--hop", "--enter",
+    "--docker", "--docker-shell", "--docker-runtime", "--forward", "--host-key", "--known-hosts",
+    "--layer", "--request-file",
+]);
+
+function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "default"): {
     host?: string; user?: string; port?: number; key?: string;
     jump?: string; hop: string[]; enter: string[];
     docker?: string; dockerShell?: string; dockerRuntime?: string;
@@ -63,7 +69,7 @@ function parseOpts(argv: string[], strict = false): {
     timeout?: number; duration?: number; stream?: string; all?: boolean;
     writeMode?: "auto" | "inplace";
     transport?: "exec" | "sftp";
-    stdinJson?: boolean; requestFile?: string; pty?: boolean;
+    stdinJson?: boolean; requestFile?: string; pty?: boolean; help?: boolean;
     stdinScript?: boolean; scriptFile?: string; // exec 免 Shell 通道（盲测 #4）
     positional: string[];
 } {
@@ -73,6 +79,12 @@ function parseOpts(argv: string[], strict = false): {
         const a = argv[i]!;
         if (noMoreOpts) { o.positional.push(a); continue; }
         if (a === "--") { noMoreOpts = true; continue; } // 命令分隔符：终止选项解析
+        if (a === "--help" || a === "-h") return { ...o, help: true };
+        if (mode === "batch" && a.startsWith("-") && a !== "--stdin-json") {
+            if (!batchValueOptions.has(a)) throw new Error(`batch 不支持 ${a}`);
+            const value = argv[i + 1];
+            if (!value || value.startsWith("-")) throw new Error(`batch 的 ${a} 需要参数值`);
+        }
         switch (a) {
             case "--host": {
                 const v = argv[++i];
@@ -120,7 +132,7 @@ function parseOpts(argv: string[], strict = false): {
             case "--script-file": o.scriptFile = argv[++i]; break; // exec 免 Shell：命令从文件读
             case "--request-file": o.requestFile = argv[++i]; break;
             default:
-                if (strict && a.startsWith("-")) throw new Error(`未知参数 ${a}。以 - 开头的路径请放在 -- 之后`);
+                if (mode !== "default" && a.startsWith("-")) throw new Error(`未知参数 ${a}。以 - 开头的路径请放在 -- 之后`);
                 o.positional.push(a);
         }
     }
@@ -238,9 +250,7 @@ function updateLayerStore<T>(update: (store: Record<string, RuntimeDescriptor>) 
     });
 }
 
-function handleLayerCmd(args: string[]): void {
-    const sub = args[1];
-    const rest = parseOpts(args.slice(2));
+function handleLayerCmd(sub: string | undefined, rest: ReturnType<typeof parseOpts>): void {
     if (sub === "save") {
         const [name] = rest.positional;
         if (!name || !rest.host) {
@@ -277,8 +287,14 @@ function handleLayerCmd(args: string[]): void {
     }
 }
 
+const sshLogger = { ...noopLogger, warn: (message: string) => console.error(`[filaxis] ${message}`) };
+
+function savedLayerDriver(name: string, layers: Record<string, RuntimeDescriptor> = loadLayerStore()): SshPtyDriver {
+    if (!Object.hasOwn(layers, name)) throw new Error(`层 '${name}' 未保存（filaxis layer list 查看；filaxis layer save ${name} --host ... 创建）`);
+    return new SshPtyDriver(layers[name]!, { logger: sshLogger });
+}
+
 async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false): Promise<RuntimeDriver> {
-    const logger = { ...noopLogger, warn: (message: string) => console.error(`[filaxis] ${message}`) };
     // PTY link 按需建（审计 M1）：exec 通道独立 ssh 进程、观察流独立 spawn——都不依赖
     // PTY link，且不 init 能保留 execChannel 的「多跳不可直达」诚实拒绝语义（统一
     // init 会把假跳板名的错误提前成建链失败，改变错误落点）；--pty 走 link.execMarker
@@ -286,13 +302,9 @@ async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false
     const drv: RuntimeDriver = (() => {
         if (opts.layer) {
             if (opts.host) throw new Error("--layer 与 --host 互斥（层路径已持久化——改路径请 filaxis layer save 覆盖）");
-            const desc = loadLayerStore()[opts.layer];
-            if (!desc) {
-                throw new Error(`层 '${opts.layer}' 未保存（filaxis layer list 查看；filaxis layer save ${opts.layer} --host ... 创建）`);
-            }
-            return new SshPtyDriver(desc, { logger });
+            return savedLayerDriver(opts.layer);
         }
-        if (opts.host) return new SshPtyDriver(buildSshDescriptor(opts), { logger });
+        if (opts.host) return new SshPtyDriver(buildSshDescriptor(opts), { logger: sshLogger });
         // local 层无路径概念——路径参数在场而 --host 缺席 = 防呆报错（静默忽略=错机器风险）
         if (opts.jump || opts.hop.length || opts.enter.length || opts.docker || opts.forward.length || opts.hostKey || opts.knownHosts) {
             throw new Error("路径描述参数（--jump/--hop/--enter/--docker/--forward/--host-key/--known-hosts）需要 --host（local 层无路径概念）");
@@ -301,6 +313,14 @@ async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false
     })();
     if (needPtyLink && drv instanceof SshPtyDriver) await drv.init();
     return drv;
+}
+
+async function destroyDriver(driver: RuntimeDriver): Promise<void> {
+    try { await driver.destroy(); }
+    catch (error) {
+        console.error(`[filaxis] 连接销毁失败: ${error instanceof Error ? error.message : String(error)}`);
+        if (!process.exitCode) process.exitCode = 1;
+    }
 }
 
 /** 读尽管道 stdin（TTY 直接报用法——绝不挂起等输入；process.stdin 双运行时兼容） */
@@ -320,11 +340,122 @@ async function readStdinAll(): Promise<string> {
     return text;
 }
 
+async function runCliBatch(o: ReturnType<typeof parseOpts>): Promise<void> {
+    // 批次组合（第十一季）：计划 JSON 经 --request-file / --stdin-json 直达
+    //（免 Shell 通道哲学——多行命令/hunk 绝不进 argv）
+    if (o.positional.length) throw new Error(`batch 不接受位置参数：${o.positional.join(" ")}`);
+    if (o.layer && o.host) throw new Error("--layer 与 --host 互斥");
+    if (!o.host && (o.user !== undefined || o.port !== undefined || o.key !== undefined
+        || o.jump || o.hop.length || o.enter.length || o.docker || o.dockerRuntime || o.dockerShell
+        || o.forward.length || o.hostKey || o.knownHosts)) {
+        throw new Error("batch 的 SSH 连接参数需要 --host；已保存层请在快照内配置");
+    }
+    if (Boolean(o.requestFile) === Boolean(o.stdinJson)) {
+        throw new Error("用法: filaxis batch [--layer X | --host ...] (--request-file <plan.json> | --stdin-json)");
+    }
+    const payload = o.requestFile ? readFileSync(o.requestFile, "utf-8") : await readStdinAll();
+    let plan: BatchPlan;
+    try {
+        plan = JSON.parse(payload) as BatchPlan;
+    } catch (e) {
+        throw new Error(`batch 计划 JSON 解析失败: ${(e as Error).message}`);
+    }
+    if (o.layer && plan && typeof plan === "object" && !Array.isArray(plan) && plan.layer === undefined) {
+        plan = { ...plan, layer: o.layer };
+    }
+    const drivers = new Map<string | undefined, RuntimeDriver>();
+    let saved: Record<string, RuntimeDescriptor> | undefined;
+    try {
+        const r = await runBatch(async (name) => {
+            const existing = drivers.get(name);
+            if (existing) return existing;
+            const driver = name === undefined ? await driverFor(o) : savedLayerDriver(name, saved ??= loadLayerStore());
+            drivers.set(name, driver);
+            return driver;
+        }, plan);
+        for (const s of r.steps) {
+            const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})${s.layer === undefined ? "" : ` layer=${s.layer}`}`;
+            if (s.status === "skipped") {
+                console.log(`${head} — ${s.skippedBecause}`);
+                continue;
+            }
+            if (s.kind === "exec") {
+                console.log(`${head} exit=${s.exitCode}${s.effectiveUser ? ` user=${s.effectiveUser}` : ""}${s.error ? ` ✗ ${s.error}` : ""}`);
+                if (s.stdout) process.stdout.write(s.stdout.endsWith("\n") ? s.stdout : s.stdout + "\n");
+                if (s.stderr) process.stderr.write(s.stderr.endsWith("\n") ? s.stderr : s.stderr + "\n");
+            } else if (s.kind === "edit" && s.edits) {
+                console.log(`${head} ${s.edits.path} 替换 ${s.edits.occurrences} 处，${s.edits.bytesBefore}B → ${s.edits.bytesAfter}B${s.edits.mutex === "degraded" ? "（无锁降级）" : ""}`);
+            } else if (s.transfer) {
+                const { bytes, transport, verification, writeMode } = s.transfer;
+                console.log(`${head} ${bytes} 字节 | transport=${transport} | verification=${verification} | writeMode=${writeMode}`);
+            } else {
+                console.log(`${head} ${((s.stdout ?? "").length)} 字符`);
+            }
+            if (s.error && s.kind !== "exec") console.error(`  ✗ ${s.error}`);
+        }
+        console.log(`batch ${r.status}${r.failedStep ? `（失败于 ${r.failedStep}）` : ""}`);
+        process.exitCode = r.status === "ok" ? 0 : 1;
+    } finally {
+        await Promise.all([...drivers.values()].map(destroyDriver));
+    }
+}
+
+const generalHelp = `filaxis CLI — 千里一线，执行有迹
+用法:
+  filaxis mcp-config [--format json|toml]  # 输出 MCP 配置片段
+  filaxis exec    [--host u@h [--port N] [--key F]] [-J jump] [--enter CMD]... [--docker CTR]
+                  [--timeout MS] [--pty] -- <command>
+                  # --enter 支持 "ssh <目标>"（自动非交互重放）与 "<...> bash" 结尾形态；
+                  # 交互式进入（su - 类）用 --pty（stderr 与 stdout 混流=终端物理行为）
+  filaxis cat     [--host ...] <path>
+  ${transferUsage("put")}
+  ${transferUsage("get")}
+  filaxis edit    [--host ...] <path> <old> <new> [--all]   # 受控编辑（TOCTOU 锁+精确替换）
+                  <path> --stdin-json | --request-file <f>  #   免 Shell 通道（JSON {old,new,all}——多行/引号保真）
+  filaxis observe [--host ...] [--stream stderr|stdout|both] [--duration MS] -- <command>
+  filaxis probe   [--host ...]                                     # 两段式环境探测
+  filaxis batch   [--layer ...|--host ...] --request-file <plan>   # 批次组合（DAG 依赖+fail-fast+逐步骤证据）
+                  --stdin-json                                 # 计划及每步可用 layer 选择已保存层
+  filaxis layer   save <name> --host ... [-J/--hop/--enter/--docker/...]   # 层路径持久化
+                  list | rm <name>                                 # 层清单/移除
+  （全子命令 --layer <name> 用已存层一行直达；与 --host 互斥）
+
+路径描述（需 --host；对齐内核三件套 connParams/sshHops/enterPipeline）:
+  -J, --jump <j>          跳板（-J：途径机不占层，ssh 自身代理）
+  --hop <user@host[:port]> 逐跳登录链（可重复=链序；每跳独立端口/用户，密钥共享 --key）
+  --enter <cmd>           进入内层 shell（可重复=管线序，如 "docker exec -i web bash"）
+  --docker <name>         糖 = --enter "docker exec -i <name> sh"（--docker-shell bash / --docker-runtime podman 可换）
+  --forward L:8080:host:80  端口透传（可重复；R:/D: 同构；bind 走 SDK descriptor）
+  --host-key tofu|strict  主机密钥策略（缺省 tofu=accept-new）
+  --known-hosts <file>    自定义 known_hosts
+连接复用：Linux 下 ControlMaster 自动多路复用（同目标跨命令毫秒级，FILAXIS_NO_MUX=1 禁用）；
+Windows 无 CM 支持退化直连。每跳独立密钥等极端拓扑请用 SDK descriptor。缺省 --host 为 local。`;
+
 async function main() {
+    const helpFlag = (value: string | undefined) => value === "--help" || value === "-h";
+    const commandHelp = new Map<string, string>([
+        ["mcp-config", "filaxis mcp-config [--format json|toml]"],
+        ["exec", "filaxis exec [--layer NAME | --host HOST] [--timeout MS] [--pty] -- <command>\nfilaxis exec [目标选项] --stdin-script | --script-file FILE"],
+        ["cat", "filaxis cat [--layer NAME | --host HOST] -- <path>"],
+        ["put", transferUsage("put")],
+        ["get", transferUsage("get")],
+        ["edit", "filaxis edit [--layer NAME | --host HOST] <path> <old> <new> [--all] [--write-mode auto|inplace]\nfilaxis edit [目标选项] <path> --stdin-json | --request-file FILE"],
+        ["observe", "filaxis observe [--layer NAME | --host HOST] [--stream stderr|stdout|both] [--duration MS] -- <command>"],
+        ["probe", "filaxis probe [--layer NAME | --host HOST]"],
+        ["batch", "filaxis batch [--layer NAME | --host HOST] --request-file FILE | --stdin-json\n目标优先级：步骤 layer → 计划 layer → --layer 或 --host。命名层来自 filaxis layer save。"],
+        ["layer", "filaxis layer save <name> --host HOST | list | rm <name>"],
+        ["layer save", "filaxis layer save <name> --host HOST [--port N] [--key FILE] [-J JUMP] [--hop HOST] [--enter CMD] [--docker CTR] [--forward SPEC] [--host-key tofu|strict] [--known-hosts FILE]"],
+        ["layer list", "filaxis layer list"],
+        ["layer rm", "filaxis layer rm <name>"],
+    ]);
+    if (!cmd || (args.length === 1 && helpFlag(cmd))) {
+        console.log(generalHelp);
+        return;
+    }
     if (cmd === "mcp-config") {
-        const usage = "用法: filaxis mcp-config [--format json|toml]";
+        const usage = `用法: ${commandHelp.get(cmd)}`;
         const options = args.slice(1);
-        if (options.length === 1 && (options[0] === "--help" || options[0] === "-h")) {
+        if (helpFlag(options[0]) || (options[0] === "--format" && helpFlag(options[2]))) {
             console.log(usage);
             return;
         }
@@ -341,15 +472,26 @@ async function main() {
     }
     // 层快照管理组（不建 driver——纯本地 descriptor 读写）
     if (cmd === "layer") {
-        handleLayerCmd(args);
+        const sub = args[1];
+        const o = parseOpts(args.slice(2));
+        if (helpFlag(sub) || o.help) {
+            console.log(`用法: ${commandHelp.get(`layer ${sub}`) ?? commandHelp.get(cmd)}`);
+            return;
+        }
+        handleLayerCmd(sub, o);
         return;
     }
     const transfer = cmd === "put" || cmd === "get" ? cmd : undefined;
-    if (transfer && args.length === 2 && (args[1] === "--help" || args[1] === "-h")) {
-        console.log(transferUsage(transfer));
+    const o = parseOpts(args.slice(1), cmd === "batch" ? "batch" : transfer ? "strict" : "default");
+    const help = commandHelp.get(cmd);
+    if (o.help && help) {
+        console.log(`用法: ${help}`);
         return;
     }
-    const o = parseOpts(args.slice(1), transfer !== undefined);
+    if (cmd === "batch") {
+        await runCliBatch(o);
+        return;
+    }
     if (transfer) {
         if (o.pty) throw new Error(`${transfer} 需要非交互 exec 通道完成文件校验`);
         if (transfer === "get" && o.writeMode !== undefined) throw new Error("--write-mode 仅用于 put");
@@ -493,92 +635,17 @@ async function main() {
                 }
                 break;
             }
-            case "batch": {
-                // 批次组合（第十一季）：计划 JSON 经 --request-file / --stdin-json 直达
-                //（免 Shell 通道哲学——多行命令/hunk 绝不进 argv）
-                if (!o.requestFile && !o.stdinJson) {
-                    throw new Error("用法: filaxis batch [--layer X | --host ...] (--request-file <plan.json> | --stdin-json)");
-                }
-                const payload = o.requestFile ? readFileSync(o.requestFile, "utf-8") : await readStdinAll();
-                let plan: BatchPlan;
-                try {
-                    plan = JSON.parse(payload) as BatchPlan;
-                } catch (e) {
-                    throw new Error(`batch 计划 JSON 解析失败: ${(e as Error).message}`);
-                }
-                if (!Array.isArray(plan.steps) || plan.steps.length === 0) {
-                    throw new Error('batch 计划需含非空 steps 数组（kind 可为 exec、edit、read、put、get）');
-                }
-                const r = await runBatch(drv, plan);
-                for (const s of r.steps) {
-                    const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})`;
-                    if (s.status === "skipped") {
-                        console.log(`${head} — ${s.skippedBecause}`);
-                        continue;
-                    }
-                    if (s.kind === "exec") {
-                        console.log(`${head} exit=${s.exitCode}${s.effectiveUser ? ` user=${s.effectiveUser}` : ""}${s.error ? ` ✗ ${s.error}` : ""}`);
-                        if (s.stdout) process.stdout.write(s.stdout.endsWith("\n") ? s.stdout : s.stdout + "\n");
-                        if (s.stderr) process.stderr.write(s.stderr.endsWith("\n") ? s.stderr : s.stderr + "\n");
-                    } else if (s.kind === "edit" && s.edits) {
-                        console.log(`${head} ${s.edits.path} 替换 ${s.edits.occurrences} 处，${s.edits.bytesBefore}B → ${s.edits.bytesAfter}B${s.edits.mutex === "degraded" ? "（无锁降级）" : ""}`);
-                    } else if (s.transfer) {
-                        const { bytes, transport, verification, writeMode } = s.transfer;
-                        console.log(`${head} ${bytes} 字节 | transport=${transport} | verification=${verification} | writeMode=${writeMode}`);
-                    } else {
-                        console.log(`${head} ${((s.stdout ?? "").length)} 字符`);
-                    }
-                    if (s.error && s.kind !== "exec") console.error(`  ✗ ${s.error}`);
-                }
-                console.log(`batch ${r.status}${r.failedStep ? `（失败于 ${r.failedStep}）` : ""}`);
-                process.exitCode = r.status === "ok" ? 0 : 1;
-                break;
-            }
             case "probe": {
                 const r = await discoverLayer(drv, { skipStage2: false });
                 console.log(JSON.stringify({ key: r.key, spec: r.spec, note: r.probeNote }, null, 2));
                 break;
             }
             default:
-                console.error(`filaxis CLI — 千里一线，执行有迹
-用法:
-  filaxis mcp-config [--format json|toml]  # 输出 MCP 配置片段
-  filaxis exec    [--host u@h [--port N] [--key F]] [-J jump] [--enter CMD]... [--docker CTR]
-                  [--timeout MS] [--pty] -- <command>
-                  # --enter 支持 "ssh <目标>"（自动非交互重放）与 "<...> bash" 结尾形态；
-                  # 交互式进入（su - 类）用 --pty（stderr 与 stdout 混流=终端物理行为）
-  filaxis cat     [--host ...] <path>
-  ${transferUsage("put")}
-  ${transferUsage("get")}
-  filaxis edit    [--host ...] <path> <old> <new> [--all]   # 受控编辑（TOCTOU 锁+精确替换）
-                  <path> --stdin-json | --request-file <f>  #   免 Shell 通道（JSON {old,new,all}——多行/引号保真）
-  filaxis observe [--host ...] [--stream stderr|stdout|both] [--duration MS] -- <command>
-  filaxis probe   [--host ...]                                     # 两段式环境探测
-  filaxis batch   [--layer ...|--host ...] --request-file <plan>   # 批次组合（DAG 依赖+fail-fast+逐步骤证据）
-                  --stdin-json                                     #   计划 JSON：{steps:[{id,kind,command/path,hunks,after}], maxParallel}
-  filaxis layer   save <name> --host ... [-J/--hop/--enter/--docker/...]   # 层路径持久化
-                  list | rm <name>                                 # 层清单/移除
-  （全子命令 --layer <name> 用已存层一行直达；与 --host 互斥）
-
-路径描述（需 --host；对齐内核三件套 connParams/sshHops/enterPipeline）:
-  -J, --jump <j>          跳板（-J：途径机不占层，ssh 自身代理）
-  --hop <user@host[:port]> 逐跳登录链（可重复=链序；每跳独立端口/用户，密钥共享 --key）
-  --enter <cmd>           进入内层 shell（可重复=管线序，如 "docker exec -i web bash"）
-  --docker <name>         糖 = --enter "docker exec -i <name> sh"（--docker-shell bash / --docker-runtime podman 可换）
-  --forward L:8080:host:80  端口透传（可重复；R:/D: 同构；bind 走 SDK descriptor）
-  --host-key tofu|strict  主机密钥策略（缺省 tofu=accept-new）
-  --known-hosts <file>    自定义 known_hosts
-连接复用：Linux 下 ControlMaster 自动多路复用（同目标跨命令毫秒级，FILAXIS_NO_MUX=1 禁用）；
-Windows 无 CM 支持退化直连。每跳独立密钥等极端拓扑请用 SDK descriptor。缺省 --host 为 local。`);
-                process.exit(cmd ? 1 : 0);
+                console.error(generalHelp);
+                process.exitCode = 1;
         }
     } finally {
-        try {
-            await drv.destroy();
-        } catch (error) {
-            console.error(`[filaxis] 连接销毁失败: ${error instanceof Error ? error.message : String(error)}`);
-            if (!process.exitCode) process.exitCode = 1;
-        }
+        await destroyDriver(drv);
     }
 }
 

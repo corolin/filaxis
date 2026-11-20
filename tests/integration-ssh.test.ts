@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { StreamSessionManager } from "../src/stream-session-manager.js";
 import { putFile, getFile } from "../src/file-transfer.js";
+import { transferLayerFile } from "../src/index.js";
 import { probeDialect } from "../src/dialect.js";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,6 +52,32 @@ async function verifyFileStdioLayer(jump?: string): Promise<void> {
 }
 
 integration("file stdio registers a direct named layer and executes without a PTY", () => verifyFileStdioLayer(), 30_000);
+
+integration("bounded SSH capture keeps both streams and the completion sentinel in pipe and file modes", async () => {
+    const saved = process.env.FILAXIS_SSH_STDIO_MODE;
+    try {
+        for (const fileMode of [false, true]) {
+            if (fileMode) process.env.FILAXIS_SSH_STDIO_MODE = "inherit";
+            else delete process.env.FILAXIS_SSH_STDIO_MODE;
+            const driver = new SshPtyDriver({ driver: "ssh", target: TARGET });
+            try {
+                const result = await driver.exec(`printf 'ab🧵'; head -c 1048576 /dev/zero; printf 'stderr-marker' >&2; head -c 1048576 /dev/zero >&2; exit 7`, { maxOutputBytes: 3 });
+                expect(result.exitCode).toBe(7);
+                expect(result.stdout).toBe("ab\n[采集阶段已截断 1048580 字节]");
+                expect(result.stderr).toContain("std\n[采集阶段已截断");
+                expect(result.effectiveUser).toBeTruthy();
+                const lateOutput = await driver.exec(
+                    "printf before; (sleep 0.2; head -c 65536 /dev/zero) & exit 9",
+                    { maxOutputBytes: 16 },
+                );
+                expect(lateOutput).toMatchObject({ exitCode: 9, stdout: "before" });
+            } finally { await driver.destroy(); }
+        }
+    } finally {
+        if (saved === undefined) delete process.env.FILAXIS_SSH_STDIO_MODE;
+        else process.env.FILAXIS_SSH_STDIO_MODE = saved;
+    }
+}, 45_000);
 jumpIntegration("file stdio registers a named layer through a TCP jump", () =>
     verifyFileStdioLayer(process.env.FILAXIS_IT_JUMP ?? "127.0.0.1"), 60_000);
 
@@ -350,6 +377,54 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
             rmSync(dir, { recursive: true, force: true });
             await drv.exec(`rm -f ${remote}`);
             await drv.destroy();
+        }
+    }, 120_000);
+
+    integration("SDK exec 上传遵循目标 umask，覆盖时保留已有权限", async () => {
+        const local = mkdtempSync(join(tmpdir(), "fx-put-mode-"));
+        const drv = new SshPtyDriver({ driver: "ssh", target: TARGET });
+        let remote: string | undefined;
+        const masks = [["022", "644"], ["027", "640"], ["077", "600"], ["444", "222"], ["002", "664"]] as const;
+        try {
+            const created = await drv.exec("mktemp -d /tmp/filaxis-put-mode.XXXXXXXXXX");
+            expect(created.exitCode).toBe(0);
+            const stage = created.stdout.trim();
+            expect(stage).toMatch(/^\/tmp\/filaxis-put-mode\.[A-Za-z0-9]{10}$/);
+            remote = stage;
+            const input = join(local, "input");
+            const payload = Buffer.from([0, 128, 255, 10]);
+            writeFileSync(input, payload);
+            for (const [mask, mode] of masks) {
+                const path = `${stage}/mode-${mask}`;
+                let stagingMode: string | undefined;
+                const exec = async (command: string) => {
+                    // GNU mv -T receives the staging payload as its second argument.
+                    const inspect = command.includes("FX_MV_OK")
+                        ? 'mv() { printf "stage-mode="; stat -c %a "$(dirname "$2")"; command mv "$@"; }; '
+                        : "";
+                    const result = await drv.exec(`umask ${mask}; ${inspect}${command}`);
+                    stagingMode ??= result.stdout.match(/stage-mode=(\d+)/)?.[1];
+                    return result;
+                };
+                await putFile(exec, await probeDialect(exec), input, path);
+                expect(stagingMode).toBe("700");
+                expect((await drv.exec(`stat -c %a ${shellQuote(path)}`)).stdout.trim()).toBe(mode);
+                expect((await drv.exec(`chmod 604 ${shellQuote(path)}`)).exitCode).toBe(0);
+                expect(await transferLayerFile(drv, "put", { localPath: input, remotePath: path }))
+                    .toMatchObject({ bytes: payload.length, verification: "sha256", writeMode: "atomic-replace" });
+                expect((await drv.exec(`stat -c %a ${shellQuote(path)}`)).stdout.trim()).toBe("604");
+            }
+            expect((await drv.exec(`find ${shellQuote(stage)} -mindepth 1 -type d -print`)).stdout.trim()).toBe("");
+        } finally {
+            try {
+                if (remote) {
+                    const files = masks.map(([mask]) => shellQuote(`${remote}/mode-${mask}`)).join(" ");
+                    await drv.exec(`rm -f ${files}; rmdir ${shellQuote(remote)}`);
+                }
+            } finally {
+                await drv.destroy();
+                rmSync(local, { recursive: true, force: true });
+            }
         }
     }, 120_000);
 
@@ -664,6 +739,32 @@ describe("第十一季：批量组合（CI 真机）", () => {
     }, 120_000);
 });
 describe("第十一季：CLI 层快照（CI 真机）", () => {
+    integration("CLI batch 解析逐步 layer、计划 layer 和命令行默认层", () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-cli-batch-"));
+        const layers = join(dir, "layers.json");
+        const planPath = join(dir, "plan.json");
+        const env = { ...process.env, FILAXIS_LAYERS: layers };
+        const run = (plan: object, layer: string) => {
+            writeFileSync(planPath, JSON.stringify(plan));
+            return execFileSync(process.execPath, [
+                "bin/filaxis.ts", "batch", "--layer", layer, "--request-file", planPath,
+            ], { encoding: "utf8", env });
+        };
+        try {
+            writeFileSync(layers, JSON.stringify({
+                root: { driver: "ssh", target: TARGET, cwd: "/" },
+                tmp: { driver: "ssh", target: TARGET, cwd: "/tmp" },
+            }));
+            const first = { id: "first", kind: "exec", command: "pwd" };
+            const second = { id: "second", kind: "exec", command: "pwd", layer: "tmp", after: ["first"] };
+            expect(run({ layer: "root", steps: [first, second] }, "tmp"))
+                .toMatch(/first .*layer=root[^\n]*\n\/\r?\n.*second .*layer=tmp[^\n]*\n\/tmp\r?\nbatch ok/);
+            expect(run({ steps: [first] }, "tmp")).toMatch(/first .*layer=tmp[^\n]*\n\/tmp\r?\nbatch ok/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 120_000);
+
     integration("layer save → exec --layer 一行直达（CM master 跨命令复用）", async () => {
         const { tmpdir } = await import("node:os");
         const { join: j } = await import("node:path");

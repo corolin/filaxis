@@ -23,7 +23,10 @@ import { noopLogger, type FilaxisLogger } from "./logger.js";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const JSONRPC_VERSION = "2.0";
 const COMMAND_PREVIEW_BYTES = 8 * 1024;
-const BATCH_STEP_PREVIEW_BYTES = 4 * 1024;
+const BATCH_PREVIEW_BYTES = 4 * 1024;
+const BATCH_TEXT_JSON_BYTES = 8 * 1024;
+const BATCH_DETAIL_BYTES = 1024;
+const FULL_OUTPUT_HINT = "，完整输出见 structuredContent";
 
 interface JsonRpcRequest {
     jsonrpc: string;
@@ -161,13 +164,14 @@ export class McpServer {
                     this.replyErr(id, -32602, `Unknown tool: ${name}`, { available: TOOL_DEFS.map((d) => d.function.name) });
                     return;
                 }
+                const textOnlyBatch = name === "run_batch" && args.output === "text";
                 try {
                     if (typeof args !== "object" || Array.isArray(args)) throw new Error(`${name} 的 arguments 需为对象`);
                     const r = await handler(args);
                     // Some clients only expose content, so include bounded command output there.
                     this.reply(id, {
-                        content: [{ type: "text", text: summarizeToolResult(name, r) }],
-                        structuredContent: r,
+                        content: [{ type: "text", text: summarizeToolResult(name, r, textOnlyBatch) }],
+                        ...(textOnlyBatch ? {} : { structuredContent: r }),
                         isError: false,
                     });
                 } catch (e) {
@@ -190,10 +194,12 @@ export class McpServer {
                         sessions: err.sessions,
                         exitCode: err.exitCode,
                     };
+                    const errorText = textOnlyBatch && err.outcome ? `outcome=${err.outcome}\n${message}` : message;
+                    const overflow = name === "run_batch" && jsonStringBytes(errorText) > BATCH_TEXT_JSON_BYTES;
                     this.reply(id, {
-                        content: [{ type: "text", text: message }],
+                        content: [{ type: "text", text: overflow ? limitBatchText(errorText, textOnlyBatch ? "" : FULL_OUTPUT_HINT) : errorText }],
                         isError: true,
-                        ...(Object.values(details).some((value) => value !== undefined)
+                        ...(!textOnlyBatch && (overflow || Object.values(details).some((value) => value !== undefined))
                             ? { structuredContent: { error: message, ...details } }
                             : {}),
                     });
@@ -216,7 +222,7 @@ export class McpServer {
 
 }
 
-function summarizeToolResult(name: string, value: unknown): string {
+function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolean): string {
     if (name === "list_layers") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["list_layers"]>>;
         return result.text;
@@ -228,19 +234,40 @@ function summarizeToolResult(name: string, value: unknown): string {
     if (name === "run_batch") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["run_batch"]>>;
         const overview = `status=${result.status}${result.failed_step ? ` | failed_step=${result.failed_step}` : ""}`;
+        const streams = result.steps.reduce((n, step) => n + Number(!!step.stdout) + Number(!!step.stderr), 0);
+        const streamLimit = Math.floor(BATCH_PREVIEW_BYTES / Math.max(1, streams));
+        const hint = textOnlyBatch ? "" : FULL_OUTPUT_HINT;
         const steps = result.steps.map((step) => {
             const header = [`${step.id} (${step.kind})`, `status=${step.status}`];
             if (step.layer !== undefined) header.push(`layer=${step.layer}`);
             if (step.exit_code !== undefined) header.push(`exit_code=${step.exit_code}`);
             if (step.outcome) header.push(`outcome=${step.outcome}`);
-            if (step.edits) header.push(`replaced=${step.edits.occurrences}`);
+            if (step.edits) {
+                header.push(`replaced=${step.edits.occurrences}`);
+                if (step.edits.write_mode) header.push(`write_mode=${step.edits.write_mode}`);
+                if (step.edits.mutex) header.push(`mutex=${step.edits.mutex}`);
+            }
             if (step.transfer) header.push(transferSummary(step.transfer));
-            const details = outputPreviews(step, BATCH_STEP_PREVIEW_BYTES);
-            if (step.error) details.push(`error: ${preview(step.error, BATCH_STEP_PREVIEW_BYTES)}`);
-            if (step.skipped_because) details.push(`skipped_because: ${preview(step.skipped_because, BATCH_STEP_PREVIEW_BYTES)}`);
-            return [header.join(" | "), ...details].join("\n");
+            const details = outputPreviews(step, textOnlyBatch ? Infinity : streamLimit, hint);
+            if (step.error) details.push(`error: ${preview(step.error, BATCH_DETAIL_BYTES, hint)}`);
+            if (step.skipped_because) details.push(`skipped_because: ${preview(step.skipped_because, BATCH_DETAIL_BYTES, hint)}`);
+            return { header: header.join(" | "), details, failed: step.status === "fail", edited: !!step.edits };
         });
-        return [overview, ...steps].join("\n\n");
+        const text = [overview, ...steps.map(({ header, details }) => [header, ...details].join("\n"))].join("\n\n");
+        if (jsonStringBytes(text) <= BATCH_TEXT_JSON_BYTES) return text;
+
+        const failed = steps.filter((step) => step.failed);
+        const edits = steps.filter((step) => !step.failed && step.edited);
+        const rest = steps.filter((step) => !step.failed && !step.edited);
+        // On overflow, prioritize failure headers and write guarantees over bulk output.
+        const prioritized = [
+            ...failed.map((step) => step.header),
+            ...edits.map((step) => step.header),
+            ...failed.filter((step) => step.details.length).map((step) => [step.header, ...step.details].join("\n")),
+            ...rest.map((step) => step.header),
+            ...[...edits, ...rest].filter((step) => step.details.length).map((step) => [step.header, ...step.details].join("\n")),
+        ];
+        return limitBatchText([overview, ...prioritized].join("\n\n"), hint);
     }
     if (name === "put_file" || name === "get_file") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["put_file"]>>;
@@ -249,24 +276,42 @@ function summarizeToolResult(name: string, value: unknown): string {
     return summarize(value);
 }
 
+function jsonStringBytes(text: string): number {
+    return Buffer.byteLength(JSON.stringify(text), "utf8");
+}
+
+function limitBatchText(text: string, hint: string): string {
+    const suffix = `\n[批次文本达到上限，部分结果已省略${hint}]`;
+    let lo = 0;
+    let hi = Math.min(text.length, BATCH_TEXT_JSON_BYTES);
+    while (lo < hi) {
+        const mid = Math.floor((lo + hi + 1) / 2);
+        if (jsonStringBytes(text.slice(0, mid) + suffix) <= BATCH_TEXT_JSON_BYTES) lo = mid;
+        else hi = mid - 1;
+    }
+    const last = text.charCodeAt(lo - 1);
+    if (last >= 0xd800 && last <= 0xdbff) lo--;
+    return text.slice(0, lo) + suffix;
+}
+
 function transferSummary(result: Awaited<ReturnType<AgentToolHandlers["put_file"]>>): string {
     return `bytes=${result.bytes} | transport=${result.transport} | verification=${result.verification} | write_mode=${result.write_mode}`;
 }
 
-function outputPreviews(output: { stdout?: string; stderr?: string }, limit: number): string[] {
+function outputPreviews(output: { stdout?: string; stderr?: string }, limit: number, hint = FULL_OUTPUT_HINT): string[] {
     const blocks: string[] = [];
-    if (output.stdout) blocks.push(`stdout:\n${preview(output.stdout, limit)}`);
-    if (output.stderr) blocks.push(`stderr:\n${preview(output.stderr, limit)}`);
+    if (output.stdout) blocks.push(`stdout:\n${preview(output.stdout, limit, hint)}`);
+    if (output.stderr) blocks.push(`stderr:\n${preview(output.stderr, limit, hint)}`);
     return blocks;
 }
 
-function preview(text: string, limit: number): string {
+function preview(text: string, limit: number, hint: string): string {
     const total = Buffer.byteLength(text, "utf8");
     if (total <= limit) return text;
     const bytes = Buffer.from(text.slice(0, limit + 1), "utf8");
     let end = limit;
     while ((bytes[end]! & 0xc0) === 0x80) end--;
-    return `${bytes.subarray(0, end).toString("utf8")}\n[已截断 ${total - end} 字节，完整输出见 structuredContent]`;
+    return `${bytes.subarray(0, end).toString("utf8")}\n[已截断 ${total - end} 字节${hint}]`;
 }
 
 /** 其他工具保留一行摘要。 */

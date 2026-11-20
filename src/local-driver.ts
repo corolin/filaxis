@@ -13,7 +13,8 @@
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";import { StringDecoder } from "node:string_decoder";
+import { createWriteStream } from "node:fs";
+import { ExecCapture, parseCompletionMarker } from "./exec-capture.js";
 
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -54,6 +55,7 @@ import type { ObservationWindowOptions, StreamWindowRegistry } from "./stream-wi
 
 /** 本地 Transport：进程内执行 + 原生 fs */
 export class LocalRuntimeDriver implements RuntimeDriver {
+    readonly supportsBoundedExec = true;
     descriptor: RuntimeDescriptor = { driver: "local", target: "localhost" };
     fs: FileSystemDriver;
 
@@ -137,6 +139,7 @@ export class LocalRuntimeDriver implements RuntimeDriver {
         const taskId = crypto.randomBytes(8).toString("hex");
         const logPath = path.join(this.execDir, `${taskId}.log`);
         const statusPath = path.join(this.execDir, `${taskId}.status.json`);
+        const auditLabel = options?.auditLabel;
 
         // FEAT-03 marker：子 shell 包裹业务命令，$? 变量锁 + nonce 防撞——
         // 用户命令内写 exit 42 也不丢退出码与 effectiveUser
@@ -149,8 +152,8 @@ export class LocalRuntimeDriver implements RuntimeDriver {
             `exit $__filaxis_ec`;
 
         return new Promise<ExecResult>((resolve, reject) => {
-            let stdout = "";
-            let stderr = "";
+            const stdout = new ExecCapture(options?.maxOutputBytes, marker);
+            const stderr = new ExecCapture(options?.maxOutputBytes);
 
             const env = { ...process.env, ...options?.env };
             const cwd = options?.cwd || this.defaultCwd || process.cwd();
@@ -191,7 +194,7 @@ export class LocalRuntimeDriver implements RuntimeDriver {
             const writeStatus = (status: string, extra: Record<string, unknown> = {}) => {
                 const payload = JSON.stringify({
                     pid: p.pid,
-                    command,
+                    command: auditLabel ?? command,
                     status,
                     startTime,
                     endTime: Date.now(),
@@ -213,22 +216,27 @@ export class LocalRuntimeDriver implements RuntimeDriver {
 
             let settled = false;
             let finished = false;
-            const logStream = createWriteStream(logPath);
+            const logStream = auditLabel === undefined ? createWriteStream(logPath) : undefined;
             // error 监听 + 终结守卫（Hydrogen R5 #1）：超时/abort 设计=进程后台续跑，
             // 其后任意输出再进 logStream.write=ERR_STREAM_WRITE_AFTER_END 崩宿主
             // （无 error 监听时同步抛）。写日志尽力而为——失败吞掉，data 侧判 finished
-            logStream.on("error", () => undefined);
-            // StringDecoder 双流（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂防护
-            const oDec = new StringDecoder("utf-8");
-            const eDec = new StringDecoder("utf-8");
-            p.stdout.on("data", (d: Buffer) => { stdout += oDec.write(d); if (!finished) logStream.write(d); });
-            p.stderr.on("data", (d: Buffer) => { stderr += eDec.write(d); if (!finished) logStream.write(d); });
+            const resumeOutput = () => { p.stdout.resume(); p.stderr.resume(); };
+            logStream?.on("error", resumeOutput);
+            logStream?.on("drain", resumeOutput);
+            const audit = (d: Buffer) => {
+                if (!finished && logStream && !logStream.destroyed && !logStream.write(d)) {
+                    p.stdout.pause();
+                    p.stderr.pause();
+                }
+            };
+            p.stdout.on("data", (d: Buffer) => { if (!finished) stdout.write(d); audit(d); });
+            p.stderr.on("data", (d: Buffer) => { if (!finished) stderr.write(d); audit(d); });
 
 
             const cleanupProcess = (exitStatus: string, extra: Record<string, unknown> = {}) => {
                 if (finished) return;
                 finished = true;
-                logStream.end();
+                logStream?.end();
                 return writeStatus(exitStatus, extra);
             };
             const detachLifecycle = () => {
@@ -245,9 +253,10 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                 // 不应撑事件循环。⚠️ 不能 spawn 后立即 unref——Bun 下 unref 子进程
                 // 不保活事件循环，低活动场景 close 事件永不触发，exec 静默挂死。
                 p.unref();
-                logStream.end();
+                logStream?.end();
+                resumeOutput();
                 void writeStatus("timeout", { error: "Command timeout", exitCode: null });
-                const e = new Error(`Command timeout after ${options.timeoutMs}ms (process continues in background, log: ${logPath}, status: ${statusPath})`) as Error & { outcome: "unknown" };
+                const e = new Error(`Command timeout after ${options.timeoutMs}ms (process continues in background${logStream ? `, log: ${logPath}` : ""}, status: ${statusPath})`) as Error & { outcome: "unknown" };
                 e.outcome = "unknown"; // 远端/本地进程终态未核实——审查问题 3：对齐 ssh 侧语义
                 reject(e);
             }, options.timeoutMs) : null;
@@ -259,7 +268,8 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                 finished = true; // 审计终态封口（close 不得覆写 aborted）
                 detachLifecycle();
                 try { p.kill("SIGTERM"); } catch { /* 已退出 */ }
-                logStream.end();
+                logStream?.end();
+                resumeOutput();
                 void writeStatus("aborted", { error: "Aborted by AbortSignal", exitCode: null });
                 const abortErr = new Error("Command aborted by AbortSignal（本地进程已 SIGTERM，终态未核实——outcome=unknown）") as Error & { name: "AbortError"; outcome: "unknown" };
                 abortErr.name = "AbortError";
@@ -279,41 +289,38 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                     // 完成哨兵原则（故障注入 1B 同源收口）：marker 尾缀是「跑完」唯一
                     // 凭证——未见哨兵（外部 kill -9/信号杀，code===null）reject 附半截
                     // 现场；哨兵在场退出码以哨兵为准。
-                    let out = stdout;
-                    let effectiveUser: string | undefined;
-                    let sentinelCode: number | undefined;
-                    const mIdx = out.lastIndexOf(`\n${marker}:`);
-                    if (mIdx !== -1) {
-                        const metaLine = out.slice(mIdx + 1).split("\n", 1)[0] ?? "";
-                        const m = metaLine.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`));
-                        if (m) {
-                            effectiveUser = m[2] === "" ? undefined : m[2];
-                            sentinelCode = parseInt(m[1]!, 10);
-                            out = out.slice(0, mIdx); // mIdx 处的 \n 是 printf 的，连同剥掉
-                        }
-                    }
+                    const evidence = stdout.evidence();
+                    const errorOutput = stderr.evidence();
+                    const completion = parseCompletionMarker(evidence, marker, stdout.completionMarker);
                     // ★ 审计与事实对齐（审查问题 3）：先验哨兵，后写审计——
                     //   completed 只在有哨兵时落盘（exitCode 用哨兵真实码）；
                     //   无哨兵落 killed + exitCode null（绝不把 null ?? 0 伪成完成）
-                    logStream.end();
-                    if (sentinelCode === undefined) {
-                        void writeStatus("killed", { exitCode: null, closeCode: code ?? null, stdinError: stdinErr?.message });
+                    logStream?.end();
+                    if (!completion) {
+                        void writeStatus("killed", {
+                            exitCode: null, closeCode: code ?? null,
+                            stdinError: auditLabel === undefined ? stdinErr?.message : undefined,
+                        });
+                        const diagnostic = auditLabel === undefined
+                            ? `${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500:\n${evidence.slice(-500)}\nstderr 尾 300:\n${errorOutput.slice(-300)}`
+                            : "";
                         const e = new Error(
-                            `命令未完成（无完成哨兵——进程被信号终止，close code=${code}）${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500:\n${out.slice(-500)}\nstderr 尾 300:\n${stderr.slice(-300)}`,
+                            `命令未完成（无完成哨兵——进程被信号终止，close code=${code}）${diagnostic}`,
                         ) as Error & { outcome: "unknown" };
                         e.outcome = "unknown";
                         reject(e);
                         return;
                     }
-                    const result = { stdout: out, stderr, exitCode: sentinelCode, effectiveUser };
-                    void writeStatus("completed", { exitCode: sentinelCode }).then(() => resolve(result));
+                    const { end, bodyBytes, exitCode, effectiveUser } = completion;
+                    const result = { stdout: stdout.result(evidence, end, bodyBytes), stderr: stderr.result(errorOutput), exitCode, effectiveUser };
+                    void writeStatus("completed", { exitCode }).then(() => resolve(result));
                 };
                 finish();
             });
 
             p.on("error", (err) => {
                 detachLifecycle();
-                const pWrite = cleanupProcess("failed", { error: err.message, exitCode: -1 });
+                const pWrite = cleanupProcess("failed", { error: auditLabel === undefined ? err.message : "Command spawn failed", exitCode: -1 });
                 if (settled) return;
                 settled = true;
                 if (pWrite) void pWrite.then(() => reject(err), () => reject(err));
@@ -334,6 +341,13 @@ class LocalFileSystem implements FileSystemDriver {
 
     async readFile(filePath: string): Promise<string> {
         return await fs.readFile(this.resolve(filePath), "utf-8");
+    }
+
+    async readFilePreview(filePath: string, maxOutputBytes: number): Promise<string> {
+        const path = this.resolve(filePath);
+        if (!(await fs.stat(path)).isFile()) throw new Error(`预览只支持普通文件：${filePath}`);
+        const capture = await ExecCapture.fromFile(path, maxOutputBytes);
+        return capture.result("");
     }
 
     /** 二进制安全读取（裸 base64——readFile 的 UTF-8 会破坏二进制字节） */
