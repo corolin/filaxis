@@ -22,6 +22,7 @@ import { OutputRingBuffer, WatchRegistry, sanitizeSessionName, type SessionLine 
 import { settleRejection } from "./async-guard.js";
 import { Vt100Screen } from "./vt100-screen.js";
 import { muxFlagsFor, autonomousSshOpts, type SshConnParams } from "./ssh-helpers.js";
+import { openSshEnvironment } from "./openssh-environment.js";
 import type { SessionEvent } from "./session-types.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
@@ -46,7 +47,7 @@ export interface StreamStartOptions {
     onScreen?: (snap: string, frames: number) => void;
 }
 
-export type SpawnImpl = (cmd: string, argv: string[], opts: { stdio: unknown[] }) => ChildProcess;
+export type SpawnImpl = (cmd: string, argv: string[], opts: { stdio: unknown[]; env?: NodeJS.ProcessEnv }) => ChildProcess;
 
 export interface StreamSessionManagerOptions {
     /** 禁用 ControlMaster（测试/平台受限） */
@@ -102,6 +103,7 @@ export class StreamSessionManager {
         const argv = [...this.sshOpts, ...mux, ...this.destArgs, "--", command];
         const child = this.spawnImpl("ssh", argv, {
             stdio: [opts.stdinScript === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+            env: openSshEnvironment(process.env, this.log),
         });
         // spawn 启动失败前置监听（Sol 87 P2-8）：error 事件异步到达——桥到 start
         // 的 reject（曾仅 finalizeStream→onExit→窗口 stale，open 照常返回零帧窗、

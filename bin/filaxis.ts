@@ -25,6 +25,7 @@ import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
 import { transferLayerFile } from "../src/layer-file-transfer.js";
+import { noopLogger } from "../src/logger.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -277,6 +278,7 @@ function handleLayerCmd(args: string[]): void {
 }
 
 async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false): Promise<RuntimeDriver> {
+    const logger = { ...noopLogger, warn: (message: string) => console.error(`[filaxis] ${message}`) };
     // PTY link 按需建（审计 M1）：exec 通道独立 ssh 进程、观察流独立 spawn——都不依赖
     // PTY link，且不 init 能保留 execChannel 的「多跳不可直达」诚实拒绝语义（统一
     // init 会把假跳板名的错误提前成建链失败，改变错误落点）；--pty 走 link.execMarker
@@ -288,9 +290,9 @@ async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false
             if (!desc) {
                 throw new Error(`层 '${opts.layer}' 未保存（filaxis layer list 查看；filaxis layer save ${opts.layer} --host ... 创建）`);
             }
-            return new SshPtyDriver(desc);
+            return new SshPtyDriver(desc, { logger });
         }
-        if (opts.host) return new SshPtyDriver(buildSshDescriptor(opts));
+        if (opts.host) return new SshPtyDriver(buildSshDescriptor(opts), { logger });
         // local 层无路径概念——路径参数在场而 --host 缺席 = 防呆报错（静默忽略=错机器风险）
         if (opts.jump || opts.hop.length || opts.enter.length || opts.docker || opts.forward.length || opts.hostKey || opts.knownHosts) {
             throw new Error("路径描述参数（--jump/--hop/--enter/--docker/--forward/--host-key/--known-hosts）需要 --host（local 层无路径概念）");

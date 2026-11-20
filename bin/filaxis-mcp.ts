@@ -14,6 +14,7 @@ import { McpServer } from "../src/mcp-server.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import type { RuntimeDescriptor } from "../src/driver.js";
+import { noopLogger } from "../src/logger.js";
 
 // argv 解析（零依赖手写——与 bin/filaxis.ts 同哲学；子集：--host/--port/--user/
 // --key/-J/--enter/--hop/--layer/--docker）
@@ -46,7 +47,10 @@ for (let i = 0; i < argv.length; i++) {
 
 async function main(): Promise<void> {
     // 层装配（与 CLI driverFor 同语义的子集）
-    const stack = new RuntimeStack();
+    // Keep diagnostics separate from MCP JSON-RPC stdout.
+    const stderr = (message: string) => console.error(`[mcp] ${message}`);
+    const logger = { ...noopLogger, warn: stderr, error: stderr };
+    const stack = new RuntimeStack({ logger });
     let opts: Parameters<typeof createAgentToolkit>[1];
     if (o.layer) {
         throw new Error("filaxis-mcp 暂不支持 --layer 快照寻址（FEAT-04 后续）——用 --host/--enter");
@@ -76,8 +80,7 @@ async function main(): Promise<void> {
     const tk = createAgentToolkit(stack, opts);
     new McpServer({
         toolkit: tk,
-        // stdout 归 JSON-RPC——任何意外日志走 stderr
-        logger: { debug: () => undefined, info: () => undefined, warn: (m: string) => console.error(`[mcp] ${m}`), error: (m: string) => console.error(`[mcp] ${m}`) },
+        logger,
     });
 }
 

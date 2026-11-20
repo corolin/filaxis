@@ -54,6 +54,21 @@ integration("file stdio registers a direct named layer and executes without a PT
 jumpIntegration("file stdio registers a named layer through a TCP jump", () =>
     verifyFileStdioLayer(process.env.FILAXIS_IT_JUMP ?? "127.0.0.1"), 60_000);
 
+test.skipIf(!IT || process.platform !== "win32")("Windows SSH file stdio works with missing system and account variables", async () => {
+    const keys = ["SystemRoot", "windir", "SystemDrive", "ProgramData", "ALLUSERSPROFILE", "USERNAME", "USERPROFILE"];
+    const previous = new Map(keys.map((name) => [name, process.env[name]]));
+    try {
+        for (const name of keys) delete process.env[name];
+        await verifyFileStdioLayer();
+        for (const name of keys) expect(process.env[name]).toBeUndefined();
+    } finally {
+        for (const [name, value] of previous) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+    }
+}, 30_000);
+
 integration("SSH rejects a broken PTY cwd and distinguishes an empty directory from a failed listing", async () => {
     const path = `/tmp/fx-session-cwd-${randomUUID()}`;
     const bad = new SshPtyDriver({ driver: "ssh", target: TARGET, cwd: path });
