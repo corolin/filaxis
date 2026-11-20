@@ -1,5 +1,11 @@
 # 牵丝 Filaxis
 
+[![CI](https://github.com/corolin/filaxis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/corolin/filaxis/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@syrkos/filaxis)](https://www.npmjs.com/package/@syrkos/filaxis)
+[![License: Apache-2.0](https://img.shields.io/github/license/corolin/filaxis)](https://github.com/corolin/filaxis/blob/main/LICENSE)
+
+简体中文 · [English](https://github.com/corolin/filaxis/blob/main/README.en.md)
+
 **千里一线，执行有迹。—— Connect · Execute · Observe · Reattach**
 
 面向自动化与 Agent 的远程执行运行时 SDK（Syrkos · 漩核旗下）。TypeScript 编写，Bun 与 Node LTS 双运行时，Windows 与 Linux 同构。**CLI / SDK / MCP Server 三入口**（`filaxis` / `createAgentToolkit` / `filaxis-mcp`）共享同一工具词汇表；CI 覆盖（均在 Ubuntu runner）：Bun 侧跑全量测试与 SSH 自环集成，Node 侧跑类型检查、边界检查、构建与编译版 CLI 冒烟（Node 不重复运行完整测试套）。
