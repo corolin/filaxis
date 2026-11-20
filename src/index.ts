@@ -25,6 +25,8 @@ export type { TerminalConfig, PromptPayload, PromptResponder, TmuxResult } from 
 export * from "./terminal/output-buffer.js";
 export * from "./stream-session-manager.js";
 export * from "./file-transfer.js";
+export { transferLayerFile } from "./layer-file-transfer.js";
+export type { FileTransferTransport, LayerFileTransferOptions, LayerFileTransferResult } from "./layer-file-transfer.js";
 export * from "./layer-env.js";
 export { resolveLocalShell } from "./shell-discovery.js";
 export { createAgentToolkit } from "./agent-toolkit.js";

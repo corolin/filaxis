@@ -19,6 +19,7 @@
 import type { RuntimeDriver } from "./driver.js";
 import { editFileMulti, type EditMultiHunk } from "./file-edit.js";
 import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
+import { shellQuote } from "./ssh-helpers.js";
 
 /** exec 步骤（命令 + 预期退出码集合——非零预期显式声明） */
 export interface BatchExecStep {
@@ -125,6 +126,7 @@ export interface BatchReport {
 export async function runBatch(
     target: RuntimeDriver | ((layer?: string) => RuntimeDriver | Promise<RuntimeDriver>),
     plan: BatchPlan,
+    options: { previewBudgetBytes?: number } = {},
 ): Promise<BatchReport> {
     // ── 计划校验（零副作用阶段）──
     if (!Array.isArray(plan?.steps) || plan.steps.length === 0) {
@@ -185,6 +187,21 @@ export async function runBatch(
         if ([...names].some((name) => name !== undefined)) throw new Error("批次计划指定了 layer，需要层解析函数");
         drivers.set(undefined, target);
     }
+    const { previewBudgetBytes } = options;
+    let previewBytes: number | undefined;
+    if (previewBudgetBytes !== undefined) {
+        if (!Number.isSafeInteger(previewBudgetBytes) || previewBudgetBytes < 0) throw new Error("previewBudgetBytes 需为非负整数");
+        let streams = 0;
+        for (const step of plan.steps) {
+            if (step.kind !== "exec" && step.kind !== "read") continue;
+            const driver = drivers.get(layerFor(step))!;
+            if (!driver.supportsBoundedExec && !(step.kind === "read" && driver.fs.readFilePreview)) {
+                throw new Error(`步骤 '${step.id}' 的运行层不支持限制输出采集，请使用 full 模式`);
+            }
+            streams += step.kind === "exec" ? 2 : 1;
+        }
+        previewBytes = Math.floor(previewBudgetBytes / Math.max(1, streams));
+    }
     const stepIdentity = (step: BatchStepWithDeps) => {
         const layer = layerFor(step);
         return { id: step.id, kind: step.kind, ...(layer !== undefined ? { layer } : {}) };
@@ -218,7 +235,7 @@ export async function runBatch(
                 const next = ready().find((st) => !running.has(st.id));
                 if (!next) return;
                 running.add(next.id);
-                const t = runStep(drivers.get(layerFor(next))!, next).then((r) => {
+                const t = runStep(drivers.get(layerFor(next))!, next, previewBytes).then((r) => {
                     reports.set(next.id, { ...stepIdentity(next), ...r });
                     if (r.status === "fail" && !failedStep) failedStep = next.id;
                 }).finally(() => {
@@ -282,12 +299,12 @@ function validateStep(step: BatchStepWithDeps): void {
     }
 }
 
-async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps): Promise<BatchStepReport> {
+async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps, previewBytes?: number): Promise<BatchStepReport> {
     const startedAt = Date.now();
     const base = { id: s.id, kind: s.kind, startedAt };
     try {
         if (s.kind === "exec") {
-            const r = await drv.exec(s.command, { timeoutMs: s.timeoutMs });
+            const r = await drv.exec(s.command, { timeoutMs: s.timeoutMs, maxOutputBytes: previewBytes });
             const expect = s.expectExit ?? [0];
             const ok = expect.includes(r.exitCode);
             return {
@@ -317,7 +334,17 @@ async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps): Promise<BatchS
             };
         }
         if (s.kind === "read") {
-            const content = await drv.fs.readFile(s.path);
+            let content: string;
+            if (previewBytes === undefined) {
+                content = await drv.fs.readFile(s.path);
+            } else if (drv.fs.readFilePreview) {
+                content = await drv.fs.readFilePreview(s.path, previewBytes);
+            } else {
+                const path = shellQuote(s.path);
+                const r = await drv.exec(`test -f ${path} && cat < ${path}`, { maxOutputBytes: previewBytes });
+                if (r.exitCode !== 0) throw new Error(`读取失败（退出码 ${r.exitCode}）：${r.stderr}`);
+                content = r.stdout;
+            }
             return { ...base, status: "ok", durationMs: Date.now() - startedAt, stdout: content };
         }
         if (s.kind === "put" || s.kind === "get") {

@@ -21,9 +21,11 @@ import type { RemoteDialect } from "./dialect.js";
 import { renderInplaceWrite, renderPreserveMode } from "./file-placement.js";
 import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
 import { openSshEnvironment } from "./openssh-environment.js";
+import { windowsCreatePrivateStage, windowsPlaceVerifiedPayload } from "./windows-upload-acl.js";
+import type { ExecOptions } from "./driver.js";
 
-/** 远端执行回调（通常是 driver 的 exec 通道） */
-export type TransferExec = (command: string) => Promise<{ stdout: string; exitCode: number }>;
+/** Forward exec options when wrapping a driver so payload-bearing calls retain their audit policy. */
+export type TransferExec = (command: string, options?: Pick<ExecOptions, "auditLabel">) => Promise<{ stdout: string; exitCode: number }>;
 
 /** put 分块大小（base64 字符数——单条命令行安全长度内） */
 const CHUNK_B64 = 48 * 1024;
@@ -51,6 +53,19 @@ export class TransferVerificationError extends Error {
 }
 
 const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+async function createUploadStage(exec: TransferExec, base: string): Promise<{ stage: string; payload: string; windows: boolean }> {
+    const nonce = randomBytes(6).toString("hex");
+    const stage = withSuffix(base.startsWith("-") ? `./${base}` : base, `.filaxis-stage-${nonce}`);
+    const dir = q(stage);
+    const result = await exec(`(umask 077; case "$(uname -s)" in MINGW*|MSYS*) ` +
+        `__fx_stage_win=$(cygpath -aw ${dir}) || exit 1; ` +
+        `FILAXIS_UPLOAD_STAGE="$__fx_stage_win" ${windowsCreatePrivateStage} && echo FX_STAGE_WINDOWS ;; ` +
+        `*) mkdir -m 700 ${dir} ;; esac)`);
+    if (result.exitCode !== 0) throw new Error(`无法创建上传暂存目录（目标未动）: ${base}`);
+    // Keep the basename unique even on shells whose mv treats a new destination directory as a container.
+    return { stage, payload: `${stage}/payload-${nonce}`, windows: result.stdout.trim() === "FX_STAGE_WINDOWS" };
+}
 
 /** 上行 put（本地文件门面）：读本地文件 → putContent（内存载荷主链路） */
 export async function putFile(
@@ -123,9 +138,8 @@ async function stageAndPlaceContent(
         throw new Error(`目标是现存目录（拒绝上传）：${remotePath}——putFile 落位语义是文件路径`);
     }
     const b64 = content.toString("base64");
-    const nonce = randomBytes(6).toString("hex");
-    const tmp = withSuffix(stageBase, `.filaxis-tmp-${nonce}`); // b64 分块临时（独占+NAME_MAX 安全——Hydrogen R5 #5）
-    const out = withSuffix(stageBase, `.filaxis-out-${nonce}`); // decode 输出临时（NAME_MAX 安全——Hydrogen R5 #5）
+    const { stage, payload: out, windows } = await createUploadStage(exec, stageBase);
+    const tmp = `${stage}/encoded`;
     const cleanup = () => exec(`rm -f ${q(tmp)} ${q(out)}`).catch(() => undefined);
     const localSha = createHash("sha256").update(content).digest("hex");
     // 分块尺寸可调（真机实证：tmux server 单命令 ~16-24K 即 "command too long"——
@@ -138,14 +152,14 @@ async function stageAndPlaceContent(
     try {
         if (!b64.length) {
             // 空文件：零分块循环不建 tmp → decode 读不存在的文件必失败——显式建空 tmp
-            const mk = await exec(`: > ${q(tmp)}`);
+            const mk = await exec(`(umask 077; : > ${q(tmp)})`);
             if (mk.exitCode !== 0) throw new Error(`put 空临时文件创建失败: ${mk.stdout}`);
         }
         for (let i = 0; i < b64.length; i += chunkSize) {
             const chunk = b64.slice(i, i + chunkSize);
-            const r = await exec(`printf %s ${q(chunk)} >> ${q(tmp)}`);
+            const r = await exec(`(umask 077; printf %s ${q(chunk)} >> ${q(tmp)})`, { auditLabel: "file upload" });
             if (r.exitCode !== 0) {
-                throw new Error(`put 分块写入失败（chunk ${i / chunkSize}，exit=${r.exitCode}）: ${r.stdout}`);
+                throw new Error(`put 分块写入失败（chunk ${i / chunkSize}，exit=${r.exitCode}）`);
             }
         }
         // decode → 独立输出临时（同目录 mv = rename 原子落位；目标此时零接触）
@@ -160,18 +174,19 @@ async function stageAndPlaceContent(
         // 统一失败清理（自排查补：分块中途失败/exec reject 此前漏清 tmp——除进程
         // 硬杀外的一切失败路径零残留）
         await cleanup();
+        await exec(`rmdir ${q(stage)}`).catch(() => undefined);
         throw e;
     }
     try {
-        const writeMode = await placeVerifiedUpload(exec, out, remotePath, opts.forceInplace);
+        const writeMode = await placeVerifiedUpload(exec, out, remotePath, { forceInplace: opts.forceInplace, applyUmask: true, windows });
         return { bytes: content.length, sha256: localSha, verified: true, verification: level, writeMode };
     } finally {
-        await exec(`rm -f ${q(tmp)}`).catch(() => undefined);
+        await exec(`rm -f ${q(tmp)}; rmdir ${q(stage)}`).catch(() => undefined);
     }
 }
 
 async function placeVerifiedUpload(
-    exec: TransferExec, out: string, remotePath: string, forceInplace = false,
+    exec: TransferExec, out: string, remotePath: string, { forceInplace = false, applyUmask = false, windows = false } = {},
 ): Promise<TransferResult["writeMode"]> {
     const cleanup = () => exec(`rm -f ${q(out)}`).catch(() => undefined);
     // 落位（GPT Astra 七轮 #3 + 八轮 #2 + bind mount 定案 + 十八轮 #2 三态 + 审计 H5）：
@@ -182,19 +197,38 @@ async function placeVerifiedUpload(
         `elif [ -L ${q(remotePath)} ]; then exit 1; else printf '%s\\n.' ${q(remotePath)}; fi) ` +
         `|| { echo FX_UNRESOLVED_LINK; exit 1; }; __fx_tgt=\${__fx_tgt%??}; `;
     const preserveMode = renderPreserveMode(q(out));
+    // The private staging directory protects the payload while its mode changes.
+    // For a new file, apply the mode a regular creation would get in this layer.
+    const setNewMode = applyUmask
+        ? `__fx_new_file=0; if [ ! -e "$__fx_tgt" ]; then ` +
+          `__fx_mask=$(umask); case "$__fx_mask" in [0-7][0-7][0-7]|0[0-7][0-7][0-7]) ;; *) echo FX_PERMISSIONS_FAIL; exit 1;; esac; ` +
+          `__fx_new_mode=$(printf '%03o' "$((0666 & ~(0$__fx_mask)))"); ` +
+          `chmod "$__fx_new_mode" ${q(out)} || { echo FX_PERMISSIONS_FAIL; exit 1; }; __fx_new_file=1; fi; `
+        : "";
+    const restoreReadablePayload = applyUmask
+        ? `if [ "$__fx_new_file" = 1 ] && [ -f ${q(out)} ]; then chmod u+r ${q(out)} || { echo FX_PERMISSIONS_FAIL; exit 1; }; fi; `
+        : "";
     const inplaceWrite = renderInplaceWrite(q(out), '"$__fx_tgt"', "echo FX_MV_CAT");
-    const place = forceInplace
-        ? inplaceWrite
-        : `${preserveMode}__fx_ob=$(basename ${q(out)} 2>/dev/null); ` +
-          `__fx_od=$(stat -c %d ${q(out)} 2>/dev/null || stat -f %d ${q(out)} 2>/dev/null); ` +
-          `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
-          `if [ -n "$__fx_od" ] && [ "$__fx_od" = "$__fx_td" ]; then ` +
-          `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+    const atomicPlace = windows
+        ? `[ -f ${q(out)} ] || { echo FX_NO_PAYLOAD; exit 1; }; ` +
+          `__fx_src_win=$(cygpath -aw ${q(out)}) && __fx_tgt_win=$(cygpath -aw "$__fx_tgt") || exit 1; ` +
+          `if FILAXIS_UPLOAD_SOURCE="$__fx_src_win" FILAXIS_UPLOAD_TARGET="$__fx_tgt_win" ${windowsPlaceVerifiedPayload}; ` +
+          `then echo FX_MV_OK; else echo FX_WINDOWS_PLACEMENT_UNKNOWN; fi`
+        : `${preserveMode}` +
+          `${setNewMode}` +
           `__fx_mv=0; ` +
           `if mv -T ${q(out)} "$__fx_tgt" 2>/dev/null; then echo FX_MV_OK; ` +
           `else if [ ! -d "$__fx_tgt" ] && mv ${q(out)} "$__fx_tgt" 2>/dev/null && __fx_mv=1 && [ ! -d "$__fx_tgt" ]; then echo FX_MV_OK; ` +
           `else if [ "$__fx_mv" = "1" ] && [ -d "$__fx_tgt" ] && mv "$__fx_tgt/$__fx_ob" ${q(out)} 2>/dev/null; then echo FX_IS_DIR; ` +
-          `else ${inplaceWrite}; fi; fi; fi; ` +
+          `else ${restoreReadablePayload}${inplaceWrite}; fi; fi; fi`;
+    const place = forceInplace
+        ? inplaceWrite
+        : `__fx_ob=$(basename ${q(out)} 2>/dev/null); ` +
+          `__fx_od=$(stat -c %d ${q(out)} 2>/dev/null || stat -f %d ${q(out)} 2>/dev/null); ` +
+          `__fx_td=$(stat -c %d "$(dirname "$__fx_tgt")" 2>/dev/null || stat -f %d "$(dirname "$__fx_tgt")" 2>/dev/null); ` +
+          `if [ -n "$__fx_od" ] && [ "$__fx_od" = "$__fx_td" ]; then ` +
+          `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
+          `${atomicPlace}; ` +
           `else ` +
           `if [ -d "$__fx_tgt" ]; then echo FX_IS_DIR; exit 1; fi; ` +
           `${inplaceWrite}; ` +
@@ -213,6 +247,9 @@ async function placeVerifiedUpload(
     // 截目标——载荷丢失后原文件曾被截成 0 字节且恢复路径无存）
     const mv = await exec(`( test ! -d ${q(remotePath)} || { echo FX_IS_DIR; exit 1; }; ${tgtSetup}${place} )`);
     const mvOut = (mv.stdout || "").trim();
+    if (mvOut.includes("FX_WINDOWS_PLACEMENT_UNKNOWN")) {
+        throw Object.assign(new Error(`Windows 上传落位或 ACL 应用结果未知，请核实目标和暂存载荷：${remotePath}（${out}）`), { outcome: "unknown" as const });
+    }
     if (mvOut === "FX_UNRESOLVED_LINK") {
         await cleanup();
         throw new Error(`put 落位失败（无法解析目标符号链接，链接已保留）: ${remotePath}`);
@@ -220,6 +257,10 @@ async function placeVerifiedUpload(
     if (mvOut.includes("FX_IS_DIR")) {
         await cleanup();
         throw new Error(`put 落位失败（目标是现存目录）——目标未动: ${remotePath}`);
+    }
+    if (mvOut.includes("FX_PERMISSIONS_FAIL")) {
+        await cleanup();
+        throw new Error(`put 落位失败（无法设置文件权限，目标未动）: ${remotePath}`);
     }
     if (mvOut.includes("FX_NO_PAYLOAD")) {
         // 载荷在落位前已消失（Sol 90 P1-3）：`< src > tgt` 重定向排序保证目标
@@ -270,8 +311,8 @@ export async function getFile(
         throw new Error(`本地目标是现存目录（拒绝下载落位）：${localPath}`);
     }
     const enc = dialect.base64Encode.join(" ");
-    const r = await exec(`${enc} < ${q(remotePath)}`);
-    if (r.exitCode !== 0) throw new Error(`get 编码回传失败: ${r.stdout}`);
+    const r = await exec(`${enc} < ${q(remotePath)}`, { auditLabel: "file download" });
+    if (r.exitCode !== 0) throw new Error(`get 编码回传失败（exit=${r.exitCode}）`);
     const content = Buffer.from(r.stdout.replace(/\s+/g, ""), "base64");
     const localSha = createHash("sha256").update(content).digest("hex");
     // 校验先行：不过 → 本地目标零接触（临时都不建）
@@ -456,23 +497,27 @@ export async function sftpPutFile(
     assertSftpPath(local, "本地");
     const target = await resolveSftpRemotePath(exec, remotePath);
     const digest = await digestFile(localPath);
-    const staged = withSuffix(target, `.filaxis-out-${randomBytes(6).toString("hex")}`);
+    const { stage, payload: staged, windows } = await createUploadStage(exec, target);
     let verification: TransferResult["verification"];
     try {
-        const batch = `put ${q(local)} ${q(staged)}\n`;
-        const r = await doSpawn(sftpBatchArgs(opts.connArgs), batch, opts.timeoutMs);
-        if (r.exitCode !== 0) {
-            throw new Error(`sftp put 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);
+        try {
+            const batch = `put ${q(local)} ${q(staged)}\n`;
+            const r = await doSpawn(sftpBatchArgs(opts.connArgs), batch, opts.timeoutMs);
+            if (r.exitCode !== 0) {
+                throw new Error(`sftp put 失败（exit=${r.exitCode}）——可降级 base64 管道: ${r.stderr.trim().slice(0, 200)}`);
+            }
+            const v = await verify(exec, dialect, staged, digest.bytes, digest.sha256);
+            if (!v.verified) throw new TransferVerificationError("put", v.detail);
+            verification = v.level;
+        } catch (error) {
+            await exec(`rm -f ${q(staged)}`).catch(() => undefined);
+            throw error;
         }
-        const v = await verify(exec, dialect, staged, digest.bytes, digest.sha256);
-        if (!v.verified) throw new TransferVerificationError("put", v.detail);
-        verification = v.level;
-    } catch (error) {
-        await exec(`rm -f ${q(staged)}`).catch(() => undefined);
-        throw error;
+        const writeMode = await placeVerifiedUpload(exec, staged, target, { forceInplace: opts.forceInplace, windows });
+        return { ...digest, verified: true, verification, writeMode };
+    } finally {
+        await exec(`rmdir ${q(stage)}`).catch(() => undefined);
     }
-    const writeMode = await placeVerifiedUpload(exec, staged, target, opts.forceInplace);
-    return { ...digest, verified: true, verification, writeMode };
 }
 
 /** 本地下载临时名（Sol 63 P2-5）：basename+后缀超 255B 截前段+短 hash（NAME_MAX 安全） */

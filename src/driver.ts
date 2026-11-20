@@ -61,6 +61,10 @@ export interface ExecOptions {
     channel?: ExecChannel;
     /** AbortSignal 硬中断子进程：abort 时子进程立即 SIGTERM，Promise 以 AbortError reject */
     signal?: AbortSignal;
+    /** Limit bytes retained per output stream. The pipe is drained and completion still requires the sentinel. */
+    maxOutputBytes?: number;
+    /** Local audit label for a sensitive operation. Record metadata without the command or streams. */
+    auditLabel?: string;
 }
 
 export interface ExecResult {
@@ -86,6 +90,8 @@ export interface FileStat {
 
 export interface FileSystemDriver {
     readFile(path: string): Promise<string>;
+    /** Read a bounded UTF-8 preview, with a truncation notice when applicable. */
+    readFilePreview?(path: string, maxOutputBytes: number): Promise<string>;
     writeFile(path: string, content: string): Promise<void>;
     exists(path: string): Promise<boolean>;
     readdir(path: string): Promise<FileEntry[]>;
@@ -111,6 +117,8 @@ import type {
 import type { ObservationWindowOptions, StreamWindow, StreamWindowRegistry } from "./stream-window.js";
 
 export interface RuntimeDriver {
+    /** The non-interactive exec channel supports maxOutputBytes without collecting full output. */
+    readonly supportsBoundedExec?: true;
     // 基础信息
     descriptor: RuntimeDescriptor;
 

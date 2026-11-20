@@ -80,7 +80,7 @@ export interface AgentToolHandlers {
     }>;
     remove_layer(args: { name: string; destroy?: boolean }): Promise<{ removed: string }>;
     // ── 批次组合（第十一季：一次调用描述多原子操作——减少 Planner 轮次）──
-    run_batch(args: { steps: Array<Record<string, unknown>>; stop_on_fail?: boolean; max_parallel?: number; layer?: string }): Promise<{
+    run_batch(args: { steps: Array<Record<string, unknown>>; stop_on_fail?: boolean; max_parallel?: number; layer?: string; output?: "text" | "full" }): Promise<{
         status: "ok" | "fail"; failed_step?: string;
         steps: Array<{
             id: string; layer?: string; kind: string; status: string; exit_code?: number; outcome?: "unknown"; stdout?: string; stderr?: string; error?: string; skipped_because?: string;
@@ -174,6 +174,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                     stop_on_fail: { type: "boolean", description: "失败即停（缺省 true）" },
                     max_parallel: { type: "number", description: "并行度上限（缺省 3）" },
                     layer: { type: "string", minLength: 1, description: "批次默认目标层名（缺省=调用时的默认层）" },
+                    output: { type: "string", enum: ["text", "full"], description: "MCP 输出模式。text 适合只读文本块的客户端，保留简短预览；full（默认）另在 structuredContent 保留完整输出" },
                 },
                 required: ["steps"],
             },
@@ -696,10 +697,11 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 await stack.removeLayer(name, { destroy });
                 return { removed: name };
             },
-            async run_batch({ steps, stop_on_fail, max_parallel, layer: layerName, ...unknownArgs }) {
+            async run_batch({ steps, stop_on_fail, max_parallel, layer: layerName, output, ...unknownArgs }) {
                 if (!Array.isArray(steps) || !steps.length) throw new Error(`steps 需为非空数组，每步提供 id 和 kind（${BATCH_STEP_KINDS.join("、")}）`);
                 const extra = Object.keys(unknownArgs);
-                if (extra.length) throw new Error(`run_batch 未知参数：${extra.join(", ")}（支持 steps、layer、stop_on_fail、max_parallel）`);
+                if (extra.length) throw new Error(`run_batch 未知参数：${extra.join(", ")}（支持 steps、layer、stop_on_fail、max_parallel、output）`);
+                if (output !== undefined && output !== "text" && output !== "full") throw new Error('output 需为 "text" 或 "full"');
                 const r = await runBatch(resolveDrv, {
                     steps: steps.map((raw, stepIdx): BatchStepWithDeps => {
                         if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`steps[${stepIdx}] 需为对象`);
@@ -716,7 +718,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     layer: layerName === undefined ? stack.activeLayer?.name : layerName,
                     stopOnFail: stop_on_fail,
                     maxParallel: max_parallel,
-                });
+                }, output === "text" ? { previewBudgetBytes: 4096 } : {});
                 return {
                     status: r.status,
                     failed_step: r.failedStep,

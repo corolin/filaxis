@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.4
+version: 0.2.5
 description: |
   牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
 
@@ -48,13 +48,14 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 - **定位/巡检期用 `run_batch` 打包**——多个 read_file/run_command 一次调用并行
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
 - `run_batch` 的顶层 `layer` 和步骤 `layer` 可以同时传。顶层是批次默认值，步骤的 `layer` 只覆盖本步。两处都省略的步骤使用调用时的默认层。结果逐步标明命名层。
+- CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。
 - `max_parallel` 是整个批次的并发上限。无依赖的步骤可以并行，包括同层的独立巡检。需要先改配置、再验证、最后重载时，用 `after` 引用前置步骤的 `id`。依赖可以跨层，前置步骤成功后才会启动后续步骤。
 - `after` 的作用域是当前批次。多个批次可能同时修改同一资源时，由调用方按实际资源串行化，例如用「环境身份 + 配置路径」作为互斥键。同一环境可能有多个层名。`run_batch` 本身不提供跨批次资源锁。
-- MCP 文本结果中，`run_batch` 逐步骤展示状态、退出码和 stdout/stderr，各流最多预览 4 KiB。`run_command` 各流最多预览 8 KiB，完整输出在 `structuredContent`。
+- `run_batch` 文本逐步展示状态、退出码、编辑的写入方式和锁状态，以及 stdout/stderr 预览。所有输出流共用 4 KiB，整个文本字段序列化后最多 8 KiB，超出时优先显示失败步骤和编辑保障。只看文本块的 MCP 客户端请传 `output: "text"`。需要完整输出时用默认的 `output: "full"`，从 `structuredContent` 取。`run_command` 的文本各流最多预览 8 KiB。
+- `output: "text"` 在本机和 SSH 层按预算采集 `exec` / `read` 预览，并继续读取完成哨兵来核实退出码。SSH 文件中转仍在磁盘接收完整输出，回读只取有界的首尾。其他层需要支持限量采集才能在文本模式下执行这些步骤。
 - 建链后立即干活，**不要**逐个 hostname/list_layers 验证——首个 run_command
   的退出码与命令输出就是执行凭证；
-- 大输出（日志/配置全文）用 `read_file` 而非 `run_command cat`——结构化返回
-  不占对话输出面。
+- 巡检只读目标配置的相关行和最近 20–30 行关键日志，例如在批次的 `exec` 步骤中用 `sed -n '20,40p' <path>` 或 `docker logs --tail 30 <container>`。批量编辑时，把刚读到的原文连同能唯一定位的上下文直接填入 `old`，在 `new` 只改目标行，无需逐行默写全文。
 - 二进制或整文件传输用 `put_file` / `get_file`。`local_path` 位于 MCP 服务进程所在机器，`remote_path` 位于目标层。传 `layer` 指定目标，`transport: "sftp"` 可选用于文件系统可直达的 SSH 层。完整示例见 [文件同步剧本](./file-sync.md)。
 - 批量上传和下载用 `run_batch` 的 `kind: "put"` / `kind: "get"`，字段与单文件工具一致。多个步骤写同一个 `local_path` 或同一目标层文件时，用 `after` 排序，或为每个下载指定不同的本地路径。
 - 宿主拦截 SSH 匿名管道时，在建层前设 `FILAXIS_SSH_STDIO_MODE=inherit`。它支持直连、单跳 `-J` 和可非交互重放的进入步骤。逐跳 PTY、交互进入、持久转发和持续观察窗需要可用的匿名管道。若首轮已发出且终态未知，先核实远端状态再决定是否重发。
@@ -65,7 +66,7 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 ### SDK 最小配方（Bun / Node 编码接入）
 
 ```ts
-import { RuntimeStack, editFile, runBatch, createAgentToolkit } from "@syrkos/filaxis";
+import { RuntimeStack, editFile, runBatch, transferLayerFile, createAgentToolkit } from "@syrkos/filaxis";
 
 const stack = new RuntimeStack();
 
@@ -97,13 +98,18 @@ const report = await runBatch(ctr.driver, {
   ],
 });
 
-// ⑤ 嵌入自定义 Agent：一行生成 OpenAI/Anthropic/Vercel AI SDK 通吃工具面
+// ⑤ 单文件上传与下载（返回传输方式、校验等级和落位语义）
+await transferLayerFile(ctr.driver, "put", { localPath: "./config.yaml", remotePath: "/app/config.yaml" });
+await transferLayerFile(ctr.driver, "get", { localPath: "./result.json", remotePath: "/app/result.json" });
+
+// ⑥ 嵌入自定义 Agent：一行生成 OpenAI/Anthropic/Vercel AI SDK 通吃工具面
 const { tools, handlers } = createAgentToolkit(stack);
 
-// ⑥ 收尾释放（移除层并销毁底层连接）
+// ⑦ 收尾释放（移除层并销毁底层连接）
 await stack.removeLayer("web", { destroy: true });
 await stack.removeLayer("prod", { destroy: true });
 ```
+
 
 ## 30 秒选型：你面对的是什么？
 

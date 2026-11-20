@@ -19,6 +19,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
 import { openSshEnvironment } from "./openssh-environment.js";
 import { StringDecoder } from "node:string_decoder";
+import { ExecCapture, parseCompletionMarker } from "./exec-capture.js";
 import * as crypto from "node:crypto";
 import type {
     RuntimeDriver, FileSystemDriver, FileEntry, ExecOptions, ExecResult, RuntimeDescriptor,
@@ -425,6 +426,7 @@ export interface SshPtyDriverOptions {
 export const __testPtyLink = PtyLink; // 测试导出面（attach spawn error 验证）
 
 export class SshPtyDriver implements RuntimeDriver {
+    readonly supportsBoundedExec = true;
     readonly descriptor: RuntimeDescriptor;
     readonly fs: FileSystemDriver;
     readonly sessions: RemoteSessionManager;
@@ -710,6 +712,7 @@ export class SshPtyDriver implements RuntimeDriver {
         if (this.layerShellGone) throw new Error(`层已退化：内层 shell 已退出（${this.layerShellGone.slice(0, 60)}）——连接仍在但已非本层环境`);
         if (this.reconnecting) throw new Error("连接意外断开，自动重连中——请稍后重试");
         if (options?.channel === "pty") {
+            if (options.maxOutputBytes !== undefined) throw new Error("PTY 不支持限制 exec 输出采集");
             if (this.useFileStdio) throw fileStdioUnsupported("交互 PTY");
             // env 显式拒绝（十轮自挖）：PTY 键入回显会混入输出捕获——exec 通道
             // （stdinCmd export 前缀）才是 env 的生效通道
@@ -798,24 +801,28 @@ export class SshPtyDriver implements RuntimeDriver {
             // 显式 stdio 模式覆盖（DeepSeek Harness 反馈）：FILAXIS_SSH_STDIO_MODE=inherit
             // 直接走文件中转（管道句柄在受限沙箱里被拦截——ssh 秒退 255 零输出）
             if (fileStdio) {
-                void spawnWithFileRedirect(argv, render.stdinCmd, { timeoutMs: options?.timeoutMs, signal: options?.signal, logger: this.log }).then((r) => {
-                    const mIdx = r.stdout.lastIndexOf(`\n${marker}:`);
-                    const m = mIdx !== -1 ? r.stdout.slice(mIdx + 1).split("\n", 1)[0]?.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`)) : null;
-                    if (!m) {
+                void spawnWithFileRedirect(argv, render.stdinCmd, {
+                    timeoutMs: options?.timeoutMs, signal: options?.signal, logger: this.log, maxOutputBytes: options?.maxOutputBytes, stdoutMarker: marker,
+                }).then((r) => {
+                    const completion = parseCompletionMarker(r.stdout, marker, r.stdoutCapture?.completionMarker);
+                    if (!completion) {
                         const e = new Error(`命令未完成（inherit 模式无完成哨兵，exit=${r.exitCode}）。stdout 尾:\n${r.stdout.slice(-500)}\nstderr 尾:\n${r.stderr.slice(-300)}`) as Error & { outcome: "unknown" };
                         e.outcome = "unknown";
                         reject(e);
                         return;
                     }
+                    const { end, bodyBytes, exitCode, effectiveUser } = completion;
                     resolve({
-                        stdout: r.stdout.slice(0, mIdx),
-                        stderr: r.stderr,
-                        exitCode: parseInt(m[1]!, 10),
-                        effectiveUser: m[2] === "" ? undefined : m[2],
+                        stdout: r.stdoutCapture ? r.stdoutCapture.result(r.stdout, end, bodyBytes) : r.stdout.slice(0, end),
+                        stderr: r.stderrCapture ? r.stderrCapture.result(r.stderr) : r.stderr,
+                        exitCode,
+                        effectiveUser,
                     });
                 }, reject);
                 return;
             }
+            const stdout = new ExecCapture(options?.maxOutputBytes, marker);
+            const stderr = new ExecCapture(options?.maxOutputBytes);
             const spawnAt = Date.now();
             const p = spawn("ssh", argv, {
                 env: openSshEnvironment(process.env, this.log),
@@ -824,14 +831,10 @@ export class SshPtyDriver implements RuntimeDriver {
                 // spawn ENOENT，连接尚未建立即崩。本地目录与远端工作目录无关。
                 stdio: ["pipe", "pipe", "pipe"],
             });
-            let stdout = "";
-            let stderr = "";
             let settled = false;
             // StringDecoder 双流（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂（64KB pipe 边界中文/emoji → U+FFFD 对）
-            const oDec = new StringDecoder("utf-8");
-            const eDec = new StringDecoder("utf-8");
-            p.stdout.on("data", (d: Buffer) => { stdout += oDec.write(d); });
-            p.stderr.on("data", (d: Buffer) => { stderr += eDec.write(d); });
+            p.stdout.on("data", (d: Buffer) => { if (!settled) stdout.write(d); });
+            p.stderr.on("data", (d: Buffer) => { if (!settled) stderr.write(d); });
             // stdin 管道错误监听（GPT Astra 九轮 P1 同病面）：ssh 提前退出时继续写
             // 管道抛 write EOF——无监听器则 uncaught 崩宿主。记录后由 close 路径
             // 裁决（无哨兵 → reject 附 outcome=unknown）
@@ -872,26 +875,16 @@ export class SshPtyDriver implements RuntimeDriver {
             if (options?.signal?.aborted) onAbort(); // race-safe：传入时已 abort
 
             p.on("close", (code) => {
-                let out = stdout;
-                let effectiveUser: string | undefined;
-                let sentinelCode: number | undefined;
-                const mIdx = out.lastIndexOf(`\n${marker}:`);
-                if (mIdx !== -1) {
-                    const metaLine = out.slice(mIdx + 1).split("\n", 1)[0] ?? "";
-                    const m = metaLine.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`));
-                    if (m) {
-                        effectiveUser = m[2] === "" ? undefined : m[2];
-                        sentinelCode = parseInt(m[1]!, 10);
-                        out = out.slice(0, mIdx);
-                    }
-                }
-                if (effectiveUser) this.effectiveUser = effectiveUser;
+                if (settled) return;
+                const evidence = stdout.evidence();
+                const errorOutput = stderr.evidence();
+                const completion = parseCompletionMarker(evidence, marker, stdout.completionMarker);
                 // 无哨兵=命令未跑完（「无法执行」语义）——reject 附半截现场（outcome=unknown）
-                if (sentinelCode === undefined) {
+                if (!completion) {
                     // 沙箱 stdio 管道损坏诊断（DeepSeek Harness 反馈）：秒退 255+
                     // 零输出=管道句柄被拦截的指纹——一次文件中转重试（cmd/sh 的 >
                     // 是文件句柄非管道句柄，沙箱放行）；重试仍败才报错附双模式现场
-                    if (isBrokenStdioExit(code, out, stderr, Date.now() - spawnAt)) {
+                    if (isBrokenStdioExit(code, evidence, errorOutput, Date.now() - spawnAt)) {
                         // 沙箱 stdio 管道损坏指纹（DeepSeek Harness 反馈）。**不自动重放**
                         //（Sol 78 P1-2）：首轮结果未知=远端可能已执行副作用——非幂等命令
                         // 重试违宪（tmux spawn 错误同款纪律「勿盲目重试非幂等命令」）。
@@ -910,12 +903,12 @@ export class SshPtyDriver implements RuntimeDriver {
                         // 连接层失败诊断（试用反馈 #29：-J/--host 传 ssh-config 别名在沙箱/
                         // 远端环境「不认」——别名解析依赖**运行环境**的 ~/.ssh/config，本机
                         // 有的别名沙箱里没有。报错直交 + 指引，缩短排障路径）
-                        const connFail = /Could not resolve hostname|Connection (timed out|refused|closed)|Permission denied|Host key verification failed|no route to host/i.test(stderr);
+                        const connFail = /Could not resolve hostname|Connection (timed out|refused|closed)|Permission denied|Host key verification failed|no route to host/i.test(errorOutput);
                         const diag = connFail
                             ? "\n[连接层失败] ssh 本身没建起链——若 --host/-J 传的是 ssh-config 别名，注意别名解析用的是**本运行环境**的 ~/.ssh/config（沙箱/远端会话可能没有该条目：改用 user@host[:port] 字面量或先补 config）"
                             : "";
                         const e = new Error(
-                            `命令未完成（无完成哨兵——通道中断/进程被信号终止，close code=${code}）${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500 字符:\n${out.slice(-500)}\nstderr 尾 300:\n${stderr.slice(-300)}${diag}`,
+                            `命令未完成（无完成哨兵——通道中断/进程被信号终止，close code=${code}）${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500 字符:\n${evidence.slice(-500)}\nstderr 尾 300:\n${errorOutput.slice(-300)}${diag}`,
                         ) as Error & { outcome: "unknown" };
                         e.outcome = "unknown";
                         reject(e);
@@ -923,7 +916,9 @@ export class SshPtyDriver implements RuntimeDriver {
                     return;
                 }
                 // 哨兵在场：退出码以哨兵为准（code===null 的信号杀竞态也不伪 0）
-                finish(() => resolve({ stdout: out, stderr, exitCode: sentinelCode, effectiveUser }));
+                const { end, bodyBytes, exitCode, effectiveUser } = completion;
+                if (effectiveUser) this.effectiveUser = effectiveUser;
+                finish(() => resolve({ stdout: stdout.result(evidence, end, bodyBytes), stderr: stderr.result(errorOutput), exitCode, effectiveUser }));
             });
             p.on("error", (err) => finish(() => reject(err)));
         });

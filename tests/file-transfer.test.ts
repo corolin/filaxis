@@ -6,6 +6,9 @@ import { mkdtempSync, writeFileSync, readFileSync, readlinkSync, rmSync, existsS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { LocalRuntimeDriver } from "../src/local-driver.js";
+import { transferLayerFile } from "../src/layer-file-transfer.js";
 import { putFile, putContent, getFile, sftpPutFile, sftpGetFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
 import { probeDialect, NULL_DIALECT, type RemoteDialect } from "../src/dialect.js";
 
@@ -16,6 +19,40 @@ const GNU: RemoteDialect = {
     sha256: ["sha256sum"],
 };
 
+test("local upload and download audit only operation metadata", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fx-transfer-audit-"));
+    const audit = join(dir, "audit");
+    const driver = new LocalRuntimeDriver({ cwd: dir, execDir: audit });
+    const payload = Buffer.concat([Buffer.from("synthetic-audit-only-fixture"), Buffer.from([0, 255, 128])]);
+    const source = join(dir, "source.bin");
+    const destination = join(dir, "download.bin");
+    const layerPath = "layer copy.bin";
+    try {
+        writeFileSync(source, payload);
+        for (const [operation, localPath] of [["put", source], ["get", destination]] as const) {
+            const result = await transferLayerFile(driver, operation, { localPath, remotePath: layerPath });
+            expect(result).toMatchObject({ bytes: payload.length, verification: "sha256" });
+        }
+        expect(readFileSync(destination)).toEqual(payload);
+        const files = readdirSync(audit);
+        expect(files.length).toBeGreaterThan(0);
+        const labels = new Set<string>();
+        for (const name of files) {
+            expect(name).toEndWith(".status.json");
+            const contents = readFileSync(join(audit, name), "utf-8");
+            expect(contents).not.toContain(payload.toString("base64"));
+            expect(contents).not.toContain("synthetic-audit-only-fixture");
+            const status = JSON.parse(contents);
+            expect(status).toMatchObject({ status: "completed", exitCode: expect.any(Number) });
+            labels.add(status.command);
+        }
+        expect(labels).toEqual(new Set(["file upload", "file download"]));
+    } finally {
+        await driver.destroy();
+        rmSync(dir, { recursive: true, force: true });
+    }
+}, 45_000);
+
 /**
  * mock 远端：内存文件系统 + bash 语义回放（printf append / base64 -d / wc -c /
  * sha256sum / rm / base64 -w 0 编码）。put 走 printf 分块真实拼接路径。
@@ -23,7 +60,8 @@ const GNU: RemoteDialect = {
 function mockRemote() {
     const files = new Map<string, Buffer>();
     const exec: TransferExec = async (cmd) => {
-        const m = cmd.match(/^printf %s '([^']*)' >> '(.+)'$/);
+        if (cmd.startsWith("(umask 077; case \"$(uname -s)\"") || cmd.startsWith("rmdir ")) return { stdout: "", exitCode: 0 };
+        const m = cmd.match(/^\(umask 077; printf %s '([^']*)' >> '(.+)'\)$/);
         if (m) {
             const prev = files.get(m[2]!) ?? Buffer.alloc(0);
             // printf %s 的字面量即 base64 文本
@@ -35,7 +73,7 @@ function mockRemote() {
             for (const f of cmd.slice(6).match(/'([^']*)'/g) ?? []) files.delete(f.slice(1, -1));
             return { stdout: "", exitCode: 0 };
         }
-        let mm = cmd.match(/^: > '(.+)'$/);
+        let mm = cmd.match(/^\(umask 077; : > '(.+)'\)$/);
         if (mm) {
             files.set(mm[1]!, Buffer.alloc(0)); // 空文件临时（Astra 六轮 #2）
             return { stdout: "", exitCode: 0 };
@@ -63,11 +101,11 @@ function mockRemote() {
             return { stdout: "FX_MV_OK", exitCode: 0 };
         }
         // forceInplace 形态（显式请求保留 inode 写）——cat src > "$tgt" && rm src
-        mm = cmd.match(/^cat < '([^']+)' > [^&]+ && rm -f '([^']+)' && echo FX_MV_CAT$/); // < src > tgt（Sol 90 P1-3 重定向排序）
-        if (mm) {
+        mm = cmd.match(/< '([^']+\/payload-[0-9a-f]+)'; then :; else echo FX_NO_PAYLOAD; fi/);
+        if (tgtM && mm) {
             const b = files.get(mm[1]!);
             if (!b) return { stdout: "", exitCode: 1 };
-            files.set(mm[1]!.replace(/\.filaxis-out-[0-9a-f]+$/, ""), b); // 落点=去 out 后缀的目标
+            files.set(tgtM[1]!, b);
             files.delete(mm[1]!);
             return { stdout: "FX_MV_CAT", exitCode: 0 };
         }
@@ -255,7 +293,7 @@ describe("sftp 快路径（FEAT-14 ②）", () => {
             spawnImpl: fakeSftp,
         });
         expect(gotArgv).toEqual(["-b", "-", "-o", "ConnectTimeout=10", "user@host"]);
-        expect(gotBatch).toMatch(/^put '.+' '\/r\/big\.bin\.filaxis-out-[a-f0-9]{12}'$/m);
+        expect(gotBatch).toMatch(/^put '.+' '\/r\/big\.bin\.filaxis-stage-([a-f0-9]{12})\/payload-\1'$/m);
         expect(r.verified).toBe(true); // 与 base64 路径同一校验标准
         expect(r.verification).toBe("sha256");
         expect(r.bytes).toBe(64 * 1024);
@@ -303,6 +341,55 @@ describe("sftp 快路径（FEAT-14 ②）", () => {
  * sh -c，走与远端一致的物理行为。
  */
 describe("putFile（真实 shell 回归）", () => {
+    test.skipIf(process.platform !== "win32")("Windows uses a protected staging ACL and preserves the destination ACL", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-private-stage-"));
+        const driver = new LocalRuntimeDriver({ cwd: dir });
+        const target = "file with spaces.bin";
+        const info = (path: string, operation: string) => execFileSync("powershell.exe", [
+            "-NoProfile", "-NonInteractive", "-Command", operation,
+        ], { encoding: "utf8", env: { ...process.env, FX_TEST_ACL_PATH: path } }).trim();
+        const snapshot = "([IO.File]::GetAccessControl($env:FX_TEST_ACL_PATH)).GetSecurityDescriptorSddlForm('Access')";
+        const staged: string[] = [];
+        const exec: TransferExec = async (command) => {
+            const create = /cygpath -aw '([^']+\.filaxis-stage-[0-9a-f]+)'/.exec(command);
+            const payload = /cygpath -aw '([^']+\/payload-[0-9a-f]+)'/.exec(command);
+            if (payload) {
+                for (const path of [payload[1]!, payload[1]!.replace(/payload-[0-9a-f]+$/, "encoded")]) {
+                    expect(info(join(dir, path),
+                        "$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User; " +
+                        "$a = [IO.File]::GetAccessControl($env:FX_TEST_ACL_PATH); " +
+                        "$rules = @($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); " +
+                        "($rules.Count -eq 1 -and $rules[0].IdentityReference -eq $sid)")).toBe("True");
+                }
+            }
+            const result = await driver.exec(command);
+            if (create && result.exitCode === 0) {
+                const path = join(dir, create[1]!);
+                staged.push(path);
+                expect(info(path, "$a = [IO.Directory]::GetAccessControl($env:FX_TEST_ACL_PATH); " +
+                    "[string]$a.AreAccessRulesProtected + ',' + @($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])).Count"))
+                    .toBe("True,1");
+            }
+            return result;
+        };
+        try {
+            const dialect = await probeDialect(exec);
+            await putContent(exec, dialect, Buffer.from("first"), target);
+            const file = join(dir, target);
+            expect(info(file, "([IO.File]::GetAccessControl($env:FX_TEST_ACL_PATH)).AreAccessRulesProtected")).toBe("False");
+            info(file, "& icacls.exe $env:FX_TEST_ACL_PATH /grant '*S-1-1-0:(R)'");
+            const before = info(file, snapshot);
+            expect(await putContent(exec, dialect, Buffer.from("second"), target)).toMatchObject({ writeMode: "atomic-replace" });
+            expect(info(file, snapshot)).toBe(before);
+            expect(readFileSync(file, "utf8")).toBe("second");
+            expect(staged).toHaveLength(2);
+            expect(staged.every((path) => !existsSync(path))).toBe(true);
+        } finally {
+            await driver.destroy();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 45_000);
+
     test.skipIf(process.platform !== "linux")("上传无法解析目标时保留符号链接", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-put-dangling-"));
         try {
@@ -351,7 +438,7 @@ describe("putFile（真实 shell 回归）", () => {
         writeFileSync(join(dirR, "dst1.bin"), "PRECIOUS");
         // 注入：chunk 正常落盘后追加非法 base64 字符 → decode invalid input 失败
         const evil: TransferExec = async (cmd) => {
-            const m = cmd.match(/^printf %s '[^']*' >> '([^']+)'$/);
+            const m = cmd.match(/^\(umask 077; printf %s '[^']*' >> '([^']+)'\)$/);
             if (m) {
                 const r = await realExec(cmd);
                 if (r.exitCode !== 0) return r;
@@ -457,7 +544,7 @@ describe("putFile（真实 shell 回归）", () => {
         writeFileSync(local, "FRESH-CONTENT");
         const dst = fwd(join(dirR, "dst6.bin"));
         const evil: TransferExec = async (cmd) => {
-            if (/^rm -f '.+\.filaxis-tmp-[0-9a-f]+'$/.test(cmd)) return { stdout: "", exitCode: 1 }; // 清理失败
+            if (/^rm -f '.+\/encoded'; rmdir /.test(cmd)) return { stdout: "", exitCode: 1 }; // 清理失败
             return realExec(cmd);
         };
         const r = await putFile(evil, GNU, local, dst); // 不抛「目标未动」（落位已成功）
@@ -502,7 +589,7 @@ describe("putFile（真实 shell 回归）", () => {
         const dst = fwd(join(dirR, "dst9.bin"));
         let n = 0;
         const evil: TransferExec = async (cmd) => {
-            if (cmd.startsWith("printf %s ") && ++n >= 2) return { stdout: "write error: No space left on device", exitCode: 1 };
+            if (cmd.startsWith("(umask 077; printf %s ") && ++n >= 2) return { stdout: "write error: No space left on device", exitCode: 1 };
             return realExec(cmd);
         };
         await expect(putFile(evil, GNU, local, dst)).rejects.toThrow(/分块写入失败.*exit=1/);
@@ -522,7 +609,7 @@ describe("putFile（真实 shell 回归）", () => {
     // GPT Sol 八十九期 P1-4/P1-5：目录回搬分支曾不核实「本次是否真搬过」——mv
     // 全败时目录里恰同名无关文件被搬出后删除/误当载荷；跨文件系统落位（载荷临时
     // 在原路径一侧、符号链接真身在另一 fs）mv 退化为复制仍报 atomic-replace。
-    test.skipIf(!hasSh)("Sol 89 P1-4/P1-5 同设备形状：__fx_mv 证据闸 + 设备分流在场，atomic-replace 保持", async () => {
+    test.skipIf(!hasSh || process.platform === "win32")("Sol 89 P1-4/P1-5 同设备形状：__fx_mv 证据闸 + 设备分流在场，atomic-replace 保持", async () => {
         const cmds: string[] = [];
         const recExec: TransferExec = async (cmd) => { cmds.push(cmd); return realExec(cmd); };
         const dst = fwd(join(dirR, "shape89.bin"));
@@ -567,7 +654,7 @@ describe("putFile（真实 shell 回归）", () => {
         const evil: TransferExec = async (cmd) => {
             const dm = cmd.match(/base64 -d < '([^']+)' > '([^']+)'/);
             if (dm) outPath = dm[2]!;
-            if (cmd.includes("__fx_mv=0")) {
+            if (cmd.includes("__fx_od=")) {
                 // 落位开始：移除已校验载荷（模拟丢失/外部清理）
                 if (outPath) rmSync(outPath, { force: true });
             }
@@ -582,7 +669,7 @@ describe("putFile（真实 shell 回归）", () => {
         const target = fwd(join(dirR, "partial-payload-missing.bin"));
         writeFileSync(target, "previous");
         const exec: TransferExec = (command) => realExec(command.includes("FX_INPLACE_PAYLOAD_MISSING")
-            ? `cat() { rm -f '${target}'.filaxis-out-*; head -c 1; return 1; }; ${command}`
+            ? `cat() { rm -f '${target}'.filaxis-stage-*/payload-*; head -c 1; return 1; }; ${command}`
             : command);
         await expect(putContent(exec, GNU, Buffer.from("new"), target, { forceInplace: true }))
             .rejects.toThrow(/目标可能已被部分改写，恢复载荷已不在/);

@@ -14,8 +14,7 @@ import { join } from "node:path";
 import { createServer } from "node:net";
 
 /** 驱动 MCP server 的测试替身：write(line) 进请求，collect() 收响应 */
-function mcpFixture(stack = new RuntimeStack()): { write: (obj: Record<string, unknown>) => void; collect: () => Array<Record<string, unknown>>; close: () => void } {
-    const tk = createAgentToolkit(stack, {});
+function mcpFixture(stack = new RuntimeStack(), tk = createAgentToolkit(stack, {})): { write: (obj: Record<string, unknown>) => void; collect: () => Array<Record<string, unknown>>; close: () => void } {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
     new McpServer({ toolkit: tk, stdin, stdout });
@@ -188,7 +187,7 @@ describe("MCP Server（REQ-0003）", () => {
         try {
             const steps = [
                 { id: "sys", kind: "exec", command: "printf SYS_READY" },
-                { id: "docker", kind: "exec", command: `printf '%s' '${"x".repeat(4093)}🧵DOCKER_TAIL'` },
+                { id: "docker", kind: "exec", command: `printf '%s' '${"x".repeat(1364)}🧵DOCKER_TAIL'` },
                 { id: "net", kind: "exec", command: "printf NET_CHECK >&2; exit 7", expect_exit: [7] },
             ];
             f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_batch", arguments: { steps } } });
@@ -197,11 +196,94 @@ describe("MCP Server（REQ-0003）", () => {
             expect(text).toContain("sys (exec) | status=ok | exit_code=0\nstdout:\nSYS_READY");
             expect(text).toContain("docker (exec) | status=ok | exit_code=0");
             expect(text).toContain("net (exec) | status=ok | exit_code=7\nstderr:\nNET_CHECK");
-            expect(text).toContain("已截断 15 字节");
+            expect(text).toContain("已截断 15 字节，完整输出见 structuredContent");
             expect(text).not.toContain("�");
             expect(result.structuredContent.steps[1]!.stdout).toEndWith("🧵DOCKER_TAIL");
+            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "run_batch", arguments: { steps, output: "text" } } });
+            const compact = (await waitId(f, 2)).result as typeof result;
+            expect(compact).not.toHaveProperty("structuredContent");
+            expect(compact.content[0]!.text).toContain("stdout:\nSYS_READY");
+            expect(compact.content[0]!.text).toContain("stderr:\nNET_CHECK");
+            expect(compact.content[0]!.text).toContain("[采集阶段已截断 ");
+            expect(compact.content[0]!.text).not.toContain("structuredContent");
         } finally { f.close(); }
     }, 15_000);
+
+    test("oversized MCP batch text preserves failures and edit guarantees within the JSON text budget", async () => {
+        const stack = new RuntimeStack();
+        const toolkit = createAgentToolkit(stack, {});
+        const failure = "\u0000".repeat(2000) + "尾";
+        toolkit.handlers.run_batch = async () => ({
+            status: "fail",
+            failed_step: "fail-0",
+            steps: [
+                { id: "edited", kind: "edit", status: "ok", edits: {
+                    path: "sample", occurrences: 1, bytes_before: 1, bytes_after: 1, hunks: [],
+                    write_mode: "inplace-write", mutex: "degraded",
+                } },
+                ...Array.from({ length: 12 }, (_, i) => ({
+                    id: `fail-${i}`, kind: "exec", status: "fail", exit_code: 2, error: failure,
+                })),
+            ],
+        });
+        const fixture = mcpFixture(stack, toolkit);
+        try {
+            fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "run_batch", arguments: { output: "text" },
+            } });
+            const { result } = await waitId(fixture, 1) as { result: { content: Array<{ text: string }> } };
+            const text = result.content[0]!.text;
+            expect(Buffer.byteLength(JSON.stringify(text))).toBeLessThanOrEqual(8 * 1024);
+            expect(text).toContain("fail-11 (exec) | status=fail | exit_code=2");
+            expect(text).toContain("write_mode=inplace-write | mutex=degraded");
+            expect(text).toContain("部分结果已省略");
+            expect(result).not.toHaveProperty("structuredContent");
+        } finally { fixture.close(); }
+    });
+
+    test("batch validation errors also fit the text budget", async () => {
+        const fixture = mcpFixture();
+        try {
+            fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "run_batch", arguments: { output: "text", steps: [{ id: "bad", kind: "😀".repeat(3500) }] },
+            } });
+            const { result } = await waitId(fixture, 1) as { result: { content: Array<{ text: string }>; isError: boolean } };
+            const text = result.content[0]!.text;
+            expect(result.isError).toBe(true);
+            expect(Buffer.byteLength(JSON.stringify(text))).toBeLessThanOrEqual(8 * 1024);
+            expect(text).toContain("未知 kind");
+            expect(text).toContain("部分结果已省略");
+            expect(result).not.toHaveProperty("structuredContent");
+        } finally { fixture.close(); }
+    });
+
+    test("text batches read bounded local file previews without loading the full file", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-mcp-read-preview-"));
+        const stack = new RuntimeStack();
+        const fixture = mcpFixture(stack);
+        const driver = new LocalRuntimeDriver({ cwd: dir });
+        try {
+            writeFileSync(join(dir, "large data"), "preview-start\n" + "x".repeat(100_000) + "\npreview-end");
+            await stack.addLayer("bounded-read", driver);
+            driver.fs.readFile = async () => { throw new Error("Full file read must not run"); };
+            fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "run_batch", arguments: { layer: "bounded-read", output: "text", steps: [
+                    { id: "read", kind: "read", path: "large data" },
+                ] },
+            } });
+            const { result } = await waitId(fixture, 1) as { result: { content: Array<{ text: string }> } };
+            const text = result.content[0]!.text;
+            expect(text).toContain("status=ok");
+            expect(text).toContain("preview-start");
+            expect(text).toContain("采集阶段已截断");
+            expect(text).not.toContain("preview-end");
+            expect(Buffer.byteLength(JSON.stringify(text))).toBeLessThanOrEqual(8 * 1024);
+        } finally {
+            fixture.close();
+            await stack.removeLayer("bounded-read", { destroy: true });
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
 
     test("run_command text preserves multiline stdout within 8 KiB and provides stderr", async () => {
         const f = mcpFixture();

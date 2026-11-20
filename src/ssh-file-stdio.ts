@@ -3,13 +3,20 @@ import * as fsSync from "node:fs";
 import * as crypto from "node:crypto";
 import { openSshEnvironment } from "./openssh-environment.js";
 import type { FilaxisLogger } from "./logger.js";
+import { ExecCapture } from "./exec-capture.js";
 
 export function sshFileStdioRequested(): boolean {
     return process.env.FILAXIS_SSH_STDIO_MODE === "inherit";
 }
 
 /** 直接启动 SSH 或 SFTP，将标准流绑定到临时文件描述符，最后读回双流。 */
-export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { timeoutMs?: number; signal?: AbortSignal; executable?: "ssh" | "sftp"; logger?: FilaxisLogger } = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: {
+    timeoutMs?: number; signal?: AbortSignal; executable?: "ssh" | "sftp"; logger?: FilaxisLogger;
+    maxOutputBytes?: number; stdoutMarker?: string;
+} = {}): Promise<{
+    stdout: string; stderr: string; exitCode: number | null; stdoutCapture?: ExecCapture; stderrCapture?: ExecCapture;
+}> {
+    if (opts.maxOutputBytes !== undefined) new ExecCapture(opts.maxOutputBytes); // validate before spawn
     const executable = opts.executable ?? "ssh";
     const os = await import("node:os");
     const fsp = await import("node:fs/promises");
@@ -93,11 +100,13 @@ export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, op
     for (const fd of [inFd, outFd, errFd]) { try { fsSync.closeSync(fd); } catch { /* 已随进程关闭 */ } }
     // stderr 读取失败不静默（Sol 83 P2-9）：EIO 等曾吞成空串——退出码照回而
     // 诊断内容丢失，调用方无从知晓。落诊断占位（stdout 同罪同判）
-    const readOrNote = async (f: string, what: string): Promise<string> => {
+    const readOrNote = async (f: string, what: string): Promise<{ text: string; capture?: ExecCapture }> => {
         try {
-            return await fsp.readFile(f, "utf-8");
+            if (opts.maxOutputBytes === undefined) return { text: await fsp.readFile(f, "utf-8") };
+            const capture = await ExecCapture.fromFile(f, opts.maxOutputBytes, what === "stdout" ? opts.stdoutMarker : undefined);
+            return { text: capture.evidence(), capture };
         } catch (e) {
-            return `[filaxis] ${what} 读取失败（${(e as Error).message}）——诊断内容丢失`;
+            return { text: `[filaxis] ${what} 读取失败（${(e as Error).message}）——诊断内容丢失` };
         }
     };
     const [out, err] = await Promise.all([
@@ -118,5 +127,9 @@ export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, op
             { code: (spawnErr as { code?: string }).code, cause: spawnErr },
         );
     }
-    return { stdout: out, stderr: err, exitCode };
+    return {
+        stdout: out.text, stderr: err.text, exitCode,
+        ...(out.capture ? { stdoutCapture: out.capture } : {}),
+        ...(err.capture ? { stderrCapture: err.capture } : {}),
+    };
 }
