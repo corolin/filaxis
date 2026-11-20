@@ -228,7 +228,7 @@ export class RuntimeStack {
         }
         let p!: Promise<RuntimeDriver>; // 自引用（回填前复检 in-flight 身份）——回调执行时已赋值
         p = (async () => {
-            const drv = this.factory.create(descriptor, fallbackCwd);
+            const drv = this.factory.create(descriptor, fallbackCwd, this.log);
             try {
                 await drv.init();
             } catch (e) {
@@ -709,7 +709,7 @@ export class RuntimeStack {
     /** terminal=true：identity 命中在该层路径**末节点**（同落点构造性成立，免 hostname 探测）；
      *  false：命中途经节点（identity 撞了中间跳——hostname 落点校验把关） */
     private async findIdentityHopHit(dest: SshHop, compatible?: (candidate: RuntimeDescriptor) => boolean): Promise<{ handle: LayerHandle; terminal: boolean } | undefined> {
-        const destId = await resolveSshIdentity(dest);
+        const destId = await resolveSshIdentity(dest, this.log);
         if (!destId || destId.startsWith("unresolved:")) {
             // 解析不可达（DNS/离线）——identity 不可靠，跳过判重（建层失败由 connect 兜底）
             return undefined;
@@ -725,7 +725,7 @@ export class RuntimeStack {
             for (let i = 0; i < path.length; i++) {
                 const candidate = path[i]!;
                 if (JSON.stringify(RuntimeStack.sshHopContext(candidate)) !== context) continue;
-                if ((await resolveSshIdentity(candidate)) === destId) {
+                if ((await resolveSshIdentity(candidate, this.log)) === destId) {
                     return { handle: h, terminal: i === path.length - 1 };
                 }
             }

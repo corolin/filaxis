@@ -8,6 +8,7 @@ import type { RuntimeDriver, RuntimeDescriptor } from "./driver.js";
 import { LocalRuntimeDriver } from "./local-driver.js";
 import { SshPtyDriver } from "./ssh-pty-driver.js";
 import { TmuxSessionDriver } from "./tmux-driver.js";
+import type { FilaxisLogger } from "./logger.js";
 
 export type DriverFactory = (descriptor: RuntimeDescriptor) => RuntimeDriver;
 
@@ -30,12 +31,12 @@ export class RuntimeFactory {
         return ["local", "ssh", "tmux", ...this.custom.keys()];
     }
 
-    create(descriptor: RuntimeDescriptor, fallbackCwd?: string): RuntimeDriver {
+    create(descriptor: RuntimeDescriptor, fallbackCwd?: string, logger?: FilaxisLogger): RuntimeDriver {
         if (descriptor.driver === "local") {
             return LocalRuntimeDriver.fromDescriptor(descriptor, fallbackCwd);
         }
         if (descriptor.driver === "ssh") {
-            return new SshPtyDriver(descriptor);
+            return new SshPtyDriver(descriptor, { logger });
         }
         if (descriptor.driver === "tmux") {
             return new TmuxSessionDriver(descriptor);

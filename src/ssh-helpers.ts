@@ -10,6 +10,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import * as crypto from "node:crypto";
 import type { RuntimeDescriptor } from "./driver.js";
 import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
+import { openSshEnvironment } from "./openssh-environment.js";
+import type { FilaxisLogger } from "./logger.js";
 
 /** 端口透传（随层连接生命周期——层在隧道在，层断即撤） */
 export interface SshPortForward {
@@ -396,7 +398,7 @@ export const SSH_INPUT_WAIT_RE =
 
 const identityCache = new Map<string, string>();
 /** 连接身份解析（ssh -G 本地解析不连网）；失败回退 unresolved: 前缀（视为不相同，不误拦） */
-export async function resolveSshIdentity(hop: SshHop): Promise<string> {
+export async function resolveSshIdentity(hop: SshHop, logger?: FilaxisLogger): Promise<string> {
     const cacheKey = typeof hop === "string" ? hop : JSON.stringify(hop);
     const cached = identityCache.get(cacheKey);
     if (cached) return cached;
@@ -404,13 +406,13 @@ export async function resolveSshIdentity(hop: SshHop): Promise<string> {
         const argv = ["-G", ...sshArgsFor(hop)];
         let stdout: string;
         if (sshFileStdioRequested()) {
-            const result = await spawnWithFileRedirect(argv, "", { timeoutMs: 8000 });
+            const result = await spawnWithFileRedirect(argv, "", { timeoutMs: 8000, logger });
             if (result.exitCode !== 0) return `unresolved:${hopHost(hop)}`;
             stdout = result.stdout;
         } else {
             const { execFile } = await import("node:child_process");
             const { promisify } = await import("node:util");
-            ({ stdout } = await promisify(execFile)("ssh", argv, { timeout: 8000 }));
+            ({ stdout } = await promisify(execFile)("ssh", argv, { timeout: 8000, env: openSshEnvironment(process.env, logger) }));
         }
         const h = stdout.match(/^hostname (\S+)$/m)?.[1] ?? hopHost(hop);
         const p = stdout.match(/^port (\d+)$/m)?.[1] ?? "22";

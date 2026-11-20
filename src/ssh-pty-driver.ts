@@ -17,6 +17,7 @@ import { StreamSessionManager } from "./stream-session-manager.js";
 import type { ObservationWindowOptions, StreamWindowRegistry } from "./stream-window.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
+import { openSshEnvironment } from "./openssh-environment.js";
 import { StringDecoder } from "node:string_decoder";
 import * as crypto from "node:crypto";
 import type {
@@ -69,12 +70,12 @@ class PtyLink {
         return `; echo __FILAXIS_FB_${this.fallbackNonce}_${step}_$?_$$`;
     }
 
-    attach(args: string[]): void {
+    attach(args: string[], logger?: FilaxisLogger): void {
         this.fallbackNonce = crypto.randomBytes(16).toString("hex");
         this.fallbackSteps.clear();
         this.fallbackSeen = undefined;
         const spawnAt = Date.now();
-        this.proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
+        this.proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], env: openSshEnvironment(process.env, logger) });
         // spawn error 监听（Sol 87 P1-4）：ssh 不在 PATH 时 ENOENT 是异步 error
         // 事件——无监听器=uncaughtException 崩**宿主**（调用方 try/catch 收不到
         // 拒绝）。归 readyRejecter/pendingExitFailure（建链失败语义，非超时指纹）
@@ -551,7 +552,7 @@ export class SshPtyDriver implements RuntimeDriver {
             this.log.warn(`[SshPty] 内层 shell 已退出，层退化：${evidence}——连接仍在但已非本层环境`);
         };
 
-        this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop), connParams));
+        this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop), connParams), this.log);
         try { await this.link.handshake(`ssh ${hopLabel(rootHop)}`); }
         catch (error) { this.link.kill(); throw error; }
         for (const hop of hops) {
@@ -797,7 +798,7 @@ export class SshPtyDriver implements RuntimeDriver {
             // 显式 stdio 模式覆盖（DeepSeek Harness 反馈）：FILAXIS_SSH_STDIO_MODE=inherit
             // 直接走文件中转（管道句柄在受限沙箱里被拦截——ssh 秒退 255 零输出）
             if (fileStdio) {
-                void spawnWithFileRedirect(argv, render.stdinCmd, { timeoutMs: options?.timeoutMs, signal: options?.signal }).then((r) => {
+                void spawnWithFileRedirect(argv, render.stdinCmd, { timeoutMs: options?.timeoutMs, signal: options?.signal, logger: this.log }).then((r) => {
                     const mIdx = r.stdout.lastIndexOf(`\n${marker}:`);
                     const m = mIdx !== -1 ? r.stdout.slice(mIdx + 1).split("\n", 1)[0]?.match(new RegExp(`^${marker}:(-?\\d+):(.*)$`)) : null;
                     if (!m) {
@@ -817,7 +818,7 @@ export class SshPtyDriver implements RuntimeDriver {
             }
             const spawnAt = Date.now();
             const p = spawn("ssh", argv, {
-                env: { ...process.env },
+                env: openSshEnvironment(process.env, this.log),
                 // 本地 ssh 进程启动目录不用 options.cwd（GPT Astra 十轮 #1）：cwd 是
                 // **远端**语义（stdinCmd 的 cd 前缀）——远端专属目录本地不存在则
                 // spawn ENOENT，连接尚未建立即崩。本地目录与远端工作目录无关。

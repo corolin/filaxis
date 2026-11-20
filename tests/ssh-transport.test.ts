@@ -13,6 +13,8 @@ import { __testBrokenStdioExit, __testFileRedirect, resolveLayerState, SshPtyDri
 import { RemoteSessionManager } from "../src/remote-session-manager.js";
 import type { SessionEvent } from "../src/session-types.js";
 import { resolveLocalShell } from "../src/shell-discovery.js";
+import { openSshEnvironment } from "../src/openssh-environment.js";
+import { noopLogger } from "../src/logger.js";
 
 test.skipIf(process.platform !== "linux")("SSH writeFile 解码器写出一部分再失败时保留原文件", async () => {
     const dir = mkdtempSync(join(tmpdir(), "fx-ssh-write-"));
@@ -1280,6 +1282,32 @@ describe("Sol 73：TMPDIR 失效回落", () => {
 // DeepSeek Harness 反馈：沙箱拦截匿名管道——stdio:'pipe' spawn 的 ssh 秒退 255
 // 零输出。快速诊断指纹（255+零输出+<500ms），文件中转由环境变量显式选择。
 describe("DS 反馈：沙箱 stdio 管道损坏", () => {
+    test.skipIf(process.platform !== "win32")("Windows OpenSSH environment fills missing values and preserves configured values", () => {
+        const source = {
+            SYSTEMROOT: "",
+            SystemRoot: "D:\\Windows",
+            programdata: "E:\\Shared Data",
+            username: "configured-user",
+            Path: "X:\\bin",
+        };
+        const warnings: string[] = [];
+        const log = { ...noopLogger, warn: (message: string) => warnings.push(message) };
+        const env = openSshEnvironment(source, log);
+        expect(env).toMatchObject({
+            SystemRoot: "D:\\Windows", windir: "D:\\Windows", SystemDrive: "D:",
+            programdata: "E:\\Shared Data", ALLUSERSPROFILE: "E:\\Shared Data", username: "configured-user", Path: "X:\\bin",
+        });
+        expect(env.SYSTEMROOT).toBeUndefined();
+        expect(source.SYSTEMROOT).toBe("");
+        expect(Object.hasOwn(source, "windir")).toBe(false);
+        expect(warnings).toEqual([]);
+        const missingRoot = { WINDIR: "D:\\Windows" };
+        expect(openSshEnvironment(missingRoot, log).SystemRoot).toBe(missingRoot.WINDIR);
+        openSshEnvironment(missingRoot, log);
+        expect(warnings).toEqual([expect.stringContaining("缺少 SystemRoot")]);
+        expect(warnings[0]).not.toContain(missingRoot.WINDIR);
+    });
+
     test("file stdio rejects PTY hops and persistent forwards before attempting a connection", async () => {
         const original = process.env.FILAXIS_SSH_STDIO_MODE;
         process.env.FILAXIS_SSH_STDIO_MODE = "inherit";

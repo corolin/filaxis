@@ -20,6 +20,7 @@ import { basename, dirname, join } from "node:path";
 import type { RemoteDialect } from "./dialect.js";
 import { renderInplaceWrite, renderPreserveMode } from "./file-placement.js";
 import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
+import { openSshEnvironment } from "./openssh-environment.js";
 
 /** 远端执行回调（通常是 driver 的 exec 通道） */
 export type TransferExec = (command: string) => Promise<{ stdout: string; exitCode: number }>;
@@ -335,7 +336,7 @@ export type SftpSpawnImpl = (argv: string[], batch: string) => Promise<{ exitCod
 async function defaultSftpSpawn(argv: string[], batch: string, timeoutMs?: number): Promise<{ exitCode: number | null; stderr: string }> {
     if (sshFileStdioRequested()) return spawnWithFileRedirect(argv, batch, { executable: "sftp", timeoutMs });
     return new Promise((resolve, reject) => {
-        const p: ChildProcess = defaultSpawn("sftp", argv, { stdio: ["pipe", "ignore", "pipe"] });
+        const p: ChildProcess = defaultSpawn("sftp", argv, { stdio: ["pipe", "ignore", "pipe"], env: openSshEnvironment() });
         const timer = timeoutMs ? setTimeout(() => {
             stderr += `\nsftp 超时（${timeoutMs}ms）`;
             p.kill("SIGKILL");

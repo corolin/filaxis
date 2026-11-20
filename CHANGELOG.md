@@ -11,6 +11,12 @@
 
 ---
 
+## 0.2.4
+
+- Windows 启动 OpenSSH 子进程时补齐缺失的系统和账户变量，保留已有值。补全覆盖 SSH 身份解析、建层、exec、PTY、观察窗和 SFTP。
+- 成功补齐 `SystemRoot` 时每个进程最多记录一次告警，CLI 和 MCP 写入 stderr，SDK 使用调用方注入的 logger。
+- 增加缺失 Windows 系统变量的真实 SSH 回归测试，并更新 README 和 Skill 的排障说明。
+
 ## 0.2.3
 
 - `FILAXIS_SSH_STDIO_MODE=inherit` 覆盖 SSH 配置解析、非交互建层和命令执行，支持直连、TCP 跳板及可重放的进入步骤。逐跳 PTY 等依赖交互通道的能力会给出明确提示。

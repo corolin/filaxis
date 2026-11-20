@@ -1,13 +1,15 @@
 import { spawn } from "node:child_process";
 import * as fsSync from "node:fs";
 import * as crypto from "node:crypto";
+import { openSshEnvironment } from "./openssh-environment.js";
+import type { FilaxisLogger } from "./logger.js";
 
 export function sshFileStdioRequested(): boolean {
     return process.env.FILAXIS_SSH_STDIO_MODE === "inherit";
 }
 
 /** 直接启动 SSH 或 SFTP，将标准流绑定到临时文件描述符，最后读回双流。 */
-export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { timeoutMs?: number; signal?: AbortSignal; executable?: "ssh" | "sftp" } = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, opts: { timeoutMs?: number; signal?: AbortSignal; executable?: "ssh" | "sftp"; logger?: FilaxisLogger } = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
     const executable = opts.executable ?? "ssh";
     const os = await import("node:os");
     const fsp = await import("node:fs/promises");
@@ -67,7 +69,7 @@ export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, op
             await cleanup();
             throw Object.assign(new DOMException("exec aborted by AbortSignal（spawn 前检出）", "AbortError"), { outcome: "unknown" });
         }
-        p = spawn(executable, argv, { stdio: [inFd, outFd, errFd] });
+        p = spawn(executable, argv, { stdio: [inFd, outFd, errFd], env: openSshEnvironment(process.env, opts.logger) });
         p.once("error", (e: Error) => { spawnErr = e; }); // 本地拒启归账（ENOENT 等）——区别于远端执行结果
     } catch (e) {
         // spawn 同步抛错清场（Sol 81 P2-5）：argv 含 NUL 等被 Node 拒启——

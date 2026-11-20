@@ -94,6 +94,8 @@ MCP 对应工具是 `put_file` 和 `get_file`。`local_path` 位于 MCP 服务�
 
 运行环境限制匿名管道时，可在启动 CLI 或 MCP 服务前设置 `FILAXIS_SSH_STDIO_MODE=inherit`。使用 SDK 时，在建立 SSH 层前设置。该模式通过临时文件为 SSH 提供标准输入和双流输出。命名层使用非交互探测核实目标和工作目录，后续执行仍以完成哨兵确认退出码。
 
+Windows 上，Filaxis 启动 OpenSSH 子进程时会补齐缺失的系统和账户环境变量，包括 `SystemRoot`、`windir`、`ProgramData` 和 `USERNAME`。已有值优先，补全只作用于子进程。成功补齐 `SystemRoot` 时，CLI 和 MCP 会在 stderr 告警一次，SDK 通过注入的 logger 记录。主机剥离这些变量和主机限制匿名管道是两类独立问题。
+
 支持免交互认证的直连、单跳 `connParams.jump`（CLI `-J`）及可非交互重放的进入步骤。逐跳 PTY 登录链、交互式进入、持久端口转发和持续观察窗需要可用的匿名管道。会话日志可用 `readSessionLog` 读取落盘内容。
 
 SSH 秒退 255 且双流为空只能作为排障线索。执行终态未知时，先核实远端状态再决定是否重发。
