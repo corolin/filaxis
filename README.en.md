@@ -66,10 +66,30 @@ npm install @syrkos/filaxis
 ```bash
 npm install -g @syrkos/filaxis
 filaxis mcp-config                # JSON with mcpServers
-filaxis mcp-config --format toml   # TOML with mcp_servers for Codex
+filaxis mcp-config --format toml  # TOML with mcp_servers for Codex
 ```
 
 `mcp-config` prints a snippet with absolute paths to the current runtime and the `filaxis-mcp` entry point. Merge it into the configuration for your MCP client and chosen scope.
+
+Or launch it directly with `npx` in your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "filaxis": {
+      "command": "npx",
+      "args": ["-y", "-p", "@syrkos/filaxis", "filaxis-mcp"]
+    }
+  }
+}
+```
+
+Exposed MCP tools (15 tools):
+
+- **Execution & batching**: `run_command`, `run_batch`
+- **Long-running sessions & observation windows**: `spawn_and_observe`, `stop_and_verify`, `observe_stream`, `read_stream`, `close_stream`
+- **File operations & transfers**: `read_file`, `edit_file`, `put_file`, `get_file`
+- **Layer management**: `push_ssh`, `push_into`, `list_layers`, `remove_layer`
 
 The npm package includes the [agent skill and four playbooks](./docs/skills/SKILL.md) and the [runtime contract](./AGENTS.md). Register the skill according to your agent's conventions.
 
@@ -120,15 +140,18 @@ See [AGENTS.md](./AGENTS.md) for the complete runtime contract.
 
 ## Benchmark
 
-The blind operations benchmark compared Filaxis CLI, Filaxis MCP, and raw SSH across three runs with the same model and no direct bypass. The latest run covered six failure points.
+Four controlled operational benchmarks (spanning `v0.1.0` to `v0.2.5`, covering LAN and cross-region multi-hop bastion topologies, white-box and zero-hint black-box scenarios; same model within each run, not directly comparable across versions due to task and model differences) are documented with full methodology and limitations in [benchmark.md](./benchmark.md).
 
-| Group | Interface | Steps | Wall time | Failures or retries | Total tokens (including cache) |
-|---|---|---:|---:|---:|---:|
-| Filaxis CLI | CLI and skill quick reference | 63 | 33m 53s | 9 | 2.89M |
-| Filaxis MCP | Native MCP tools | 79 | 34m 44s | 4 | 4.45M |
-| Raw SSH | Native SSH and shell | 93 | 35m 26s | 31 | 5.12M |
+Latest run (Report 4: `v0.2.5`, cross-region no-`ProxyJump` bastion, **zero-hint black-box with 9 cascading faults** + cross-region `PUT`/`GET` binary file transfers, `Gemini 4 Hydrogen` lightweight-tier subagents, 100% pass rate across all 4 groups):
 
-The CLI group used 43.6% fewer tokens than raw SSH. The MCP group had the fewest failures or retries. See the [benchmark report](https://github.com/corolin/filaxis/blob/main/benchmark.md) for the methodology and full results.
+| Group | Interface | Turns | Wall time | Errors / friction | Active tokens (`in+out`) | Operational active *(excl. doc pre-read)* | Total tokens *(incl. cache)* |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **Filaxis MCP** | Native `filaxis-mcp` tools | **14** | **225s** *(3m 45s)* | **0** | **81,297** | **50,362** | **561,736** |
+| Filaxis SDK | `@syrkos/filaxis` TS orchestration | 18 | 273s *(4m 33s)* | **0** | 104,563 | 67,823 | 890,017 |
+| Filaxis CLI | `filaxis` + `SKILL.md` | 22 | 368s *(6m 08s)* | 3 | 106,587 | 79,535 | 1,051,857 |
+| Raw SSH | Native `ssh` / `scp` + shell | 24 | 483s *(8m 03s)* | 4 | 107,151 | 86,917 | 999,825 |
+
+In this cross-region no-`-J` black-box scenario, Filaxis MCP completed with **0 errors**, **53.4% shorter wall time**, and **24.1% fewer total active tokens** (**42.1% fewer** excluding doc pre-read; **43.8% fewer** total tokens including cache) than raw SSH. Note that these are single-run operational samples (not multi-seed averages), and in simple white-box LAN tasks with explicit paths the gap is much smaller (see Report 1, Test 2); Filaxis delivers its largest gains in **zero-hint, multi-hop, cascading failure troubleshooting**.
 
 ## License
 

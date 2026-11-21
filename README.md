@@ -72,6 +72,26 @@ filaxis mcp-config --format toml  # TOML，使用 mcp_servers（Codex）
 
 命令把 MCP 配置片段写到标准输出，包含当前运行时和 `filaxis-mcp` 入口的绝对路径。Agent 根据自身平台和所需作用域选择配置位置，再将片段合并到现有配置。
 
+也可直接在 MCP 客户端配置中通过 `npx` 启动：
+
+```json
+{
+  "mcpServers": {
+    "filaxis": {
+      "command": "npx",
+      "args": ["-y", "-p", "@syrkos/filaxis", "filaxis-mcp"]
+    }
+  }
+}
+```
+
+暴露的 15 个 MCP 工具速览：
+
+- **命令与批处理**：`run_command`、`run_batch`
+- **长跑会话与观察窗**：`spawn_and_observe`、`stop_and_verify`、`observe_stream`、`read_stream`、`close_stream`
+- **文件读写与传输**：`read_file`、`edit_file`、`put_file`、`get_file`
+- **多层连接管理**：`push_ssh`、`push_into`、`list_layers`、`remove_layer`
+
 npm 包包含 [Skill 入口与四份子剧本](docs/skills/SKILL.md)，以及配套的 [AGENTS.md](AGENTS.md)。需要登记 Skill 时，由 Agent 按自身平台的规则处理这些文件。
 
 ## CLI 文件传输
@@ -115,19 +135,20 @@ SSH 秒退 255 且双流为空只能作为排障线索。执行终态未知时�
 - [examples/](./examples/)：跨主机诊断 / 长跑观察 / Agent 工具面最小封装（三可运行示例）
 - [docs/skills/](./docs/skills/)：场景操作剧本（给人也给 Agent）
 
-## Benchmark（真实运维盲测）
+## Benchmark（真实运维对照评测）
 
-三季同模型盲测（flash 级子代理、跨地域多跳、零提示黑盒、`directBypass = 0`）的完整
-A/B/C 对照报告见 [benchmark.md](./benchmark.md)。最新一季（六故障点黑盒）总账：
+四期受控实战评测（涵盖 `v0.1.0` ~ `v0.2.5`，内网与跨地域多跳、明盒与纯黑盒场景；每期内采用同模型对照，跨期因版本、考题与模型档位不同不可直接横向等同）的完整数据、方法论与局限说明见 [benchmark.md](./benchmark.md)。
 
-| 组别 | 方式 | 步数 | 耗时 | 失败/重试 | 总 Token（含 cache） |
-|---|---|---:|---:|---:|---:|
-| **牵丝 CLI** | `filaxis` + SKILL 速查配方 | **63** | **33m53s** | 9 | **2.89M** |
-| 牵丝 MCP | `filaxis-mcp` 原生工具 | 79 | 34m44s | **4** | 4.45M |
-| 裸 SSH | 原生 ssh + shell | 93 | 43m26s | 32 | 5.12M |
+最新一期（第四份：`v0.2.5` 跨地域无 `ProxyJump` 真实堡垒机、**0 提示纯黑盒 9 处联动故障** + 跨海 `PUT`/`GET` 二进制文件传输，`Gemini 4 Hydrogen` 轻量档位子代理，四组均 100% 达标）总账：
 
-CLI 组总 Token 省 **43.6%**、失败次数 **1/3.5** 于裸 SSH；MCP 组失败率全场最低
-（结构化参数免疫三层引号地狱）。盲测方法论与逐季数据见报告全文。
+| 组别 | 方式 | 轮数 | 耗时 | 报错/摩擦 | 全量活跃 Token (`in+out`) | 纯实战活跃 Token *(去文档预读)* | 总吞吐 Token *(含 cache)* |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **牵丝 MCP** | `filaxis-mcp` 原生工具 | **14** | **225s** *(3m45s)* | **0** | **81,297** | **50,362** | **561,736** |
+| 牵丝 SDK | `@syrkos/filaxis` TS 编排 | 18 | 273s *(4m33s)* | **0** | 104,563 | 67,823 | 890,017 |
+| 牵丝 CLI | `filaxis` + `SKILL.md` | 22 | 368s *(6m08s)* | 3 | 106,587 | 79,535 | 1,051,857 |
+| 裸 SSH | 原生 `ssh` / `scp` + shell | 24 | 483s *(8m03s)* | 4 | 107,151 | 86,917 | 999,825 |
+
+在跨地域无 `-J` 纯黑盒排障场景下，牵丝 MCP 组达成 **0 报错**、墙钟耗时缩短 **53.4%**、全量活跃 Token 省 **24.1%**（剥离文档预读的纯实战活跃 Token 省 **42.1%**、总吞吐省 **43.8%**）。需要说明的是：上述结果为单次实战采样（非多随机种子统计），且在路径明确的简单局域网任务中裸 SSH 与牵丝差距较小（见报告第一份测试二）；牵丝的效率与稳定性优势主要集中在**无路径提示、多跳穿透与多故障联动排障**场景。
 
 ## 许可
 
