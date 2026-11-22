@@ -141,7 +141,7 @@ See [AGENTS.md](./AGENTS.md) for the complete runtime contract.
 
 ## Benchmark
 
-Four controlled operational benchmarks (spanning `v0.1.0` to `v0.2.5`, covering LAN and cross-region multi-hop bastion topologies, white-box and zero-hint black-box scenarios; same model within each run, not directly comparable across versions due to task and model differences) are documented with full methodology and limitations in [benchmark.en.md](./benchmark.en.md).
+Four controlled operational benchmarks (spanning `v0.1.0` to `v0.2.5`, covering LAN and cross-region multi-hop bastion topologies, white-box and zero-hint black-box scenarios; same model within each run, not directly comparable across versions due to task and model differences) are documented with full methodology and limitations in [benchmark.en.md](https://github.com/corolin/filaxis/blob/main/benchmark.en.md).
 
 Latest run (Report 4: `v0.2.5`, cross-region no-`ProxyJump` bastion, **zero-hint black-box with 9 cascading faults** + cross-region `PUT`/`GET` binary file transfers, `Gemini 4 Hydrogen` lightweight-tier subagents, 100% pass rate across all 4 groups):
 

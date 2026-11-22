@@ -1,6 +1,6 @@
 {
   "name": "@syrkos/filaxis",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "牵丝 Filaxis — 面向自动化与 Agent 的远程执行运行时 SDK（Syrkos · 漩核）。千里一线，执行有迹。",
   "type": "module",
   "license": "Apache-2.0",

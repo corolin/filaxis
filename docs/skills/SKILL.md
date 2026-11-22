@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.5
+version: 0.2.6
 description: |
   牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
 

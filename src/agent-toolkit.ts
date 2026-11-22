@@ -205,14 +205,15 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "spawn_and_observe",
             description:
-                "启动后台任务或常驻服务（输出落盘到 log_base 对应的 .out/.err 文件，立即返回 session_id 与 log_base 句柄不阻塞）。" +
-                "适用于需要等待就绪标记（ready_marker——回溯热窗口，快输出竞态安全）、自动捕获错误模式（error_pattern——命中即收摊）并在结束后用 stop_and_verify 核实进程终态与退出码的场景。" +
+                "启动后台任务或常驻服务，输出落盘到 log_base 对应的 .out/.err 文件。省略 ready_marker 时，启动后返回 session_id 和 log_base。" +
+                "提供 ready_marker 时，先回溯近期输出并等待标记，确认就绪后返回；超时或进程提前退出时报告错误。" +
+                "可用 error_pattern 监测错误并请求停止，后续用 stop_and_verify 核实进程终态与退出码。" +
                 "若只需持续流式查看实时输出（如 tail -f / 监控日志）并按游标翻页续读，请改用 observe_stream + read_stream。",
                 parameters: {
                 type: "object",
                 properties: {
                     command: { type: "string", description: "长跑命令" },
-                    ready_marker: { type: "string", description: "就绪标记（如 'listening on'）" },
+                    ready_marker: { type: "string", description: "可选的就绪标记（如 'listening on'）。提供时，本次调用等待标记后返回" },
                     error_pattern: { type: "string", description: "错误模式（命中即收摊）" },
                     name: { type: "string", description: "会话名（人读前缀）" },
                     layer: { type: "string", description: "目标层名（缺省=默认层）" },
@@ -298,7 +299,8 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "get_file",
             description:
-                "从目标层下载单个文件到 MCP 服务所在机器（支持二进制）。先传输至本地暂存文件并校验大小与 SHA-256 后再落位，校验失败不破坏已有本地文件；" +
+                "从目标层下载单个文件到 MCP 服务所在机器（支持二进制）。始终校验大小，目标层支持 SHA-256 时再校验摘要。请用 verification 区分 sha256 与 size。" +
+                "通过校验后才落位，校验失败不破坏已有本地文件。" +
                 "成功时会覆盖已存在的 local_path，返回传输通道、字节大小、校验等级 (verification) 与写入形态 (write_mode)。" +
                 "仅读取远端小文本请用 read_file，批量传输多个文件请使用 run_batch。",
             parameters: {
