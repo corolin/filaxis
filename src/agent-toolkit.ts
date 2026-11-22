@@ -240,11 +240,13 @@ export const TOOL_DEFS: AgentToolDef[] = [
         type: "function",
         function: {
             name: "read_file",
-            description: "读取远端层文件（UTF-8 文本）。返回内容与 (size, mtime_ms)。",
+            description:
+                "只读获取目标层中的 UTF-8 文本文件（不修改远端状态），返回 { path, content, size, mtime_ms }。" +
+                "文件不存在、无权限或层不支持元数据时报错；下载二进制文件请改用 get_file，同时读多个文件优先使用 run_batch，后续受控修改请配合 edit_file。",
             parameters: {
                 type: "object",
                 properties: {
-                    path: { type: "string" },
+                    path: { type: "string", minLength: 1, description: "目标层内的文件路径（绝对路径或相对层工作目录）" },
                     layer: { type: "string", description: "目标层名（缺省=默认层）" },
                 },
                 required: ["path"],
@@ -293,7 +295,10 @@ export const TOOL_DEFS: AgentToolDef[] = [
         type: "function",
         function: {
             name: "get_file",
-            description: "从目标层下载一个文件到 MCP 服务所在机器。支持二进制，校验后落位，可能覆盖目标文件。返回传输元数据。",
+            description:
+                "从目标层下载单个文件到 MCP 服务所在机器（支持二进制）。先传输至本地暂存文件并校验大小与 SHA-256 后再落位，校验失败不破坏已有本地文件；" +
+                "成功时会覆盖已存在的 local_path，返回传输通道、字节大小、校验等级 (verification) 与写入形态 (write_mode)。" +
+                "仅读取远端小文本请用 read_file，批量传输多个文件请使用 run_batch。",
             parameters: {
                 type: "object",
                 additionalProperties: false,
@@ -342,10 +347,12 @@ export const TOOL_DEFS: AgentToolDef[] = [
         type: "function",
         function: {
             name: "close_stream",
-            description: "关闭观察窗并释放其观察流。",
+            description:
+                "关闭由 observe_stream 打开的本地观察窗，确认终止并回收对应的远端观察流进程与通道资源，返回 { window_id, closed: true }。" +
+                "观察完成后应及时调用以防残留流进程；若 window_id 不存在或已关闭则报错（不影响其他观察窗）。",
             parameters: {
                 type: "object",
-                properties: { window_id: { type: "string" } },
+                properties: { window_id: { type: "string", minLength: 1, description: "由 observe_stream 返回的观察窗 ID" } },
                 required: ["window_id"],
             },
         },
