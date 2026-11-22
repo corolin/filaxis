@@ -92,7 +92,7 @@ Exposed MCP tools (15 tools):
 - **File operations & transfers**: `read_file`, `edit_file`, `put_file`, `get_file`
 - **Layer management**: `push_ssh`, `push_into`, `list_layers`, `remove_layer`
 
-The npm package includes the [agent skill and four playbooks](./docs/skills/SKILL.md) and the [runtime contract](./AGENTS.md). Register the skill according to your agent's conventions.
+The npm package includes the [English agent skill](./docs/skills/SKILL.en.md), [four playbooks](./docs/skills/), and the [runtime contract](./AGENTS.md). Register the skill according to your agent's conventions.
 
 ## File transfers
 
