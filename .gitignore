@@ -11,3 +11,4 @@ dist/
 docs/*
 !docs/skills/
 drafts/
+specs/
