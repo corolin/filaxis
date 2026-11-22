@@ -185,8 +185,10 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "run_command",
             description:
-                "执行一次性命令（⚠️ 多条命令/多文件操作请改用 run_batch 一次并行打包；不会自己结束的命令用 observe_stream）。退出码如实返回（非零不是异常——是数据，供条件分支）；" +
-                "只有无法执行（超时/中断/连接死）才报错。stdout 与 stderr 分离返回。",
+                "执行会自行结束的一次性命令（多条命令/多文件操作请改用 run_batch 一次并行打包；" +
+                "持续盯实时输出且不关心退出码的命令如 tail -f 请改用 observe_stream 直接启动并流式读取；" +
+                "需后台起停服务、等就绪标记并核实进程退出码的任务请改用 spawn_and_observe）。" +
+                "退出码如实返回（非零不是异常——是数据，供条件分支）；只有无法执行（超时/中断/连接死）才报错。stdout 与 stderr 分离返回。",
             parameters: {
                 type: "object",
                 properties: {
@@ -203,9 +205,9 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "spawn_and_observe",
             description:
-                "启动长跑任务（立即返回句柄不阻塞）。可选就绪标记（ready_marker——回溯热窗口，" +
-                "快输出进程竞态安全）与错误模式（error_pattern——命中即自动收摊防遗忘泄漏）。" +
-                "后续用 stop_and_verify 停止并核实终态。",
+                "启动后台任务或常驻服务（输出落盘到 log_base 对应的 .out/.err 文件，立即返回 session_id 与 log_base 句柄不阻塞）。" +
+                "适用于需要等待就绪标记（ready_marker——回溯热窗口，快输出竞态安全）、自动捕获错误模式（error_pattern——命中即收摊）并在结束后用 stop_and_verify 核实进程终态与退出码的场景。" +
+                "若只需持续流式查看实时输出（如 tail -f / 监控日志）并按游标翻页续读，请改用 observe_stream + read_stream。",
                 parameters: {
                 type: "object",
                 properties: {
@@ -311,11 +313,14 @@ export const TOOL_DEFS: AgentToolDef[] = [
         type: "function",
         function: {
             name: "observe_stream",
-            description: "打开持续观察窗并立即返回 window_id。用 read_stream 回看或续读，用 close_stream 关闭。",
+            description:
+                "直接启动一条持续输出命令并打开本地滚动观察窗，立即返回 window_id（不等待命令结束）。" +
+                "适用于实时盯日志或持续监控输出（如 tail -f、事件流），配合 read_stream 按游标非破坏回看/翻页/续读，完成后用 close_stream 关闭并回收远端流进程。" +
+                "若需后台起停服务、等待就绪标记并核实进程退出码，请改用 spawn_and_observe + stop_and_verify。",
             parameters: {
                 type: "object",
                 properties: {
-                    command: { type: "string" },
+                    command: { type: "string", minLength: 1, description: "由本工具启动并持续观察流式输出的命令（如 'tail -f /var/log/app.log'）" },
                     stream: { type: "string", enum: ["stdout", "stderr", "both"], description: "流过滤，缺省 both" },
                     name: { type: "string", description: "窗口显示名称" },
                     layer: { type: "string", description: "目标层名，缺省使用默认层" },
