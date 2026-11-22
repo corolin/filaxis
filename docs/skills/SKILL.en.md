@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.5
+version: 0.2.6
 description: |
   Entry skill guide for the Filaxis remote execution runtime (@syrkos/filaxis) — 30-second execution mode selector, MCP/CLI/SDK recipes, and core execution contracts for reliable SSH, Docker, and multi-hop agent operations.
 
