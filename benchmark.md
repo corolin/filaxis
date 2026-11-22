@@ -1,5 +1,7 @@
 # `@syrkos/filaxis` 运维能力 Benchmark 报告合集
 
+简体中文 · [English](./benchmark.en.md)
+
 本报告收录 `@syrkos/filaxis` 在不同版本与网络拓扑下的 **4 份受控对照基准评测**：
 
 1. **第一份（`v0.1.0`）**：跨地域黑盒排障与局域网明确指令对照（`Gemini-3.8-Flash`，3 组：Raw SSH / MCP / CLI）

@@ -3,6 +3,7 @@
 [![CI](https://github.com/corolin/filaxis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/corolin/filaxis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@syrkos/filaxis)](https://www.npmjs.com/package/@syrkos/filaxis)
 [![License: Apache-2.0](https://img.shields.io/github/license/corolin/filaxis)](https://github.com/corolin/filaxis/blob/main/LICENSE)
+[![Glama MCP Server](https://glama.ai/mcp/servers/corolin/filaxis/badges/score.svg)](https://glama.ai/mcp/servers/corolin/filaxis)
 
 [简体中文](https://github.com/corolin/filaxis/blob/main/README.md) · English
 
@@ -140,7 +141,7 @@ See [AGENTS.md](./AGENTS.md) for the complete runtime contract.
 
 ## Benchmark
 
-Four controlled operational benchmarks (spanning `v0.1.0` to `v0.2.5`, covering LAN and cross-region multi-hop bastion topologies, white-box and zero-hint black-box scenarios; same model within each run, not directly comparable across versions due to task and model differences) are documented with full methodology and limitations in [benchmark.md](./benchmark.md).
+Four controlled operational benchmarks (spanning `v0.1.0` to `v0.2.5`, covering LAN and cross-region multi-hop bastion topologies, white-box and zero-hint black-box scenarios; same model within each run, not directly comparable across versions due to task and model differences) are documented with full methodology and limitations in [benchmark.en.md](./benchmark.en.md).
 
 Latest run (Report 4: `v0.2.5`, cross-region no-`ProxyJump` bastion, **zero-hint black-box with 9 cascading faults** + cross-region `PUT`/`GET` binary file transfers, `Gemini 4 Hydrogen` lightweight-tier subagents, 100% pass rate across all 4 groups):
 

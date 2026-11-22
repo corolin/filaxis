@@ -3,6 +3,7 @@
 [![CI](https://github.com/corolin/filaxis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/corolin/filaxis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@syrkos/filaxis)](https://www.npmjs.com/package/@syrkos/filaxis)
 [![License: Apache-2.0](https://img.shields.io/github/license/corolin/filaxis)](https://github.com/corolin/filaxis/blob/main/LICENSE)
+[![Glama MCP Server](https://glama.ai/mcp/servers/corolin/filaxis/badges/score.svg)](https://glama.ai/mcp/servers/corolin/filaxis)
 
 简体中文 · [English](https://github.com/corolin/filaxis/blob/main/README.en.md)
 
