@@ -442,17 +442,19 @@ export class RuntimeStack {
         // 未注册）。自定义 driver 的复用走 connect 缓存键（driverKey 含全量 config——
         // 十五轮）自然隔离，不做跨层 identity 合并
         const hit = descriptor.driver === "ssh" ? await this.findIdentityHit(descriptor) : undefined;
-        if (hit) {
+        if (hit && this.namedLayers.get(hit.handle.name) === hit.handle) {
             const reused = hit.terminal || await this.verifyLanding(hit.handle, hopHost(layerPathIdentities(descriptor).at(-1) ?? ""));
-            if (reused) {
-                this.log.info(`[Filaxis] 层 '${name}' 落点已由 '${hit.handle.name}' 持有——幂等复用（不重复建连）`);
-                return { handle: hit.handle, reused: true, reusedFrom: hit.handle.name };
+            if (this.namedLayers.get(hit.handle.name) === hit.handle) {
+                if (reused) {
+                    this.log.info(`[Filaxis] 层 '${name}' 落点已由 '${hit.handle.name}' 持有——幂等复用（不重复建连）`);
+                    return { handle: hit.handle, reused: true, reusedFrom: hit.handle.name };
+                }
+                throw new Error(
+                    `层名 '${name}' 的落点 identity 命中既有层 '${hit.handle.name}' 的途经节点，且落点校验不符` +
+                    `（期望 ${hopHost(layerPathIdentities(descriptor).at(-1) ?? "?")}，实测 ${hit.handle.actualHostname ?? "?"}）` +
+                    `（宁重连不错主机）：请检查连接参数后重试`,
+                );
             }
-            throw new Error(
-                `层名 '${name}' 的落点 identity 命中既有层 '${hit.handle.name}' 的途经节点，且落点校验不符` +
-                `（期望 ${hopHost(layerPathIdentities(descriptor).at(-1) ?? "?")}，实测 ${hit.handle.actualHostname ?? "?"}）` +
-                `（宁重连不错主机）：请检查连接参数后重试`,
-            );
         }
         const driver = await this.connect(descriptor);
         const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
@@ -729,7 +731,7 @@ export class RuntimeStack {
             for (let i = 0; i < path.length; i++) {
                 const candidate = path[i]!;
                 if (JSON.stringify(RuntimeStack.sshHopContext(candidate)) !== context) continue;
-                if ((await resolve(candidate, this.log)) === destId) {
+                if ((await resolve(candidate, this.log)) === destId && this.namedLayers.get(h.name) === h) {
                     return { handle: h, terminal: i === path.length - 1 };
                 }
             }

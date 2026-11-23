@@ -1,24 +1,31 @@
 ---
 name: filaxis-runtime
-version: 0.2.8
+metadata:
+  version: "0.2.9"
 description: |
-  牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
-
-  必读于（借鉴 modern-web-guidance 的触发清单设计）：
-  - 任何跨层/远程执行、观察、会话、文件编辑、多机排查任务开始前
-  - 拿到 unknown 终态 / 写入三轴结果需要解读时
-  - 连接层失败（别名/跳板/多跳不可直达）需要自救时
-
-  不必读：
-  - 纯本地一次性命令（本机 shell 能直接解决）
-  - 与本 SDK 无关的任务（数据库/CI 管线/纯前端）
+  使用 Filaxis（@syrkos/filaxis）执行跨层命令、批量巡检、管理后台任务、观察日志或操作目标层文件。
+  也用于排查 SSH 别名与跳板、解读 unknown 终态或写入保障。纯本机一次性命令和与 Filaxis 无关的任务可跳过。
 ---
 
 # Filaxis 技能剧本 · 总入口
 
 > 这份是**引导与选型**：先在这里定打法，再进具体剧本。API 签名见包内版本化文档；语义契约全文见 [AGENTS.md](../../AGENTS.md)。
 
-## 10 秒上手：复制即用配方（禁止先读源码——盲测实测通读源码花 44 万 Token 零命令）
+## 30 秒选型
+
+先用下表选执行入口，只读命中的剧本。执行后核对退出码、就绪标记或对应的文件结果。终态未知时先核实，再决定是否重试。
+
+| 任务意图 | MCP 工具或参考 |
+|---|---|
+| 等一条会自行结束的命令并获取退出码 | `run_command` |
+| 批量巡检或按依赖跨层执行 | `run_batch`。涉及跳板或多机取证时读 [跨主机排查](./cross-host-diagnosis.md) |
+| 启动后台服务、等就绪或核实进程退出码 | `spawn_and_observe` → `stop_and_verify`。读 [长跑任务](./longrun-observe.md) |
+| 按游标实时看日志、看完关窗 | `observe_stream` → `read_stream` → `close_stream`。读 [持续观察窗](./stream-window.md) |
+| 列目录、读写、传输或删除文件 | `list_directory`、`read_file`、`edit_file`、`put_file`、`get_file`、`delete_file`。读 [文件操作](./file-sync.md) |
+| 切回仍注册的默认层 | 用 `list_layers` 找层名，再用 `set_active_layer` 切换。单次指定目标时可直接传 `layer` |
+| CLI 限时查看输出 | `filaxis observe`，适用于只取一段观察结果 |
+
+## CLI 快速上手
 
 ```bash
 # ① 建层（一次性；之后全部 --layer 复用，免拼连接参数）
@@ -86,7 +93,7 @@ const ctr = await stack.layerInto("prod", "web", "docker exec -i nginx sh");
 const r = await host.driver.exec("uptime", { timeoutMs: 10_000 });
 console.log(r.exitCode, r.stdout, r.stderr);
 
-// ③ 受控编辑（CAS 原子写回；Docker 单文件 bind mount 传 writeMode: "inplace"）
+// ③ 受控编辑（写回前核对文件版本；Docker 单文件 bind mount 可传 writeMode: "inplace"）
 const ed = await editFile(ctr.driver, "/etc/nginx/nginx.conf", "worker_processes 1;", "worker_processes auto;", {
   writeMode: "auto",
 });
@@ -113,20 +120,6 @@ await stack.removeLayer("prod", { destroy: true });
 ```
 
 
-## 30 秒选型：你面对的是什么？
-
-```
-命令会自己结束吗？
-├─ 会（一次性：curl/nginx -t/systemctl status）→ exec（退出码是数据）
-├─ 不会（tail -f/top/常驻服务/训练）
-│   ├─ 只想看一段输出 ────────────→ CLI observe（限时快照，缺省 8s）
-│   ├─ 值守等关键行/错误模式 ──────→ execSession + watcher → longrun-observe.md
-│   └─ 需要持续读取/回看 ─────────→ observe_stream → read_stream → close_stream（stream-window.md）
-└─ 要改远端文件 ──────────────────→ editFile 受控编辑 → file-sync.md
-                                    （传输 put/get 也在 file-sync.md）
-跨主机排查/抓包对照/跳板拓扑 ────────→ cross-host-diagnosis.md
-```
-
 ## 核心契约速查（违者=生产事故）
 
 | 契约 | 一句话 |
@@ -135,7 +128,7 @@ await stack.removeLayer("prod", { destroy: true });
 | **退出码是数据** | exec 非零退出码不抛异常；只有「无法执行」（超时/断链/abort）才 reject |
 | **完成哨兵是唯一凭证** | 无哨兵（断链/远端 kill）= reject + `outcome:"unknown"`——绝不伪造退出码，绝不自动重放非幂等命令 |
 | **永不结束的命令不进 exec** | exec 是「等完成」语义——`tail -f`/`top` 必超时；换 observe / 会话+watcher |
-| **写入三轴别混读** | `mutex`（锁保护）× `writeMode`（原子/保留 inode）× `verification`（校验等级）——一个「成功」背后三个独立保证，逐个看 |
+| **受控编辑** | CAS 全称 Compare-and-Swap（比较后写回）。写前比较文件修改时间、大小和内容指纹，发现冲突就拒绝写回。分别查看 `mutex` 与 `writeMode`。传输校验等级见 `verification` |
 | **PTY 通道 stderr 混流** | 终端物理语义不是 bug；exec 通道才分离 |
 | **别名是运行环境的** | `--host`/`-J` 的 ssh-config 别名用**本运行环境**的 `~/.ssh/config`——跨环境用 `user@host[:port]` 字面量 |
 

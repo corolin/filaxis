@@ -11,12 +11,12 @@
  */
 import { randomUUID } from "node:crypto";
 import { StreamWindowRegistry, type StreamFrame } from "./stream-window.js";
-import type { RuntimeStack } from "./runtime-stack.js";
+import type { LayerHandle, RuntimeStack } from "./runtime-stack.js";
 import { editFile } from "./file-edit.js";
 import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
 import type { TransferResult } from "./file-transfer.js";
 import { BATCH_STEP_KINDS, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
-import type { RuntimeDriver } from "./driver.js";
+import type { FileEntry, RuntimeDriver } from "./driver.js";
 import { SessionOwnership, type StopResult } from "./session-ownership.js";
 import { sshArgsFor } from "./ssh-helpers.js";
 
@@ -81,6 +81,8 @@ export interface AgentToolHandlers {
         stdout: string; stderr: string; exit_code: number; effective_user?: string;
     }>;
     read_file(args: { path: string; layer?: string }): Promise<{ path: string; content: string; size: number; mtime_ms: number }>;
+    list_directory(args: { path: string; layer?: string }): Promise<{ path: string; entries: FileEntry[] }>;
+    delete_file(args: { path: string; layer?: string }): Promise<{ path: string; deleted: true }>;
     put_file(args: AgentFilePutArgs): Promise<AgentFileTransferResult>;
     get_file(args: AgentFileTransferArgs): Promise<AgentFileTransferResult>;
     edit_file(args: { path: string; old: string; new: string; all?: boolean; write_mode?: "auto" | "inplace"; layer?: string }): Promise<{
@@ -107,6 +109,7 @@ export interface AgentToolHandlers {
     list_layers(args: Record<string, never>): Promise<{
         text: string; layers: Array<{ name: string; driver: string; target?: string }>;
     }>;
+    set_active_layer(args: { name: string }): Promise<{ active_layer: string }>;
     remove_layer(args: { name: string; destroy?: boolean }): Promise<{ removed: string }>;
     // ── 批次组合（第十一季：一次调用描述多原子操作——减少 Planner 轮次）──
     run_batch(args: { steps: Array<Record<string, unknown>>; stop_on_fail?: boolean; max_parallel?: number; layer?: BatchLayerTarget; output?: "text" | "full" }): Promise<{
@@ -148,6 +151,24 @@ const fileTransferProperties = {
 };
 
 const layerNameSchema = { type: "string", minLength: 1, pattern: "\\S" };
+const layerPathParameters = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        path: { type: "string", minLength: 1, description: "目标层内的绝对路径或相对工作目录的路径" },
+        layer: { ...layerNameSchema, description: "目标层名，省略时使用默认层" },
+    },
+    required: ["path"],
+};
+
+function layerPathArgs(args: { path: string; layer?: string }) {
+    const { path, layer, ...extra } = args;
+    if (Object.keys(extra).length) throw new Error("只接受 path 和 layer");
+    if (typeof path !== "string" || !path.length || path.includes("\0")) throw new Error("path 需为不含 NUL 的非空路径");
+    if (layer !== undefined && (typeof layer !== "string" || !layer.trim())) throw new Error("layer 需为非空层名");
+    return { path, layer };
+}
+
 const sshHostSchema = { type: "string", minLength: 1, pattern: "^\\S+$", description: "目标主机（user@host 或运行环境的 SSH 配置别名）" };
 const sshTargetSchema = {
     type: "object",
@@ -258,7 +279,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                                 write_mode: { type: "string", enum: ["auto", "inplace"], description: "kind=edit/put：inplace 保留目标 inode" },
                                 hunks: {
                                     type: "array",
-                                    description: "kind=edit：替换对（一次 CAS 原子应用——任一未命中整批拒绝不写）",
+                                    description: "kind=edit：同一文件的替换对。全部匹配且写前版本校验通过才写回；任一未命中则本步骤不写",
                                     items: {
                                         type: "object",
                                         properties: {
@@ -294,10 +315,11 @@ export const TOOL_DEFS: AgentToolDef[] = [
                 "退出码如实返回（非零不是异常——是数据，供条件分支）；只有无法执行（超时/中断/连接死）才报错。stdout 与 stderr 分离返回。",
             parameters: {
                 type: "object",
+                additionalProperties: false,
                 properties: {
-                    command: { type: "string", description: "shell 命令" },
+                    command: { ...layerNameSchema, description: "shell 命令" },
                     timeout_ms: { type: "number", description: "超时毫秒（缺省 120000）" },
-                    layer: { type: "string", description: "目标层名（缺省=默认层——最近 push_ssh/push_into 的层）" },
+                    layer: { ...layerNameSchema, description: "目标层名，省略时使用当前默认层" },
                 },
                 required: ["command"],
             },
@@ -308,11 +330,11 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "spawn_and_observe",
             description:
-                "启动后台任务或常驻服务，输出落盘到 log_base 对应的 .out/.err 文件。省略 ready_marker 时，启动后返回 session_id 和 log_base。" +
+                "管理后台任务或服务的进程生命周期。需要等待服务就绪、按错误模式停止或核实退出码时使用本工具。" +
+                "输出写入 log_base 对应的 .out/.err 文件。省略 ready_marker 时，启动后返回 session_id 和 log_base。" +
                 "提供 ready_marker 时，先回溯近期输出并等待标记，确认就绪后返回；超时或进程提前退出时报告错误。" +
-                "可用 error_pattern 监测错误并请求停止，后续用 stop_and_verify 核实进程终态与退出码。" +
-                "若只需持续流式查看实时输出（如 tail -f / 监控日志）并按游标翻页续读，请改用 observe_stream + read_stream。",
-                parameters: {
+                "用 stop_and_verify 停止会话并核实终态。持续查看日志可用 observe_stream 开窗。",
+            parameters: {
                 type: "object",
                 properties: {
                     command: { type: "string", description: "长跑命令" },
@@ -362,16 +384,33 @@ export const TOOL_DEFS: AgentToolDef[] = [
     {
         type: "function",
         function: {
+            name: "list_directory",
+            description: "列出目标层目录的直接子项，含隐藏项、名称和目录标志。可用时返回文件大小和修改时间。目录不存在或读取失败时报错。",
+            parameters: layerPathParameters,
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "delete_file",
+            description: "永久删除目标层的一个文件或符号链接本身。拒绝目录和递归删除。目标不存在时报错；连接中断且终态未知时请先核实，再决定是否重试。",
+            parameters: layerPathParameters,
+        },
+    },
+    {
+        type: "function",
+        function: {
             name: "edit_file",
             description:
-                "受控编辑远端文件：精确替换（唯一命中校验，all=true 全替换）+ TOCTOU 乐观锁（他人先写则拒绝）" +
-                "+ base64 保真写回（零 Shell 转义——绝不 sed -i）。未命中/多处命中/冲突均报错不盲写。" +
-                "返回 write_mode：atomic-replace=原子替换；inplace-write=保留 inode（bind mount 挂载点 mv 不可用降级）——非原子写入，中断可暴露半截。",
+                "对目标层的 UTF-8 文本做字面替换。Compare-and-Swap（CAS）在写回前比较文件的修改时间、大小和内容指纹，版本冲突时拒绝写回。" +
+                "默认要求 old 唯一命中，all=true 时替换所有匹配。返回 mutex 和 write_mode。atomic-replace 表示原子替换，" +
+                "inplace-write 表示保留 inode 原地写入，中断可能留下部分内容。",
             parameters: {
                 type: "object",
+                additionalProperties: false,
                 properties: {
-                    path: { type: "string" },
-                    old: { type: "string", description: "待替换片段（含足够上下文唯一）" },
+                    path: { type: "string", minLength: 1 },
+                    old: { type: "string", minLength: 1, description: "待替换片段（含足够上下文唯一）" },
                     new: { type: "string" },
                     all: { type: "boolean", description: "多处命中全替换（缺省报错）" },
                     write_mode: { type: "string", enum: ["auto", "inplace"], description: "inplace=已知 bind mount 挂载环境显式请求保留 inode 写（跳过 mv 失败尝试）" },
@@ -419,9 +458,9 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "observe_stream",
             description:
-                "直接启动一条持续输出命令并打开本地滚动观察窗，立即返回 window_id（不等待命令结束）。" +
-                "适用于实时盯日志或持续监控输出（如 tail -f、事件流），配合 read_stream 按游标非破坏回看/翻页/续读，完成后用 close_stream 关闭并回收远端流进程。" +
-                "若需后台起停服务、等待就绪标记并核实进程退出码，请改用 spawn_and_observe + stop_and_verify。",
+                "实时查看日志或事件流，例如 tail -f。启动观察命令并立即返回滚动窗口的 window_id。" +
+                "用 read_stream 按游标回看或续读，用 close_stream 关闭窗口并回收观察命令。" +
+                "启动和管理后台服务的进程生命周期请用 spawn_and_observe。",
             parameters: {
                 type: "object",
                 properties: {
@@ -438,7 +477,8 @@ export const TOOL_DEFS: AgentToolDef[] = [
         type: "function",
         function: {
             name: "read_stream",
-            description: "读取本地观察窗。可读最近帧、按 before_seq 向前翻页、按 window_ms 回看或按 since_seq 续读。每次续读用 last_delivered_seq，gap 表示游标区间有丢失。",
+            description: "读取本地观察窗的日志帧。可读最近帧、按 before_seq 向前翻页、按 window_ms 回看或按 since_seq 续读。" +
+                "续读用 last_delivered_seq，向前翻页用 first_frame_seq 或本页首帧号。使用当前结果格式里的游标，gap 表示有帧缺失。",
             parameters: {
                 type: "object",
                 properties: {
@@ -521,6 +561,19 @@ export const TOOL_DEFS: AgentToolDef[] = [
     {
         type: "function",
         function: {
+            name: "set_active_layer",
+            description: "将一个已注册层设为默认层，影响之后省略 layer 的工具调用。连接和其他层保留，返回 active_layer。可用 list_layers 查看可选层名。",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: { name: { ...layerNameSchema, description: "已注册的层名" } },
+                required: ["name"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
             name: "remove_layer",
             description:
                 "移出命名层（缺省连接保留在指纹缓存——再建同层零成本；destroy=true 才真销毁连接）。",
@@ -568,17 +621,23 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
     /** 层寻址（第十季注册表）：显式层名 > 注册表默认层（最近 push）> 初始层——
      *  未用层族时与旧行为逐字节一致（零破坏），push 后六工具自动落新默认层 */
     const resolveDrv = async (layerName?: string): Promise<RuntimeDriver> => {
-        if (layerName) return stack.layer(layerName).driver;
+        if (layerName !== undefined) {
+            if (typeof layerName !== "string" || !layerName.trim()) throw new Error("layer 需为非空层名");
+            return stack.layer(layerName).driver;
+        }
         return stack.active ?? await layer();
     };
-    const connectSsh = async ({ host, name, connParams }: ReturnType<typeof sshConnection>): Promise<PushSshResult> => {
-        const result = await stack.addLayer(name, {
+    const connectSsh = async ({ host, name, connParams }: ReturnType<typeof sshConnection>) => {
+        const { handle, reused, reusedFrom } = await stack.addLayer(name, {
             driver: "ssh", target: host,
             config: Object.keys(connParams).length ? { connParams } : undefined,
         });
         return {
-            layer: result.handle.name, reused: result.reused, reused_from: result.reusedFrom,
-            note: result.reused ? "落点已由既有层持有——幂等复用（未重复建连）" : "新层已建并成为默认层",
+            handle,
+            result: {
+                layer: handle.name, reused, reused_from: reusedFrom,
+                note: reused ? "落点已由既有层持有——幂等复用（未重复建连）" : "新层已建并成为默认层",
+            },
         };
     };
     function pushSsh(args: PushSshTarget & { targets?: never }): Promise<PushSshResult>;
@@ -588,23 +647,34 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
             if (typeof args.host !== "string" || !args.host.trim()) {
                 throw new Error("push_ssh 需提供单目标 host 或批量 targets");
             }
-            return connectSsh(sshConnection(args));
+            return (await connectSsh(sshConnection(args))).result;
         }
         if (Object.keys(args).some((key) => key !== "targets")) throw new Error("push_ssh 的 targets 必须单独提供");
         const targets = sshBatchTargets(args.targets);
         const results: PushSshBatchResult["results"] = [];
-        const layers = new Set<string>();
+        const connected = new Map<number, LayerHandle>();
         let failures = 0;
         // Serial registration preserves RuntimeStack's landing reuse and default-layer order.
         for (const target of targets) {
             const { host, name } = target;
             try {
-                const result = await connectSsh(target);
-                layers.add(result.layer);
+                const { handle, result } = await connectSsh(target);
+                connected.set(results.length, handle);
                 results.push({ host, name, status: "ok", ...result });
             } catch (error) {
                 failures++;
                 results.push({ host, name, status: "fail", error: error instanceof Error ? error.message : String(error) });
+            }
+        }
+        const layers = new Set<string>();
+        for (const [index, handle] of connected) {
+            if (stack.layers.get(handle.name) === handle) {
+                layers.add(handle.name);
+            } else {
+                const { host, name } = results[index]!;
+                const error = `层 '${handle.name}' 在批量建连期间已移除或被替换`;
+                results[index] = { host, name, status: "fail", error };
+                failures++;
             }
         }
         return {
@@ -688,10 +758,12 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         },
         get layer(): Promise<RuntimeDriver> { return layer(); }, // 惰性 getter（失败不缓存+注册命名表——Hydrogen R7 #4）
         handlers: {
-            async run_command({ command, timeout_ms, layer: layerName }) {
+            async run_command({ command, timeout_ms, layer: layerName, ...extra }) {
                 if (Array.isArray(layerName)) {
                     throw new Error("run_command 的 layer 仅支持单个层名；同一命令发往多个层请改用 run_batch 并传 layer 数组");
                 }
+                if (Object.keys(extra).length) throw new Error("run_command 含未知参数，目标层字段为 layer");
+                if (typeof command !== "string" || !command.trim()) throw new Error("command 需为非空字符串");
                 const drv = await resolveDrv(layerName);
                 const r = await drv.exec(command, { timeoutMs: timeout_ms });
                 return {
@@ -755,7 +827,24 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const content = await drv.fs.readFile(path);
                 return { path, content, size: st.size, mtime_ms: st.mtimeMs };
             },
-            async edit_file({ path, old, new: newStr, all, write_mode: writeMode, layer: layerName }) {
+            async list_directory(args) {
+                const { path, layer: layerName } = layerPathArgs(args);
+                const drv = await resolveDrv(layerName);
+                return { path, entries: await drv.fs.readdir(path) };
+            },
+            async delete_file(args) {
+                const { path, layer: layerName } = layerPathArgs(args);
+                if (/(?:^|\/)\.{1,2}$|\/$/.test(path)) throw new Error("delete_file 需要单文件路径");
+                const drv = await resolveDrv(layerName);
+                if (drv.descriptor.driver === "local" && process.platform === "win32"
+                    && /(?:^|\\)\.{1,2}$|\\$/.test(path)) {
+                    throw new Error("delete_file 需要单文件路径");
+                }
+                await drv.fs.rm(path, { recursive: false, force: false });
+                return { path, deleted: true };
+            },
+            async edit_file({ path, old, new: newStr, all, write_mode: writeMode, layer: layerName, ...extra }) {
+                if (Object.keys(extra).length) throw new Error("edit_file 含未知参数，目标层字段为 layer");
                 const drv = await resolveDrv(layerName);
                 const r = await editFile(drv, path, old, newStr, { all, writeMode });
                 return { path: r.path, occurrences: r.occurrences, bytes_before: r.bytesBefore, bytes_after: r.bytesAfter, mutex: r.mutex, write_mode: r.writeMode };
@@ -847,6 +936,11 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
             async remove_layer({ name, destroy }) {
                 await stack.removeLayer(name, { destroy });
                 return { removed: name };
+            },
+            async set_active_layer({ name, ...extra }) {
+                if (Object.keys(extra).length) throw new Error("set_active_layer 只接受 name");
+                if (typeof name !== "string" || !name.trim()) throw new Error("name 需为非空层名");
+                return { active_layer: stack.setActive(name).name };
             },
             async run_batch({ steps, stop_on_fail, max_parallel, layer: layerName, output, ...unknownArgs }) {
                 if (!Array.isArray(steps) || !steps.length) throw new Error(`steps 需为非空数组，每步提供 id 和 kind（${BATCH_STEP_KINDS.join("、")}）`);

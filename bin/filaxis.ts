@@ -571,7 +571,8 @@ async function main() {
                     } catch (e) {
                         throw new Error(`JSON 载荷解析失败（${o.requestFile ?? "stdin"}）: ${(e as Error).message}`);
                     }
-                    if (typeof req.old !== "string" || typeof req.new !== "string") {
+                    if (!req || typeof req.old !== "string" || typeof req.new !== "string"
+                        || (req.all !== undefined && typeof req.all !== "boolean")) {
                         throw new Error('JSON 载荷需含字符串字段 "old" 与 "new"（可选 "all": boolean）');
                     }
                     old = req.old;

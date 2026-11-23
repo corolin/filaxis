@@ -25,6 +25,8 @@ const JSONRPC_VERSION = "2.0";
 const COMMAND_PREVIEW_BYTES = 8 * 1024;
 const BATCH_PREVIEW_BYTES = 4 * 1024;
 const BATCH_TEXT_JSON_BYTES = 8 * 1024;
+const STREAM_TEXT_JSON_BYTES = 8 * 1024;
+const DIRECTORY_TEXT_JSON_BYTES = 8 * 1024;
 const BATCH_DETAIL_BYTES = 1024;
 const FULL_OUTPUT_HINT = "，完整输出见 structuredContent";
 
@@ -137,7 +139,8 @@ export class McpServer {
                     // 在任何 schema 读取之前必达，是唯一可靠的发现面）
                     instructions: [
                         "【先看这行】多文件读取/多命令巡检/同命令发往多层/定位排查 → 优先 run_batch（一次调用并行打包，支持传 layer 数组自动扇出，不要逐个工具循环）；读工具 schema 时同轮并发读取（逐个读每步一趟 LLM）；",
-                        "持续查看日志 → observe_stream 开窗、read_stream 回看或续读、close_stream 关闭；等就绪或错误模式 → spawn_and_observe；",
+                        "管理后台任务或服务（等就绪、按错误模式停止、核实退出码）→ spawn_and_observe + stop_and_verify。",
+                        "实时查看日志或事件流 → observe_stream 开窗、read_stream 按游标读帧、close_stream 回收观察命令。",
                         "edit_file 支持 write_mode:'inplace'（bind mount 保 inode 免重启）；",
                         "在 MCP 服务主机与目标层之间传输文件用 put_file 和 get_file。",
                         "契约：退出码是数据（非零不是异常）；终态三态 exited/stopped/unknown；unknown 后用 stop_and_verify 核实。",
@@ -194,7 +197,8 @@ export class McpServer {
                         sessions: err.sessions,
                         exitCode: err.exitCode,
                     };
-                    const errorText = textOnlyBatch && err.outcome ? `outcome=${err.outcome}\n${message}` : message;
+                    const errorText = (textOnlyBatch || name === "delete_file") && err.outcome
+                        ? `outcome=${err.outcome}\n${message}` : message;
                     const overflow = name === "run_batch" && jsonStringBytes(errorText) > BATCH_TEXT_JSON_BYTES;
                     this.reply(id, {
                         content: [{ type: "text", text: overflow ? limitBatchText(errorText, textOnlyBatch ? "" : FULL_OUTPUT_HINT) : errorText }],
@@ -227,9 +231,24 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
         const result = value as Awaited<ReturnType<AgentToolHandlers["list_layers"]>>;
         return result.text;
     }
+    if (name === "set_active_layer") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["set_active_layer"]>>;
+        return `active_layer=${singleLine(result.active_layer)}`;
+    }
+    if (name === "delete_file") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["delete_file"]>>;
+        return `deleted=true | path=${singleLine(result.path)}`;
+    }
+    if (name === "list_directory") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["list_directory"]>>;
+        return summarizeDirectory(result);
+    }
     if (name === "run_command") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["run_command"]>>;
         return [`exit=${result.exit_code}`, ...outputPreviews(result, COMMAND_PREVIEW_BYTES)].join("\n");
+    }
+    if (name === "read_stream") {
+        return summarizeStreamRead(value as Awaited<ReturnType<AgentToolHandlers["read_stream"]>>);
     }
     if (name === "push_ssh") {
         const result = value as PushSshResult | PushSshBatchResult;
@@ -287,6 +306,73 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
     return summarize(value);
 }
 
+function summarizeDirectory(result: Awaited<ReturnType<AgentToolHandlers["list_directory"]>>): string {
+    const header = `path=${singleLine(result.path)} | entries=${result.entries.length}`;
+    const omitted = "\n[目录文本达到上限，完整结果见 structuredContent]";
+    const omittedBytes = jsonStringBytes(omitted) - 2;
+    let remaining = DIRECTORY_TEXT_JSON_BYTES - jsonStringBytes(header);
+    if (remaining < 0) return limitText(header, omitted, DIRECTORY_TEXT_JSON_BYTES);
+    const lines = [header];
+    for (const [index, entry] of result.entries.entries()) {
+        const line = `${entry.isDirectory ? "dir" : "file"} ${singleLine(entry.name)}`;
+        const bytes = jsonStringBytes(`\n${line}`) - 2;
+        const reserve = index < result.entries.length - 1 ? omittedBytes : 0;
+        if (bytes + reserve > remaining) {
+            return remaining >= omittedBytes ? lines.join("\n") + omitted : limitText(header, omitted, DIRECTORY_TEXT_JSON_BYTES);
+        }
+        lines.push(line);
+        remaining -= bytes;
+    }
+    return lines.join("\n");
+}
+
+function summarizeStreamRead(result: Awaited<ReturnType<AgentToolHandlers["read_stream"]>>): string {
+    const { frames, last_delivered_seq: cursor } = result;
+    const status = [
+        `window=${singleLine(result.window_id)}`, `frames=${frames.length}`,
+        `oldest_seq=${result.oldest_seq}`, `newest_seq=${result.newest_seq}`, `stale=${result.stale}`,
+    ];
+    if (result.gap) status.push("gap=true");
+    if (result.timed_out) status.push("timed_out=true");
+    if (result.exit_code !== undefined) status.push(`exit_code=${result.exit_code}`);
+    if (result.error) status.push(`error=${preview(singleLine(result.error), 256, FULL_OUTPUT_HINT)}`);
+
+    let firstSeq: number | undefined;
+    let lastSeq = cursor;
+    const header = (count: number, first?: number, last?: number, partialFrame = false) => [
+        ...status, `text_frames=${count}`,
+        ...(first === undefined ? [] : [`first_frame_seq=${first}`]),
+        ...(last === undefined ? [] : [`last_delivered_seq=${last}`]),
+        ...(count < frames.length || partialFrame ? ["text_truncated=true"] : []),
+        ...(partialFrame ? ["frame_truncated=true"] : []),
+    ].join(" | ");
+    const lines: string[] = [];
+    let lineBytes = 0;
+    const forward = cursor !== undefined;
+    // Incremental reads show the first frames; snapshots and backwards pages show the latest.
+    for (let index = 0; index < frames.length; index++) {
+        const frame = frames[forward ? index : frames.length - 1 - index]!;
+        const line = `[${frame.seq} ${frame.stream ?? "output"}] ${singleLine(frame.text)}`;
+        const bytes = jsonStringBytes(`\n${line}`) - 2;
+        const first = forward ? firstSeq ?? frame.seq : frame.seq;
+        const last = forward ? frame.seq : lastSeq ?? frame.seq;
+        if (jsonStringBytes(header(index + 1, first, last)) + lineBytes + bytes > STREAM_TEXT_JSON_BYTES) {
+            if (!lines.length) {
+                const text = `${header(1, frame.seq, frame.seq, true)}\n${line}`;
+                return limitText(text, "\n[此帧仅显示预览，完整帧见 structuredContent]", STREAM_TEXT_JSON_BYTES);
+            }
+            break;
+        }
+        lines.push(line);
+        lineBytes += bytes;
+        firstSeq = first;
+        lastSeq = last;
+    }
+    if (!forward) lines.reverse();
+    // The structured cursor covers the entire page. The text cursor covers the displayed frames.
+    return [header(lines.length, firstSeq, lastSeq), ...lines].join("\n");
+}
+
 function singleLine(text: string): string {
     return text.replace(/[\p{Cc}\u2028\u2029]/gu, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
@@ -296,12 +382,15 @@ function jsonStringBytes(text: string): number {
 }
 
 function limitBatchText(text: string, hint: string): string {
-    const suffix = `\n[批次文本达到上限，部分结果已省略${hint}]`;
+    return limitText(text, `\n[批次文本达到上限，部分结果已省略${hint}]`, BATCH_TEXT_JSON_BYTES);
+}
+
+function limitText(text: string, suffix: string, maxBytes: number): string {
     let lo = 0;
-    let hi = Math.min(text.length, BATCH_TEXT_JSON_BYTES);
+    let hi = Math.min(text.length, maxBytes);
     while (lo < hi) {
         const mid = Math.floor((lo + hi + 1) / 2);
-        if (jsonStringBytes(text.slice(0, mid) + suffix) <= BATCH_TEXT_JSON_BYTES) lo = mid;
+        if (jsonStringBytes(text.slice(0, mid) + suffix) <= maxBytes) lo = mid;
         else hi = mid - 1;
     }
     const last = text.charCodeAt(lo - 1);

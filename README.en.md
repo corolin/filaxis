@@ -46,7 +46,7 @@ if (stop.status === "unknown") {
 | Long-running sessions | `execSession` returns immediately. Output is recorded in separate `.out` and `.err` files and is available through a recent-output buffer, line watchers, and readiness checks. |
 | Streaming observation | A separate SSH channel streams live output. It can share the SSH master connection through ControlMaster where available. |
 | Persistent sessions | The tmux backend can reattach across processes by `terminalId` and restore the working directory. |
-| File transfer and editing | `putFile` and `getFile` verify size and, when available, SHA-256 with support for GNU, BSD, and BusyBox tools. `editFile` performs compare-and-swap edits and reports the write mode, lock protection, and verification level. |
+| File transfer and editing | `putFile` and `getFile` report the verification level, using size and SHA-256 when available. `editFile` uses compare-and-swap (CAS) to check the file version before writing, and reports the lock protection and write mode. |
 | Environment discovery | Discover installed tools and GPU capabilities, select suitable layers with `matchLayers({ needs })`, and flag saved results when fingerprints drift. |
 | Connection management | Reuse connections by topology fingerprint. Filaxis reconnects with backoff and tracks degraded layers. |
 | SSH host verification | Trust on first use by default, with explicit strict mode and a configurable `known_hosts` file. The SDK accepts private-key paths. |
@@ -86,12 +86,12 @@ Or launch it directly with `npx` in your MCP client configuration:
 }
 ```
 
-Exposed MCP tools (15 tools):
+Exposed MCP tools (18 tools):
 
 - **Execution & batching**: `run_command`, `run_batch`
 - **Long-running sessions & observation windows**: `spawn_and_observe`, `stop_and_verify`, `observe_stream`, `read_stream`, `close_stream`
-- **File operations & transfers**: `read_file`, `edit_file`, `put_file`, `get_file`
-- **Layer management**: `push_ssh`, `push_into`, `list_layers`, `remove_layer`
+- **Files and directories**: `list_directory`, `read_file`, `edit_file`, `put_file`, `get_file`, `delete_file`
+- **Layer management**: `push_ssh`, `push_into`, `list_layers`, `set_active_layer`, `remove_layer`
 
 The npm package includes the [English agent skill](./docs/skills/SKILL.en.md), [four playbooks](./docs/skills/), and the [runtime contract](./AGENTS.md). Register the skill according to your agent's conventions.
 

@@ -1,17 +1,10 @@
 ---
 name: filaxis-runtime
-version: 0.2.8
+metadata:
+  version: "0.2.9"
 description: |
-  Entry skill guide for the Filaxis remote execution runtime (@syrkos/filaxis) — 30-second execution mode selector, MCP/CLI/SDK recipes, and core execution contracts for reliable SSH, Docker, and multi-hop agent operations.
-
-  Read before starting:
-  - Any cross-layer or remote command execution, log observation, background session, file edit/transfer, or multi-host troubleshooting task
-  - Interpreting `unknown` termination outcomes or 3-axis file-write guarantees (`mutex`, `writeMode`, `verification`)
-  - Diagnosing connection failures (SSH config aliases, jump hosts, or no-ProxyJump bastion traversal)
-
-  Skip when:
-  - Running simple local one-off commands directly in the host shell
-  - Working on tasks unrelated to remote execution or Filaxis
+  Use Filaxis (@syrkos/filaxis) to run commands across layers, batch inspections, manage background jobs, follow logs, or operate on files.
+  Also use it to diagnose SSH aliases and jump hosts or interpret unknown outcomes and write guarantees. Skip for simple local shell commands and tasks unrelated to Filaxis.
 ---
 
 # Filaxis Agent Skill — Quick Start & Runtime Guide
@@ -26,7 +19,21 @@ description: |
 
 ---
 
-## 10-Second Start: Copy-Paste CLI Recipes (Do Not Read Source Code First)
+## Choose an entry point
+
+Match the task to an entry point and read the relevant playbook. After execution, check the exit code, readiness marker, or file result. Verify an unknown outcome before deciding whether to retry.
+
+| Task | MCP tool or reference |
+|---|---|
+| Wait for one finite command and collect its exit code | `run_command` |
+| Batch inspections or apply dependencies across layers | `run_batch`. For bastions or multi-host investigation, read [Cross-host diagnosis](./cross-host-diagnosis.md) |
+| Start a background service, wait for readiness, or verify its exit code | `spawn_and_observe` → `stop_and_verify`. Read [Long-running jobs](./longrun-observe.md) |
+| Follow logs with a cursor and close the view when finished | `observe_stream` → `read_stream` → `close_stream`. Read [Observation windows](./stream-window.md) |
+| List a directory, read, edit, transfer, or delete a file | `list_directory`, `read_file`, `edit_file`, `put_file`, `get_file`, `delete_file`. Read [File operations](./file-sync.md) |
+| Switch back to an existing layer as the default | Find its name with `list_layers` and call `set_active_layer`. Pass `layer` for a one-call override |
+| Observe a command for a limited interval in the CLI | `filaxis observe` |
+
+## CLI quick start
 
 > Reading package source files upfront wastes hundreds of thousands of tokens. Use these recipes directly:
 
@@ -94,7 +101,7 @@ const ctr = await stack.layerInto("prod", "web", "docker exec -i nginx sh");
 const res = await host.driver.exec("uptime", { timeoutMs: 10_000 });
 console.log(res.exitCode, res.stdout, res.stderr);
 
-// 3. Controlled CAS edit (pass writeMode: "inplace" for Docker single-file bind mounts)
+// 3. Controlled edit with a pre-write version check (writeMode: "inplace" for single-file bind mounts)
 const ed = await editFile(ctr.driver, "/etc/nginx/nginx.conf", "worker_processes 1;", "worker_processes auto;", {
   writeMode: "auto",
 });
@@ -122,22 +129,6 @@ await stack.removeLayer("prod", { destroy: true });
 
 ---
 
-## 30-Second Decision Tree
-
-```
-Will the command exit on its own?
-├─ Yes (one-off: curl / nginx -t / systemctl status) ──→ run_command / exec (exit code is data)
-├─ No (tail -f / top / long-running daemon / training)
-│   ├─ Quick time-bounded snapshot ───────────────────→ CLI observe (default 8s snapshot)
-│   ├─ Wait for ready marker / error pattern & verify exit → spawn_and_observe + stop_and_verify
-│   └─ Live non-destructive stream cursor / paging ───→ observe_stream → read_stream → close_stream
-└─ Modifying or moving remote files
-    ├─ Text config / code edits ──────────────────────→ edit_file (CAS + lock + writeMode)
-    └─ Binary or full-file transfers ─────────────────→ put_file / get_file (or run_batch)
-```
-
----
-
 ## Core Execution Contracts (Never Violate These)
 
 | Contract | Rule |
@@ -146,7 +137,7 @@ Will the command exit on its own?
 | **Exit code is data** | Nonzero command exit codes do **not** throw in `exec` / `run_command`. Only execution failures (timeout, abort, dead transport) reject or error. |
 | **Completion sentinel required** | Missing completion markers (disconnect, remote kill, local abort) produce `outcome: "unknown"` — never fabricate exit code `0` and never blindly replay non-idempotent commands. |
 | **No never-ending commands in `exec`** | `exec` / `run_command` waits for completion — `tail -f` or `top` will time out. Use `observe_stream` (for streaming logs) or `spawn_and_observe` (for managed background jobs). |
-| **Three orthogonal write axes** | Inspect `mutex` (lock protection), `write_mode` (`atomic-replace` vs. `inplace-write` for bind mounts), and `verification` (size / SHA-256) independently. |
+| **Controlled edits** | CAS stands for compare-and-swap. Filaxis checks modification time, size, and a content fingerprint before writing and rejects a version conflict. Check `mutex` and `write_mode` separately. For file transfers, check `verification`. |
 | **PTY combines stderr** | `channel: "pty"` merges stdout and stderr by terminal semantics; default `exec` keeps them separate. |
 | **SSH aliases are host-local** | `--host` and `-J` / `jump` aliases resolve against the runtime host's `~/.ssh/config`. Use explicit `user@host[:port]` literals when running across containers or sandboxes. |
 

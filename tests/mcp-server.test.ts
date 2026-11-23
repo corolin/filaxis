@@ -8,7 +8,7 @@ import { McpServer } from "../src/mcp-server.js";
 import { createAgentToolkit, TOOL_DEFS } from "../src/agent-toolkit.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -47,6 +47,89 @@ async function waitId(f: { collect: () => Array<Record<string, unknown>> }, id: 
 }
 
 describe("MCP Server（REQ-0003）", () => {
+    test("directory listing, default-layer switching, and non-recursive deletion", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-mcp-directory-"));
+        const stack = new RuntimeStack();
+        const fixture = mcpFixture(stack);
+        const call = async (id: number, name: string, args: Record<string, unknown>) => {
+            fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+            return (await waitId(fixture, id)).result;
+        };
+        try {
+            const previous = join(dir, "previous");
+            const current = join(dir, "current");
+            mkdirSync(previous);
+            mkdirSync(current);
+            mkdirSync(join(previous, "nested"));
+            writeFileSync(join(previous, "-literal"), "previous");
+            writeFileSync(join(current, "-literal"), "current");
+            writeFileSync(join(previous, ".hidden"), "hidden");
+            if (process.platform !== "win32") symlinkSync("nested", join(previous, "link"));
+            const previousDriver = new LocalRuntimeDriver({ cwd: previous });
+            await stack.addLayer("previous", previousDriver);
+            await stack.addLayer("current", new LocalRuntimeDriver({ cwd: current }));
+
+            expect(await call(1, "set_active_layer", { name: "unknown" })).toMatchObject({ isError: true });
+            expect(stack.activeLayer?.name).toBe("current");
+            expect(await call(2, "set_active_layer", { name: "previous" })).toMatchObject({
+                structuredContent: { active_layer: "previous" }, content: [{ text: "active_layer=previous" }],
+            });
+            expect(await call(3, "list_directory", { path: "." })).toMatchObject({
+                content: [{ text: expect.stringContaining("file .hidden") }],
+                structuredContent: { entries: expect.arrayContaining([
+                    expect.objectContaining({ name: "nested", isDirectory: true }),
+                    expect.objectContaining({ name: "-literal", isDirectory: false }),
+                ]) },
+            });
+            expect(await call(4, "list_directory", { path: "missing" })).toMatchObject({ isError: true });
+            expect(await call(5, "delete_file", { path: "nested", recursive: true })).toMatchObject({ isError: true });
+            expect(await call(6, "delete_file", { path: "nested" })).toMatchObject({ isError: true });
+            expect(await call(7, "delete_file", { path: "-literal" })).toMatchObject({
+                structuredContent: { deleted: true, path: "-literal" },
+            });
+            expect(await call(8, "delete_file", { path: "-literal" })).toMatchObject({ isError: true });
+            if (process.platform !== "win32") {
+                mkdirSync(join(previous, "other", "deeper"), { recursive: true });
+                writeFileSync(join(previous, "other", "target"), "physical");
+                writeFileSync(join(previous, "target"), "lexical");
+                symlinkSync("other/deeper", join(previous, "alias"));
+                expect(await call(9, "delete_file", { path: "link/." })).toMatchObject({ isError: true });
+                expect(await call(10, "delete_file", { path: "link" })).toMatchObject({
+                    structuredContent: { deleted: true, path: "link" },
+                });
+                expect(await call(12, "delete_file", { path: "alias/../target" })).toMatchObject({ isError: false });
+                expect(existsSync(join(previous, "other", "target"))).toBe(false);
+                expect(readFileSync(join(previous, "target"), "utf8")).toBe("lexical");
+            }
+            expect(existsSync(join(previous, "nested"))).toBe(true);
+            expect(existsSync(join(previous, "-literal"))).toBe(false);
+            expect(readFileSync(join(current, "-literal"), "utf8")).toBe("current");
+            previousDriver.fs.rm = async () => {
+                throw Object.assign(new Error("connection lost"), { outcome: "unknown" });
+            };
+            expect(await call(11, "delete_file", { path: ".hidden" })).toMatchObject({
+                isError: true, content: [{ text: "outcome=unknown\nconnection lost" }],
+                structuredContent: { outcome: "unknown" },
+            });
+            const entries = Array.from({ length: 60 }, (_, i) => ({ name: `entry-${i}-${"雪".repeat(80)}-end`, isDirectory: false }));
+            previousDriver.fs.readdir = async () => entries;
+            const listed = await call(13, "list_directory", { path: "." }) as {
+                content: Array<{ text: string }>; structuredContent: { entries: typeof entries };
+            };
+            const listingText = listed.content[0]!.text;
+            expect(listed.structuredContent.entries).toEqual(entries);
+            expect(Buffer.byteLength(JSON.stringify(listingText))).toBeLessThanOrEqual(8192);
+            expect(listingText).toContain("完整结果见 structuredContent");
+            const fileLines = listingText.split("\n").filter((line) => line.startsWith("file "));
+            expect(fileLines.length).toBeGreaterThan(0);
+            expect(fileLines.every((line) => line.endsWith("-end"))).toBe(true);
+        } finally {
+            fixture.close();
+            await Promise.all([...stack.layers.keys()].map((name) => stack.removeLayer(name, { destroy: true })));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("put_file and get_file transfer bytes on the selected layer and report verification", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-mcp-transfer-"));
         const stack = new RuntimeStack();
@@ -367,6 +450,16 @@ describe("MCP Server（REQ-0003）", () => {
         // 多行 old（第二处的上下文消歧）+引号+缩进——结构化直达不经宿主 Shell
         const old2 = '{ "path": "/api/v2", "strip_prefix": false }';
         const new2 = '{ "path": "/api/v2", "strip_prefix": true }';
+        for (const [index, invalid] of [
+            { layer: "" }, { layer_name: "elsewhere" }, { old: "", all: true }, { all: "false" }, { write_mode: "typo" },
+        ].entries()) {
+            const id = index + 10;
+            f.write({ jsonrpc: "2.0", id, method: "tools/call", params: {
+                name: "edit_file", arguments: { path: p, old: old2, new: new2, ...invalid },
+            } });
+            expect((await waitId(f, id)).result).toMatchObject({ isError: true });
+        }
+        expect(readFileSync(p, "utf8")).toBe(content);
         f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "edit_file", arguments: { path: p, old: old2, new: new2 } } });
         const r = await waitId(f, 1);
         const res = (r as { result: { isError: boolean; structuredContent: { occurrences: number } } }).result;
@@ -451,7 +544,9 @@ test("MCP opens, reads, and closes a continuous window by ID", async () => {
     const fixture = mcpFixture();
     const call = async (id: number, name: string, args: Record<string, unknown>) => {
         fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
-        return (await waitId(fixture, id)).result as { isError: boolean; structuredContent: Record<string, unknown> };
+        return (await waitId(fixture, id)).result as {
+            isError: boolean; content: Array<{ text: string }>; structuredContent: Record<string, unknown>;
+        };
     };
     try {
         expect((await call(0, "observe_stream", { command: "echo LEGACY", duration_ms: 10 })).isError).toBe(true);
@@ -460,6 +555,8 @@ test("MCP opens, reads, and closes a continuous window by ID", async () => {
         const window_id = opened.structuredContent.window_id;
         const read = await call(2, "read_stream", { window_id, since_seq: 0, wait_ms: 5000 });
         expect(read.structuredContent).toMatchObject({ frames: [{ text: "MCP_WINDOW", stream: "stdout", seq: 1 }] });
+        expect(read.content[0]!.text).toContain("[1 stdout] MCP_WINDOW");
+        expect(read.content[0]!.text).toContain("last_delivered_seq=1");
         const closed = await call(3, "close_stream", { window_id });
         expect(closed.structuredContent).toEqual({ window_id, closed: true });
         expect((await call(4, "read_stream", { window_id })).isError).toBe(true);
@@ -467,6 +564,67 @@ test("MCP opens, reads, and closes a continuous window by ID", async () => {
         fixture.close();
     }
 }, 20_000);
+
+test("read_stream text stays bounded and pages without skipping undisplayed frames", async () => {
+    const stack = new RuntimeStack();
+    const toolkit = createAgentToolkit(stack);
+    const frames = Array.from({ length: 30 }, (_, index) => ({
+        seq: index + 1, ts: 0, stream: index === 1 ? "stderr" as const : "stdout" as const,
+        text: `line-${index + 1} ` + "雪".repeat(200) + "\u001b[0m",
+    }));
+    toolkit.handlers.read_stream = async ({ window_id, since_seq, before_seq }) => {
+        const page = window_id === "oversized" ? [{ ...frames[0]!, text: "oversized " + "雪".repeat(4000) }, ...frames.slice(1)] : frames;
+        const selected = page.filter(({ seq }) => seq > (since_seq ?? 0) && seq < (before_seq ?? Infinity));
+        return {
+            window_id, oldest_seq: 1, newest_seq: 30, stale: false, frames: selected,
+            ...(since_seq === undefined ? {} : { last_delivered_seq: selected.at(-1)?.seq ?? since_seq }),
+            ...(selected.length ? {} : { timed_out: true }),
+        };
+    };
+    const fixture = mcpFixture(stack, toolkit);
+    const read = async (id: number, args: Record<string, number>, window_id = "fixture") => {
+        fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: {
+            name: "read_stream", arguments: { window_id, ...args },
+        } });
+        const result = (await waitId(fixture, id)).result as {
+            content: Array<{ text: string }>;
+            structuredContent: Awaited<ReturnType<typeof toolkit.handlers.read_stream>>;
+        };
+        const text = result.content[0]!.text;
+        expect(Buffer.byteLength(JSON.stringify(text))).toBeLessThanOrEqual(8192);
+        return { text, structured: result.structuredContent };
+    };
+    try {
+        const first = await read(1, { since_seq: 0 });
+        expect(first.structured).toEqual({
+            window_id: "fixture", oldest_seq: 1, newest_seq: 30, stale: false, frames, last_delivered_seq: 30,
+        });
+        expect(first.text).toContain("text_truncated=true");
+        expect(first.text).toContain("[2 stderr] line-2");
+        expect(first.text).toContain("\\u001b[0m");
+        const cursor = Number(first.text.match(/last_delivered_seq=(\d+)/)?.[1]);
+        expect(cursor).toBeGreaterThan(2);
+        expect(cursor).toBeLessThan(30);
+        expect((await read(2, { since_seq: cursor })).text).toContain(`[${cursor + 1} stdout] line-${cursor + 1} `);
+
+        const backwards = await read(3, { before_seq: 30 });
+        const firstSeq = Number(backwards.text.match(/first_frame_seq=(\d+)/)?.[1]);
+        expect(firstSeq).toBeGreaterThan(1);
+        expect(backwards.text).toContain("[29 stdout] line-29 ");
+        expect((await read(4, { before_seq: firstSeq })).text).toContain(`[${firstSeq - 1} stdout] line-${firstSeq - 1} `);
+        const empty = await read(5, { since_seq: 30 });
+        expect(empty.text).toContain("last_delivered_seq=30");
+        expect(empty.text).toContain("timed_out=true");
+        const oversized = await read(6, { since_seq: 0 }, "oversized");
+        expect(oversized.text).toContain("frame_truncated=true");
+        expect(oversized.text).toContain("last_delivered_seq=1");
+        expect(oversized.text).toContain("[1 stdout] oversized");
+        expect(oversized.structured.frames[0]?.text).toHaveLength(4010);
+        expect((await read(7, { since_seq: 1 }, "oversized")).text).toContain("[2 stderr] line-2");
+    } finally {
+        fixture.close();
+    }
+});
 
 describe("MCP layer array fan-out", () => {
     test("push_ssh validates all batch targets and reports usable layers after partial failure", async () => {
