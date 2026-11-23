@@ -760,6 +760,8 @@ describe("第十一季：CLI 层快照（CI 真机）", () => {
             expect(run({ layer: "root", steps: [first, second] }, "tmp"))
                 .toMatch(/first .*layer=root[^\n]*\n\/\r?\n.*second .*layer=tmp[^\n]*\n\/tmp\r?\nbatch ok/);
             expect(run({ steps: [first] }, "tmp")).toMatch(/first .*layer=tmp[^\n]*\n\/tmp\r?\nbatch ok/);
+            const fan = run({ layer: ["root", "tmp"], steps: [first, second] }, "tmp");
+            expect(fan).toMatch(/first@root .*layer=root[^\n]*\n\/\r?\n.*first@tmp .*layer=tmp[^\n]*\n\/tmp\r?\n.*second .*layer=tmp[^\n]*\n\/tmp\r?\nbatch ok/);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

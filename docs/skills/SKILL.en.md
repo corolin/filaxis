@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.6
+version: 0.2.7
 description: |
   Entry skill guide for the Filaxis remote execution runtime (@syrkos/filaxis) — 30-second execution mode selector, MCP/CLI/SDK recipes, and core execution contracts for reliable SSH, Docker, and multi-hop agent operations.
 
@@ -58,9 +58,10 @@ filaxis exec --layer <name> --timeout 8000 -- "(printf 'PING\n'; sleep 1) | nc 1
 ## MCP Practical Guidelines
 
 - **Batch inspection and multi-step fixes with `run_batch`**: Combine multiple `read_file`, `run_command`, `edit_file`, `put`, and `get` steps into a single parallel `run_batch` call instead of sequential single-tool loops.
-- **Layer targeting precedence**: Top-level `layer` sets the batch default; per-step `layer` overrides only that step; omitting both uses the active default layer. `filaxis batch --request-file plan.json` shares the same precedence (step `layer` > plan `layer` > `--layer`/`--host` > local).
+- **Layer targeting precedence & multi-layer fan-out**: Both top-level `layer` and per-step `layer` accept either a single layer name or a non-empty array of layer names (top-level sets the batch default; per-step overrides only that step; omitting both uses the active default layer). Multi-layer arrays expand each step into `id@layer` instances that run in parallel up to `max_parallel` (single-element arrays keep the original `id`), and downstream `after` dependencies wait for all expanded instances to succeed (`kind: "get"` rejects multi-layer arrays to avoid overwriting the same `local_path`). `filaxis batch --request-file plan.json` shares the same precedence and array expansion (step `layer` > plan `layer` > `--layer`/`--host` > local).
+- **Local targeting**: Layer arrays look up registered or saved names. SDK callers can register the local host with `stack.addLayer("local", { driver: "local" })`. The CLI and standalone MCP server leave the local default unnamed.
 - **Concurrency & ordering (`max_parallel` and `after`)**: Independent steps run in parallel up to `max_parallel`. Use `after: ["step-id"]` to serialize dependent steps (e.g., edit config -> validate -> reload service), even across layers.
-- **Cross-batch coordination**: `after` applies within a single batch. Serialize concurrent batches modifying the same resource externally (e.g., keyed by environment identity + file path).
+- **Resource coordination**: `after` references the original step IDs declared in the same batch. Fan-out executes once per layer name, and different names may point to the same environment. Serialize operations that modify the same resource using its environment identity and file path.
 - **Text vs. structured output**: `run_batch` text previews share 4 KiB across streams and cap at 8 KiB total (prioritizing failed steps and edit guarantees). Clients that only read text blocks can pass `output: "text"`; use the default `output: "full"` to read full `structuredContent`. `run_command` previews up to 8 KiB per stream.
 - **Start working right after connecting**: Do not waste turns running `hostname` or `list_layers` after `push_ssh`/`push_into` — the first `run_command`'s exit code and output confirm the layer.
 - **Targeted file reading & minimal edits**: Inspect specific line ranges or recent logs (`sed -n '20,40p' <path>` or `docker logs --tail 30 <container>`). For `edit_file`, copy only the exact target lines with minimal unique context into `old`.

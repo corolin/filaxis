@@ -69,13 +69,28 @@ export interface BatchGetStep extends BatchFileTransferStep {
 export type BatchStep = BatchExecStep | BatchEditStep | BatchReadStep | BatchPutStep | BatchGetStep;
 export const BATCH_STEP_KINDS = ["exec", "edit", "read", "put", "get"] as const satisfies readonly BatchStep["kind"][];
 
+/** 目标层：单个层名或同步展开到多个层的层名数组 */
+export type BatchLayerTarget = string | string[];
+
 /** 依赖边：after 列出的步骤全部 ok 后才启动；无 after = 就绪即可并行 */
-export type BatchStepWithDeps = BatchStep & { after?: string[]; layer?: string };
+export type BatchStepWithDeps = BatchStep & { after?: string[]; layer?: BatchLayerTarget };
+
+type ResolvedBatchStep = BatchStep & { layer?: string };
+
+interface BatchStepGroup {
+    order: number;
+    after: string[];
+    steps: ResolvedBatchStep[];
+    dependents: BatchStepGroup[];
+    pendingDependencies: number;
+    pendingSuccesses: number;
+    nextStep: number;
+}
 
 export interface BatchPlan {
     steps: BatchStepWithDeps[];
-    /** 默认命名层。步骤可覆盖；命名层需要传入层解析函数。 */
-    layer?: string;
+    /** 默认命名层（支持数组扇出）。步骤可覆盖；命名层需要传入层解析函数。 */
+    layer?: BatchLayerTarget;
     /** 失败即停（缺省 true——未启动步骤标 skipped） */
     stopOnFail?: boolean;
     /** 并行度上限（缺省 3；exec 通道每并行步一条 ssh 子进程） */
@@ -134,36 +149,61 @@ export async function runBatch(
         // 绕过 CLI 的消费方拿到「成功执行了零个步骤」的假成功）
         throw new Error(`批次计划非法：steps 需非空数组（kind 可为 ${BATCH_STEP_KINDS.join("、")}）`);
     }
-    if (plan.layer !== undefined && !nonEmptyString(plan.layer)) throw new Error("批次计划非法：layer 需非空字符串");
+    const planLayers = validateLayerTarget(plan.layer, "layer");
     if (plan.stopOnFail !== undefined && typeof plan.stopOnFail !== "boolean") throw new Error("stopOnFail 需为布尔值");
-    const byId = new Map<string, BatchStepWithDeps>();
-    for (const [index, s] of plan.steps.entries()) {
-        if (!nonEmptyString(s?.id)) throw new Error(`批次计划非法：steps[${index}].id 需非空字符串`);
-        if (byId.has(s.id)) throw new Error(`批次计划非法：id 重复 '${s.id}'`);
-        // kind 前置校验（Sol 55 P2-E）：未知 kind 曾在 runStep 执行中才抛——计划里
-        // 合法步骤已跑过（exec 已执行）才报未知类型。零副作用阶段拦死
-        if (!BATCH_STEP_KINDS.includes(s.kind)) {
-            throw new Error(`批次计划非法：未知 kind '${s.kind}'（合法: ${BATCH_STEP_KINDS.join("、")}）`);
+    const groups = new Map<string, BatchStepGroup>();
+    const expandedSteps: ResolvedBatchStep[] = [];
+    const expandedIds = new Set<string>();
+    for (const [index, step] of plan.steps.entries()) {
+        if (!nonEmptyString(step?.id)) throw new Error(`批次计划非法：steps[${index}].id 需非空字符串`);
+        if (groups.has(step.id)) throw new Error(`批次计划非法：id 重复 '${step.id}'`);
+        if (!BATCH_STEP_KINDS.includes(step.kind)) {
+            throw new Error(`批次计划非法：未知 kind '${step.kind}'（合法: ${BATCH_STEP_KINDS.join("、")}）`);
         }
-        validateStep(s);
-        byId.set(s.id, s);
+        const targetLayers = validateStep(step) ?? planLayers ?? [undefined];
+        if (step.kind === "get" && targetLayers.length > 1) {
+            throw new Error(`批次计划非法：步骤 '${step.id}' 的 kind='get' 不支持多个目标层（并发下载会覆盖同一 local_path），请拆分为独立步骤`);
+        }
+        const { after: dependencies, ...operation } = step;
+        if (operation.kind === "exec" && operation.expectExit) operation.expectExit = [...operation.expectExit];
+        if (operation.kind === "edit") operation.hunks = operation.hunks.map((hunk) => ({ ...hunk }));
+        const steps = targetLayers.map((layer) => {
+            const id = targetLayers.length === 1 ? step.id : `${step.id}@${layer}`;
+            if (expandedIds.has(id)) throw new Error(`批次计划非法：展开后的步骤 id 冲突 '${id}'`);
+            expandedIds.add(id);
+            return { ...operation, id, layer };
+        });
+        for (const instance of steps) expandedSteps.push(instance);
+        const after = [...new Set(dependencies)];
+        groups.set(step.id, {
+            order: index, after, steps, dependents: [],
+            pendingDependencies: after.length, pendingSuccesses: steps.length, nextStep: 0,
+        });
     }
-    for (const s of plan.steps) {
-        for (const dep of s.after ?? []) {
-            if (!byId.has(dep)) throw new Error(`批次计划非法：步骤 '${s.id}' 的 after 引用未知步骤 '${dep}'`);
+
+    const roots: BatchStepGroup[] = [];
+    for (const [id, group] of groups) {
+        if (group.steps.length > 1 && expandedIds.has(id)) {
+            throw new Error(`批次计划非法：展开后的步骤 id 冲突 '${id}'`);
+        }
+        for (const dep of group.after) {
+            const prerequisite = groups.get(dep);
+            if (!prerequisite) throw new Error(`批次计划非法：步骤 '${id}' 的 after 引用未知步骤 '${dep}'`);
+            prerequisite.dependents.push(group);
+        }
+        if (group.pendingDependencies === 0) roots.push(group);
+    }
+    // Validate the logical DAG without expanding dependency edges between instances.
+    const ordered = roots.slice();
+    const remaining = new Map<BatchStepGroup, number>();
+    for (const group of ordered) {
+        for (const dependent of group.dependents) {
+            const count = (remaining.get(dependent) ?? dependent.pendingDependencies) - 1;
+            remaining.set(dependent, count);
+            if (count === 0) ordered.push(dependent);
         }
     }
-    // 环检测（DFS 三色）
-    const color = new Map<string, 1 | 2>(); // 1=在途 2=完成
-    const visit = (id: string, trail: string[]): void => {
-        const c = color.get(id);
-        if (c === 1) throw new Error(`批次计划非法：依赖环（${[...trail, id].join(" → ")}）`);
-        if (c === 2) return;
-        color.set(id, 1);
-        for (const dep of byId.get(id)!.after ?? []) visit(dep, [...trail, id]);
-        color.set(id, 2);
-    };
-    for (const s of plan.steps) visit(s.id, []);
+    if (ordered.length !== groups.size) throw new Error("批次计划非法：存在依赖环");
 
     // ── 执行（就绪并行 + fail-fast）──
     const reports = new Map<string, BatchStepReport>();
@@ -175,92 +215,109 @@ export async function runBatch(
         throw new Error(`maxParallel 非法（${plan.maxParallel}）——须为 ≥1 的数字`);
     }
     const maxParallel = Math.floor(rawP);
-    const layerFor = (step: BatchStepWithDeps) => step.layer ?? plan.layer;
-    const names = new Set(plan.steps.map(layerFor));
+    const { previewBudgetBytes } = options;
+    if (previewBudgetBytes !== undefined && (!Number.isSafeInteger(previewBudgetBytes) || previewBudgetBytes < 0)) {
+        throw new Error("previewBudgetBytes 需为非负整数");
+    }
+    const names = new Set(expandedSteps.map((s) => s.layer));
     const drivers = new Map<string | undefined, RuntimeDriver>();
     if (typeof target === "function") {
         for (const name of names) {
             if (name !== undefined) drivers.set(name, await target(name));
         }
         if (names.has(undefined)) drivers.set(undefined, await target());
+        for (const [name, driver] of drivers) {
+            if (!driver) throw new Error(`批次计划非法：未解析到运行层 '${name ?? "(默认)"}'`);
+        }
     } else {
         if ([...names].some((name) => name !== undefined)) throw new Error("批次计划指定了 layer，需要层解析函数");
         drivers.set(undefined, target);
     }
-    const { previewBudgetBytes } = options;
     let previewBytes: number | undefined;
     if (previewBudgetBytes !== undefined) {
-        if (!Number.isSafeInteger(previewBudgetBytes) || previewBudgetBytes < 0) throw new Error("previewBudgetBytes 需为非负整数");
         let streams = 0;
-        for (const step of plan.steps) {
+        for (const step of expandedSteps) {
             if (step.kind !== "exec" && step.kind !== "read") continue;
-            const driver = drivers.get(layerFor(step))!;
-            if (!driver.supportsBoundedExec && !(step.kind === "read" && driver.fs.readFilePreview)) {
+            const driver = drivers.get(step.layer)!;
+            const nativeRead = step.kind === "read" && typeof driver.fs.readFilePreview === "function";
+            if (!nativeRead && !driver.supportsBoundedExec) {
                 throw new Error(`步骤 '${step.id}' 的运行层不支持限制输出采集，请使用 full 模式`);
             }
-            streams += step.kind === "exec" ? 2 : 1;
+            streams += nativeRead ? 1 : 2;
         }
         previewBytes = Math.floor(previewBudgetBytes / Math.max(1, streams));
     }
-    const stepIdentity = (step: BatchStepWithDeps) => {
-        const layer = layerFor(step);
-        return { id: step.id, kind: step.kind, ...(layer !== undefined ? { layer } : {}) };
-    };
+    const stepIdentity = (step: ResolvedBatchStep) => ({
+        id: step.id,
+        kind: step.kind,
+        ...(step.layer !== undefined ? { layer: step.layer } : {}),
+    });
     let failedStep: string | undefined;
 
-    const done = (id: string): boolean => reports.get(id)?.status === "ok";
-    const ready = (): BatchStepWithDeps[] =>
-        plan.steps.filter((s) => !reports.has(s.id) && (s.after ?? []).every(done));
+    // Prefer earlier eligible steps as before, with a heap of ready group heads.
+    const ready = roots.slice();
+    const enqueue = (group: BatchStepGroup): void => {
+        let index = ready.length;
+        while (index > 0) {
+            const parent = Math.floor((index - 1) / 2);
+            if (ready[parent]!.order < group.order) break;
+            ready[index] = ready[parent]!;
+            index = parent;
+        }
+        ready[index] = group;
+    };
+    const removeHead = (): void => {
+        const last = ready.pop()!;
+        if (!ready.length) return;
+        let index = 0;
+        while (index * 2 + 1 < ready.length) {
+            let child = index * 2 + 1;
+            if (ready[child + 1] && ready[child + 1]!.order < ready[child]!.order) child++;
+            if (last.order < ready[child]!.order) break;
+            ready[index] = ready[child]!;
+            index = child;
+        }
+        ready[index] = last;
+    };
 
-    for (;;) {
-        if (failedStep && stopOnFail) {
-            // fail-fast：未启动步骤全标 skipped；已启动的并行兄弟照常等完成（其结果已记录）
-            for (const s of plan.steps) {
-                if (!reports.has(s.id)) {
-                    reports.set(s.id, {
-                        ...stepIdentity(s), status: "skipped",
-                        skippedBecause: `批次失败于 '${failedStep}'（fail-fast）`,
-                    });
+    const inflight = new Set<Promise<void>>();
+    const pull = (): void => {
+        while (ready.length && inflight.size < maxParallel && !(failedStep && stopOnFail)) {
+            const group = ready[0]!;
+            const step = group.steps[group.nextStep++]!;
+            if (group.nextStep === group.steps.length) removeHead();
+            const task = runStep(drivers.get(step.layer)!, step, previewBytes).then((report) => {
+                reports.set(step.id, { ...stepIdentity(step), ...report });
+                if (report.status === "fail") {
+                    failedStep ??= step.id;
+                } else if (--group.pendingSuccesses === 0) {
+                    for (const dependent of group.dependents) {
+                        if (--dependent.pendingDependencies === 0) enqueue(dependent);
+                    }
                 }
-            }
-            break;
-        }
-        // 工作池调度（Hydrogen R4 #4）：曾按批 Promise.all=波次屏障——同批 1 个慢
-        // 步骤拖住全部空槽、就绪的后续步骤干等。改为 N worker 竞争拉取：完成即补位
-        const running = new Set<string>();
-        const inflight = new Set<Promise<void>>();
-        const pull = (): void => {
-            while (inflight.size < maxParallel) {
-                if (failedStep && stopOnFail) return;
-                const next = ready().find((st) => !running.has(st.id));
-                if (!next) return;
-                running.add(next.id);
-                const t = runStep(drivers.get(layerFor(next))!, next, previewBytes).then((r) => {
-                    reports.set(next.id, { ...stepIdentity(next), ...r });
-                    if (r.status === "fail" && !failedStep) failedStep = next.id;
-                }).finally(() => {
-                    inflight.delete(t);
-                    pull(); // 完成即补位（空闲槽立即吃下一个就绪步骤）
-                });
-                inflight.add(t);
-            }
-        };
-        pull();
-        while (inflight.size > 0) await Promise.all([...inflight]);
-        // fail-fast 已触发 → 回循环头统一标 skipped（保留原 fail-fast 文案语义）
-        if (failedStep && stopOnFail) continue;
-        // 池收尾后仍无报告的步骤=被失败依赖卡死（stopOnFail=false 路径）
-        const stuck = plan.steps.filter((s) => !reports.has(s.id));
-        for (const s of stuck) {
-            reports.set(s.id, {
-                ...stepIdentity(s), status: "skipped",
-                skippedBecause: `依赖步骤未 ok（${(s.after ?? []).filter((d) => !done(d)).join(", ")}）`,
+            }).finally(() => {
+                inflight.delete(task);
+                pull();
             });
+            inflight.add(task);
         }
-        break;
+    };
+    pull();
+    while (inflight.size) await Promise.all([...inflight]);
+
+    for (const group of groups.values()) {
+        const skipped = group.steps.filter((step) => !reports.has(step.id));
+        if (!skipped.length) continue;
+        const skippedBecause = failedStep && stopOnFail
+            ? `批次失败于 '${failedStep}'（fail-fast）`
+            : `依赖步骤未 ok（${group.after.flatMap((dep) => groups.get(dep)!.steps
+                .filter((step) => reports.get(step.id)?.status !== "ok").map((step) => step.id)).join(", ")}）`;
+        for (const step of skipped) {
+            reports.set(step.id, { ...stepIdentity(step), status: "skipped", skippedBecause });
+        }
     }
 
-    const steps = plan.steps.map((s) => reports.get(s.id)!);
+    const steps = expandedSteps.map((s) => reports.get(s.id)!);
     return { status: failedStep ? "fail" : "ok", steps, failedStep };
 }
 
@@ -268,38 +325,66 @@ function nonEmptyString(value: unknown): value is string {
     return typeof value === "string" && value.trim().length > 0;
 }
 
-function validateStep(step: BatchStepWithDeps): void {
+function validateLayerTarget(value: unknown, label: string): string[] | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value === "string") {
+        if (!nonEmptyString(value)) {
+            throw new Error(`批次计划非法：${label} 需为非空字符串或非空字符串数组`);
+        }
+        return [value];
+    }
+    if (Array.isArray(value)) {
+        if (value.length === 0) {
+            throw new Error(`批次计划非法：${label} 需为非空字符串或非空字符串数组`);
+        }
+        const seen = new Set<string>();
+        for (const name of value) {
+            if (!nonEmptyString(name)) {
+                throw new Error(`批次计划非法：${label} 需为非空字符串或非空字符串数组`);
+            }
+            if (seen.has(name)) {
+                throw new Error(`批次计划非法：${label} 含重复层名 '${name}'`);
+            }
+            seen.add(name);
+        }
+        return [...seen];
+    }
+    throw new Error(`批次计划非法：${label} 需为非空字符串或非空字符串数组`);
+}
+
+function validateStep(step: BatchStepWithDeps): string[] | undefined {
     const invalid = (field: string, expected: string): never => {
         throw new Error(`批次计划非法：步骤 '${step.id}' 的 ${field} ${expected}`);
     };
-    if (step.layer !== undefined && !nonEmptyString(step.layer)) invalid("layer", "需非空字符串");
-    if (step.after !== undefined && (!Array.isArray(step.after) || !step.after.every(nonEmptyString))) {
+    const stepLayers = validateLayerTarget(step.layer, `步骤 '${step.id}' 的 layer`);
+    if (step.after !== undefined && (!Array.isArray(step.after) || ![...step.after].every(nonEmptyString))) {
         invalid("after", "需为步骤 id 数组");
     }
     if (step.kind === "exec") {
         if (!nonEmptyString(step.command)) invalid("command", "需非空字符串");
         if (step.timeoutMs !== undefined && (!Number.isFinite(step.timeoutMs) || step.timeoutMs <= 0)) invalid("timeout_ms/timeoutMs", "需为正数");
-        if (step.expectExit !== undefined && (!Array.isArray(step.expectExit) || !step.expectExit.every(Number.isSafeInteger))) {
+        if (step.expectExit !== undefined && (!Array.isArray(step.expectExit) || ![...step.expectExit].every(Number.isSafeInteger))) {
             invalid("expect_exit/expectExit", "需为整数数组");
         }
-        return;
+        return stepLayers;
     }
     if (step.kind === "put" || step.kind === "get") {
         try { validateFileTransferFields(step.kind, step); }
         catch (error) { invalid("传输参数", (error as Error).message); }
-        return;
+        return stepLayers;
     }
     if (!nonEmptyString(step.path)) invalid("path", "需非空字符串");
     if (step.kind === "edit") {
-        if (!Array.isArray(step.hunks) || !step.hunks.length || !step.hunks.every((h) =>
+        if (!Array.isArray(step.hunks) || !step.hunks.length || ![...step.hunks].every((h) =>
             typeof h?.old === "string" && h.old.length > 0 && typeof h.new === "string" && (h.all === undefined || typeof h.all === "boolean"))) {
             invalid("hunks", "需为非空数组，每项须含非空字符串 old、字符串 new，以及可选布尔值 all");
         }
         if (step.writeMode !== undefined && step.writeMode !== "auto" && step.writeMode !== "inplace") invalid("write_mode/writeMode", "须为 auto 或 inplace");
     }
+    return stepLayers;
 }
 
-async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps, previewBytes?: number): Promise<BatchStepReport> {
+async function runStep(drv: RuntimeDriver, s: ResolvedBatchStep, previewBytes?: number): Promise<BatchStepReport> {
     const startedAt = Date.now();
     const base = { id: s.id, kind: s.kind, startedAt };
     try {
@@ -337,7 +422,7 @@ async function runStep(drv: RuntimeDriver, s: BatchStepWithDeps, previewBytes?: 
             let content: string;
             if (previewBytes === undefined) {
                 content = await drv.fs.readFile(s.path);
-            } else if (drv.fs.readFilePreview) {
+            } else if (typeof drv.fs.readFilePreview === "function") {
                 content = await drv.fs.readFilePreview(s.path, previewBytes);
             } else {
                 const path = shellQuote(s.path);

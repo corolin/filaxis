@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.6
+version: 0.2.7
 description: |
   牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
 
@@ -47,10 +47,11 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 **MCP 形态实战指引**（第十二季盲测 B 组教训）：
 - **定位/巡检期用 `run_batch` 打包**——多个 read_file/run_command 一次调用并行
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
-- `run_batch` 的顶层 `layer` 和步骤 `layer` 可以同时传。顶层是批次默认值，步骤的 `layer` 只覆盖本步。两处都省略的步骤使用调用时的默认层。结果逐步标明命名层。
+- `run_batch` 的顶层 `layer` 和步骤 `layer` 均支持传单个层名或层名数组（也可同时传：顶层是批次默认值，步骤的 `layer` 仅覆盖本步；两处都省略时使用调用时的默认层）。传多个层名数组时，步骤按 `id@layer` 展开并在 `max_parallel` 并发池内并行执行，下游 `after` 需等被依赖步骤的所有展开实例均 ok 后才启动（`kind: "get"` 不支持多层数组，防并发覆盖同一 `local_path`）；单元素数组保留原 `id`。结果逐步标明命名层。
 - CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。
+- 层名数组只查已注册或保存的层。SDK 可用 `stack.addLayer("local", { driver: "local" })` 把本机加入命名层；CLI 和独立 MCP 服务的本机默认目标不会自动注册为 `local`。
 - `max_parallel` 是整个批次的并发上限。无依赖的步骤可以并行，包括同层的独立巡检。需要先改配置、再验证、最后重载时，用 `after` 引用前置步骤的 `id`。依赖可以跨层，前置步骤成功后才会启动后续步骤。
-- `after` 的作用域是当前批次。多个批次可能同时修改同一资源时，由调用方按实际资源串行化，例如用「环境身份 + 配置路径」作为互斥键。同一环境可能有多个层名。`run_batch` 本身不提供跨批次资源锁。
+- `after` 引用当前批次计划里声明的原始步骤 ID。同一环境可能有多个层名，扇出按层名各执行一次。多个步骤或批次可能同时修改同一资源时，由调用方按实际资源串行化，例如用「环境身份 + 配置路径」作为互斥键。
 - `run_batch` 文本逐步展示状态、退出码、编辑的写入方式和锁状态，以及 stdout/stderr 预览。所有输出流共用 4 KiB，整个文本字段序列化后最多 8 KiB，超出时优先显示失败步骤和编辑保障。只看文本块的 MCP 客户端请传 `output: "text"`。需要完整输出时用默认的 `output: "full"`，从 `structuredContent` 取。`run_command` 的文本各流最多预览 8 KiB。
 - `output: "text"` 在本机和 SSH 层按预算采集 `exec` / `read` 预览，并继续读取完成哨兵来核实退出码。SSH 文件中转仍在磁盘接收完整输出，回读只取有界的首尾。其他层需要支持限量采集才能在文本模式下执行这些步骤。
 - 建链后立即干活，**不要**逐个 hostname/list_layers 验证——首个 run_command
