@@ -21,6 +21,11 @@ filaxis get --layer host --transport sftp -- /var/tmp/result.bin ./result.bin
 
 两个命令都传单个文件。`put` 的参数顺序是本地源、层内目标，`get` 反过来。查看 JSON 结果的 `verification` 和 `writeMode`。SFTP 失败时命令直接报错，由调用方核实后决定是否改用 exec。含通配符、引号或控制字符的文件名使用 exec。
 
+## MCP 目录与单文件删除
+
+- `list_directory` 接受 `path` 和可选的 `layer`，列出直接子项，包括隐藏项。文本块显示名称与类型，条目元数据在 `structuredContent.entries`。
+- `delete_file` 永久删除一个文件或符号链接本身。目录和递归删除会报错。未明确目标层时使用当前默认层。若返回 `outcome: "unknown"`，先核实目标路径，再决定是否重试。
+
 ## MCP 上传和下载
 
 调用 `put_file` 上传，下例向 `app` 层写入文件。
@@ -50,10 +55,20 @@ filaxis get --layer host --transport sftp -- /var/tmp/result.bin ./result.bin
 
 独立传输可以并行。使用不同的本地目标路径下载到同一台 MCP 服务机器，或用 `after` 串行写入同一路径。
 
-## 受控编辑 editFile（一行替代 20 行样板 / 免 sed -i 写坏）
+## 受控编辑与 CAS
 
-- `editFile(drv, path, oldStr, newStr, { all? })`：**读+戳一次往返**（stat+内容指纹 sha256 前 12 位+base64 读）→ **精确替换**（唯一命中校验——0 命中/多处命中均报错；`all: true` 全替换）→ **远端 CAS 原子写回**（一次往返：stat+内容指纹比对+tmp 写+mv 原子替换——内容指纹封死 stat 秒级粒度的同秒盲区）→ 失败/冲突均报错不盲写。**仅适用 UTF-8 文本**（含非 UTF-8 字节显式拒绝——GBK/二进制静默写回=永久损坏）；二进制编辑走 `readBase64` + 自行改写 + `writeFile`；大文件（base64 >90KB——MAX_ARG_STRLEN 单参数 128KB 安全线内留余量）回落 fs 层路径（非原子，结果 `writeMode:"inplace-write"` 显式标注）。
-- 裸 SSH 用 `sed -i` 改远端文件 = 四层引号转义地狱（实测两翻车+写坏 40 行配置）——受控编辑一行写对。
+CAS 是 **Compare-and-Swap（比较后写回）**。每次编辑先读取目标 UTF-8 文件，再用文件的修改时间、大小和 SHA-256 指纹前 12 个十六进制字符记录版本。Filaxis 按字面匹配 `old`，默认要求唯一命中，`all: true` 可明确要求替换所有匹配。写回前再次比较版本，发现不一致时拒绝写回并报告冲突。
+
+例如用 MCP `edit_file` 提交一次替换。版本检查以本次编辑内部读取的文件为基准，调用者提供刚读到的原文片段。
+
+```json
+{"layer":"app","path":"/app/config.yaml","old":"port: 8080","new":"port: 9090"}
+```
+
+- `mutex` 报告锁保护。具备 `flock` 时，核验和落位受同一把协作锁保护。`degraded` 表示无锁，核验与写入之间仍有并发窗口。
+- `write_mode`（SDK 为 `writeMode`）报告落位方式。`atomic-replace` 使用临时文件替换目标，`inplace-write` 保留 inode，写入中断可能留下部分内容。
+- 编辑后的 Base64 载荷超过 90,000 字符时，走文件系统回退。回退会在写入前核验并在写后核对内容指纹，结果报告 `degraded` 和 `inplace-write`。回验失败发生在写入之后，应核实目标内容。
+- 二进制文件使用传输工具。传输的 `verification` 描述大小或 SHA-256 校验等级。
 
 ## 陷阱清单
 

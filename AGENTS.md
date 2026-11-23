@@ -30,7 +30,7 @@
 5. **通道语义**：缺省 `channel:"exec"`（stdout/stderr 分离、**层上下文拼装**——层的 cwd/env/enter 进入管线〔`docker exec`/`ssh` 形态〕在独立通道自动非交互重放，exec 直达层内环境）；`channel:"pty"` 继承层内交互状态（su/cd），但 **stderr 混流是终端物理语义**，不是 bug。多跳 PTY 链与交互式二次跳转对 exec 通道**显式拒绝**——这是诚实行为，换 pty 或把途径机收敛为 `-J`。`-J`/`--host` 传 ssh-config **别名**时，别名解析用的是**本运行环境**的 `~/.ssh/config`——沙箱/远端会话里可能没有该条目（连接层报错会带此提示），跨环境请用 `user@host[:port]` 字面量。`jump` 只支持**单跳**（结构化 `SshJumpSpec` 正门/字符串白名单解析——跳板参数会拼进经 shell 执行的 ProxyCommand，白名单外字符直接拒绝）；多跳逗号链显式拒绝，多跳正门是层模型 `sshInto` 逐跳派生。
 6. **跨流顺序**：双文件落盘后的聚合序是**本地到达序**（近似），不承诺进程真实写入序。
 7. **方言适配自动进行**：base64/sha256 按连接探测缓存（OPNsense/Alpine 形态已测）——但你自己的远端脚本原语若依赖 GNU 方言，请同样探测，勿硬编码。
-8. **CAS 校验 ≠ 写入原子性（两轴正交，看 `writeMode` 字段）**：受控编辑/传输缺省 tmp+mv 原子替换（`atomic-replace`）；**Docker 单文件 bind mount 挂载点 mv 不可用**（EBUSY/EXDEV）——自动降级保留 inode 写入（`inplace-write`）：写入中断可能暴露半截文件，消费方须知。已知挂载环境可显式传 `writeMode:"inplace"` 跳过失败尝试。`mutex`（锁保护）与 `verification`（校验等级）同理都是独立轴——别把四个保证混读成一个「成功」。
+8. **CAS（Compare-and-Swap，比较后写回）**。受控编辑读取 UTF-8 文件及其版本信息，按字面匹配替换片段，然后在写回前比对文件的修改时间、大小和内容指纹。发现文件版本变化时拒绝写回。分别查看 `mutex`（锁保护）与 `writeMode`（写入方式）：`atomic-replace` 通过临时文件替换目标，`inplace-write` 保留 inode，中断可能留下部分内容。Docker 单文件 bind mount 可自动降级为原地写入，已知挂载点也可显式传 `writeMode:"inplace"`。大文件回退路径前后核验，并报告 `mutex:"degraded"` 和 `writeMode:"inplace-write"`。文件传输另用 `verification` 报告传输校验等级。
 9. **PTY 键入大数据的边界（依赖面声明）**：canonical 行规程的 4096 在 Linux 实测是 **read 分段线而非丢弃线**（无 readline 的 sh 层 + 消费者忙/闲双场景、单行 16K 均完整——缓冲满时 master 写入被流控阻塞退避不丢；回归已钉住，退化即红）。但这**不是跨平台统一保证**（BSD 规程/老内核行为无承诺）；传输数据一律经 b64 中继（字母表对行规程/ICRNL/INTR/EOF 结构免疫，控制字符回归锁定）。非 Linux 环境 tmux 层传超大单行前先小载荷探路。
 
 ## 环境规格与漂移

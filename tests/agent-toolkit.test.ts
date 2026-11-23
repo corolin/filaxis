@@ -25,13 +25,66 @@ class MockSshDriver {
 }
 
 describe("createAgentToolkit（反馈 #3）", () => {
+    test("explicit invalid layer never falls back to the active driver", async () => {
+        const driver = new MockSshDriver({ driver: "fixture" });
+        let executions = 0;
+        driver.exec = async () => { executions++; return { stdout: "", stderr: "", exitCode: 0 }; };
+        const stack = new RuntimeStack();
+        await stack.addLayer("fixture", driver as unknown as RuntimeDriver);
+        const { handlers } = createAgentToolkit(stack);
+        for (const layer of ["", " ", null, false, 0]) {
+            await expect(handlers.run_command({ command: "fixture", layer: layer as never })).rejects.toThrow(/非空层名/);
+        }
+        const misspelled = { command: "fixture", layer_name: "elsewhere" };
+        await expect(handlers.run_command(misspelled)).rejects.toThrow(/目标层字段为 layer/);
+        await expect(handlers.run_command({ command: "" })).rejects.toThrow(/command 需为非空字符串/);
+        expect(executions).toBe(0);
+        expect((await handlers.run_command({ command: "fixture" })).exit_code).toBe(0);
+        expect(executions).toBe(1);
+        await stack.removeLayer("fixture", { destroy: true });
+    });
+
+    test("push_ssh batch excludes layers replaced before the response", async () => {
+        const stack = new RuntimeStack();
+        const addLayer = stack.addLayer.bind(stack);
+        const slowEntered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        stack.addLayer = async (name) => {
+            if (name === "slow") {
+                slowEntered.resolve();
+                await release.promise;
+            }
+            return addLayer(name, new MockSshDriver({ driver: "fixture" }) as unknown as RuntimeDriver);
+        };
+        const batch = createAgentToolkit(stack).handlers.push_ssh({ targets: ["first", "slow"] });
+        try {
+            await slowEntered.promise;
+            await stack.removeLayer("first", { destroy: true });
+            await stack.addLayer("first", { driver: "local" });
+            release.resolve();
+            expect(await batch).toMatchObject({
+                status: "partial",
+                layers: ["slow"],
+                results: [
+                    { name: "first", status: "fail", error: expect.stringContaining("已移除或被替换") },
+                    { name: "slow", status: "ok", layer: "slow" },
+                ],
+            });
+        } finally {
+            release.resolve();
+            await batch;
+            await Promise.all([...stack.layers.keys()].map((name) => stack.removeLayer(name, { destroy: true })));
+        }
+    });
+
     test("工具定义 + run_command 退出码是数据", async () => {
         const tk = createAgentToolkit(new RuntimeStack());
         expect(tk.tools.map((t) => t.function.name)).toEqual([
             "run_batch", // 置顶（第十三季黑盒：Lazy schema 按序读——run_batch 排第 7 被漏读）
             "run_command", "spawn_and_observe", "stop_and_verify",
-            "read_file", "edit_file", "put_file", "get_file", "observe_stream", "read_stream", "close_stream",
-            "push_ssh", "push_into", "list_layers", "remove_layer", // 第十季层族
+            "read_file", "list_directory", "delete_file", "edit_file", "put_file", "get_file",
+            "observe_stream", "read_stream", "close_stream",
+            "push_ssh", "push_into", "list_layers", "set_active_layer", "remove_layer",
         ]);
         const r = await tk.handlers.run_command({ command: "echo tk-out; exit 4" });
         expect(r.stdout.trim()).toBe("tk-out");

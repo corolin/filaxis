@@ -393,6 +393,15 @@ class LocalFileSystem implements FileSystemDriver {
     }
 
     async rm(filePath: string, options?: { recursive?: boolean; force?: boolean}): Promise<void> {
+        if (!options?.recursive && !options?.force) {
+            // A single unlink cannot remove a directory if the entry changes concurrently.
+            const target = process.platform === "win32" ? this.resolve(filePath)
+                : this.baseCwd && !path.isAbsolute(filePath)
+                ? this.baseCwd + path.sep + filePath
+                : filePath;
+            await fs.unlink(target);
+            return;
+        }
         await fs.rm(this.resolve(filePath), options);
     }
 

@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { editFile, EditConflictError } from "../src/file-edit.js";
+import { editFile, editFileMulti, EditConflictError } from "../src/file-edit.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
 import type { RuntimeDriver } from "../src/driver.js";
@@ -12,6 +12,16 @@ import type { RuntimeDriver } from "../src/driver.js";
 const dir = mkdtempSync(join(tmpdir(), "fx-edit-"));
 
 describe("editFile（TOCTOU+精确替换）", () => {
+    test("invalid edit arguments are rejected before reading or writing", async () => {
+        const driver = { exec: () => { throw new Error("driver called for invalid input"); } } as unknown as RuntimeDriver;
+        await expect(editFile(driver, "/fixture", "", "insert", { all: true })).rejects.toThrow(/old 需为非空字符串/);
+        await expect(editFile(driver, "/fixture", "x", "y", { all: "false" as never })).rejects.toThrow(/all 需为布尔值/);
+        await expect(editFile(driver, "/fixture", "x", "y", { writeMode: "typo" as never })).rejects.toThrow(/writeMode 须为/);
+        await expect(editFileMulti(driver, "/fixture", [
+            { old: "a", new: "b" }, { old: "", new: "c", all: true },
+        ])).rejects.toThrow(/hunk #1 的 old 需为非空字符串/);
+    });
+
     test.skipIf(process.platform !== "linux")("符号链接编辑与同目标别名共用 CAS 锁", async () => {
         const fixture = mkdtempSync(join(tmpdir(), "fx-edit-aliases-"));
         try {

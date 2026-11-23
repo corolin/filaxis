@@ -115,6 +115,15 @@ integration("SSH rejects a broken PTY cwd and distinguishes an empty directory f
         expect(entries).toHaveLength(34);
         expect(entries.find((entry) => entry.name === name)).toMatchObject({ isDirectory: false, size: 0 });
         expect(entries.find((entry) => entry.name === ".nested")).toMatchObject({ isDirectory: true });
+        const scoped = new SshPtyDriver({ driver: "ssh", target: TARGET, cwd: path });
+        try {
+            expect((await scoped.exec("touch ./-literal")).exitCode).toBe(0);
+            await scoped.fs.rm("-literal");
+            expect(await scoped.fs.exists("-literal")).toBe(false);
+            await expect(scoped.fs.rm(".nested")).rejects.toThrow(/rm 失败/);
+        } finally {
+            await scoped.destroy();
+        }
     } finally {
         await drv.fs.rm(path, { recursive: true, force: true });
         await drv.destroy();

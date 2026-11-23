@@ -11,6 +11,13 @@
 
 ---
 
+## 0.2.9
+
+- MCP 新增 `list_directory`、`set_active_layer` 和非递归的 `delete_file`。
+- `read_stream` 的 MCP 文本块显示日志帧和相应游标。后台会话与观察窗的选择条件移到工具描述首句。
+- 命令和受控编辑拒绝无效目标参数，避免误用默认层。批量 `push_ssh` 返回前核对连接句柄，报告建连期间被移除或替换的层。
+- 中英文 Skill 将任务选型放在入口，并解释 Compare-and-Swap（CAS）的写前检查、锁保护和写入方式。
+
 ## 0.2.8
 
 - MCP 和 Agent Toolkit 的 `push_ssh` 可按目标或 SSH 配置别名列表批量建立命名层，逐目标报告新建、复用或连接失败，并返回可用于 `run_batch.layer` 的实际层名。

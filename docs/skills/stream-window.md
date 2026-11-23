@@ -8,6 +8,7 @@
 1. 用 `observe_stream` 开窗并取得 `window_id`。窗口持续接收指定层的 stdout 和 stderr，可在开窗时按流过滤。
 2. 用 `read_stream` 回看。缺省返回最近帧。传 `before_seq` 可向前翻页，传 `window_ms` 可回看最近一段时间。
 3. 用 `since_seq` 续读，下一次从 `last_delivered_seq` 接着读。可用 `wait_ms` 等新增帧，等待超时后窗口继续接收。返回 `gap` 时从已有落盘日志补读被覆盖的历史。
+   仅读取 MCP 文本块时，使用文本块内的 `last_delivered_seq` 续读，或用 `first_frame_seq` 作为下一次向前翻页的 `before_seq`。达到文本上限时会标记 `text_truncated=true`。单帧超过上限时展示该帧预览并标记 `frame_truncated=true`，完整帧可从同一响应的 `structuredContent` 读取。
 4. 用 `close_stream` 关窗。本地窗口等待所属进程组或 Windows Job 退出，SSH 窗口等待本地 SSH 观察进程退出。若停止失败或超时，返回 `outcome: "unknown"`，可用同一个窗口 ID 读取历史或重试关闭。流自然退出后，窗口在回收前仍保留可回看的帧，读取结果中的 `exit_code` 是观察进程的退出码。
 
 ## SDK 剧本

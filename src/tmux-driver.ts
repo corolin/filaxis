@@ -165,7 +165,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 退出码入闸（Sol 87 P2-7）：rm/mkdir 曾丢 exitCode——对普通文件 mkdir、
             // 无 force 删缺席路径都报正常完成。凭证纪律同 readFile/writeFile
             async rm(p, options) {
-                const r = await self.exec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}${q(p)}`);
+                const r = await self.exec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}-- ${q(p)}`);
                 // force 只影响命令形态（-f 豁免缺席路径——exit 0）；非零退出=真实
                 // 失败（目录未递归删等）照传（Sol 88 P2-1：曾 force 下吞掉一切非零
                 //——对现存目录的非递归删除谎报完成、目录仍在）

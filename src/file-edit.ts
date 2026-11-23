@@ -97,6 +97,19 @@ export const shaCmdOf = (f: string) =>
 const shaCmdOfContent = (content: string) =>
     crypto.createHash("sha256").update(content, "utf-8").digest("hex").slice(0, 12);
 
+function validateEditTarget(path: string, writeMode: EditFileOptions["writeMode"]): void {
+    if (typeof path !== "string" || !path.length || path.includes("\0")) throw new Error("path 需为不含 NUL 的非空路径");
+    if (writeMode !== undefined && writeMode !== "auto" && writeMode !== "inplace") {
+        throw new Error("write_mode/writeMode 须为 auto 或 inplace");
+    }
+}
+
+function validateReplacement(old: string, replacement: string, all: boolean | undefined, label: string): void {
+    if (typeof old !== "string" || !old.length) throw new Error(`${label} 的 old 需为非空字符串`);
+    if (typeof replacement !== "string") throw new Error(`${label} 的 new 需为字符串`);
+    if (all !== undefined && typeof all !== "boolean") throw new Error(`${label} 的 all 需为布尔值`);
+}
+
 /**
  * 受控编辑（真 2 次往返 + 远端 CAS 原子写回）：
  * ① 读+戳+方言探测（1 次往返）：`stat 戳; sha 戳; __FXS__; base64 -d 探测;
@@ -116,6 +129,9 @@ export async function editFile(
     newStr: string,
     opts: EditFileOptions = {},
 ): Promise<EditFileResult> {
+    const { all, writeMode } = opts;
+    validateEditTarget(path, writeMode);
+    validateReplacement(oldStr, newStr, all, "editFile");
     const sr = await readStamped(drv, path);
     const occurrences = sr.content0.split(oldStr).length - 1;
     if (occurrences === 0) {
@@ -123,13 +139,13 @@ export async function editFile(
         throw new Error(`未命中待替换片段（0 处）: ${path}（oldStr 长度 ${oldStr.length}，文件 ${sr.content0.length} 字符）。`
             + `提示：若 old 含引号/多行/缩进——行内 argv 可能被宿主 Shell 剥引号或截断，改用免 Shell 载荷通道（CLI: edit <path> --stdin-json 或 --request-file <file>；SDK: editFile 直传字符串）后重试`);
     }
-    if (occurrences > 1 && !opts.all) {
+    if (occurrences > 1 && !all) {
         throw new Error(`多处命中（${occurrences} 处）——精确替换语义拒绝；确认全替换请传 { all: true }: ${path}`);
     }
     // 字面替换语义（GPT Astra #5）：String.replace 的 replacement 含 $&/$$ 等替换
     // 语法会被 V8 解释（实测 old→"$&-new" 写成 "old-new"）——回调返回值按字面处理
-    const edited = opts.all ? sr.content0.split(oldStr).join(newStr) : sr.content0.replace(oldStr, () => newStr);
-    const w = await casWrite(drv, path, sr, edited, opts.writeMode === "inplace");
+    const edited = all ? sr.content0.split(oldStr).join(newStr) : sr.content0.replace(oldStr, () => newStr);
+    const w = await casWrite(drv, path, sr, edited, writeMode === "inplace");
     return {
         path,
         occurrences,
@@ -152,11 +168,19 @@ export async function editFileMulti(
     hunks: Array<{ old: string; new: string; all?: boolean }>,
     opts: Pick<EditFileOptions, "writeMode"> = {},
 ): Promise<EditFileMultiResult> {
-    if (hunks.length === 0) throw new Error(`editFileMulti 需至少一个 hunk: ${path}`);
+    const { writeMode } = opts;
+    validateEditTarget(path, writeMode);
+    if (!Array.isArray(hunks) || !hunks.length) throw new Error(`editFileMulti 需至少一个 hunk: ${path}`);
+    const replacements = Array.from(hunks, (hunk, index) => {
+        if (!hunk || typeof hunk !== "object") throw new Error(`hunk #${index} 需为替换对象`);
+        const { old, new: replacement, all } = hunk;
+        validateReplacement(old, replacement, all, `hunk #${index}`);
+        return { old, new: replacement, all };
+    });
     const sr = await readStamped(drv, path);
     let content = sr.content0;
     const applied: EditMultiHunk[] = [];
-    for (const [i, h] of hunks.entries()) {
+    for (const [i, h] of replacements.entries()) {
         const n = content.split(h.old).length - 1;
         if (n === 0) {
             throw new Error(`hunk #${i} 未命中（0 处，整批拒绝未写入）: ${path}（oldStr 长度 ${h.old.length}，当前内容 ${content.length} 字符——先前 hunk 已应用后的内容）`);
@@ -167,7 +191,7 @@ export async function editFileMulti(
         content = h.all ? content.split(h.old).join(h.new) : content.replace(h.old, () => h.new); // 回调=字面替换（$ 语义免疫）
         applied.push({ old: h.old, new: h.new, occurrences: n });
     }
-    const w = await casWrite(drv, path, sr, content, opts.writeMode === "inplace");
+    const w = await casWrite(drv, path, sr, content, writeMode === "inplace");
     return {
         path,
         occurrences: applied.reduce((s, h) => s + h.occurrences, 0),

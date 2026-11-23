@@ -49,7 +49,7 @@ stack.events.on("exit", (e) => console.log("session", e.sessionId, "exit", e.exi
 | 观察流 | 内置 | 独立 SSH channel 真流式直推（无轮询）；ControlMaster 复用；注意力衰减回收 |
 | 持久会话 | 内置 | tmux 后端 terminalId 跨进程 re-attach + cwd 恢复 |
 | 文件传输 | 内置 | `putFile/getFile` base64 管道分块 + size/sha256 双校验 + **方言适配**（GNU/BSD/busybox——OPNsense/Alpine 不再必错） |
-| 受控编辑 | 内置 | `editFile` CAS 原子写回（写入形态/锁保护/校验等级三轴显式报告，见 AGENTS.md 第 8 条） |
+| 受控编辑 | 内置 | `editFile` 用 Compare-and-Swap（CAS）在写回前核对文件版本。结果分别报告锁保护和写入方式，详见 AGENTS.md 第 8 条。 |
 | 环境规格 | 内置 | 两段式自发现（语言/GPU/关键包）蒸馏落盘；`matchLayers({needs})` 按需选层；指纹漂移标 stale |
 | 连接治理 | 内置 | 连接拓扑指纹复用（同拓扑零重建）；3 次退避自动重连；层状态机与退化哨兵 |
 | 安全边界 | 内置 | host key 策略显式（tofu 缺省/strict+known_hosts）；凭据只传路径永不外泄；渲染永不含密钥内容 |
@@ -87,12 +87,12 @@ filaxis mcp-config --format toml  # TOML，使用 mcp_servers（Codex）
 }
 ```
 
-暴露的 15 个 MCP 工具速览：
+暴露的 18 个 MCP 工具速览：
 
 - **命令与批处理**：`run_command`、`run_batch`
 - **长跑会话与观察窗**：`spawn_and_observe`、`stop_and_verify`、`observe_stream`、`read_stream`、`close_stream`
-- **文件读写与传输**：`read_file`、`edit_file`、`put_file`、`get_file`
-- **多层连接管理**：`push_ssh`、`push_into`、`list_layers`、`remove_layer`
+- **文件与目录**：`list_directory`、`read_file`、`edit_file`、`put_file`、`get_file`、`delete_file`
+- **多层连接管理**：`push_ssh`、`push_into`、`list_layers`、`set_active_layer`、`remove_layer`
 
 npm 包包含 [Skill 入口与四份子剧本](docs/skills/SKILL.md)，以及配套的 [AGENTS.md](AGENTS.md)。需要登记 Skill 时，由 Agent 按自身平台的规则处理这些文件。
 

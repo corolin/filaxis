@@ -508,7 +508,7 @@ export class SshPtyDriver implements RuntimeDriver {
                 return entries;
             },
             async rm(p, options) {
-                const r = await fsExec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}${q(p)}`);
+                const r = await fsExec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}-- ${q(p)}`);
                 if (r.exitCode !== 0) throw new Error(`rm 失败（exit=${r.exitCode}）: ${p}`);
             },
             async mkdir(p, options) {
