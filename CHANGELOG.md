@@ -11,6 +11,11 @@
 
 ---
 
+## 0.2.8
+
+- MCP 和 Agent Toolkit 的 `push_ssh` 可按目标或 SSH 配置别名列表批量建立命名层，逐目标报告新建、复用或连接失败，并返回可用于 `run_batch.layer` 的实际层名。
+- 建立命名 SSH 层时按有效 OpenSSH 配置判断连接是否可复用。共享同一内网地址且经不同代理的 SSH 别名会分别建连。
+
 ## 0.2.7
 
 - SDK `runBatch`、CLI `batch` 和 MCP `run_batch` 支持在计划或步骤的 `layer` 中指定多个命名层。多层步骤按 `id@layer` 报告，`after` 等待前置步骤的所有实例成功，整个批次共享并发上限。

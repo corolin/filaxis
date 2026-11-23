@@ -685,12 +685,21 @@ describe("第十一季：批量组合（CI 真机）", () => {
         const toolkit = createAgentToolkit(stack);
         try {
             await stack.addLayer("controller", { driver: "local" });
-            await toolkit.handlers.push_ssh({ host: TARGET, name: "remote" });
+            const connections = await toolkit.handlers.push_ssh({ targets: [
+                { host: TARGET, name: "remote" }, { host: TARGET, name: "duplicate-landing" },
+            ] });
+            expect(connections).toMatchObject({
+                status: "ok", active_layer: "remote", layers: ["remote"],
+                results: [
+                    { layer: "remote", reused: false },
+                    { layer: "remote", reused: true },
+                ],
+            });
             const result = await toolkit.handlers.run_batch({
                 layer: "controller",
                 steps: [
                     { id: "local", kind: "exec", command: "printf controller" },
-                    { id: "syntax", kind: "exec", layer: "remote", command: "if true; then\n  echo unfinished", expect_exit: [2], after: ["local"] },
+                    { id: "syntax", kind: "exec", layer: connections.layers, command: "if true; then\n  echo unfinished", expect_exit: [2], after: ["local"] },
                     { id: "script", kind: "exec", layer: "remote", command: "cat <<'END'\n'quoted' $HOME\nEND\n# final comment", after: ["syntax"] },
                     { id: "done", kind: "exec", command: "printf done", after: ["script"] },
                 ],

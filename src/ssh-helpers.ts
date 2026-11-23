@@ -396,9 +396,23 @@ export function hopSshCommand(hop: SshHop): string {
 export const SSH_INPUT_WAIT_RE =
     /(?:password|passphrase|verification\s+code|login|密码|口令)[^\n]*[:：]\s*$|yes\s*\/\s*no|are you sure|continue connecting/i;
 
-const identityCache = new Map<string, string>();
+interface SshIdentity {
+    landing: string;
+    reuseKey: string;
+}
+
+const identityCache = new Map<string, SshIdentity>();
 /** 连接身份解析（ssh -G 本地解析不连网）；失败回退 unresolved: 前缀（视为不相同，不误拦） */
 export async function resolveSshIdentity(hop: SshHop, logger?: FilaxisLogger): Promise<string> {
+    return (await lookupSshIdentity(hop, logger))?.landing ?? `unresolved:${hopHost(hop)}`;
+}
+
+/** Identity for connection reuse, including the effective OpenSSH configuration. */
+export async function resolveSshReuseKey(hop: SshHop, logger?: FilaxisLogger): Promise<string | undefined> {
+    return (await lookupSshIdentity(hop, logger))?.reuseKey;
+}
+
+async function lookupSshIdentity(hop: SshHop, logger?: FilaxisLogger): Promise<SshIdentity | undefined> {
     const cacheKey = typeof hop === "string" ? hop : JSON.stringify(hop);
     const cached = identityCache.get(cacheKey);
     if (cached) return cached;
@@ -407,21 +421,31 @@ export async function resolveSshIdentity(hop: SshHop, logger?: FilaxisLogger): P
         let stdout: string;
         if (sshFileStdioRequested()) {
             const result = await spawnWithFileRedirect(argv, "", { timeoutMs: 8000, logger });
-            if (result.exitCode !== 0) return `unresolved:${hopHost(hop)}`;
+            if (result.exitCode !== 0) return undefined;
             stdout = result.stdout;
         } else {
             const { execFile } = await import("node:child_process");
             const { promisify } = await import("node:util");
             ({ stdout } = await promisify(execFile)("ssh", argv, { timeout: 8000, env: openSshEnvironment(process.env, logger) }));
         }
-        const h = stdout.match(/^hostname (\S+)$/m)?.[1] ?? hopHost(hop);
-        const p = stdout.match(/^port (\d+)$/m)?.[1] ?? "22";
-        const u = stdout.match(/^user (\S+)$/m)?.[1] ?? "";
-        const id = `${u ? u + "@" : ""}${h}:${p}`;
+        const config = stdout.replace(/\r\n/g, "\n");
+        const h = config.match(/^hostname (\S+)$/m)?.[1];
+        const p = config.match(/^port (\d+)$/m)?.[1];
+        const u = config.match(/^user (\S+)$/m)?.[1];
+        if (!h || !p || !u) return undefined;
+        const { createHash } = await import("node:crypto");
+        // A proxy or a config token can expand the original alias at connect time.
+        // Keep it when the effective configuration can still depend on it.
+        const aliasSensitive = /^proxy(?:command|jump) (?!none$).+$/m.test(config) || /%n/.test(config);
+        const effective = aliasSensitive ? config : config.replace(/^host .*\n/m, "");
+        const id = {
+            landing: `${u}@${h}:${p}`,
+            reuseKey: createHash("sha256").update(effective).update(aliasSensitive ? hopHost(hop) : "").digest("hex"),
+        };
         identityCache.set(cacheKey, id);
         return id;
     } catch {
-        return `unresolved:${hopHost(hop)}`;
+        return undefined;
     }
 }
 

@@ -18,6 +18,7 @@ import type { TransferResult } from "./file-transfer.js";
 import { BATCH_STEP_KINDS, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
 import type { RuntimeDriver } from "./driver.js";
 import { SessionOwnership, type StopResult } from "./session-ownership.js";
+import { sshArgsFor } from "./ssh-helpers.js";
 
 export interface AgentToolDef {
     type: "function";
@@ -46,6 +47,35 @@ function agentTransferResult({ writeMode, ...result }: LayerFileTransferResult):
     return { ...result, write_mode: writeMode };
 }
 
+export interface PushSshTarget {
+    host: string;
+    port?: number;
+    user?: string;
+    key?: string;
+    jump?: string;
+    name?: string;
+}
+
+export interface PushSshResult {
+    layer: string;
+    reused: boolean;
+    reused_from?: string;
+    note?: string;
+}
+
+export interface PushSshBatchArgs {
+    targets: Array<string | PushSshTarget>;
+}
+
+export interface PushSshBatchResult {
+    status: "ok" | "partial" | "fail";
+    active_layer?: string;
+    layers: string[];
+    results: Array<{ host: string; name: string } & (
+        ({ status: "ok" } & PushSshResult) | { status: "fail"; error: string }
+    )>;
+}
+
 export interface AgentToolHandlers {
     run_command(args: { command: string; timeout_ms?: number; layer?: string }): Promise<{
         stdout: string; stderr: string; exit_code: number; effective_user?: string;
@@ -69,9 +99,8 @@ export interface AgentToolHandlers {
     }>;
     stop_and_verify(args: { session_id: string; layer?: string }): Promise<StopResult>;
     // ── 层族（第十季命名层注册表——Paramiko 式句柄寻址）──
-    push_ssh(args: { host: string; port?: number; user?: string; key?: string; jump?: string; name?: string }): Promise<{
-        layer: string; reused: boolean; reused_from?: string; note?: string;
-    }>;
+    push_ssh(args: PushSshBatchArgs & Partial<Record<keyof PushSshTarget, never>>): Promise<PushSshBatchResult>;
+    push_ssh(args: PushSshTarget & { targets?: never }): Promise<PushSshResult>;
     push_into(args: { enter_cmd: string; label?: string; from?: string; name?: string }): Promise<{
         layer: string; target?: string;
     }>;
@@ -119,6 +148,70 @@ const fileTransferProperties = {
 };
 
 const layerNameSchema = { type: "string", minLength: 1, pattern: "\\S" };
+const sshHostSchema = { type: "string", minLength: 1, pattern: "^\\S+$", description: "目标主机（user@host 或运行环境的 SSH 配置别名）" };
+const sshTargetSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        host: sshHostSchema,
+        port: { type: "integer", minimum: 1, maximum: 65535, description: "SSH 端口" },
+        user: { type: "string", description: "登录用户名" },
+        key: { type: "string", description: "私钥文件路径（-i）" },
+        jump: { type: "string", description: "跳板（-J，途径机不占层）" },
+        name: { ...layerNameSchema, description: "层名（省略时使用 host）" },
+    },
+    required: ["host"],
+};
+const sshTargetsSchema = {
+    type: "array",
+    minItems: 1,
+    description: "按顺序尝试的目标。字符串可直接使用当前运行环境的 SSH 配置别名",
+    items: { anyOf: [sshHostSchema, sshTargetSchema] },
+};
+
+function sshConnection({ host, port, user, key, jump, name }: PushSshTarget) {
+    const connParams = {
+        ...(port != null ? { port: Number(port) } : {}),
+        ...(user ? { user: String(user) } : {}),
+        ...(key ? { keyFile: String(key) } : {}),
+        ...(jump ? { jump: String(jump) } : {}),
+    };
+    return { host: String(host), name: name ?? String(host), connParams };
+}
+
+function sshBatchTargets(targets: PushSshBatchArgs["targets"]) {
+    if (!Array.isArray(targets) || !targets.length) throw new Error("push_ssh 的 targets 需为非空数组");
+    const names = new Set<string>();
+    return Array.from(targets, (entry, index) => {
+        const raw = typeof entry === "string" ? { host: entry } : entry;
+        const label = `targets[${index}]`;
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${label} 需为主机名或对象`);
+        if (Object.keys(raw).some((key) => !Object.hasOwn(sshTargetSchema.properties, key))) {
+            throw new Error(`${label} 含未知连接字段`);
+        }
+        for (const field of ["host", "user", "key", "jump", "name"] as const) {
+            const value = raw[field];
+            if (field !== "host" && value === undefined) continue;
+            if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value)) {
+                throw new Error(`${label}.${field} 需为非空字符串且不能含控制字符`);
+            }
+        }
+        if (!/^[^@\s]+(?:@[^@\s]+)?$/.test(raw.host) || raw.host.startsWith("-")
+            || (raw.user !== undefined && (/[\s@]/.test(raw.user) || raw.host.includes("@")))) {
+            throw new Error(`${label} 的 host 或 user 无效`);
+        }
+        if (raw.port !== undefined && (!Number.isInteger(raw.port) || raw.port < 1 || raw.port > 65535)) {
+            throw new Error(`${label}.port 需为 1 到 65535 的整数`);
+        }
+        const connection = sshConnection(raw);
+        // Check the same target and jump argument rules as the actual SSH driver.
+        sshArgsFor({ host: connection.host, conn: connection.connParams });
+        if (names.has(connection.name)) throw new Error(`targets 含重复层名 '${connection.name}'`);
+        names.add(connection.name);
+        return connection;
+    });
+}
+
 const batchLayerSchema = (description: string) => ({
     anyOf: [
         layerNameSchema,
@@ -379,19 +472,21 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "push_ssh",
             description:
-                "建立命名 ssh 层（成为默认层——后续工具缺省落它）。同落点幂等复用（reused=true 返回既有层，" +
-                "不重复建连）+ 落点校验（宁重连不错主机）。跳板传 jump（-J 不占层）。",
+                "建立命名 SSH 层。单个目标传 host，批量传 targets（主机、SSH 配置别名或连接对象的数组）。" +
+                "批量按输入顺序尝试，返回各目标结果。layers 非空时可直接传给 run_batch。新建层成为默认层。" +
+                "同落点可复用，结果中的 layer 是实际层名。跳板传 jump。",
             parameters: {
                 type: "object",
-                properties: {
-                    host: { type: "string", description: "目标主机（user@host 或 ssh config 别名）" },
-                    port: { type: "number", description: "SSH 端口（非 22 时指定）" },
-                    user: { type: "string", description: "登录用户名" },
-                    key: { type: "string", description: "私钥文件路径（-i）" },
-                    jump: { type: "string", description: "跳板（-J：途径机不占层）" },
-                    name: { type: "string", description: "层名（缺省=host；注册表内唯一，显式寻址用）" },
-                },
-                required: ["host"],
+                properties: { ...sshTargetSchema.properties, targets: sshTargetsSchema },
+                oneOf: [
+                    sshTargetSchema,
+                    {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: { targets: sshTargetsSchema },
+                        required: ["targets"],
+                    },
+                ],
             },
         },
     },
@@ -476,6 +571,49 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         if (layerName) return stack.layer(layerName).driver;
         return stack.active ?? await layer();
     };
+    const connectSsh = async ({ host, name, connParams }: ReturnType<typeof sshConnection>): Promise<PushSshResult> => {
+        const result = await stack.addLayer(name, {
+            driver: "ssh", target: host,
+            config: Object.keys(connParams).length ? { connParams } : undefined,
+        });
+        return {
+            layer: result.handle.name, reused: result.reused, reused_from: result.reusedFrom,
+            note: result.reused ? "落点已由既有层持有——幂等复用（未重复建连）" : "新层已建并成为默认层",
+        };
+    };
+    function pushSsh(args: PushSshTarget & { targets?: never }): Promise<PushSshResult>;
+    function pushSsh(args: PushSshBatchArgs & Partial<Record<keyof PushSshTarget, never>>): Promise<PushSshBatchResult>;
+    async function pushSsh(args: PushSshTarget | PushSshBatchArgs): Promise<PushSshResult | PushSshBatchResult> {
+        if (!("targets" in args)) {
+            if (typeof args.host !== "string" || !args.host.trim()) {
+                throw new Error("push_ssh 需提供单目标 host 或批量 targets");
+            }
+            return connectSsh(sshConnection(args));
+        }
+        if (Object.keys(args).some((key) => key !== "targets")) throw new Error("push_ssh 的 targets 必须单独提供");
+        const targets = sshBatchTargets(args.targets);
+        const results: PushSshBatchResult["results"] = [];
+        const layers = new Set<string>();
+        let failures = 0;
+        // Serial registration preserves RuntimeStack's landing reuse and default-layer order.
+        for (const target of targets) {
+            const { host, name } = target;
+            try {
+                const result = await connectSsh(target);
+                layers.add(result.layer);
+                results.push({ host, name, status: "ok", ...result });
+            } catch (error) {
+                failures++;
+                results.push({ host, name, status: "fail", error: error instanceof Error ? error.message : String(error) });
+            }
+        }
+        return {
+            status: failures === 0 ? "ok" : failures === targets.length ? "fail" : "partial",
+            active_layer: stack.activeLayer?.name,
+            layers: [...layers],
+            results,
+        };
+    }
     const transferFile = async (operation: "put" | "get", args: AgentFilePutArgs): Promise<AgentFileTransferResult> => {
         const { local_path, remote_path, layer: layerName, transport, timeout_ms, write_mode, ...unknownFields } = args;
         const extra = Object.keys(unknownFields);
@@ -679,21 +817,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 return { window_id, closed: true };
             },
             // ── 层族（第十季命名层注册表）──
-            async push_ssh({ host, port, user, key, jump, name }) {
-                const connParams: Record<string, unknown> = {};
-                if (port != null) connParams.port = Number(port);
-                if (user) connParams.user = String(user);
-                if (key) connParams.keyFile = String(key);
-                if (jump) connParams.jump = String(jump);
-                const r = await stack.addLayer(name ?? String(host), {
-                    driver: "ssh", target: String(host),
-                    config: Object.keys(connParams).length ? { connParams } : undefined,
-                });
-                return {
-                    layer: r.handle.name, reused: r.reused, reused_from: r.reusedFrom,
-                    note: r.reused ? "落点已由既有层持有——幂等复用（未重复建连）" : "新层已建并成为默认层",
-                };
-            },
+            push_ssh: pushSsh,
             async push_into(args) {
                 // 参数别名宽收（第十二季语法糖）：enter_cmd / enterCommand / enter_command / enterCmd
                 // 等价——Agent 手滑完整词不再静默漏建层（同款事故：enterCommand 拼错→裸宿主机层）

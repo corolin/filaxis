@@ -17,7 +17,7 @@
 
 import * as readline from "node:readline";
 import { version } from "../package.json" with { type: "json" };
-import { TOOL_DEFS, type AgentToolHandlers, type AgentToolkit } from "./agent-toolkit.js";
+import { TOOL_DEFS, type AgentToolHandlers, type AgentToolkit, type PushSshBatchResult, type PushSshResult } from "./agent-toolkit.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -231,6 +231,17 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
         const result = value as Awaited<ReturnType<AgentToolHandlers["run_command"]>>;
         return [`exit=${result.exit_code}`, ...outputPreviews(result, COMMAND_PREVIEW_BYTES)].join("\n");
     }
+    if (name === "push_ssh") {
+        const result = value as PushSshResult | PushSshBatchResult;
+        if ("results" in result) {
+            const overview = `status=${result.status}${result.active_layer ? ` | active_layer=${singleLine(result.active_layer)}` : ""}`;
+            const lines = result.results.map((target) => target.status === "ok"
+                ? `[ok] ${singleLine(target.name)} | layer=${singleLine(target.layer)} | reused=${target.reused}`
+                : `[fail] ${singleLine(target.name)} | ${singleLine(preview(target.error, BATCH_DETAIL_BYTES, FULL_OUTPUT_HINT))}`);
+            const summary = [overview, ...lines].join("\n");
+            return jsonStringBytes(summary) <= BATCH_TEXT_JSON_BYTES ? summary : limitBatchText(summary, FULL_OUTPUT_HINT);
+        }
+    }
     if (name === "run_batch") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["run_batch"]>>;
         const overview = `status=${result.status}${result.failed_step ? ` | failed_step=${result.failed_step}` : ""}`;
@@ -274,6 +285,10 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
         return transferSummary(result);
     }
     return summarize(value);
+}
+
+function singleLine(text: string): string {
+    return text.replace(/[\p{Cc}\u2028\u2029]/gu, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 function jsonStringBytes(text: string): number {
