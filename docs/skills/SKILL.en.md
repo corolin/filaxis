@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.9"
+  version: "0.2.10"
 description: |
   Use Filaxis (@syrkos/filaxis) to run commands across layers, batch inspections, manage background jobs, follow logs, or operate on files.
   Also use it to diagnose SSH aliases and jump hosts or interpret unknown outcomes and write guarantees. Skip for simple local shell commands and tasks unrelated to Filaxis.
@@ -32,6 +32,8 @@ Match the task to an entry point and read the relevant playbook. After execution
 | List a directory, read, edit, transfer, or delete a file | `list_directory`, `read_file`, `edit_file`, `put_file`, `get_file`, `delete_file`. Read [File operations](./file-sync.md) |
 | Switch back to an existing layer as the default | Find its name with `list_layers` and call `set_active_layer`. Pass `layer` for a one-call override |
 | Observe a command for a limited interval in the CLI | `filaxis observe` |
+
+For work expected to take over two minutes, such as an OS upgrade or a long build, start a session with `spawn_and_observe`. In one Antigravity run, the host ended an MCP call at about three minutes. A tool's `timeout_ms` cannot extend the host deadline. Follow the [long-running jobs playbook](./longrun-observe.md) to read the logs and verify the outcome.
 
 ## CLI quick start
 

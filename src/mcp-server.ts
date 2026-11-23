@@ -23,6 +23,7 @@ import { noopLogger, type FilaxisLogger } from "./logger.js";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const JSONRPC_VERSION = "2.0";
 const COMMAND_PREVIEW_BYTES = 8 * 1024;
+const FILE_TEXT_JSON_BYTES = 8 * 1024;
 const BATCH_PREVIEW_BYTES = 4 * 1024;
 const BATCH_TEXT_JSON_BYTES = 8 * 1024;
 const STREAM_TEXT_JSON_BYTES = 8 * 1024;
@@ -197,8 +198,16 @@ export class McpServer {
                         sessions: err.sessions,
                         exitCode: err.exitCode,
                     };
-                    const errorText = (textOnlyBatch || name === "delete_file") && err.outcome
-                        ? `outcome=${err.outcome}\n${message}` : message;
+                    const evidence: string[] = [];
+                    if (err.outcome && (textOnlyBatch || name === "delete_file" || name === "spawn_and_observe")) {
+                        evidence.push(`outcome=${singleLine(err.outcome)}`);
+                    }
+                    if (name === "spawn_and_observe") {
+                        if (err.sessionId) evidence.push(`session_id=${singleLine(err.sessionId)}`);
+                        if (err.logBase) evidence.push(`log_base=${singleLine(err.logBase)}`);
+                        if (err.exitCode != null) evidence.push(`exit_code=${err.exitCode}`);
+                    }
+                    const errorText = [...evidence, message].join("\n");
                     const overflow = name === "run_batch" && jsonStringBytes(errorText) > BATCH_TEXT_JSON_BYTES;
                     this.reply(id, {
                         content: [{ type: "text", text: overflow ? limitBatchText(errorText, textOnlyBatch ? "" : FULL_OUTPUT_HINT) : errorText }],
@@ -238,6 +247,25 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
     if (name === "delete_file") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["delete_file"]>>;
         return `deleted=true | path=${singleLine(result.path)}`;
+    }
+    if (name === "read_file") {
+        const { content } = value as Awaited<ReturnType<AgentToolHandlers["read_file"]>>;
+        if (!content.length) return "[空文件]";
+        if (content.length <= FILE_TEXT_JSON_BYTES && jsonStringBytes(content) <= FILE_TEXT_JSON_BYTES) return content;
+        return limitText(content, "\n[文件正文已截断，完整正文见 structuredContent.content]", FILE_TEXT_JSON_BYTES);
+    }
+    if (name === "spawn_and_observe") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["spawn_and_observe"]>>;
+        const lines = [`session_id=${singleLine(result.session_id)}`, `log_base=${singleLine(result.log_base)}`];
+        if (result.note) lines.push(`note=${singleLine(result.note)}`);
+        return lines.join("\n");
+    }
+    if (name === "stop_and_verify") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["stop_and_verify"]>>;
+        const lines = [`status=${result.status}`];
+        if (result.exit_code != null) lines.push(`exit_code=${result.exit_code}`);
+        if (result.note) lines.push(`note=${singleLine(result.note)}`);
+        return lines.join("\n");
     }
     if (name === "list_directory") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["list_directory"]>>;
@@ -428,7 +456,6 @@ function summarize(r: unknown): string {
         if (o.occurrences !== undefined) bits.push(`replaced=${o.occurrences}`);
         if (o.window_id !== undefined) bits.push(`window=${o.window_id}`);
         if (Array.isArray(o.frames)) bits.push(`frames=${o.frames.length}`);
-        if (o.session_id !== undefined) bits.push(`session=${String(o.session_id).slice(0, 24)}`);
         if (o.status !== undefined) bits.push(`status=${o.status}`);
         if (Array.isArray(o.lines)) bits.push(`lines=${o.lines.length}`);
         if (o.stdout !== undefined) {

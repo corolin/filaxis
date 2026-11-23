@@ -21,6 +21,7 @@ import type {
 } from "./session-types.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 import { renderSessionCodeGuard, renderSessionGroupState, renderSessionWorker } from "./session-group.js";
+import { decodeFileRead } from "./file-transfer.js";
 
 const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
@@ -66,17 +67,20 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 // 凭证纪律（Sol 73 P1-2）：编码/wc 命令失败（exit≠0）不作内容凭证
                 //——故障注入时 base64 失败曾静默返回空串
                 if (st.exitCode !== 0) throw new Error(`readFile 失败（wc 退出码 ${st.exitCode}）: ${p}`);
-                const size = parseInt((st.stdout || "").trim(), 10);
-                if (!Number.isFinite(size)) throw new Error(`readFile 失败（文件不存在或不可读）: ${p}`);
+                const sizeText = st.stdout.trim();
+                const size = Number(sizeText);
+                if (!/^\d+$/.test(sizeText) || !Number.isSafeInteger(size)) {
+                    throw new Error(`readFile 失败（文件大小无法核实）: ${p}`);
+                }
                 if (size * 2 <= 12_000) {
-                    const r = await self.exec(`base64 ${q(p)}`);
+                    const r = await self.exec(`base64 < ${q(p)}`);
                     if (r.exitCode !== 0) throw new Error(`readFile 失败（base64 退出码 ${r.exitCode}）: ${p}`);
-                    return Buffer.from((r.stdout || "").replace(/\s+/g, ""), "base64").toString("utf-8");
+                    return decodeFileRead(r.stdout, p, size);
                 }
                 const tmp = `/tmp/filaxis-read-${Math.random().toString(36).slice(2, 10)}.b64`;
                 // && 连接 + 退出码查（Hydrogen R11 #1）：base64 失败（无权限/被删）曾仍
                 // 创建空 tmp、wc -c 返 0 exit 0——readFile 静默返回空串而非报错
-                const tot = await self.exec(`base64 ${q(p)} > ${q(tmp)} && wc -c < ${q(tmp)}`);
+                const tot = await self.exec(`base64 < ${q(p)} > ${q(tmp)} && wc -c < ${q(tmp)}`);
                 const total = parseInt((tot.stdout || "").trim(), 10);
                 // total 异常也走 finally 清理（曾在此 throw 遗留 tmp——throw 挪 try 内）
                 try {
@@ -92,15 +96,9 @@ export class TmuxSessionDriver implements RuntimeDriver {
                         if (pg.exitCode !== 0) {
                             throw new Error(`readFile 分页读失败（页偏移 ${off} 退出码 ${pg.exitCode}）: ${p}`);
                         }
-                        b64 += (pg.stdout || "").replace(/\s+/g, "");
+                        b64 += pg.stdout.replace(/[ \t\r\n]+/g, "");
                     }
-                    const content = Buffer.from(b64, "base64");
-                    if (content.length !== size) {
-                        throw new Error(
-                            `readFile 长度对账失败（解码 ${content.length}B ≠ 源 ${size}B——分页途中丢页/截断）: ${p}`,
-                        );
-                    }
-                    return content.toString("utf-8");
+                    return decodeFileRead(b64, p, size);
                 } finally {
                     await self.exec(`rm -f ${q(tmp)}`).catch(() => undefined);
                 }
@@ -118,7 +116,9 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 return r.stdout.trim() === "Y";
             },
             async stat(p) {
-                const r = await self.exec(`stat -c '%s %Y' ${q(p)} 2>/dev/null || stat -f '%z %m' ${q(p)} 2>/dev/null || true`);
+                const operand = q(cdTargetArg(p));
+                const r = await self.exec(`stat -Lc '%s %Y' ${operand} 2>/dev/null || stat -Lf '%z %m' ${operand} 2>/dev/null || true`);
+                if (r.exitCode !== 0) return null;
                 const m = r.stdout.trim().match(/^(\d+)\s+(\d+)$/);
                 return m ? { size: parseInt(m[1]!, 10), mtimeMs: parseInt(m[2]!, 10) * 1000 } : null;
             },

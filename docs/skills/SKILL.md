@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.9"
+  version: "0.2.10"
 description: |
   使用 Filaxis（@syrkos/filaxis）执行跨层命令、批量巡检、管理后台任务、观察日志或操作目标层文件。
   也用于排查 SSH 别名与跳板、解读 unknown 终态或写入保障。纯本机一次性命令和与 Filaxis 无关的任务可跳过。
@@ -24,6 +24,8 @@ description: |
 | 列目录、读写、传输或删除文件 | `list_directory`、`read_file`、`edit_file`、`put_file`、`get_file`、`delete_file`。读 [文件操作](./file-sync.md) |
 | 切回仍注册的默认层 | 用 `list_layers` 找层名，再用 `set_active_layer` 切换。单次指定目标时可直接传 `layer` |
 | CLI 限时查看输出 | `filaxis observe`，适用于只取一段观察结果 |
+
+预计超过两分钟的任务（如系统升级或长编译）优先用 `spawn_and_observe` 启动。Antigravity 实测曾在约三分钟终止单次 MCP 调用，工具的 `timeout_ms` 无法延长宿主的调用时限。按 [长跑任务剧本](./longrun-observe.md) 查看落盘日志并核实终态。
 
 ## CLI 快速上手
 

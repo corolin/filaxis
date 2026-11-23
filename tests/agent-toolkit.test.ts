@@ -121,6 +121,22 @@ describe("createAgentToolkit（反馈 #3）", () => {
         expect(r.note).toContain("verify"); // unknown 后自动接 verify（双通道不可达才保持）
     }, 15_000);
 
+    test("stop_and_verify validates the handle and needs an exit code before reporting exited", async () => {
+        let stopCalls = 0;
+        const driver = {
+            async stopSession() { stopCalls++; return { status: "exited", exitCode: null }; },
+            async verifySession() { return { status: "exited", exitCode: null }; },
+        } as unknown as RuntimeDriver;
+        const { handlers } = createAgentToolkit(new RuntimeStack(), { driver });
+        await expect(handlers.stop_and_verify({ session_id: "", layer: "__initial__" })).rejects.toThrow(/完整的非空会话 ID/);
+        await expect(handlers.stop_and_verify({ session_id: "fixture", layer: "" })).rejects.toThrow(/非空层名/);
+        expect(stopCalls).toBe(0);
+        expect(await handlers.stop_and_verify({ session_id: "fixture", layer: "__initial__" })).toMatchObject({
+            status: "unknown", note: expect.stringContaining("再次调用 stop_and_verify"),
+        });
+        expect(stopCalls).toBe(1);
+    });
+
     // GPT Astra 二轮 #3：spawn 在远端层的会话曾固定回初始层停（停错层必然失败）——
     // 修后按归属层（spawn 时的 driver）停止
     test("stop_and_verify：跨层会话按归属层停止（不落初始层）", async () => {
@@ -155,7 +171,7 @@ describe("createAgentToolkit（反馈 #3）", () => {
     test("stop_and_verify：unknown 后重试仍找归属层；终态确定才清归属", async () => {
         const stack = new RuntimeStack();
         const calls: string[] = [];
-        let stopResult: { status: string } = { status: "unknown" };
+        let stopResult: { status: string; exitCode?: number } = { status: "unknown" };
         const remoteDrv = {
             descriptor: { driver: "ssh", target: "r2" },
             async exec() { return { stdout: "", stderr: "", exitCode: 0 }; },
@@ -176,9 +192,9 @@ describe("createAgentToolkit（反馈 #3）", () => {
         const r1 = await tk.handlers.stop_and_verify({ session_id: "rs-own" });
         expect(r1.status).toBe("unknown");
         // 重试（网络恢复后再核实）：仍走归属层，不落初始层
-        stopResult = { status: "exited" };
+        stopResult = { status: "exited", exitCode: 0 };
         const r2 = await tk.handlers.stop_and_verify({ session_id: "rs-own" });
-        expect(r2.status).toBe("exited");
+        expect(r2).toEqual({ status: "exited", exit_code: 0 });
         expect(calls).toEqual(["remote:rs-own", "remote:rs-own"]); // 两次都在归属层（修前第二次落 init）
         await stack.removeLayer("r2");
     }, 15_000);

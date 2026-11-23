@@ -358,10 +358,8 @@ export class RemoteSessionManager {
         if (e.pid == null) return { status: "unknown" };
         try {
             const finishIfExited = async () => {
-                const code = await this.readExitCode(e.base);
-                const value = code.exitCode === 0 ? code.stdout.trim() : "";
-                if (!/^\d+$/.test(value)) return undefined;
-                const exitCode = Number(value);
+                const exitCode = await this.readExitCode(e.base);
+                if (exitCode === null) return undefined;
                 await this.flushTail(e);
                 this.finalize(e, exitCode);
                 return { status: "exited" as const, exitCode };
@@ -454,11 +452,10 @@ export class RemoteSessionManager {
         if (!e.running) return { status: "exited", exitCode: e.exitCode ?? null };
         if (e.pid == null) return { status: "unknown" };
         try {
-            const code = await this.readExitCode(e.base);
-            const codeStr = code.exitCode === 0 ? (code.stdout || "").trim() : ""; // 命令失败不采信输出（Sol 57/58 P1-2）
-            if (codeStr !== "" && /^\d+$/.test(codeStr)) {
+            const exitCode = await this.readExitCode(e.base);
+            if (exitCode !== null) {
                 await this.flushTail(e); // 终态冲刷（二十三期 #2——尾行喂 watcher）
-                this.finalize(e, parseInt(codeStr, 10));
+                this.finalize(e, exitCode);
                 return { status: "exited", exitCode: e.exitCode };
             }
             if (e.recovered) {
@@ -487,8 +484,11 @@ export class RemoteSessionManager {
         return `${this.logDir}/${sessionId}`;
     }
 
-    private readExitCode(base: string) {
-        return this.exec(`cat ${q(base)}.code 2>/dev/null && (${renderSessionCodeGuard(base)}true)`);
+    private async readExitCode(base: string): Promise<number | null> {
+        const result = await this.exec(`cat ${q(base)}.code 2>/dev/null && (${renderSessionCodeGuard(base)}true)`);
+        if (result.exitCode !== 0) return null;
+        const value = result.stdout.trim();
+        return /^\d{1,3}$/.test(value) && Number(value) <= 255 ? Number(value) : null;
     }
 
     /** Verify durable evidence without claiming ownership or sending a signal. */
@@ -668,21 +668,14 @@ export class RemoteSessionManager {
                     } catch { /* 单流读失败——下轮再试 */ }
                 }
             });
-            // 终态：.code 文件在场 = 进程已退出（nohup 包装的 echo 已落盘）
-            const code = await this.readExitCode(entry.base);
-            const codeStr = code.exitCode === 0 ? (code.stdout || "").trim() : ""; // 命令失败不采信输出（Sol 57/58 P1-2）
-            if (codeStr !== "" && /^\d+$/.test(codeStr)) {
-                await this.flushTail(entry); // 终态冲刷：无尾换行的末行也喂 watcher
-                this.finalize(entry, parseInt(codeStr, 10));
-            } else if (entry.pid != null) {
-                // 无 .code 但进程没了（被外部 kill -9）→ unknown 退出码。
-                // 组感知（Hydrogen R3 #6）：与 stop/verify 同口径（孙进程持组
-                // 仍活=会话还在跑——裸 kill -0 主 PID 曾在多代脚本下提前判死）
-                if (await this.probeTree(entry) === false) {
-                    await this.flushTail(entry);
-                    this.finalize(entry, null);
-                }
+            let exitCode = await this.readExitCode(entry.base);
+            if (exitCode === null) {
+                if (entry.pid == null || await this.probeTree(entry) !== false) return;
+                // The wrapper may publish its code between the first read and the death probe.
+                exitCode = await this.readExitCode(entry.base);
             }
+            await this.flushTail(entry);
+            this.finalize(entry, exitCode);
         } catch {
             /* 轮询失败（exec 通道断）——下轮再试；终态核实属 stop()/result() 职责 */
         }

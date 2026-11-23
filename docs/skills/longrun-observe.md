@@ -16,6 +16,8 @@
 
 ## 剧本
 
+MCP 长跑任务用 `spawn_and_observe` 启动，保存文本块里的完整 `session_id`、`log_base` 和目标层。持续看日志时，用 `observe_stream` 在同一层跟随 `log_base` 对应的 `.out` 或 `.err`，然后用 `read_stream` 续读。关闭观察窗会回收观察命令。任务自然退出后，用完整 `session_id` 调 `stop_and_verify` 获取可核实的退出码。会话归属缓存过期时，使用原目标层的 `layer`。
+
 1. **启动即返，不要阻塞在 execSession**：长跑任务是会话不是 exec——`execSession` 返回句柄（`sessionId`/`logBase`/`pid`）后立刻挂 watcher，人再离开。
 2. **watcher 三态用法**：
    - 等成功标记（如 `epoch=100`）→ `once: true`；
@@ -38,4 +40,4 @@
 - **流设备日志陷阱（Linux 实锤）**：容器/服务里的日志路径可能是 `/dev/stderr`、`/dev/stdout` 的软链或挂载（如 nginx 容器的 `error.log -> /dev/stderr`）——`tail -f` 流设备不会正常跟随，轻则空转重则挂死。先 `ls -l <log>` 或 `readlink -f <log>` 确认是真实文件再 tail；是流设备就改从进程 stderr 观察（`observe --stream stderr` / `docker logs`），别跟设备文件较劲。
 - **慢消费者**：迭代读取跟不上产出时，事件队列会丢最旧并累计 dropped 计数——先查计数再断言「什么都没发生」。
 - 探测 GPU 时 `nvidia-smi` 驱动不通信会输出整段失败文案——规格层已做收窄，你的自定义解析也要防。
-- 会话退出后句柄保留一个 TTL 窗口供补读——过了窗口查落盘文件，不要反复重试句柄。
+- 会话终态的工具缓存有保留期限。过期时用原目标层和完整 ID 核实，或查落盘日志。
