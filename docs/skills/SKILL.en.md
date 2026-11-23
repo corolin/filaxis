@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.7
+version: 0.2.8
 description: |
   Entry skill guide for the Filaxis remote execution runtime (@syrkos/filaxis) — 30-second execution mode selector, MCP/CLI/SDK recipes, and core execution contracts for reliable SSH, Docker, and multi-hop agent operations.
 
@@ -58,6 +58,7 @@ filaxis exec --layer <name> --timeout 8000 -- "(printf 'PING\n'; sleep 1) | nc 1
 ## MCP Practical Guidelines
 
 - **Batch inspection and multi-step fixes with `run_batch`**: Combine multiple `read_file`, `run_command`, `edit_file`, `put`, and `get` steps into a single parallel `run_batch` call instead of sequential single-tool loops.
+- **Batch SSH connections**: Call `push_ssh` with `{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`. Strings can be SSH config aliases resolved in the runtime environment. Targets are attempted in order and individual connection failures are reported without stopping the batch. Pass the deduplicated `layers` from successful and reused connections directly to `run_batch.layer`. `active_layer` reports the default layer at the end of the call.
 - **Layer targeting precedence & multi-layer fan-out**: Both top-level `layer` and per-step `layer` accept either a single layer name or a non-empty array of layer names (top-level sets the batch default; per-step overrides only that step; omitting both uses the active default layer). Multi-layer arrays expand each step into `id@layer` instances that run in parallel up to `max_parallel` (single-element arrays keep the original `id`), and downstream `after` dependencies wait for all expanded instances to succeed (`kind: "get"` rejects multi-layer arrays to avoid overwriting the same `local_path`). `filaxis batch --request-file plan.json` shares the same precedence and array expansion (step `layer` > plan `layer` > `--layer`/`--host` > local).
 - **Local targeting**: Layer arrays look up registered or saved names. SDK callers can register the local host with `stack.addLayer("local", { driver: "local" })`. The CLI and standalone MCP server leave the local default unnamed.
 - **Concurrency & ordering (`max_parallel` and `after`)**: Independent steps run in parallel up to `max_parallel`. Use `after: ["step-id"]` to serialize dependent steps (e.g., edit config -> validate -> reload service), even across layers.

@@ -469,6 +469,70 @@ test("MCP opens, reads, and closes a continuous window by ID", async () => {
 }, 20_000);
 
 describe("MCP layer array fan-out", () => {
+    test("push_ssh validates all batch targets and reports usable layers after partial failure", async () => {
+        const stack = new RuntimeStack();
+        const addLayer = stack.addLayer.bind(stack);
+        const attempted: Array<{ name: string; descriptor: Parameters<RuntimeStack["addLayer"]>[1] }> = [];
+        stack.addLayer = async (name, descriptor) => {
+            attempted.push({ name, descriptor });
+            if (name === "unreachable") throw new Error("fixture connection failed");
+            if (name === "same-host") return { handle: stack.layer("web"), reused: true, reusedFrom: "web" };
+            return addLayer(name, new LocalRuntimeDriver());
+        };
+        const f = mcpFixture(stack);
+        const call = async (id: number, name: string, args: Record<string, unknown>) => {
+            f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+            return (await waitId(f, id)).result;
+        };
+        try {
+            const invalid = [
+                { targets: [] },
+                { targets: ["web", { host: "other", name: "web" }] },
+                { targets: ["web", { host: "db", port: 0 }] },
+                { targets: ["web", { host: "db", jump: "one,two" }] },
+                { targets: ["web", { host: "deploy@db", user: "other" }] },
+                { targets: ["web", "deploy@"] },
+                { targets: ["web", { host: "db", name: "db\n01" }] },
+                { targets: ["web"], host: "db" },
+                { hosts: ["web"] },
+            ];
+            for (const [index, args] of invalid.entries()) {
+                expect(await call(index, "push_ssh", args)).toMatchObject({ isError: true });
+            }
+            expect(attempted).toHaveLength(0);
+            expect(await call(10, "push_ssh", { targets: [
+                "web", "unreachable", { host: "db", name: "database", port: 2222, user: "deploy", jump: "bastion" }, "same-host",
+            ] })).toMatchObject({
+                isError: false,
+                content: [{ text: expect.stringContaining("[fail] unreachable | fixture connection failed") }],
+                structuredContent: {
+                    status: "partial",
+                    active_layer: "database",
+                    layers: ["web", "database"],
+                    results: [
+                        { host: "web", name: "web", status: "ok", layer: "web", reused: false },
+                        { host: "unreachable", status: "fail" },
+                        { host: "db", name: "database", status: "ok", layer: "database", reused: false },
+                        { host: "same-host", status: "ok", layer: "web", reused: true, reused_from: "web" },
+                    ],
+                },
+            });
+            expect(attempted[2]).toEqual({
+                name: "database",
+                descriptor: { driver: "ssh", target: "db", config: { connParams: { port: 2222, user: "deploy", jump: "bastion" } } },
+            });
+            expect(await call(11, "push_ssh", { targets: ["unreachable"] })).toMatchObject({
+                structuredContent: { status: "fail", layers: [], active_layer: "database" },
+            });
+            expect(await call(12, "push_ssh", { host: "single" })).toMatchObject({
+                structuredContent: { layer: "single", reused: false },
+            });
+        } finally {
+            f.close();
+            await Promise.all([...stack.layers.keys()].map((name) => stack.removeLayer(name, { destroy: true })));
+        }
+    });
+
     test("tools/list exposes string | string[] schema for run_batch layer and step layer", async () => {
         const f = mcpFixture();
         try {

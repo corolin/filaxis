@@ -15,7 +15,7 @@ import { RuntimeFactory } from "./factory.js";
 import { EventBus } from "./events.js";
 import { settleRejection } from "./async-guard.js";
 import {
-    enterStepsOf, layerDisplayName, layerPathIdentities, resolveSshIdentity, ENTER_ALIAS_KEYS,
+    enterStepsOf, layerDisplayName, layerPathIdentities, resolveSshIdentity, resolveSshReuseKey, ENTER_ALIAS_KEYS,
     hopHost, type SshHop, type SshConnParams,
 } from "./ssh-helpers.js";
 import type { SessionEvent } from "./session-types.js";
@@ -697,7 +697,7 @@ export class RuntimeStack {
                 },
             });
             return contextKey(descriptor) === contextKey(candidate);
-        });
+        }, resolveSshReuseKey);
     }
 
     private static sshHopContext(hop?: SshHop): unknown {
@@ -708,8 +708,12 @@ export class RuntimeStack {
 
     /** terminal=true：identity 命中在该层路径**末节点**（同落点构造性成立，免 hostname 探测）；
      *  false：命中途经节点（identity 撞了中间跳——hostname 落点校验把关） */
-    private async findIdentityHopHit(dest: SshHop, compatible?: (candidate: RuntimeDescriptor) => boolean): Promise<{ handle: LayerHandle; terminal: boolean } | undefined> {
-        const destId = await resolveSshIdentity(dest, this.log);
+    private async findIdentityHopHit(
+        dest: SshHop,
+        compatible?: (candidate: RuntimeDescriptor) => boolean,
+        resolve: (hop: SshHop, logger: FilaxisLogger) => Promise<string | undefined> = resolveSshIdentity,
+    ): Promise<{ handle: LayerHandle; terminal: boolean } | undefined> {
+        const destId = await resolve(dest, this.log);
         if (!destId || destId.startsWith("unresolved:")) {
             // 解析不可达（DNS/离线）——identity 不可靠，跳过判重（建层失败由 connect 兜底）
             return undefined;
@@ -725,7 +729,7 @@ export class RuntimeStack {
             for (let i = 0; i < path.length; i++) {
                 const candidate = path[i]!;
                 if (JSON.stringify(RuntimeStack.sshHopContext(candidate)) !== context) continue;
-                if ((await resolveSshIdentity(candidate, this.log)) === destId) {
+                if ((await resolve(candidate, this.log)) === destId) {
                     return { handle: h, terminal: i === path.length - 1 };
                 }
             }

@@ -1,6 +1,6 @@
 ---
 name: filaxis-runtime
-version: 0.2.7
+version: 0.2.8
 description: |
   牵丝 Filaxis 远程执行运行时的技能剧本总入口——选型决策树（exec 还是观察还是会话）+ 核心契约速查 + 四份场景剧本索引。
 
@@ -45,6 +45,7 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 ```
 
 **MCP 形态实战指引**（第十二季盲测 B 组教训）：
+- 多个 SSH 目标可用一次 `push_ssh` 调用，例如 `{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`。字符串可用运行环境 SSH 配置里的别名。按输入顺序建连，单个目标失败后继续尝试。返回的 `layers` 只含建连成功或复用的实际层名，并已去重，非空时可直接传给 `run_batch.layer`。批量结果的 `active_layer` 是调用结束时的默认层。
 - **定位/巡检期用 `run_batch` 打包**——多个 read_file/run_command 一次调用并行
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
 - `run_batch` 的顶层 `layer` 和步骤 `layer` 均支持传单个层名或层名数组（也可同时传：顶层是批次默认值，步骤的 `layer` 仅覆盖本步；两处都省略时使用调用时的默认层）。传多个层名数组时，步骤按 `id@layer` 展开并在 `max_parallel` 并发池内并行执行，下游 `after` 需等被依赖步骤的所有展开实例均 ok 后才启动（`kind: "get"` 不支持多层数组，防并发覆盖同一 `local_path`）；单元素数组保留原 `id`。结果逐步标明命名层。

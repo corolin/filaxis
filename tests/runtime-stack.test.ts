@@ -3,6 +3,9 @@
  * + 命名层注册表状态机（第十季 Layer 渗透——Paramiko 式句柄）
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { EventBus } from "../src/events.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
@@ -1311,6 +1314,38 @@ describe("Sol 77：索引销毁中跳过/嵌套不互覆", () => {
         await (a as unknown as MockLayerDriver).destroy();
         await (b as unknown as MockLayerDriver).destroy();
     }, 15_000);
+});
+
+test.skipIf(process.platform === "win32")("SSH aliases with different proxy routes get distinct named layers", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "filaxis-ssh-route-"));
+    const savedPath = process.env.PATH;
+    const stack = new RuntimeStack();
+    stack.connect = async (descriptor) => new MockLayerDriver(descriptor) as unknown as RuntimeDriver;
+    try {
+        writeFileSync(join(dir, "ssh"), [
+            "#!/bin/sh",
+            'test "$1" = -G || exit 1',
+            'printf "host %s\\nuser deploy\\nhostname 10.0.0.5\\nport 22\\n" "$2"',
+            'case "$2" in',
+            '  fx-route-a) printf "proxyjump bastion-a\\n";;',
+            '  fx-route-b) printf "proxyjump bastion-b\\n";;',
+            'esac',
+        ].join("\n") + "\n", { mode: 0o700 });
+        process.env.PATH = [dir, savedPath].filter(Boolean).join(delimiter);
+        const add = (name: string, target: string) => stack.addLayer(name, { driver: "ssh", target });
+        const first = await add("routed-a", "fx-route-a");
+        const second = await add("routed-b", "fx-route-b");
+        expect(second.reused).toBe(false);
+        expect(second.handle.driver).not.toBe(first.handle.driver);
+        expect((await add("same-route", "fx-route-a")).handle).toBe(first.handle);
+        const direct = await add("direct", "fx-direct-a");
+        expect((await add("direct-alias", "fx-direct-b")).handle).toBe(direct.handle);
+    } finally {
+        if (savedPath === undefined) delete process.env.PATH;
+        else process.env.PATH = savedPath;
+        await Promise.all([...stack.layers.keys()].map((name) => stack.removeLayer(name)));
+        rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("sshInto only reuses a landing with matching connection settings", async () => {
