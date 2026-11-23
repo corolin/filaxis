@@ -353,12 +353,13 @@ export const TOOL_DEFS: AgentToolDef[] = [
             name: "stop_and_verify",
             description:
                 "停止任务并核实终态。status 三态：exited=拿到退出码；stopped=终止已核实；" +
-                "unknown=核实不可达（非成功非失败——重试核实或显式上报，严禁当已清理）。",
+                "unknown=终态证据不足。可用完整 session_id 和原目标层再次核实，或上报结果未知。",
             parameters: {
                 type: "object",
+                additionalProperties: false,
                 properties: {
-                    session_id: { type: "string", description: "spawn_and_observe 返回的 session_id" },
-                    layer: { type: "string", description: "外部或已过期会话需要指定所属层，初始层用 __initial__" },
+                    session_id: { ...layerNameSchema, description: "spawn_and_observe 返回的完整 session_id" },
+                    layer: { ...layerNameSchema, description: "外部会话或归属已过期时指定原目标层，初始层用 __initial__" },
                 },
                 required: ["session_id"],
             },
@@ -370,15 +371,9 @@ export const TOOL_DEFS: AgentToolDef[] = [
             name: "read_file",
             description:
                 "只读获取目标层中的 UTF-8 文本文件（不修改远端状态），返回 { path, content, size, mtime_ms }。" +
-                "文件不存在、无权限或层不支持元数据时报错；下载二进制文件请改用 get_file，同时读多个文件优先使用 run_batch，后续受控修改请配合 edit_file。",
-            parameters: {
-                type: "object",
-                properties: {
-                    path: { type: "string", minLength: 1, description: "目标层内的文件路径（绝对路径或相对层工作目录）" },
-                    layer: { type: "string", description: "目标层名（缺省=默认层）" },
-                },
-                required: ["path"],
-            },
+                "MCP 文本块显示正文，超限时显示带截断标记的预览。文件不存在、无权限或层不支持元数据时报错。" +
+                "下载二进制文件用 get_file，多文件读取用 run_batch，受控修改用 edit_file。",
+            parameters: layerPathParameters,
         },
     },
     {
@@ -731,21 +726,21 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
             stopRes = await drv.stopSession(h.sessionId);
         } catch { /* 停止通道失败——unknown 处理 */ }
         const st = stopRes?.status;
-        if (st === "exited" || st === "stopped") {
+        if (st === "stopped" || (st === "exited" && Number.isSafeInteger(stopRes?.exitCode))) {
             sessionOwner.remember(h.sessionId, { status: st, exit_code: stopRes?.exitCode });
             throw mk("stopped", `${st === "exited" ? "已停止（进程本已退出）" : "停止已核实"}${st === "exited" && stopRes?.exitCode != null ? `（exitCode=${stopRes.exitCode}）` : ""}${causeNote}`);
         }
         // unknown / 停止抛错：verify 双通道裁决（结论值放 try 外——三十四期教训）
         let stillRunningNote: string | undefined;
-        let exitedViaVerify: number | null | undefined;
+        let exitedViaVerify: number | undefined;
         try {
             const v = await drv.verifySession(h.sessionId);
             if (v.status === "running") stillRunningNote = "实测仍在运行（stop 未生效）";
-            else if (v.status === "exited") exitedViaVerify = v.exitCode ?? null;
+            else if (v.status === "exited" && Number.isSafeInteger(v.exitCode)) exitedViaVerify = v.exitCode ?? undefined;
         } catch { /* verify 不可达——保持 unknown */ }
         if (exitedViaVerify !== undefined) {
             sessionOwner.remember(h.sessionId, { status: "exited", exit_code: exitedViaVerify });
-            throw mk("stopped", `已退出（exitCode=${exitedViaVerify ?? "?"}）${causeNote}`);
+            throw mk("stopped", `已退出（exitCode=${exitedViaVerify}）${causeNote}`);
         }
         throw mk("unknown", `${stillRunningNote ?? "停止结果未知（停止/核实通道均不可确认）"}${causeNote}`);
     };
@@ -807,10 +802,10 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                             const verified = await Promise.resolve()
                                 .then(() => drv.verifySession(h.sessionId))
                                 .catch(() => undefined);
-                            if (verified?.status === "exited") {
+                            if (verified?.status === "exited" && Number.isSafeInteger(verified.exitCode)) {
                                 sessionOwner.remember(h.sessionId, { status: "exited", exit_code: verified.exitCode });
                                 throw Object.assign(new Error(
-                                    `进程已退出（exitCode=${verified.exitCode ?? "?"}），未见 ready 标记 '${ready_marker}'`,
+                                    `进程已退出（exitCode=${verified.exitCode}），未见 ready 标记 '${ready_marker}'`,
                                 ), { outcome: "exited", exitCode: verified.exitCode, sessionId: h.sessionId, logBase: h.logBase });
                             }
                         }
@@ -819,7 +814,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 }
                 return { session_id: h.sessionId, log_base: h.logBase, note };
             },
-            async read_file({ path, layer: layerName }) {
+            async read_file(args) {
+                const { path, layer: layerName } = layerPathArgs(args);
                 const drv = await resolveDrv(layerName);
                 if (!drv.fs.stat) throw new Error("该层不支持 read_file 的元数据（fs.stat 缺席）");
                 const st = await drv.fs.stat(path);
@@ -844,7 +840,11 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 return { path, deleted: true };
             },
             async edit_file({ path, old, new: newStr, all, write_mode: writeMode, layer: layerName, ...extra }) {
-                if (Object.keys(extra).length) throw new Error("edit_file 含未知参数，目标层字段为 layer");
+                const unknown = Object.keys(extra);
+                if (unknown.length) {
+                    const hint = unknown.includes("hunks") ? "。单次编辑传 old 和 new，多处替换可用 run_batch 的 edit 步骤" : "";
+                    throw new Error(`edit_file 未知参数：${unknown.map((field) => JSON.stringify(field)).join(", ")}${hint}`);
+                }
                 const drv = await resolveDrv(layerName);
                 const r = await editFile(drv, path, old, newStr, { all, writeMode });
                 return { path: r.path, occurrences: r.occurrences, bytes_before: r.bytesBefore, bytes_after: r.bytesAfter, mutex: r.mutex, write_mode: r.writeMode };
@@ -991,7 +991,12 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     })),
                 };
             },
-            async stop_and_verify({ session_id, layer: layerName }) {
+            async stop_and_verify({ session_id, layer: layerName, ...extra }) {
+                if (Object.keys(extra).length) throw new Error("stop_and_verify 只接受 session_id 和 layer");
+                if (typeof session_id !== "string" || !session_id.trim()) throw new Error("session_id 需为完整的非空会话 ID");
+                if (layerName !== undefined && (typeof layerName !== "string" || !layerName.trim())) {
+                    throw new Error("layer 需为非空层名");
+                }
                 // 归属寻层（GPT Astra 二轮 #3 / 三轮 #1 / 四轮 #1）：spawn 在远端层的会话回该层停。
                 // unknown 时自动接一次 verifySession 核实原语（DeepSeek 评审追问的 unknown 闭环）——
                 // stop 的 unknown 是「停止瞬间核实不可达」，verify 是延迟后的独立探测通道。
@@ -1011,16 +1016,14 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 } catch {
                     r = { status: "unknown", exitCode: null }; // 停止通道失败——归 unknown 走 verify
                 }
-                let status: "exited" | "stopped" | "unknown" =
-                    r.status === "exited" || r.status === "stopped" || r.status === "unknown"
-                        ? r.status
-                        : (r.exitCode != null ? "exited" : "unknown"); // 旧形态归一：无死亡证明=unknown
+                let status: "exited" | "stopped" | "unknown" = r.status === "stopped" ? "stopped"
+                    : r.status !== "unknown" && Number.isSafeInteger(r.exitCode) ? "exited" : "unknown";
                 let exitCode = r.exitCode;
                 let stillRunningNote: string | undefined;
                 if (status === "unknown") {
                     try {
                         const v = await drv.verifySession(session_id);
-                        if (v.status === "exited") { status = "exited"; exitCode = v.exitCode ?? null; }
+                        if (v.status === "exited" && Number.isSafeInteger(v.exitCode)) { status = "exited"; exitCode = v.exitCode; }
                         else if (v.status === "running") {
                             stillRunningNote = "进程实测仍在运行（stop 未生效——不可中断态或权限不足）";
                         }
@@ -1035,7 +1038,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 }
                 return {
                     status: "unknown",
-                    note: stillRunningNote ?? "stop 与 verify 双通道均不可达——重连后 verify_session 或显式上报",
+                    note: stillRunningNote ?? "未取得可核实的终态。重连后，用完整 session_id 和原目标层再次调用 stop_and_verify，或上报结果未知。",
                 };
             },
         },

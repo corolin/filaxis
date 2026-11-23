@@ -117,7 +117,12 @@ integration("SSH rejects a broken PTY cwd and distinguishes an empty directory f
         expect(entries.find((entry) => entry.name === ".nested")).toMatchObject({ isDirectory: true });
         const scoped = new SshPtyDriver({ driver: "ssh", target: TARGET, cwd: path });
         try {
-            expect((await scoped.exec("touch ./-literal")).exitCode).toBe(0);
+            expect((await scoped.exec("printf fixture > ./-literal")).exitCode).toBe(0);
+            expect(await scoped.fs.stat?.("-literal")).toMatchObject({ size: 7 });
+            expect(await scoped.fs.readFile("-literal")).toBe("fixture");
+            expect((await scoped.exec("ln -s ./-literal alias-to-file")).exitCode).toBe(0);
+            expect(await scoped.fs.stat?.("alias-to-file")).toMatchObject({ size: 7 });
+            expect(await scoped.fs.readFile("alias-to-file")).toBe("fixture");
             await scoped.fs.rm("-literal");
             expect(await scoped.fs.exists("-literal")).toBe(false);
             await expect(scoped.fs.rm(".nested")).rejects.toThrow(/rm 失败/);

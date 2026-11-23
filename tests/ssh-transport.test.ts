@@ -543,6 +543,29 @@ describe("RemoteSessionManager（mock 远端）", () => {
         expect(m.list()[0]!.running).toBe(false);
     });
 
+    test("poll preserves a natural exit code published between the first read and the process probe", async () => {
+        let code = "";
+        const exited = Promise.withResolvers<number | null>();
+        const manager = new RemoteSessionManager({
+            pollMs: 10,
+            exec: async (cmd) => {
+                if (cmd.includes(".pid.tmp")) return { stdout: "4242", exitCode: 0 };
+                if (cmd.startsWith("cat ") && cmd.includes(".code 2>")) {
+                    return { stdout: code, exitCode: code ? 0 : 1 };
+                }
+                if (cmd.includes("echo ALIVE")) {
+                    code = "7";
+                    return { stdout: "DEAD", exitCode: 0 };
+                }
+                return { stdout: "", exitCode: 0 };
+            },
+        });
+        manager.onEvent = (event) => { if (event.type === "exit") exited.resolve(event.exitCode); };
+        const { sessionId } = await manager.start("fixture");
+        expect(await exited.promise).toBe(7);
+        expect(await manager.stop(sessionId)).toEqual({ status: "exited", exitCode: 7 });
+    });
+
     test("watch 命中（轮询增量）+ tail/readLog", async () => {
         const remote = fakeRemote();
         const m = new RemoteSessionManager({ exec: remote.exec, pollMs: 20 });

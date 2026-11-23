@@ -34,7 +34,7 @@ import {
 } from "./ssh-helpers.js";
 import { RemoteSessionManager } from "./remote-session-manager.js";
 import { probeDialect, type RemoteDialect } from "./dialect.js";
-import { writeInplaceContent } from "./file-transfer.js";
+import { decodeFileRead, writeInplaceContent } from "./file-transfer.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 const ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r(?!\n)/g;
@@ -464,7 +464,8 @@ export class SshPtyDriver implements RuntimeDriver {
             return m ? { size: Number(m[1]), mtimeMs: Number(m[2]) * 1000 } : null;
         };
         const statOf = async (p: string) => {
-            const r = await fsExec(`stat -c '%s %Y' ${q(p)} 2>/dev/null || stat -f '%z %m' ${q(p)} 2>/dev/null || true`);
+            const operand = q(cdTargetArg(p));
+            const r = await fsExec(`stat -Lc '%s %Y' ${operand} 2>/dev/null || stat -Lf '%z %m' ${operand} 2>/dev/null || true`);
             return r.exitCode === 0 ? parseStat(r.stdout) : null;
         };
         this.fs = {
@@ -472,9 +473,9 @@ export class SshPtyDriver implements RuntimeDriver {
                 // 远端 b64 直出+本地解码（Hydrogen R4 #2）：曾远端 | base64 -d——①BSD 的
                 // base64 无 -d（-D）②exitCode 不查（文件不存在静默返回空串=契约违背，
                 // runBatch 的 read 步骤误报 ok）③解码输出经 stdout UTF-8 拼接易损坏
-                const r = await fsExec(`base64 ${q(p)} 2>/dev/null`);
+                const r = await fsExec(`base64 2>/dev/null < ${q(p)}`);
                 if (r.exitCode !== 0) throw new Error(`readFile 失败（exit=${r.exitCode}）: ${p}`);
-                return Buffer.from(r.stdout.replace(/[^A-Za-z0-9+/=]/g, ""), "base64").toString("utf-8");
+                return decodeFileRead(r.stdout, p);
             },
             async writeFile(p, content) {
                 writeDialect ??= probeDialect(fsExec).catch((error) => {

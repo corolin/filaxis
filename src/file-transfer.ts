@@ -27,6 +27,17 @@ import type { ExecOptions } from "./driver.js";
 /** Forward exec options when wrapping a driver so payload-bearing calls retain their audit policy. */
 export type TransferExec = (command: string, options?: Pick<ExecOptions, "auditLabel">) => Promise<{ stdout: string; exitCode: number }>;
 
+/** Decode standard Base64, allowing line wrapping but rejecting malformed output. */
+export function decodeFileRead(output: string, path: string, expectedBytes?: number): string {
+    const encoded = output.replace(/[ \t\r\n]+/g, "");
+    const content = Buffer.from(encoded, "base64");
+    if (content.toString("base64") !== encoded) throw new Error(`readFile 返回无效 Base64: ${path}`);
+    if (expectedBytes !== undefined && content.length !== expectedBytes) {
+        throw new Error(`readFile 长度对账失败（解码 ${content.length}B，源 ${expectedBytes}B）: ${path}`);
+    }
+    return content.toString("utf-8");
+}
+
 /** put 分块大小（base64 字符数——单条命令行安全长度内） */
 const CHUNK_B64 = 48 * 1024;
 

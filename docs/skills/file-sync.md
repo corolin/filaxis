@@ -24,6 +24,7 @@ filaxis get --layer host --transport sftp -- /var/tmp/result.bin ./result.bin
 ## MCP 目录与单文件删除
 
 - `list_directory` 接受 `path` 和可选的 `layer`，列出直接子项，包括隐藏项。文本块显示名称与类型，条目元数据在 `structuredContent.entries`。
+- `read_file` 的文本块显示文件正文，保留换行与缩进。文本序列化后最多 8 KiB，超限会标记截断，完整正文在 `structuredContent.content`。
 - `delete_file` 永久删除一个文件或符号链接本身。目录和递归删除会报错。未明确目标层时使用当前默认层。若返回 `outcome: "unknown"`，先核实目标路径，再决定是否重试。
 
 ## MCP 上传和下载

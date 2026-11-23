@@ -41,6 +41,7 @@ export class SessionOwnership {
     remember(id: string, result: StopResult): void {
         const entry = this.get(id);
         if (!entry || !("driver" in entry) || result.status === "unknown") return;
+        if (result.status === "exited" && !Number.isSafeInteger(result.exit_code)) return;
         const { status, ...details } = result;
         this.entries.set(id, { result: { status, ...details }, expiresAt: Date.now() + this.retentionMs });
     }

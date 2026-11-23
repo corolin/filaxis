@@ -340,6 +340,58 @@ describe("MCP Server（REQ-0003）", () => {
         } finally { fixture.close(); }
     });
 
+    test("read_file displays exact text and marks an oversized preview without changing the structured body", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-mcp-read-body-"));
+        const stack = new RuntimeStack();
+        const fixture = mcpFixture(stack);
+        const small = 'Types: deb\r\n  Suites: stable\r\n# 中文 "quoted"\r\n';
+        const boundary = "x".repeat(8190);
+        const large = 'File start\n' + '雪🧵\n"\\'.repeat(1200) + '\nFile end';
+        const read = async (id: number, args: Record<string, unknown>) => {
+            fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "read_file", arguments: args } });
+            return (await waitId(fixture, id)).result as {
+                isError: boolean;
+                content: Array<{ text: string }>;
+                structuredContent?: { path: string; content: string; size: number; mtime_ms: number };
+            };
+        };
+        try {
+            for (const [name, text] of [["small.sources", small], ["boundary", boundary], ["large", large], ["empty", ""]] as const) {
+                writeFileSync(join(dir, name), text);
+            }
+            await stack.addLayer("files", new LocalRuntimeDriver({ cwd: dir }));
+            const exact = await read(1, { path: "small.sources", layer: "files" });
+            expect(exact.isError).toBe(false);
+            expect(exact.content[0]?.text).toBe(small);
+            expect(exact.structuredContent).toMatchObject({
+                path: "small.sources", content: small, size: Buffer.byteLength(small),
+            });
+            expect((await read(2, { path: "boundary" })).content[0]?.text).toBe(boundary);
+            const clipped = await read(3, { path: "large" });
+            const text = clipped.content[0]!.text;
+            expect(clipped.isError).toBe(false);
+            expect(text).toContain("文件正文已截断");
+            expect(text).not.toContain("File end");
+            expect(Buffer.byteLength(JSON.stringify(text))).toBeLessThanOrEqual(8192);
+            const prefix = text.slice(0, text.lastIndexOf("\n[文件正文已截断"));
+            expect(large.startsWith(prefix)).toBe(true);
+            expect(/[\uD800-\uDFFF]/u.test(prefix)).toBe(false);
+            expect(clipped.structuredContent?.content).toBe(large);
+            const empty = await read(4, { path: "empty" });
+            expect(empty.content[0]?.text).toBe("[空文件]");
+            expect(empty.structuredContent?.content).toBe("");
+            for (const [index, args] of [{ path: "missing" }, { path: "small.sources", layer_name: "other" }].entries()) {
+                const error = await read(index + 5, args);
+                expect(error.isError).toBe(true);
+                expect(error.structuredContent?.content).toBeUndefined();
+            }
+        } finally {
+            fixture.close();
+            if (stack.layers.has("files")) await stack.removeLayer("files", { destroy: true });
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("text batches read bounded local file previews without loading the full file", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-mcp-read-preview-"));
         const stack = new RuntimeStack();
@@ -482,6 +534,13 @@ describe("MCP Server（REQ-0003）", () => {
         const res = (r as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
         expect(res.isError).toBeTrue();
         expect(res.content[0]!.text).toContain("未命中"); // 语义保留非泛化
+        f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+            name: "edit_file", arguments: { path: p, hunks: [{ old: "hello", new: "changed" }] },
+        } });
+        expect(await waitId(f, 2)).toMatchObject({
+            result: { isError: true, content: [{ text: expect.stringContaining('未知参数："hunks"') }] },
+        });
+        expect(readFileSync(p, "utf8")).toBe("hello\n");
         f.close();
         rmSync(d, { recursive: true, force: true });
     });
@@ -516,6 +575,69 @@ describe("MCP Server（REQ-0003）", () => {
         expect(["stopped", "exited", "unknown"]).toContain(stopRes.result.structuredContent.status); // 三态可辨
         f.close();
     }, 20_000);
+
+    test("a text-only client can verify a naturally exited session using the full launch handle", async () => {
+        const stack = new RuntimeStack();
+        const driver = new LocalRuntimeDriver();
+        await stack.addLayer("fixture", driver);
+        const fixture = mcpFixture(stack);
+        const call = async (id: number, name: string, args: Record<string, unknown>) => {
+            fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+            return (await waitId(fixture, id, 10_000)).result as {
+                isError: boolean; content: Array<{ text: string }>; structuredContent: Record<string, unknown>;
+            };
+        };
+        try {
+            const launched = await call(1, "spawn_and_observe", {
+                command: "echo READY; sleep 1; exit 7", ready_marker: "READY", name: "long-session-name",
+            });
+            expect(launched.isError).toBe(false);
+            const handle = Object.fromEntries(launched.content[0]!.text.split("\n").map((line) => line.split("=", 2)));
+            const sessionId = handle.session_id!;
+            expect(sessionId.length).toBeGreaterThan(24);
+            expect(sessionId).toBe(launched.structuredContent.session_id);
+            expect(handle.log_base).toBe(launched.structuredContent.log_base);
+            const deadline = Date.now() + 10_000;
+            let terminal = await driver.verifySession(sessionId);
+            while (terminal.status !== "exited" && Date.now() < deadline) {
+                await Bun.sleep(25);
+                terminal = await driver.verifySession(sessionId);
+            }
+            expect(terminal).toEqual({ status: "exited", exitCode: 7 });
+            const shortened = await call(2, "stop_and_verify", { session_id: sessionId.slice(0, 24) });
+            expect(shortened.content[0]!.text).toContain("status=unknown\nnote=会话归属未知或已过期");
+            const result = await call(3, "stop_and_verify", { session_id: sessionId });
+            expect(result.structuredContent).toEqual({ status: "exited", exit_code: 7 });
+            expect(result.content[0]!.text).toBe("status=exited\nexit_code=7");
+        } finally {
+            fixture.close();
+            await stack.removeLayer("fixture", { destroy: true });
+        }
+    }, 20_000);
+
+    test("a failed readiness check returns full handle and unknown outcome in the text block", async () => {
+        const stack = new RuntimeStack();
+        const sessionId = "ready-fixture-0123456789abcdef0123456789abcdef";
+        const logBase = "/tmp/filaxis-sessions/" + sessionId;
+        const driver = {
+            execSession: async () => ({ sessionId, logBase, pid: 123 }),
+            tailSession: async () => [],
+            stopSession: async () => ({ status: "exited", exitCode: null }),
+            verifySession: async () => ({ status: "exited", exitCode: null }),
+        } as unknown as import("../src/driver.js").RuntimeDriver;
+        const fixture = mcpFixture(stack, createAgentToolkit(stack, { driver, readyTimeoutMs: 5 }));
+        try {
+            fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "spawn_and_observe", arguments: { command: "fixture", ready_marker: "READY" },
+            } });
+            const { result } = await waitId(fixture, 1) as { result: {
+                isError: boolean; content: Array<{ text: string }>; structuredContent: Record<string, unknown>;
+            } };
+            expect(result.isError).toBe(true);
+            expect(result.structuredContent).toMatchObject({ outcome: "unknown", sessionId, logBase });
+            expect(result.content[0]!.text).toContain(`outcome=unknown\nsession_id=${sessionId}\nlog_base=${logBase}\n`);
+        } finally { fixture.close(); }
+    });
 });
 
 test("remove_layer returns all unresolved session handles via MCP", async () => {

@@ -15,6 +15,19 @@ import { TerminalManager } from "../src/terminal-manager.js";
 import { TmuxSessionDriver } from "../src/tmux-driver.js";
 import { resolveLocalShell } from "../src/shell-discovery.js";
 
+test("tmux small file reads reject damaged Base64 and short decoded output", async () => {
+    const driver = new TmuxSessionDriver({ driver: "tmux" });
+    let stdout = "eAo=\n";
+    driver.exec = async (command) => ({
+        stdout: command.startsWith("wc ") ? "2\n" : stdout, stderr: "", exitCode: 0,
+    });
+    expect(await driver.fs.readFile("fixture")).toBe("x\n");
+    stdout = "eA==";
+    await expect(driver.fs.readFile("fixture")).rejects.toThrow(/长度对账失败/);
+    stdout = "eAo=!";
+    await expect(driver.fs.readFile("fixture")).rejects.toThrow(/无效 Base64/);
+});
+
 test.skipIf(process.platform !== "linux")("tmux stop reaps a background child after its shell exits", async () => {
     if (!(await TmuxInvoker.isAvailable())) return;
     const dir = mkdtempSync(join(tmpdir(), "fx-session-stop-"));
@@ -1057,7 +1070,7 @@ describe("Sol 74：tmux 会话语义", () => {
             if (!myTmp) { myTmp = m[1]!; return; } // 首页：捕获中转名
             if (!hit) { hit = true; Bun.spawnSync([shPath(), "-c", `rm -f ${myTmp}`]); } // 次页前删它
         } });
-        await expect(drv.fs.readFile(src)).rejects.toThrow(/分页读失败|长度对账/); // 修前：~5922B 正常完成
+        await expect(drv.fs.readFile(src)).rejects.toThrow(/分页读失败|长度对账|无效 Base64/); // 修前：~5922B 正常完成
     }, 20_000);
 
     test("#4 init 克隆：调用方 descriptor 不被补写 terminalId", async () => {
