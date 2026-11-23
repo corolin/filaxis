@@ -136,7 +136,7 @@ export class McpServer {
                     // 几个基础 schema 就动手——高杠杆组合工具被藏视野外。instructions
                     // 在任何 schema 读取之前必达，是唯一可靠的发现面）
                     instructions: [
-                        "【先看这行】多文件读取/多命令巡检/定位排查 → 优先 run_batch（一次调用并行打包，不要逐个工具循环）；读工具 schema 时同轮并发读取（逐个读每步一趟 LLM）；",
+                        "【先看这行】多文件读取/多命令巡检/同命令发往多层/定位排查 → 优先 run_batch（一次调用并行打包，支持传 layer 数组自动扇出，不要逐个工具循环）；读工具 schema 时同轮并发读取（逐个读每步一趟 LLM）；",
                         "持续查看日志 → observe_stream 开窗、read_stream 回看或续读、close_stream 关闭；等就绪或错误模式 → spawn_and_observe；",
                         "edit_file 支持 write_mode:'inplace'（bind mount 保 inode 免重启）；",
                         "在 MCP 服务主机与目标层之间传输文件用 put_file 和 get_file。",

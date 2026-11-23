@@ -15,7 +15,7 @@ import type { RuntimeStack } from "./runtime-stack.js";
 import { editFile } from "./file-edit.js";
 import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
 import type { TransferResult } from "./file-transfer.js";
-import { BATCH_STEP_KINDS, runBatch, type BatchStepWithDeps } from "./batch.js";
+import { BATCH_STEP_KINDS, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
 import type { RuntimeDriver } from "./driver.js";
 import { SessionOwnership, type StopResult } from "./session-ownership.js";
 
@@ -80,7 +80,7 @@ export interface AgentToolHandlers {
     }>;
     remove_layer(args: { name: string; destroy?: boolean }): Promise<{ removed: string }>;
     // ── 批次组合（第十一季：一次调用描述多原子操作——减少 Planner 轮次）──
-    run_batch(args: { steps: Array<Record<string, unknown>>; stop_on_fail?: boolean; max_parallel?: number; layer?: string; output?: "text" | "full" }): Promise<{
+    run_batch(args: { steps: Array<Record<string, unknown>>; stop_on_fail?: boolean; max_parallel?: number; layer?: BatchLayerTarget; output?: "text" | "full" }): Promise<{
         status: "ok" | "fail"; failed_step?: string;
         steps: Array<{
             id: string; layer?: string; kind: string; status: string; exit_code?: number; outcome?: "unknown"; stdout?: string; stderr?: string; error?: string; skipped_because?: string;
@@ -118,6 +118,15 @@ const fileTransferProperties = {
     timeout_ms: { type: "integer", minimum: 1, maximum: 2147483647, description: "每次 SSH 命令或 SFTP 进程的超时毫秒数，缺省 120000" },
 };
 
+const layerNameSchema = { type: "string", minLength: 1, pattern: "\\S" };
+const batchLayerSchema = (description: string) => ({
+    anyOf: [
+        layerNameSchema,
+        { type: "array", minItems: 1, uniqueItems: true, items: layerNameSchema },
+    ],
+    description,
+});
+
 /** 工具定义单一来源（REQ-0003 MCP tools/list 同源序列化——零漂移） */
 export const TOOL_DEFS: AgentToolDef[] = [
     // run_batch 置顶（第十三季黑盒实测：Lazy schema 按序读 6 个基础
@@ -129,9 +138,10 @@ export const TOOL_DEFS: AgentToolDef[] = [
             name: "run_batch",
             description:
                 "批次组合：一次调用描述多个文件或命令操作（exec/edit/read/put/get），按依赖边（after）拓扑执行——" +
-                "步骤 layer 可覆盖批次 layer；after 可跨层引用步骤 id。无依赖步骤并行，顺序链靠 after 显式保序；默认任一步失败即停（未启动步骤标 " +
-                "skipped）。返回逐步骤状态与证据（退出码/输出/编辑明细）。**不做自动回滚**（配置恢复≠运行" +
-                "状态回滚——重载可能已产生外部副作用），失败现场交回调用方决策。",
+                "批次与步骤 layer 均支持层名或层名数组。多个层名按 id@layer 展开，单个层名保留原 id；kind=get 只接受单层。" +
+                "after 引用计划中声明的步骤 id，等待该步骤在所有目标层成功。" +
+                "无依赖步骤并行，顺序链靠 after 显式保序；默认任一步失败即停（未启动步骤标 skipped）。返回逐步骤状态与证据（退出码/输出/编辑明细）。" +
+                "**不做自动回滚**（配置恢复≠运行状态回滚——重载可能已产生外部副作用），失败现场交回调用方决策。",
             parameters: {
                 type: "object",
                 additionalProperties: false,
@@ -147,7 +157,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                                 ...fileTransferProperties,
                                 id: { type: "string", description: "步骤唯一 id（after 引用用）" },
                                 kind: { type: "string", enum: BATCH_STEP_KINDS },
-                                layer: { type: "string", minLength: 1, description: "当前步骤的目标层名，覆盖批次默认层" },
+                                layer: batchLayerSchema("覆盖批次默认层。多个层名按 id@layer 展开，单元素数组保留原 id；kind=get 只接受单层"),
                                 command: { type: "string", description: "kind=exec：shell 命令" },
                                 expect_exit: { type: "array", items: { type: "number" }, description: "kind=exec：预期退出码集合（缺省 [0]）" },
                                 timeout_ms: { type: "number", description: "kind=exec：超时毫秒" },
@@ -173,7 +183,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                     },
                     stop_on_fail: { type: "boolean", description: "失败即停（缺省 true）" },
                     max_parallel: { type: "number", description: "并行度上限（缺省 3）" },
-                    layer: { type: "string", minLength: 1, description: "批次默认目标层名（缺省=调用时的默认层）" },
+                    layer: batchLayerSchema("批次默认目标层名或层名数组（缺省=调用时的默认层；传数组时未覆盖 layer 的步骤自动展开到各层并行执行）"),
                     output: { type: "string", enum: ["text", "full"], description: "MCP 输出模式。text 适合只读文本块的客户端，保留简短预览；full（默认）另在 structuredContent 保留完整输出" },
                 },
                 required: ["steps"],
@@ -185,7 +195,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "run_command",
             description:
-                "执行会自行结束的一次性命令（多条命令/多文件操作请改用 run_batch 一次并行打包；" +
+                "执行会自行结束的一次性命令（多条命令或多文件操作请用 run_batch；同一命令发往多个层时可传 layer 数组；" +
                 "持续盯实时输出且不关心退出码的命令如 tail -f 请改用 observe_stream 直接启动并流式读取；" +
                 "需后台起停服务、等就绪标记并核实进程退出码的任务请改用 spawn_and_observe）。" +
                 "退出码如实返回（非零不是异常——是数据，供条件分支）；只有无法执行（超时/中断/连接死）才报错。stdout 与 stderr 分离返回。",
@@ -541,6 +551,9 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         get layer(): Promise<RuntimeDriver> { return layer(); }, // 惰性 getter（失败不缓存+注册命名表——Hydrogen R7 #4）
         handlers: {
             async run_command({ command, timeout_ms, layer: layerName }) {
+                if (Array.isArray(layerName)) {
+                    throw new Error("run_command 的 layer 仅支持单个层名；同一命令发往多个层请改用 run_batch 并传 layer 数组");
+                }
                 const drv = await resolveDrv(layerName);
                 const r = await drv.exec(command, { timeoutMs: timeout_ms });
                 return {

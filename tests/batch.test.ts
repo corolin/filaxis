@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { runBatch, editFileMulti } from "../src/index.js";
+import { runBatch, editFileMulti, type RuntimeDriver } from "../src/index.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
 
@@ -217,4 +217,240 @@ test("空 steps → 显式拒绝（内核级守卫，不再只靠 CLI）", async
     const drv = new LocalRuntimeDriver();
     await expect(runBatch(drv, { steps: [] })).rejects.toThrow(/steps 需非空/);
     await expect(runBatch(drv, {} as never)).rejects.toThrow(/steps 需非空/);
+});
+
+describe("runBatch layer 数组扇出", () => {
+    function makeMockResolver(
+        execImpl: (layer: string, command: string) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
+        missing: Set<string> = new Set(),
+    ) {
+        const calls: string[] = [];
+        const drivers = new Map<string, RuntimeDriver>();
+        const resolve = async (layer?: string): Promise<RuntimeDriver> => {
+            const name = layer ?? "__default__";
+            if (missing.has(name)) throw new Error(`层 '${name}' 不存在`);
+            if (!drivers.has(name)) {
+                drivers.set(name, {
+                    descriptor: { driver: "mock", target: name },
+                    supportsBoundedExec: true,
+                    async exec(command: string) {
+                        calls.push(`${name}:${command}`);
+                        return execImpl(name, command);
+                    },
+                } as unknown as RuntimeDriver);
+            }
+            return drivers.get(name)!;
+        };
+        return { resolve, calls };
+    }
+
+    test("步骤级 layer 数组按 id@layer 展开并行，stopOnFail=false 时兄弟层继续执行", async () => {
+        const { resolve, calls } = makeMockResolver(async (layer, cmd) => ({
+            stdout: `${layer}:${cmd}`,
+            stderr: layer === "b" ? "boom" : "",
+            exitCode: layer === "b" ? 2 : 0,
+        }));
+        const r = await runBatch(resolve, {
+            stopOnFail: false,
+            steps: [
+                { id: "check", kind: "exec", layer: ["a", "b", "c"], command: "uptime" },
+            ],
+        });
+        expect(r.status).toBe("fail");
+        expect(r.failedStep).toBe("check@b");
+        expect(r.steps.map((s) => ({ id: s.id, layer: s.layer, status: s.status, exitCode: s.exitCode }))).toEqual([
+            { id: "check@a", layer: "a", status: "ok", exitCode: 0 },
+            { id: "check@b", layer: "b", status: "fail", exitCode: 2 },
+            { id: "check@c", layer: "c", status: "ok", exitCode: 0 },
+        ]);
+        expect(calls).toHaveLength(3);
+    });
+
+    test("计划级 layer 数组扇出未覆盖步骤，步骤覆盖单层时保留原 id", async () => {
+        const { resolve, calls } = makeMockResolver(async (layer, cmd) => ({
+            stdout: `${layer}:${cmd}`,
+            stderr: "",
+            exitCode: 0,
+        }));
+        const r = await runBatch(resolve, {
+            layer: ["a", "b"],
+            steps: [
+                { id: "probe", kind: "exec", command: "uname -a" },
+                { id: "solo", kind: "exec", layer: "c", command: "hostname" },
+            ],
+        });
+        expect(r.status).toBe("ok");
+        expect(r.steps.map((s) => ({ id: s.id, layer: s.layer, stdout: s.stdout }))).toEqual([
+            { id: "probe@a", layer: "a", stdout: "a:uname -a" },
+            { id: "probe@b", layer: "b", stdout: "b:uname -a" },
+            { id: "solo", layer: "c", stdout: "c:hostname" },
+        ]);
+        expect(calls).toEqual(["a:uname -a", "b:uname -a", "c:hostname"]);
+    });
+
+    test("单元素数组 layer: ['a'] 保留原步骤 id（不加 @a 后缀）", async () => {
+        const { resolve } = makeMockResolver(async (layer) => ({ stdout: layer, stderr: "", exitCode: 0 }));
+        const r = await runBatch(resolve, {
+            steps: [{ id: "single", kind: "exec", layer: ["a"], command: "id" }],
+        });
+        expect(r.status).toBe("ok");
+        expect(r.steps).toHaveLength(1);
+        expect(r.steps[0]).toMatchObject({ id: "single", layer: "a", status: "ok", stdout: "a" });
+    });
+
+    test("after 扇入：需等待所有展开实例 ok；部分失败（stopOnFail=false）时下游标 skipped 并指出失败实例", async () => {
+        const order: string[] = [];
+        const { resolve } = makeMockResolver(async (layer, cmd) => {
+            if (cmd === "fan" && layer === "a") await new Promise((r) => setTimeout(r, 30));
+            order.push(`${cmd}@${layer}`);
+            return { stdout: layer, stderr: "", exitCode: 0 };
+        });
+        const okReport = await runBatch(resolve, {
+            maxParallel: 2,
+            steps: [
+                { id: "fan", kind: "exec", layer: ["a", "b"], command: "fan" },
+                { id: "join", kind: "exec", layer: "c", command: "join", after: ["fan"] },
+            ],
+        });
+        expect(okReport.status).toBe("ok");
+        expect(order[order.length - 1]).toBe("join@c");
+        expect(order.slice(0, 2).sort()).toEqual(["fan@a", "fan@b"]);
+
+        const { resolve: resolveFail, calls: failCalls } = makeMockResolver(async (layer, cmd) => ({
+            stdout: `${layer}:${cmd}`,
+            stderr: "",
+            exitCode: cmd === "fan" && layer === "b" ? 1 : 0,
+        }));
+        const failReport = await runBatch(resolveFail, {
+            stopOnFail: false,
+            steps: [
+                { id: "fan", kind: "exec", layer: ["a", "b"], command: "fan" },
+                { id: "join", kind: "exec", layer: "c", command: "join", after: ["fan"] },
+            ],
+        });
+        expect(failReport.status).toBe("fail");
+        expect(failCalls).toEqual(["a:fan", "b:fan"]);
+        const joinStep = failReport.steps.find((s) => s.id === "join")!;
+        expect(joinStep.status).toBe("skipped");
+        expect(joinStep.skippedBecause).toContain("fan@b");
+    });
+
+    test("扇入完成后立即补满并发池，并保持就绪步骤的计划优先级", async () => {
+        const releaseJoin = Promise.withResolvers<void>();
+        const bothStarted = Promise.withResolvers<void>();
+        let started = 0;
+        const { resolve, calls } = makeMockResolver(async (_layer, command) => {
+            if (command === "join") {
+                if (++started === 2) bothStarted.resolve();
+                await releaseJoin.promise;
+            }
+            return { stdout: "", stderr: "", exitCode: 0 };
+        });
+        const batch = runBatch(resolve, {
+            maxParallel: 2,
+            steps: [
+                { id: "join", kind: "exec", layer: ["a", "b"], command: "join", after: ["root", "root"] },
+                { id: "root", kind: "exec", layer: "c", command: "root" },
+            ],
+        });
+        try {
+            await bothStarted.promise;
+            expect(calls).toEqual(["c:root", "a:join", "b:join"]);
+        } finally {
+            releaseJoin.resolve();
+        }
+        expect((await batch).status).toBe("ok");
+
+        const { resolve: resolveOrdered, calls: orderedCalls } = makeMockResolver(async () => ({
+            stdout: "", stderr: "", exitCode: 0,
+        }));
+        await runBatch(resolveOrdered, {
+            maxParallel: 1,
+            steps: [
+                { id: "join", kind: "exec", layer: ["a", "b"], command: "join", after: ["root"] },
+                { id: "root", kind: "exec", layer: "c", command: "root" },
+                { id: "last", kind: "exec", layer: "c", command: "last" },
+            ],
+        });
+        expect(orderedCalls).toEqual(["c:root", "a:join", "b:join", "c:last"]);
+    });
+
+    test("文本预算按 read 的采集通道分摊，exec 回读计入 stderr", async () => {
+        const limits: Array<number | undefined> = [];
+        const native = { fs: { async readFilePreview(_path: string, limit: number) {
+            limits.push(limit);
+            return "native";
+        } } } as unknown as RuntimeDriver;
+        const fallback = {
+            supportsBoundedExec: true,
+            fs: {},
+            async exec(_command: string, options?: { maxOutputBytes?: number }) {
+                limits.push(options?.maxOutputBytes);
+                return { stdout: "fallback", stderr: "", exitCode: 0 };
+            },
+        } as unknown as RuntimeDriver;
+        const report = await runBatch((name) => name === "native" ? native : fallback, {
+            steps: [{ id: "read", kind: "read", path: "/file", layer: ["native", "fallback"] }],
+        }, { previewBudgetBytes: 300 });
+        expect(limits).toEqual([100, 100]);
+        expect(report.steps.map((step) => step.stdout)).toEqual(["native", "fallback"]);
+    });
+
+    test("零副作用校验：空数组/非法元素/重复层名/展开 id 冲突/get 多层/缺失层均在执行前拒绝", async () => {
+        const { resolve, calls } = makeMockResolver(
+            async (layer) => ({ stdout: layer, stderr: "", exitCode: 0 }),
+            new Set(["missing"]),
+        );
+        // 计划级空数组
+        await expect(runBatch(resolve, {
+            layer: [],
+            steps: [{ id: "s", kind: "exec", command: "echo 1" }],
+        })).rejects.toThrow(/非空字符串或非空字符串数组/);
+        // 步骤级空数组
+        await expect(runBatch(resolve, {
+            steps: [{ id: "s", kind: "exec", layer: [], command: "echo 1" }],
+        })).rejects.toThrow(/非空字符串或非空字符串数组/);
+        // 非法元素
+        await expect(runBatch(resolve, {
+            steps: [{ id: "s", kind: "exec", layer: ["a", "  "], command: "echo 1" }],
+        })).rejects.toThrow(/非空字符串或非空字符串数组/);
+        // 重复层名
+        await expect(runBatch(resolve, {
+            steps: [{ id: "s", kind: "exec", layer: ["a", "a"], command: "echo 1" }],
+        })).rejects.toThrow(/含重复层名 'a'/);
+        const sparse = new Array<string>(2);
+        sparse[0] = "a";
+        const neverResolve = () => { throw new Error("invalid plan reached the layer resolver"); };
+        await expect(runBatch(neverResolve, {
+            layer: sparse,
+            steps: [{ id: "s", kind: "exec", command: "echo 1" }],
+        })).rejects.toThrow(/非空字符串或非空字符串数组/);
+        // 展开后的 id 冲突
+        await expect(runBatch(resolve, {
+            steps: [
+                { id: "check", kind: "exec", layer: ["a", "b"], command: "echo 1" },
+                { id: "check@a", kind: "exec", layer: "c", command: "echo 2" },
+            ],
+        })).rejects.toThrow(/展开后的步骤 id 冲突 'check@a'/);
+        await expect(runBatch(neverResolve, {
+            steps: [
+                { id: "check", kind: "exec", layer: ["a", "b"], command: "echo 1" },
+                { id: "check@a", kind: "exec", layer: ["c", "d"], command: "echo 2" },
+            ],
+        })).rejects.toThrow(/展开后的步骤 id 冲突 'check@a'/);
+        // kind=get 多层拒绝
+        await expect(runBatch(resolve, {
+            steps: [
+                { id: "dl", kind: "get", layer: ["a", "b"], localPath: "./out.bin", remotePath: "/tmp/out.bin" },
+            ],
+        })).rejects.toThrow(/kind='get' 不支持多个目标层/);
+        // 数组中含缺失层：先于任何步骤执行报错（零副作用）
+        await expect(runBatch(resolve, {
+            steps: [
+                { id: "ok_first", kind: "exec", layer: "a", command: "echo ok" },
+                { id: "fan", kind: "exec", layer: ["a", "missing"], command: "echo nope" },
+            ],
+        })).rejects.toThrow(/层 'missing' 不存在/);
+        expect(calls).toHaveLength(0);
+    });
 });

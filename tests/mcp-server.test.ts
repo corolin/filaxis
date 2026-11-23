@@ -467,3 +467,98 @@ test("MCP opens, reads, and closes a continuous window by ID", async () => {
         fixture.close();
     }
 }, 20_000);
+
+describe("MCP layer array fan-out", () => {
+    test("tools/list exposes string | string[] schema for run_batch layer and step layer", async () => {
+        const f = mcpFixture();
+        try {
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+            const { result } = await waitId(f, 1) as {
+                result: { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }> };
+            };
+            const batchTool = result.tools.find((t) => t.name === "run_batch")!;
+            const expectedAnyOf = [
+                { type: "string", minLength: 1, pattern: "\\S" },
+                { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1, pattern: "\\S" } },
+            ];
+            expect(batchTool.inputSchema.properties.layer).toMatchObject({ anyOf: expectedAnyOf });
+            const stepsSchema = batchTool.inputSchema.properties.steps as {
+                items: { properties: Record<string, unknown> };
+            };
+            expect(stepsSchema.items.properties.layer).toMatchObject({ anyOf: expectedAnyOf });
+        } finally { f.close(); }
+    });
+
+    test("run_batch fans out layer array in full and text modes and divides bounded output budget", async () => {
+        const stack = new RuntimeStack();
+        const first = new LocalRuntimeDriver();
+        const second = new LocalRuntimeDriver();
+        const maxBytesSeen: number[] = [];
+        const origFirstExec = first.exec.bind(first);
+        const origSecondExec = second.exec.bind(second);
+        first.exec = (cmd, opts) => {
+            if (opts?.maxOutputBytes !== undefined) maxBytesSeen.push(opts.maxOutputBytes);
+            return origFirstExec(cmd, opts);
+        };
+        second.exec = (cmd, opts) => {
+            if (opts?.maxOutputBytes !== undefined) maxBytesSeen.push(opts.maxOutputBytes);
+            return origSecondExec(cmd, opts);
+        };
+        await stack.addLayer("first", first);
+        await stack.addLayer("second", second);
+        const f = mcpFixture(stack);
+        try {
+            const steps = [{ id: "fan", kind: "exec", command: "printf 'LINE_%s' 'ok'" }];
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "run_batch", arguments: { layer: ["first", "second"], steps },
+            } });
+            const fullRes = (await waitId(f, 1, 20_000)).result as {
+                isError: boolean;
+                content: Array<{ text: string }>;
+                structuredContent: { status: string; steps: Array<{ id: string; layer?: string; stdout?: string }> };
+            };
+            expect(fullRes.isError).toBe(false);
+            expect(fullRes.content[0]!.text).toContain("fan@first (exec) | status=ok | layer=first");
+            expect(fullRes.content[0]!.text).toContain("fan@second (exec) | status=ok | layer=second");
+            expect(fullRes.structuredContent).toMatchObject({
+                status: "ok",
+                steps: [
+                    { id: "fan@first", layer: "first", stdout: "LINE_ok" },
+                    { id: "fan@second", layer: "second", stdout: "LINE_ok" },
+                ],
+            });
+
+            // text mode: 1 exec step across 2 layers = 4 streams → 4096 / 4 = 1024 bytes per stream
+            const textSteps = [{ id: "bounded", kind: "exec", command: `printf '%s' '${"A".repeat(1500)}'` }];
+            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+                name: "run_batch", arguments: { layer: ["first", "second"], steps: textSteps, output: "text" },
+            } });
+            const textRes = (await waitId(f, 2, 20_000)).result as {
+                isError: boolean;
+                content: Array<{ text: string }>;
+            };
+            expect(textRes.isError).toBe(false);
+            expect(textRes).not.toHaveProperty("structuredContent");
+            expect(maxBytesSeen).toEqual([1024, 1024]);
+            expect(textRes.content[0]!.text).toContain("bounded@first (exec) | status=ok | layer=first");
+            expect(textRes.content[0]!.text).toContain("bounded@second (exec) | status=ok | layer=second");
+            expect(textRes.content[0]!.text).toContain("[采集阶段已截断 ");
+        } finally {
+            f.close();
+            await stack.removeLayer("first", { destroy: true });
+            await stack.removeLayer("second", { destroy: true });
+        }
+    }, 30_000);
+
+    test("run_command rejects array layer and points caller to run_batch", async () => {
+        const f = mcpFixture();
+        try {
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "run_command", arguments: { command: "echo hi", layer: ["a", "b"] },
+            } });
+            const res = (await waitId(f, 1)).result as { isError: boolean; content: Array<{ text: string }> };
+            expect(res.isError).toBe(true);
+            expect(res.content[0]!.text).toContain("run_batch");
+        } finally { f.close(); }
+    });
+});
