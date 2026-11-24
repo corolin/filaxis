@@ -834,7 +834,7 @@ describe("三十七期", () => {
         // 宿主未崩（测试还在跑即证明）
     });
 
-    test("#2 stop_and_verify 停止通道抛错 → unknown + verify 继续（不裸抛）", async () => {
+    test("#2 stop_session 停止通道抛错 → unknown + verify 继续（不裸抛）", async () => {
         let verifyCalled = false;
         const drv = {
             descriptor: { driver: "local" },
@@ -847,7 +847,7 @@ describe("三十七期", () => {
             verifySession: async () => { verifyCalled = true; return { status: "exited", exitCode: 3 }; },
         } as unknown as import("../src/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: drv });
-        const r = await tk.handlers.stop_and_verify({ session_id: "s34", layer: "__initial__" });
+        const r = await tk.handlers.stop_session({ session_id: "s34", layer: "__initial__" });
         expect(verifyCalled).toBe(true); // 修前：stop 抛错后 verify 根本不执行
         expect(r.status).toBe("exited"); // verify 采纳真实退出码
         expect((r as { exit_code?: number }).exit_code).toBe(3);

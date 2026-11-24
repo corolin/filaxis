@@ -35,6 +35,7 @@ import {
 import { RemoteSessionManager } from "./remote-session-manager.js";
 import { probeDialect, type RemoteDialect } from "./dialect.js";
 import { decodeFileRead, writeInplaceContent } from "./file-transfer.js";
+import { buildPosixRenameCmd, buildPosixRmGuardCmd, throwRemoteFsCmdError } from "./file-placement.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 const ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r(?!\n)/g;
@@ -76,7 +77,9 @@ class PtyLink {
         this.fallbackSteps.clear();
         this.fallbackSeen = undefined;
         const spawnAt = Date.now();
-        this.proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], env: openSshEnvironment(process.env, logger) });
+        this.proc = spawn("ssh", args, {
+            stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: openSshEnvironment(process.env, logger),
+        });
         // spawn error 监听（Sol 87 P1-4）：ssh 不在 PATH 时 ENOENT 是异步 error
         // 事件——无监听器=uncaughtException 崩**宿主**（调用方 try/catch 收不到
         // 拒绝）。归 readyRejecter/pendingExitFailure（建链失败语义，非超时指纹）
@@ -465,24 +468,47 @@ export class SshPtyDriver implements RuntimeDriver {
         };
         const statOf = async (p: string) => {
             const operand = q(cdTargetArg(p));
-            const r = await fsExec(`stat -Lc '%s %Y' ${operand} 2>/dev/null || stat -Lf '%z %m' ${operand} 2>/dev/null || true`);
-            return r.exitCode === 0 ? parseStat(r.stdout) : null;
+            const r = await fsExec(
+                `( test -d ${operand} && printf 'd ' || printf 'f '; ` +
+                `stat -Lc '%s %Y' ${operand} 2>/dev/null || stat -Lf '%z %m' ${operand} 2>/dev/null || LC_ALL=C ls -Lld -- ${operand} >/dev/null )`,
+            );
+            if (r.exitCode !== 0) {
+                const detail = (r.stderr || r.stdout || "").trim();
+                if (/permission denied|operation not permitted/i.test(detail)) {
+                    throw new Error(`stat 权限不足: ${p}: ${detail}`);
+                }
+                return null;
+            }
+            const m = r.stdout.trim().match(/^([df])\s+([\s\S]+)$/);
+            if (!m) return null;
+            const parsed = parseStat(m[2]!);
+            return parsed ? { ...parsed, isDirectory: m[1] === "d" } : null;
+        };
+        const writeFile: FileSystemDriver["writeFile"] = async (p, content, options) => {
+            writeDialect ??= probeDialect(fsExec).catch((error) => {
+                writeDialect = undefined;
+                throw error;
+            });
+            await writeInplaceContent(
+                fsExec, await writeDialect, Buffer.from(content, "utf-8"), p,
+                undefined, { exclusive: options?.exclusive },
+            );
         };
         this.fs = {
             async readFile(p) {
                 // 远端 b64 直出+本地解码（Hydrogen R4 #2）：曾远端 | base64 -d——①BSD 的
                 // base64 无 -d（-D）②exitCode 不查（文件不存在静默返回空串=契约违背，
                 // runBatch 的 read 步骤误报 ok）③解码输出经 stdout UTF-8 拼接易损坏
-                const r = await fsExec(`base64 2>/dev/null < ${q(p)}`);
-                if (r.exitCode !== 0) throw new Error(`readFile 失败（exit=${r.exitCode}）: ${p}`);
+                const r = await fsExec(`base64 < ${q(p)}`);
+                if (r.exitCode !== 0) {
+                    const detail = (r.stderr || r.stdout || "").trim();
+                    throw new Error(detail ? `readFile 失败（exit=${r.exitCode}）: ${p}: ${detail}` : `readFile 失败（exit=${r.exitCode}）: ${p}`);
+                }
                 return decodeFileRead(r.stdout, p);
             },
-            async writeFile(p, content) {
-                writeDialect ??= probeDialect(fsExec).catch((error) => {
-                    writeDialect = undefined;
-                    throw error;
-                });
-                await writeInplaceContent(fsExec, await writeDialect, Buffer.from(content, "utf-8"), p);
+            writeFile,
+            async createFile(p, content) {
+                await writeFile(p, content, { exclusive: true });
             },
             async exists(p) {
                 const r = await fsExec(`test -e ${q(p)} && echo Y || echo N`);
@@ -490,13 +516,21 @@ export class SshPtyDriver implements RuntimeDriver {
             },
             stat: statOf,
             async readdir(p): Promise<FileEntry[]> {
-                const r = await fsExec(`cd ${q(cdTargetArg(p))} && [ -r . ] || exit 1; ` +
+                const target = cdTargetArg(p);
+                const dotTarget = q(`${target.replace(/\/+$/, "")}/.`);
+                const r = await fsExec(
+                    `( if ! cd ${q(target)} 2>/dev/null; then LC_ALL=C ls -1 -- ${dotTarget} >/dev/null; exit 1; fi; ` +
+                    `if [ ! -r . ]; then LC_ALL=C ls -1 -- . >/dev/null; exit 1; fi; ` +
                     `for entry in .[!.]* ..?* [!.]*; do ` +
                     `[ -e "./$entry" ] || [ -L "./$entry" ] || continue; ` +
                     `if [ -d "./$entry" ]; then kind=d; else kind=f; fi; ` +
                     `info=$(stat -c '%s %Y' "./$entry" 2>/dev/null || stat -f '%z %m' "./$entry" 2>/dev/null) || info=; ` +
-                    `printf '%s\\0%s\\0%s\\0' "$entry" "$kind" "$info" || exit 1; done`);
-                if (r.exitCode !== 0) throw new Error(`readdir 失败（exit=${r.exitCode}）: ${p}`);
+                    `printf '%s\\0%s\\0%s\\0' "$entry" "$kind" "$info" || exit 1; done )`,
+                );
+                if (r.exitCode !== 0) {
+                    const detail = (r.stderr || r.stdout || "").trim();
+                    throw new Error(detail ? `readdir 失败（exit=${r.exitCode}）: ${p}: ${detail}` : `readdir 失败（exit=${r.exitCode}）: ${p}`);
+                }
                 const frames = r.stdout.split("\0");
                 if (frames.pop() !== "" || frames.length % 3 !== 0) throw new Error(`readdir 未收到完整目录列表: ${p}`);
                 const entries: FileEntry[] = [];
@@ -509,12 +543,32 @@ export class SshPtyDriver implements RuntimeDriver {
                 return entries;
             },
             async rm(p, options) {
-                const r = await fsExec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}-- ${q(p)}`);
+                const stripped = p.replace(/\/+$/, "");
+                const trailingSlash = /\/$/.test(p);
+                if (!stripped || /(?:^|\/)\.{1,2}$/.test(stripped) || (!options?.recursive && trailingSlash)) {
+                    throw new Error(`rm 拒绝危险或无效路径: ${p}`);
+                }
+                const rmCmd = `rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}-- ${q(p)}`;
+                if (options?.recursive) {
+                    const guarded = buildPosixRmGuardCmd(p, { force: options?.force });
+                    const r = await fsExec(guarded);
+                    if (r.exitCode !== 0) throwRemoteFsCmdError("rm", p, r);
+                    return;
+                }
+                const r = await fsExec(rmCmd);
                 if (r.exitCode !== 0) throw new Error(`rm 失败（exit=${r.exitCode}）: ${p}`);
             },
             async mkdir(p, options) {
-                const r = await fsExec(`mkdir ${options?.recursive ? "-p " : ""}${q(p)}`);
+                const r = await fsExec(`mkdir ${options?.recursive ? "-p " : ""}-- ${q(p)}`);
                 if (r.exitCode !== 0) throw new Error(`mkdir 失败（exit=${r.exitCode}）: ${p}`);
+            },
+            async rename(from, to) {
+                const invalid = (p: string) => !p || /\/$/.test(p) || /(?:^|\/)\.{1,2}$/.test(p);
+                if (invalid(from) || invalid(to)) {
+                    throw new Error(`rename 需要精确的文件或目录路径: ${from} -> ${to}`);
+                }
+                const r = await fsExec(buildPosixRenameCmd(from, to));
+                if (r.exitCode !== 0) throwRemoteFsCmdError("rename", `${from} -> ${to}`, r);
             },
         };
         this.sessions = new RemoteSessionManager({ exec: (cmd) => this.exec(cmd), logger: this.log });
@@ -827,6 +881,7 @@ export class SshPtyDriver implements RuntimeDriver {
             const spawnAt = Date.now();
             const p = spawn("ssh", argv, {
                 env: openSshEnvironment(process.env, this.log),
+                windowsHide: true,
                 // 本地 ssh 进程启动目录不用 options.cwd（GPT Astra 十轮 #1）：cwd 是
                 // **远端**语义（stdinCmd 的 cd 前缀）——远端专属目录本地不存在则
                 // spawn ENOENT，连接尚未建立即崩。本地目录与远端工作目录无关。

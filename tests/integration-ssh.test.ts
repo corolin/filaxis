@@ -328,7 +328,7 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
             let cursor = 0;
             const frames: Array<{ text: string; stream?: string }> = [];
             while (frames.length < 3) {
-                const page = await toolkit.handlers.read_stream({ window_id, since_seq: cursor, wait_ms: 5000 });
+                const page = await toolkit.handlers.observe_stream({ window_id, since_seq: cursor, wait_ms: 5000 });
                 if (!page.frames.length) break;
                 frames.push(...page.frames);
                 cursor = page.last_delivered_seq!;
@@ -337,14 +337,14 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
             expect(frames).toContainEqual(expect.objectContaining({ text: "/tmp", stream: "stdout" }));
             expect(frames).toContainEqual(expect.objectContaining({ text: "REMOTE_ERR", stream: "stderr" }));
             expect(frames.at(-1)?.text).toBe("REMOTE_LATE");
-            const history = await toolkit.handlers.read_stream({ window_id, before_seq: cursor });
+            const history = await toolkit.handlers.observe_stream({ window_id, before_seq: cursor });
             expect(history.frames.map(({ text }) => text).sort()).toEqual(["/tmp", "REMOTE_ERR"]);
-            const done = await toolkit.handlers.read_stream({ window_id, since_seq: cursor, wait_ms: 5000 });
+            const done = await toolkit.handlers.observe_stream({ window_id, since_seq: cursor, wait_ms: 5000 });
             expect(done).toMatchObject({ stale: true, exit_code: 0 });
             await toolkit.handlers.close_stream({ window_id });
 
             const failed = await toolkit.handlers.observe_stream({ command: "printf '\\342\\202'; exit 37", layer: "remote-window" });
-            const terminal = await toolkit.handlers.read_stream({ window_id: failed.window_id, since_seq: 0, wait_ms: 5000 });
+            const terminal = await toolkit.handlers.observe_stream({ window_id: failed.window_id, since_seq: 0, wait_ms: 5000 });
             expect(terminal).toMatchObject({ stale: true, exit_code: 37, frames: [{ text: "�", stream: "stdout" }] });
             await toolkit.handlers.close_stream({ window_id: failed.window_id });
         } finally {
@@ -699,7 +699,7 @@ describe("第十一季：批量组合（CI 真机）", () => {
         const toolkit = createAgentToolkit(stack);
         try {
             await stack.addLayer("controller", { driver: "local" });
-            const connections = await toolkit.handlers.push_ssh({ targets: [
+            const connections = await toolkit.handlers.connect_layer({ targets: [
                 { host: TARGET, name: "remote" }, { host: TARGET, name: "duplicate-landing" },
             ] });
             expect(connections).toMatchObject({

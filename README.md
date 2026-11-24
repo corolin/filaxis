@@ -87,12 +87,12 @@ filaxis mcp-config --format toml  # TOML，使用 mcp_servers（Codex）
 }
 ```
 
-暴露的 18 个 MCP 工具速览：
+暴露的 12 个 MCP 工具速览：
 
 - **命令与批处理**：`run_command`、`run_batch`
-- **长跑会话与观察窗**：`spawn_and_observe`、`stop_and_verify`、`observe_stream`、`read_stream`、`close_stream`
-- **文件与目录**：`list_directory`、`read_file`、`edit_file`、`put_file`、`get_file`、`delete_file`
-- **多层连接管理**：`push_ssh`、`push_into`、`list_layers`、`set_active_layer`、`remove_layer`
+- **长跑会话与观察窗**：`start_session`、`stop_session`、`observe_stream`、`close_stream`
+- **文件与路径管理**：`read_path`、`edit_file`、`manage_path`、`transfer_file`
+- **多层连接管理**：`connect_layer`、`manage_layers`
 
 npm 包包含 [Skill 入口与四份子剧本](docs/skills/SKILL.md)，以及配套的 [AGENTS.md](AGENTS.md)。需要登记 Skill 时，由 Agent 按自身平台的规则处理这些文件。
 
@@ -105,7 +105,7 @@ filaxis get --host user@host --transport sftp -- /var/tmp/result.bin ./result.bi
 
 `put/get` 传输单个文件，支持 `--layer` 和 `--host`。默认用层的 exec 通道，可进入容器。SSH 目标的文件系统可直接访问时，可显式选择 `--transport sftp`，包括经 `-J` 跳板的连接。两条路径都先校验暂存文件再落位，JSON 结果标明校验等级和写入形态。详见 [文件同步剧本](docs/skills/file-sync.md)。
 
-MCP 对应工具是 `put_file` 和 `get_file`。`local_path` 位于 MCP 服务所在机器，`remote_path` 位于目标层。可用 `layer` 选择命名层。
+MCP 对应工具是 `transfer_file`（传 `direction: "put" | "get"`）。`local_path` 位于 MCP 服务所在机器，`remote_path` 位于目标层。可用 `layer` 选择命名层。
 
 ## 已验证的平台与连接方式
 

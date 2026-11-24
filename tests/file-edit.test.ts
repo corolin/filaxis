@@ -312,44 +312,62 @@ describe("editFile（TOCTOU+精确替换）", () => {
     }, 30_000);
 });
 
-describe("toolkit 新工具（read_file/edit_file/observe_stream）", () => {
-    test("read_file + edit_file 真跑", async () => {
+describe("toolkit 新工具（read_path/edit_file/observe_stream）", () => {
+    test("read_path + edit_file（CAS + 直接写入）真跑", async () => {
         const d2 = mkdtempSync(join(tmpdir(), "fx-tk-"));
         const p = join(d2, "conf.env");
         writeFileSync(p, "TOKEN=FX_8829\n");
         const tk = createAgentToolkit(new RuntimeStack(), {});
-        const rf = await tk.handlers.read_file({ path: p });
+        const rf = await tk.handlers.read_path({ path: p });
+        expect(rf.type).toBe("file");
+        if (rf.type !== "file") throw new Error("expected file");
         expect(rf.content).toContain("FX_8829");
         expect(rf.size).toBeGreaterThan(0);
+        const dirRead = await tk.handlers.read_path({ path: d2 });
+        expect(dirRead.type).toBe("directory");
+        if (dirRead.type !== "directory") throw new Error("expected directory");
+        expect(dirRead.entries.some((e) => e.name === "conf.env" && !e.isDirectory)).toBe(true);
         const ef = await tk.handlers.edit_file({ path: p, old: "FX_8829", new: "FX_9999" });
+        expect(ef.mode).toBe("edit");
         expect(ef.occurrences).toBe(1);
         expect(ef.mutex === "flock" || ef.mutex === "degraded").toBe(true); // 保护等级透传到 Agent 工具面（Astra 五轮 P2）
-        expect((await tk.handlers.read_file({ path: p })).content).toContain("FX_9999");
+        const rfAfter = await tk.handlers.read_path({ path: p });
+        expect(rfAfter.type === "file" && rfAfter.content).toContain("FX_9999");
+
+        // 直接创建/写入文本（默认拒绝覆写，overwrite=true 才覆写，create_dirs=true 自动建父目录）
+        const createdPath = join(d2, "nested", "new.txt");
+        const wf = await tk.handlers.edit_file({ path: createdPath, content: "HELLO_NEW\n", create_dirs: true });
+        expect(wf).toEqual({ mode: "write", path: createdPath, created: true, bytes_after: 10 });
+        await expect(tk.handlers.edit_file({ path: createdPath, content: "OVERWRITE" })).rejects.toThrow(/拒绝覆盖/);
+        const ow = await tk.handlers.edit_file({ path: createdPath, content: "OVERWRITTEN", overwrite: true });
+        expect(ow).toEqual({ mode: "write", path: createdPath, created: false, bytes_after: 11 });
         rmSync(d2, { recursive: true, force: true });
     }, 20_000);
 
-    test("observe_stream 持续接收，按流过滤、回看和游标续读", async () => {
+    test("observe_stream 开窗首读、按流过滤、回看和游标续读", async () => {
         const tk = createAgentToolkit(new RuntimeStack(), {});
         const dir = mkdtempSync(join(tmpdir(), "fx-window-test-"));
         const gate = join(dir, "gate");
         const path = (await import("../src/ssh-helpers.js")).shellQuote(gate.replace(/\\/g, "/"));
         try {
-            const { window_id } = await tk.handlers.observe_stream({
+            const first = await tk.handlers.observe_stream({
                 command: `echo IGNORE; printf 'E1\\nE2\\nE3\\n' >&2; while [ ! -f ${path} ]; do sleep 0.1; done; echo E4 >&2`,
                 stream: "stderr",
+                limit: 1,
+                wait_ms: 8000,
             });
-            const first = await tk.handlers.read_stream({ window_id, since_seq: 0, wait_ms: 8000, limit: 1 });
+            const window_id = first.window_id;
             expect(first.frames.map(({ text, stream }) => [text, stream])).toEqual([["E1", "stderr"]]);
-            const rest = await tk.handlers.read_stream({ window_id, since_seq: first.last_delivered_seq, wait_ms: 8000 });
+            const rest = await tk.handlers.observe_stream({ window_id, since_seq: first.last_delivered_seq, wait_ms: 8000 });
             expect(rest.frames.map((frame) => frame.text)).toEqual(["E2", "E3"]);
-            const backward = await tk.handlers.read_stream({ window_id, before_seq: rest.newest_seq, limit: 2 });
+            const backward = await tk.handlers.observe_stream({ window_id, before_seq: rest.newest_seq, limit: 2 });
             expect(backward.frames.map((frame) => frame.text)).toEqual(["E1", "E2"]);
-            const timeout = await tk.handlers.read_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 20 });
+            const timeout = await tk.handlers.observe_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 20 });
             expect(timeout.timed_out).toBe(true);
             writeFileSync(gate, "");
-            const late = await tk.handlers.read_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 8000 });
+            const late = await tk.handlers.observe_stream({ window_id, since_seq: rest.newest_seq, wait_ms: 8000 });
             expect(late.frames.map((frame) => frame.text)).toEqual(["E4"]);
-            const history = await tk.handlers.read_stream({ window_id, window_ms: 30000 });
+            const history = await tk.handlers.observe_stream({ window_id, window_ms: 30000 });
             expect(history.frames.map((frame) => frame.text)).toEqual(["E1", "E2", "E3", "E4"]);
             expect(await tk.handlers.close_stream({ window_id })).toEqual({ window_id, closed: true });
         } finally {

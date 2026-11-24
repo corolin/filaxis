@@ -86,17 +86,21 @@ export interface FileEntry {
 export interface FileStat {
     mtimeMs: number;
     size: number;
+    isDirectory?: boolean;
 }
 
 export interface FileSystemDriver {
     readFile(path: string): Promise<string>;
     /** Read a bounded UTF-8 preview, with a truncation notice when applicable. */
     readFilePreview?(path: string, maxOutputBytes: number): Promise<string>;
-    writeFile(path: string, content: string): Promise<void>;
+    writeFile(path: string, content: string, options?: { exclusive?: boolean }): Promise<void>;
+    /** 原子独占创建并写入 UTF-8 文件（目标已存在时抛 EEXIST，绝不覆盖） */
+    createFile?(path: string, content: string): Promise<void>;
     exists(path: string): Promise<boolean>;
     readdir(path: string): Promise<FileEntry[]>;
     rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
     mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
+    rename?(from: string, to: string): Promise<void>;
     /** 可选 stat（mtimeMs/size）——先读后写闸的数据依赖 */
     stat?(path: string): Promise<FileStat | null>;
     /**

@@ -18,7 +18,7 @@ const tools = {
             return layer.exec(cmd, { timeoutMs: 30_000 });
         },
     },
-    spawn_and_observe: {
+    start_session: {
         description: "启动长跑任务并注册观察（ready 标记 + 错误模式）。返回 sessionId 与首窗口",
         handler: async (cmd: string, readyMarker: string, errorPattern?: string) => {
             const layer = await stack.connect({ driver: "local" });
@@ -43,7 +43,7 @@ const tools = {
             return { sessionId: h.sessionId, tail: await layer.tailSession(h.sessionId, 5) };
         },
     },
-    stop_and_verify: {
+    stop_session: {
         description: "停止任务并核实终态（unknown=核实不可达，非成功非失败——需重试或上报）",
         handler: async (sessionId: string) => {
             const layer = await stack.connect({ driver: "local" });
@@ -63,12 +63,12 @@ const stack = new RuntimeStack();
 const r = await tools.run_command.handler("echo tool-ok; exit 3");
 console.log("run_command:", r.stdout.trim(), "exitCode:", r.exitCode, "user:", r.effectiveUser);
 
-const obs = await tools.spawn_and_observe.handler(
+const obs = await tools.start_session.handler(
     "echo READY; for i in 1 2 3; do echo tick-$i; sleep 0.1; done; sleep 20",
     "READY",
     "NEVER_MATCH",
 );
-console.log("spawn_and_observe:", obs.sessionId, "首窗口:", obs.tail.join(","));
+console.log("start_session:", obs.sessionId, "首窗口:", obs.tail.join(","));
 
-const stop = await tools.stop_and_verify.handler(obs.sessionId);
-console.log("stop_and_verify:", stop.status);
+const stop = await tools.stop_session.handler(obs.sessionId);
+console.log("stop_session:", stop.status);

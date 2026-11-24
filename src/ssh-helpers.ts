@@ -426,7 +426,9 @@ async function lookupSshIdentity(hop: SshHop, logger?: FilaxisLogger): Promise<S
         } else {
             const { execFile } = await import("node:child_process");
             const { promisify } = await import("node:util");
-            ({ stdout } = await promisify(execFile)("ssh", argv, { timeout: 8000, env: openSshEnvironment(process.env, logger) }));
+            ({ stdout } = await promisify(execFile)("ssh", argv, {
+                timeout: 8000, windowsHide: true, env: openSshEnvironment(process.env, logger),
+            }));
         }
         const config = stdout.replace(/\r\n/g, "\n");
         const h = config.match(/^hostname (\S+)$/m)?.[1];

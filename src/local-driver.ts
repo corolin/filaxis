@@ -13,7 +13,8 @@
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, realpath as realpathCallback } from "node:fs";
+import { promisify } from "node:util";
 import { ExecCapture, parseCompletionMarker } from "./exec-capture.js";
 
 import path from "node:path";
@@ -330,13 +331,122 @@ export class LocalRuntimeDriver implements RuntimeDriver {
     }
 }
 
+const nativeRealpath = typeof realpathCallback?.native === "function"
+    ? promisify(realpathCallback.native)
+    : fs.realpath;
+
+/** Bun 在 Linux 上会对 fs.realpath/realpath.native 词法折叠 ".."，POSIX 需逐段按内核语义解析符号链接 */
+async function resolvePosixRealpath(inputPath: string): Promise<string> {
+    if (!inputPath) {
+        await fs.lstat(inputPath);
+    }
+    let absPath = inputPath;
+    if (!absPath.startsWith("/")) {
+        const procCwd = process.cwd();
+        const sep = procCwd.endsWith("/") ? "" : "/";
+        absPath = `${procCwd}${sep}${absPath}`;
+    }
+    let needDir = inputPath.length > 1 && inputPath.endsWith("/");
+    const queue = absPath.split("/");
+    let current = "/";
+    let symlinkCount = 0;
+    while (queue.length > 0) {
+        const seg = queue.shift()!;
+        if (seg === "" || seg === ".") continue;
+        if (seg === "..") {
+            current = path.posix.dirname(current);
+            continue;
+        }
+        const next = current === "/" ? `/${seg}` : `${current}/${seg}`;
+        const st = await fs.lstat(next);
+        if (st.isSymbolicLink()) {
+            if (++symlinkCount > 40) {
+                throw Object.assign(
+                    new Error(`ELOOP: too many levels of symbolic links, realpath '${inputPath}'`),
+                    { code: "ELOOP" as const },
+                );
+            }
+            const linkTarget = await fs.readlink(next);
+            if (linkTarget.length > 1 && linkTarget.endsWith("/") && queue.every((s) => s === "")) {
+                needDir = true;
+            }
+            if (linkTarget.startsWith("/")) current = "/";
+            queue.unshift(...linkTarget.split("/"));
+            continue;
+        }
+        if (!st.isDirectory() && (queue.some((s) => s !== "") || needDir)) {
+            throw Object.assign(
+                new Error(`ENOTDIR: not a directory, realpath '${inputPath}'`),
+                { code: "ENOTDIR" as const },
+            );
+        }
+        current = next;
+    }
+    return current;
+}
+
+async function resolveRealpath(inputPath: string): Promise<string> {
+    return process.platform === "win32"
+        ? await nativeRealpath(inputPath)
+        : await resolvePosixRealpath(inputPath);
+}
+
+function sameOrAncestorPath(candidate: string, targetPath: string, isWin: boolean): boolean {
+    const normA = isWin ? candidate.toLowerCase() : candidate;
+    const normB = isWin ? targetPath.toLowerCase() : targetPath;
+    const trailing = normA.endsWith(path.sep) ? "" : path.sep;
+    return normA === normB || normB.startsWith(normA + trailing);
+}
+
 class LocalFileSystem implements FileSystemDriver {
     constructor(private readonly baseCwd?: string) {}
 
-    /** 相对路径基于 descriptor.cwd 解析（Hydrogen R10 #1：与 ssh 层 execChannel
-     *  的 cwd 继承对齐——曾直接落 process.cwd=跨后端行为不一致） */
+    private rawBaseCwd(): string {
+        const procCwd = process.cwd();
+        if (!this.baseCwd) return procCwd;
+        if (path.isAbsolute(this.baseCwd)) return this.baseCwd;
+        const sep = procCwd.endsWith(path.sep) ? "" : path.sep;
+        return `${procCwd}${sep}${this.baseCwd}`;
+    }
+
+    /** 相对路径基于原始 descriptor.cwd 拼接，不做词法折叠以对齐 spawn({ cwd }) 的内核解析语义 */
     private resolve(filePath: string): string {
-        return this.baseCwd ? path.resolve(this.baseCwd, filePath) : filePath;
+        if (!this.baseCwd || path.isAbsolute(filePath)) return filePath;
+        const base = this.rawBaseCwd();
+        const sep = base.endsWith(path.sep) ? "" : path.sep;
+        return `${base}${sep}${filePath}`;
+    }
+
+    private async resolveEntryPath(filePath: string, opts?: { ignoreMissingParent?: boolean }): Promise<string | null> {
+        let rawPath: string;
+        if (path.isAbsolute(filePath)) {
+            rawPath = filePath;
+        } else {
+            const base = this.rawBaseCwd();
+            let resolvedBase: string;
+            try {
+                resolvedBase = await resolveRealpath(base);
+            } catch (err) {
+                if (opts?.ignoreMissingParent && (err as NodeJS.ErrnoException)?.code === "ENOENT") {
+                    return null;
+                }
+                throw err;
+            }
+            const sep = resolvedBase.endsWith(path.sep) ? "" : path.sep;
+            rawPath = `${resolvedBase}${sep}${filePath}`;
+        }
+        const rawParent = path.dirname(rawPath);
+        const baseName = path.basename(rawPath);
+        let realParent: string;
+        try {
+            realParent = await resolveRealpath(rawParent);
+        } catch (err) {
+            if (opts?.ignoreMissingParent && (err as NodeJS.ErrnoException)?.code === "ENOENT") {
+                return null;
+            }
+            throw err;
+        }
+        return path.join(realParent, baseName);
     }
 
     async readFile(filePath: string): Promise<string> {
@@ -356,8 +466,15 @@ class LocalFileSystem implements FileSystemDriver {
         return Buffer.from(buf).toString("base64");
     }
 
-    async writeFile(filePath: string, content: string): Promise<void> {
-        await fs.writeFile(this.resolve(filePath), content, "utf-8");
+    async writeFile(filePath: string, content: string, options?: { exclusive?: boolean }): Promise<void> {
+        await fs.writeFile(this.resolve(filePath), content, {
+            encoding: "utf-8",
+            ...(options?.exclusive ? { flag: "wx" } : {}),
+        });
+    }
+
+    async createFile(filePath: string, content: string): Promise<void> {
+        await this.writeFile(filePath, content, { exclusive: true });
     }
 
     async exists(filePath: string): Promise<boolean> {
@@ -369,20 +486,23 @@ class LocalFileSystem implements FileSystemDriver {
         }
     }
 
-    async stat(filePath: string): Promise<{ mtimeMs: number; size: number } | null> {
+    async stat(filePath: string): Promise<{ mtimeMs: number; size: number; isDirectory: boolean } | null> {
         try {
             const st = await fs.stat(this.resolve(filePath));
-            return { mtimeMs: st.mtimeMs, size: st.size };
-        } catch {
-            return null;
+            return { mtimeMs: st.mtimeMs, size: st.size, isDirectory: st.isDirectory() };
+        } catch (err) {
+            const code = (err as NodeJS.ErrnoException)?.code;
+            if (code === "ENOENT" || code === "ENOTDIR") return null;
+            throw err;
         }
     }
 
     async readdir(dirPath: string): Promise<FileEntry[]> {
         const resolved = this.resolve(dirPath);
         const dirents = await fs.readdir(resolved, { withFileTypes: true });
+        const sep = resolved.endsWith(path.sep) ? "" : path.sep;
         return await Promise.all(dirents.map(async (d) => {
-            const stats = await fs.stat(path.join(resolved, d.name)).catch(() => null);
+            const stats = await fs.stat(`${resolved}${sep}${d.name}`).catch(() => null);
             return {
                 name: d.name,
                 isDirectory: d.isDirectory(),
@@ -393,19 +513,90 @@ class LocalFileSystem implements FileSystemDriver {
     }
 
     async rm(filePath: string, options?: { recursive?: boolean; force?: boolean}): Promise<void> {
+        const isWin = process.platform === "win32";
+        const stripped = isWin ? filePath.replace(/[/\\]+$/, "") : filePath.replace(/\/+$/, "");
+        if (!stripped || (isWin ? /(?:^|[/\\])\.{1,2}$/ : /(?:^|\/)\.{1,2}$/).test(stripped)) {
+            throw new Error(`rm 拒绝危险或无效路径: ${filePath}`);
+        }
+        if (isWin && /^[A-Za-z]:[/\\]*$/.test(filePath)) {
+            throw new Error(`rm 拒绝删除根目录: ${filePath}`);
+        }
+        const hasTrailingSep = isWin ? /[/\\]$/.test(filePath) : /\/$/.test(filePath);
+        if (!options?.recursive && !options?.force && hasTrailingSep) {
+            throw new Error(`rm 非递归删除需要单文件路径: ${filePath}`);
+        }
+        const baseCwdRaw = this.rawBaseCwd();
+        const target = await this.resolveEntryPath(stripped, { ignoreMissingParent: options?.force });
+        if (!target) return;
+        if (hasTrailingSep) {
+            const lstatSep = await fs.lstat(target).catch(() => null);
+            if (lstatSep && (lstatSep.isSymbolicLink() || !lstatSep.isDirectory())) {
+                throw new Error(`rm 目标不是真实目录（拒绝带尾分隔符的符号链接或文件）: ${filePath}`);
+            }
+        }
+        if (target === path.parse(target).root) {
+            throw new Error(`rm 拒绝删除根目录: ${filePath}`);
+        }
+        if (options?.recursive) {
+            const realCwd = await resolveRealpath(baseCwdRaw).catch(() => path.resolve(baseCwdRaw));
+            if (sameOrAncestorPath(target, realCwd, isWin)) {
+                throw new Error(`rm 拒绝删除工作目录或上级目录: ${filePath}`);
+            }
+            const lstat = await fs.lstat(target).catch(() => null);
+            if (lstat && !lstat.isSymbolicLink()) {
+                const realTarget = await resolveRealpath(target).catch(() => null);
+                if (realTarget && (realTarget === path.parse(realTarget).root
+                    || sameOrAncestorPath(realTarget, realCwd, isWin))) {
+                    throw new Error(`rm 拒绝删除工作目录或上级目录: ${filePath}`);
+                }
+            }
+        }
         if (!options?.recursive && !options?.force) {
-            // A single unlink cannot remove a directory if the entry changes concurrently.
-            const target = process.platform === "win32" ? this.resolve(filePath)
-                : this.baseCwd && !path.isAbsolute(filePath)
-                ? this.baseCwd + path.sep + filePath
-                : filePath;
             await fs.unlink(target);
             return;
         }
-        await fs.rm(this.resolve(filePath), options);
+        await fs.rm(target, options);
     }
 
     async mkdir(dirPath: string, options?: {recursive?: boolean}): Promise<void> {
         await fs.mkdir(this.resolve(dirPath), options);
+    }
+
+    async rename(from: string, to: string): Promise<void> {
+        const isWin = process.platform === "win32";
+        const hasTrailingOrDot = (p: string) => !p
+            || (isWin
+                ? /[/\\]$/.test(p) || /(?:^|[/\\])\.{1,2}$/.test(p) || /^[A-Za-z]:[/\\]*$/.test(p)
+                : /\/$/.test(p) || /(?:^|\/)\.{1,2}$/.test(p));
+        if (hasTrailingOrDot(from) || hasTrailingOrDot(to)) {
+            throw new Error(`rename 需要精确的文件或目录路径: ${from} -> ${to}`);
+        }
+        const resolvedFrom = (await this.resolveEntryPath(from))!;
+        const resolvedTo = (await this.resolveEntryPath(to))!;
+        const destStat = await fs.stat(resolvedTo).catch(() => null);
+        if (destStat?.isDirectory()) {
+            throw new Error(`rename 失败（目标是现存目录）: ${from} -> ${to}`);
+        }
+        const srcStat = await fs.lstat(resolvedFrom);
+        const destParentStat = await fs.stat(path.dirname(resolvedTo));
+        if (srcStat.dev !== destParentStat.dev) {
+            throw Object.assign(
+                new Error(`rename 失败（不支持跨文件系统移动 EXDEV）: ${from} -> ${to}`),
+                { code: "EXDEV" as const },
+            );
+        }
+        if (srcStat.isDirectory()) {
+            if (sameOrAncestorPath(resolvedFrom, resolvedTo, isWin)) {
+                throw Object.assign(
+                    new Error(`rename 失败（不能将目录移入自身或子目录 EINVAL）: ${from} -> ${to}`),
+                    { code: "EINVAL" as const },
+                );
+            }
+            const destLstat = destStat ?? await fs.lstat(resolvedTo).catch(() => null);
+            if (destLstat) {
+                throw new Error(`rename 失败（目标已存在）: ${from} -> ${to}`);
+            }
+        }
+        await fs.rename(resolvedFrom, resolvedTo);
     }
 }

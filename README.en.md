@@ -86,12 +86,12 @@ Or launch it directly with `npx` in your MCP client configuration:
 }
 ```
 
-Exposed MCP tools (18 tools):
+Exposed MCP tools (12 tools):
 
 - **Execution & batching**: `run_command`, `run_batch`
-- **Long-running sessions & observation windows**: `spawn_and_observe`, `stop_and_verify`, `observe_stream`, `read_stream`, `close_stream`
-- **Files and directories**: `list_directory`, `read_file`, `edit_file`, `put_file`, `get_file`, `delete_file`
-- **Layer management**: `push_ssh`, `push_into`, `list_layers`, `set_active_layer`, `remove_layer`
+- **Long-running sessions & observation windows**: `start_session`, `stop_session`, `observe_stream`, `close_stream`
+- **Files and paths**: `read_path`, `edit_file`, `manage_path`, `transfer_file`
+- **Layer management**: `connect_layer`, `manage_layers`
 
 The npm package includes the [English agent skill](./docs/skills/SKILL.en.md), [four playbooks](./docs/skills/), and the [runtime contract](./AGENTS.md). Register the skill according to your agent's conventions.
 
@@ -104,7 +104,7 @@ filaxis get --host user@host --transport sftp -- /var/tmp/result.bin ./result.bi
 
 `put` and `get` move one file at a time. The default exec transport follows the target layer, including entry into a container. Use `--transport sftp` when the SSH server exposes the target filesystem directly, including through a TCP jump host. Results include the verification level and write mode.
 
-In MCP, use `put_file` or `get_file` with `local_path` on the MCP server host and `remote_path` in the target layer. Specify `layer` to address a named layer. For multiple files, use `put` and `get` steps in `run_batch`. The [file transfer playbook](./docs/skills/file-sync.md) includes examples.
+In MCP, use `transfer_file` (`direction: "put" | "get"`) with `local_path` on the MCP server host and `remote_path` in the target layer. Specify `layer` to address a named layer. For multiple files, use `put` and `get` steps in `run_batch`. The [file transfer playbook](./docs/skills/file-sync.md) includes examples.
 
 ## Tested platforms and connection methods
 

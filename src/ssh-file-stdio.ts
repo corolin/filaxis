@@ -76,7 +76,9 @@ export async function spawnWithFileRedirect(argv: string[], stdinCmd: string, op
             await cleanup();
             throw Object.assign(new DOMException("exec aborted by AbortSignal（spawn 前检出）", "AbortError"), { outcome: "unknown" });
         }
-        p = spawn(executable, argv, { stdio: [inFd, outFd, errFd], env: openSshEnvironment(process.env, opts.logger) });
+        p = spawn(executable, argv, {
+            stdio: [inFd, outFd, errFd], windowsHide: true, env: openSshEnvironment(process.env, opts.logger),
+        });
         p.once("error", (e: Error) => { spawnErr = e; }); // 本地拒启归账（ENOENT 等）——区别于远端执行结果
     } catch (e) {
         // spawn 同步抛错清场（Sol 81 P2-5）：argv 含 NUL 等被 Node 拒启——
