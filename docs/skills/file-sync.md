@@ -21,27 +21,27 @@ filaxis get --layer host --transport sftp -- /var/tmp/result.bin ./result.bin
 
 两个命令都传单个文件。`put` 的参数顺序是本地源、层内目标，`get` 反过来。查看 JSON 结果的 `verification` 和 `writeMode`。SFTP 失败时命令直接报错，由调用方核实后决定是否改用 exec。含通配符、引号或控制字符的文件名使用 exec。
 
-## MCP 目录与单文件删除
+## MCP 路径读取与管理
 
-- `list_directory` 接受 `path` 和可选的 `layer`，列出直接子项，包括隐藏项。文本块显示名称与类型，条目元数据在 `structuredContent.entries`。
-- `read_file` 的文本块显示文件正文，保留换行与缩进。文本序列化后最多 8 KiB，超限会标记截断，完整正文在 `structuredContent.content`。
-- `delete_file` 永久删除一个文件或符号链接本身。目录和递归删除会报错。未明确目标层时使用当前默认层。若返回 `outcome: "unknown"`，先核实目标路径，再决定是否重试。
+- `read_path` 接受 `path` 和可选的 `layer`，自动区分文件与目录：文件时文本块显示 UTF-8 正文（序列化上限 8 KiB，超限标记截断，完整正文在 `structuredContent.content`）；目录时列出直接子项，条目元数据在 `structuredContent.entries`。
+- `manage_path` 统一管理目录与路径生命周期：`action: "mkdir"` 创建目录（默认 `parents: true`）；`action: "move"` 移动或重命名（需 `destination`，前置拒绝目标是现存目录及跨设备目录移动）；`action: "delete"` 删除路径（默认 `recursive: false` 仅删单文件或符号链接本身并拒绝目录；传 `recursive: true` 可递归删除目录，前置拒绝根目录、`.` / `..`、当前工作目录及上级路径）。前置检查只负责防误操作，不防御同权限并发进程在校验与执行之间的目录调包（TOCTOU），底层原生命令报错原样返回给调用方；若因信号中断返回 `outcome: "unknown"`，先核实目标路径，再决定是否重试。
+- 在 `tmux` 层需要运行超大脚本（超过 `send-keys` 单条 ~15.5 KB 限制）时，单次 `run_command` 会前置报错且不封存窗格；请改用 `run_batch` 先 `kind: "put"` 上传脚本，再通过 `after` 串联 `kind: "exec"` 执行。
 
 ## MCP 上传和下载
 
-调用 `put_file` 上传，下例向 `app` 层写入文件。
+调用 `transfer_file` 上传或下载单个文件。下例向 `app` 层写入文件（`direction: "put"`）。
 
 ```json
-{"layer":"app","local_path":"./config.yaml","remote_path":"/app/config.yaml"}
+{"direction":"put","layer":"app","local_path":"./config.yaml","remote_path":"/app/config.yaml"}
 ```
 
-调用 `get_file` 下载，下例用 SFTP 把二进制文件写到 MCP 服务所在机器。
+下例用 SFTP 从 `host` 层下载二进制文件到 MCP 服务所在机器（`direction: "get"`）。
 
 ```json
-{"layer":"host","remote_path":"/var/tmp/result.bin","local_path":"./result.bin","transport":"sftp"}
+{"direction":"get","layer":"host","remote_path":"/var/tmp/result.bin","local_path":"./result.bin","transport":"sftp"}
 ```
 
-`local_path` 由 MCP 服务进程解析，相对路径以其工作目录为准。两个工具都可能覆盖目标文件，成功后返回字节数、摘要、校验等级和 `write_mode`。文件内容直接写入目标路径。传输层和校验规则与 CLI 一致。
+`local_path` 由 MCP 服务进程解析，相对路径以其工作目录为准。`transfer_file` 可能覆盖目标文件，成功后返回字节数、摘要、校验等级和 `write_mode`。传输层和校验规则与 CLI 一致。
 
 多个文件可以放进同一次 `run_batch`。下例先从 `source` 层取回文件，再上传到 `target` 层。每步结果的 `transfer` 包含校验信息。
 

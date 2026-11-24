@@ -29,9 +29,12 @@ export { transferLayerFile } from "./layer-file-transfer.js";
 export type { FileTransferTransport, LayerFileTransferOptions, LayerFileTransferResult } from "./layer-file-transfer.js";
 export * from "./layer-env.js";
 export { resolveLocalShell } from "./shell-discovery.js";
-export { createAgentToolkit } from "./agent-toolkit.js";
+export { createAgentToolkit, TOOL_DEFS } from "./agent-toolkit.js";
 export type {
     AgentToolkit, AgentToolDef, AgentToolHandlers, AgentToolkitOptions,
+    ConnectSshTarget, ConnectSshResult, ConnectSshBatchArgs, ConnectSshBatchResult,
+    ConnectIntoArgs, ConnectIntoResult, ObserveStreamResult, ReadPathResult,
+    AgentEditFileResult, ManagePathResult, ManageLayersResult,
     PushSshTarget, PushSshResult, PushSshBatchArgs, PushSshBatchResult,
 } from "./agent-toolkit.js";
 export { discoverLayer } from "./layer-discovery.js";

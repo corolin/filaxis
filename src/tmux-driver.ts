@@ -21,7 +21,8 @@ import type {
 } from "./session-types.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 import { renderSessionCodeGuard, renderSessionGroupState, renderSessionWorker } from "./session-group.js";
-import { decodeFileRead } from "./file-transfer.js";
+import { readPagedFileBytes } from "./file-transfer.js";
+import { buildPosixRenameCmd, buildPosixRmGuardCmd, throwRemoteFsCmdError } from "./file-placement.js";
 
 const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
@@ -58,58 +59,19 @@ export class TmuxSessionDriver implements RuntimeDriver {
         const self = this;
         this.fs = {
             async readFile(p) {
-                // 真机实证（远端 Linux）：pane capture 滚动窗口 ~500 行（capture_scrollback
-                // 缺省），80KB b64 在 220 列 pane 折行 400+ 行——窗口外头部永久丢；且远端
-                // 解码形态长行折行混入多余换行。读方向两段式：小文件单次 b64 读回（本地
-                // \s+ 归一解码——折行免疫）；大文件 b64 落远端临时 + 字节分页读（每页
-                // 8K b64 折 ~40 行稳居窗口内，与滚动窗口彻底解耦）
-                const st = await self.exec(`wc -c < ${q(p)} 2>/dev/null`);
-                // 凭证纪律（Sol 73 P1-2）：编码/wc 命令失败（exit≠0）不作内容凭证
-                //——故障注入时 base64 失败曾静默返回空串
-                if (st.exitCode !== 0) throw new Error(`readFile 失败（wc 退出码 ${st.exitCode}）: ${p}`);
-                const sizeText = st.stdout.trim();
-                const size = Number(sizeText);
-                if (!/^\d+$/.test(sizeText) || !Number.isSafeInteger(size)) {
-                    throw new Error(`readFile 失败（文件大小无法核实）: ${p}`);
-                }
-                if (size * 2 <= 12_000) {
-                    const r = await self.exec(`base64 < ${q(p)}`);
-                    if (r.exitCode !== 0) throw new Error(`readFile 失败（base64 退出码 ${r.exitCode}）: ${p}`);
-                    return decodeFileRead(r.stdout, p, size);
-                }
-                const tmp = `/tmp/filaxis-read-${Math.random().toString(36).slice(2, 10)}.b64`;
-                // && 连接 + 退出码查（Hydrogen R11 #1）：base64 失败（无权限/被删）曾仍
-                // 创建空 tmp、wc -c 返 0 exit 0——readFile 静默返回空串而非报错
-                const tot = await self.exec(`base64 < ${q(p)} > ${q(tmp)} && wc -c < ${q(tmp)}`);
-                const total = parseInt((tot.stdout || "").trim(), 10);
-                // total 异常也走 finally 清理（曾在此 throw 遗留 tmp——throw 挪 try 内）
-                try {
-                    if (tot.exitCode !== 0 || !Number.isFinite(total)) {
-                        throw new Error(`readFile 失败（base64 退出码 ${tot.exitCode}）: ${p}`);
-                    }
-                    let b64 = "";
-                    for (let off = 1; off <= total; off += 8_000) {
-                        const pg = await self.exec(`tail -c +${off} ${q(tmp)} | head -c 8000`);
-                        // 分页凭证纪律（Sol 74 P1-2）：管道尾 rc 只反映 head——中转文件
-                        // 被删/读取失败曾静默跳页，9KB 源文件返回 5.9KB 还正常完成。
-                        // 逐页退出码入闸 + 末尾长度对账（解码字节 == wc 实测源大小）
-                        if (pg.exitCode !== 0) {
-                            throw new Error(`readFile 分页读失败（页偏移 ${off} 退出码 ${pg.exitCode}）: ${p}`);
-                        }
-                        b64 += pg.stdout.replace(/[ \t\r\n]+/g, "");
-                    }
-                    return decodeFileRead(b64, p, size);
-                } finally {
-                    await self.exec(`rm -f ${q(tmp)}`).catch(() => undefined);
-                }
+                const buf = await readPagedFileBytes((cmd) => self.exec(cmd), "base64", p);
+                return buf.toString("utf-8");
             },
-            async writeFile(p, content) {
+            async writeFile(p, content, options) {
                 const buf = Buffer.from(content, "utf-8");
                 const { putContent, writeInplaceContent } = await import("./file-transfer.js");
                 const exec = (cmd: string) => self.exec(cmd);
                 const dialect = await self.dialect();
-                if (buf.length <= 9_000) await writeInplaceContent(exec, dialect, buf, p, 12_000);
-                else await putContent(exec, dialect, buf, p, { chunkB64: 12_000 });
+                if (buf.length <= 9_000) await writeInplaceContent(exec, dialect, buf, p, 12_000, { exclusive: options?.exclusive });
+                else await putContent(exec, dialect, buf, p, { chunkB64: 12_000, exclusive: options?.exclusive });
+            },
+            async createFile(p, content) {
+                await (self.fs.writeFile)(p, content, { exclusive: true });
             },
             async exists(p) {
                 const r = await self.exec(`test -e ${q(p)} && echo Y || echo N`);
@@ -117,10 +79,20 @@ export class TmuxSessionDriver implements RuntimeDriver {
             },
             async stat(p) {
                 const operand = q(cdTargetArg(p));
-                const r = await self.exec(`stat -Lc '%s %Y' ${operand} 2>/dev/null || stat -Lf '%z %m' ${operand} 2>/dev/null || true`);
-                if (r.exitCode !== 0) return null;
-                const m = r.stdout.trim().match(/^(\d+)\s+(\d+)$/);
-                return m ? { size: parseInt(m[1]!, 10), mtimeMs: parseInt(m[2]!, 10) * 1000 } : null;
+                // 持久会话 shell 内严禁裸 exit（必须包在 ( ... ) 子 shell 中）
+                const r = await self.exec(
+                    `( test -d ${operand} && printf 'd ' || printf 'f '; ` +
+                    `stat -Lc '%s %Y' ${operand} 2>/dev/null || stat -Lf '%z %m' ${operand} 2>/dev/null || LC_ALL=C ls -Lld -- ${operand} >/dev/null )`,
+                );
+                if (r.exitCode !== 0) {
+                    const detail = (r.stderr || r.stdout || "").trim();
+                    if (/permission denied|operation not permitted/i.test(detail)) {
+                        throw new Error(`stat 权限不足: ${p}: ${detail}`);
+                    }
+                    return null;
+                }
+                const m = r.stdout.trim().match(/^([df])\s+(\d+)\s+(-?\d+)$/);
+                return m ? { size: parseInt(m[2]!, 10), mtimeMs: parseInt(m[3]!, 10) * 1000, isDirectory: m[1] === "d" } : null;
             },
             async readdir(p): Promise<FileEntry[]> {
                 // 逐名 hex 帧传输（Sol 89 P2-1）：PTY 里 ls 的**终端展示形态**对
@@ -132,10 +104,13 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 // 列出来的是别处）；**cd 锚定 cdTargetArg**（Sol 90 P2-2：相对路径
                 // 裸交 cd 被 CDPATH 改写到另一棵树、命中还打印路径进 hex 流触发帧
                 // 损坏）；**glob 用 `.* *` + case 排 . / ..**（Sol 90 P2-1：`.[!.]*`
-                // 曾把 `..hidden` 这类「第二个字符是点」的合法名静默漏掉）；cd 失败
-                // 零输出=空列表（旧 ls || true 同语义）
+                // 曾把 `..hidden` 这类「第二个字符是点」的合法名静默漏掉）
+                const target = cdTargetArg(p);
+                const dotTarget = q(`${target.replace(/\/+$/, "")}/.`);
                 const r = await self.exec(
-                    `( unset GLOBIGNORE; set +f; cd ${q(cdTargetArg(p))} 2>/dev/null || exit; ` +
+                    `( unset GLOBIGNORE; set +f; ` +
+                    `if ! cd ${q(target)} 2>/dev/null; then LC_ALL=C ls -1 -- ${dotTarget} >/dev/null; exit 1; fi; ` +
+                    `if [ ! -r . ]; then LC_ALL=C ls -1 -- . >/dev/null; exit 1; fi; ` +
                     `printf 'FX_LIST;'; __fx_n=0; for __fx_e in .[!.]* ..?* [!.]*; do ` +
                     `[ -e "$__fx_e" ] || [ -L "$__fx_e" ] || continue; ` +
                     `__fx_hex=$(printf %s "$__fx_e" | od -An -v -tx1) || exit 1; ` +
@@ -146,7 +121,10 @@ export class TmuxSessionDriver implements RuntimeDriver {
                 const end = frames.at(-2)?.match(/^FX_COUNT_(\d+)$/);
                 if (r.exitCode !== 0 || frames[0] !== "FX_LIST" || frames.at(-1) !== "" ||
                     !end || Number(end[1]) !== frames.length - 3) {
-                    throw new Error(`readdir 未收到完整目录列表（exit=${r.exitCode}）: ${p}`);
+                    const detail = (r.stderr || r.stdout || "").trim();
+                    throw new Error(detail
+                        ? `readdir 未收到完整目录列表（exit=${r.exitCode}）: ${p}: ${detail}`
+                        : `readdir 未收到完整目录列表（exit=${r.exitCode}）: ${p}`);
                 }
                 const out: FileEntry[] = [];
                 for (const h of frames.slice(1, -2)) {
@@ -165,15 +143,35 @@ export class TmuxSessionDriver implements RuntimeDriver {
             // 退出码入闸（Sol 87 P2-7）：rm/mkdir 曾丢 exitCode——对普通文件 mkdir、
             // 无 force 删缺席路径都报正常完成。凭证纪律同 readFile/writeFile
             async rm(p, options) {
-                const r = await self.exec(`rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}-- ${q(p)}`);
+                const stripped = p.replace(/\/+$/, "");
+                const trailingSlash = /\/$/.test(p);
+                if (!stripped || /(?:^|\/)\.{1,2}$/.test(stripped) || (!options?.recursive && trailingSlash)) {
+                    throw new Error(`rm 拒绝危险或无效路径: ${p}`);
+                }
+                const rmCmd = `rm ${options?.recursive ? "-r " : ""}${options?.force ? "-f " : ""}-- ${q(p)}`;
+                if (options?.recursive) {
+                    const guarded = buildPosixRmGuardCmd(p, { force: options?.force });
+                    const r = await self.exec(guarded);
+                    if (r.exitCode !== 0) throwRemoteFsCmdError("rm", p, r);
+                    return;
+                }
+                const r = await self.exec(rmCmd);
                 // force 只影响命令形态（-f 豁免缺席路径——exit 0）；非零退出=真实
                 // 失败（目录未递归删等）照传（Sol 88 P2-1：曾 force 下吞掉一切非零
                 //——对现存目录的非递归删除谎报完成、目录仍在）
-                if (r.exitCode !== 0) throw new Error(`rm 失败（exit=${r.exitCode}）: ${p}`);
+                if (r.exitCode !== 0) throwRemoteFsCmdError("rm", p, r);
             },
             async mkdir(p, options) {
-                const r = await self.exec(`mkdir ${options?.recursive ? "-p " : ""}${q(p)}`);
-                if (r.exitCode !== 0) throw new Error(`mkdir 失败（exit=${r.exitCode}）: ${p}`);
+                const r = await self.exec(`mkdir ${options?.recursive ? "-p " : ""}-- ${q(p)}`);
+                if (r.exitCode !== 0) throwRemoteFsCmdError("mkdir", p, r);
+            },
+            async rename(from, to) {
+                const invalid = (p: string) => !p || /\/$/.test(p) || /(?:^|\/)\.{1,2}$/.test(p);
+                if (invalid(from) || invalid(to)) {
+                    throw new Error(`rename 需要精确的文件或目录路径: ${from} -> ${to}`);
+                }
+                const r = await self.exec(buildPosixRenameCmd(from, to));
+                if (r.exitCode !== 0) throwRemoteFsCmdError("rename", `${from} -> ${to}`, r);
             },
         };
     }
@@ -383,7 +381,7 @@ export class TmuxSessionDriver implements RuntimeDriver {
             throw new Error("tmux 层不支持 env（send-keys 键入回显会混入输出捕获——终端物理语义）；请内联进命令文本或换 ssh/local 层");
         }
         // signal 显式拒绝（Hydrogen R4 #3）：runCommand 通道无 abort 挂钩——静默忽略
-        // 会让调用方以为可取消。指路 execSession+stop_and_verify（有完整三态收口）
+        // 会让调用方以为可取消。指路 execSession+stopSession（有完整三态收口）
         if (options?.signal) {
             throw new Error("tmux 层 exec 不支持 AbortSignal（runCommand 无中断挂钩）；改用 execSession + stopSession（三态收口）");
         }

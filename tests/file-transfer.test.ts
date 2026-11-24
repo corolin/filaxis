@@ -856,3 +856,89 @@ describe("Sol 73：长名漏网入口", () => {
         return { files, exec };
     }
 });
+
+describe("[P2] tmux 大文件分块下载（避开输出滚动窗口截断）", () => {
+    const hasSh = Boolean(Bun.which("sh"));
+    test.skipIf(!hasSh)("128 KiB 二进制文件经受限输出窗口的 tmux 层下载完整通过", async () => {
+        const shPath = Bun.which("sh")!;
+        const dir = mkdtempSync(join(tmpdir(), "fx-tmux-get128k-"));
+        const fwd = (p: string) => p.replace(/\\/g, "/");
+        try {
+            const payload = Buffer.alloc(128 * 1024);
+            for (let i = 0; i < payload.length; i++) payload[i] = (i * 37 + 13) & 0xff;
+            const remoteFile = join(dir, "remote-128k.bin");
+            const localOut = join(dir, "local-128k.bin");
+            writeFileSync(remoteFile, payload);
+
+            let maxStdoutSeen = 0;
+            const cappedTmuxDriver = {
+                descriptor: { driver: "tmux" as const },
+                async exec(cmd: string) {
+                    const p = Bun.spawn([shPath, "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+                    const [stdout, stderr, exitCode] = await Promise.all([
+                        new Response(p.stdout).text(),
+                        new Response(p.stderr).text(),
+                        p.exited,
+                    ]);
+                    maxStdoutSeen = Math.max(maxStdoutSeen, stdout.length);
+                    // 模拟 tmux 滚动缓冲上限（超过 32KB 的单次输出头部被截掉）
+                    const bounded = stdout.length > 32_000 ? stdout.slice(-32_000) : stdout;
+                    return { stdout: bounded, stderr, exitCode };
+                },
+            } as never;
+
+            const res = await transferLayerFile(cappedTmuxDriver, "get", {
+                remotePath: fwd(remoteFile),
+                localPath: localOut,
+            });
+            expect(res.verified).toBe(true);
+            expect(res.bytes).toBe(128 * 1024);
+            expect(maxStdoutSeen).toBeLessThanOrEqual(9_000);
+            expect(Buffer.compare(readFileSync(localOut), payload)).toBe(0);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 25_000);
+
+    test("[P2] 下载暂存编码命令抛错时仍进入 finally 清理远端临时文件", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-tmux-get-clean-"));
+        try {
+            const localOut = join(dir, "local-never-written.bin");
+            let stagedTmp = "";
+            let cleanedTmp = "";
+            const exec: TransferExec = async (cmd) => {
+                if (cmd.startsWith("wc -c < ")) return { stdout: "131072\n", exitCode: 0 };
+                const mStage = cmd.match(/> '(\/tmp\/filaxis-read-[0-9a-f]+\.b64)'/);
+                if (mStage) {
+                    stagedTmp = mStage[1]!;
+                    throw Object.assign(new Error("模拟编码完成后通道中断"), { outcome: "unknown" as const });
+                }
+                const mClean = cmd.match(/^rm -f '(\/tmp\/filaxis-read-[0-9a-f]+\.b64)'$/);
+                if (mClean) {
+                    cleanedTmp = mClean[1]!;
+                    return { stdout: "", exitCode: 0 };
+                }
+                return { stdout: "", exitCode: 0 };
+            };
+            const dialect = {
+                family: "gnu",
+                base64Encode: ["base64", "-w", "0"],
+                base64Decode: ["base64", "-d"],
+                sha256: ["sha256sum"],
+            } as never;
+            let caught: (Error & { outcome?: string }) | undefined;
+            try {
+                await getFile(exec, dialect, "/remote/big.bin", localOut, { chunkB64: 12_000 });
+            } catch (err) {
+                caught = err as Error & { outcome?: string };
+            }
+            expect(caught?.message).toContain("模拟编码完成后通道中断");
+            expect(caught?.outcome).toBe("unknown");
+            expect(stagedTmp).toMatch(/^\/tmp\/filaxis-read-[0-9a-f]+\.b64$/);
+            expect(cleanedTmp).toBe(stagedTmp);
+            expect(() => readFileSync(localOut)).toThrow();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});

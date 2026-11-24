@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.10"
+  version: "0.2.11"
 description: |
   使用 Filaxis（@syrkos/filaxis）执行跨层命令、批量巡检、管理后台任务、观察日志或操作目标层文件。
   也用于排查 SSH 别名与跳板、解读 unknown 终态或写入保障。纯本机一次性命令和与 Filaxis 无关的任务可跳过。
@@ -19,13 +19,13 @@ description: |
 |---|---|
 | 等一条会自行结束的命令并获取退出码 | `run_command` |
 | 批量巡检或按依赖跨层执行 | `run_batch`。涉及跳板或多机取证时读 [跨主机排查](./cross-host-diagnosis.md) |
-| 启动后台服务、等就绪或核实进程退出码 | `spawn_and_observe` → `stop_and_verify`。读 [长跑任务](./longrun-observe.md) |
-| 按游标实时看日志、看完关窗 | `observe_stream` → `read_stream` → `close_stream`。读 [持续观察窗](./stream-window.md) |
-| 列目录、读写、传输或删除文件 | `list_directory`、`read_file`、`edit_file`、`put_file`、`get_file`、`delete_file`。读 [文件操作](./file-sync.md) |
-| 切回仍注册的默认层 | 用 `list_layers` 找层名，再用 `set_active_layer` 切换。单次指定目标时可直接传 `layer` |
+| 启动后台服务、等就绪或核实进程退出码 | `start_session` → `stop_session`。读 [长跑任务](./longrun-observe.md) |
+| 按游标实时看日志、看完关窗 | `observe_stream`（开窗即读+游标续读）→ `close_stream`。读 [持续观察窗](./stream-window.md) |
+| 读文件/列目录、编辑/建文本、建目录/移动/删除、传文件 | `read_path`、`edit_file`、`manage_path`、`transfer_file`。读 [文件操作](./file-sync.md) |
+| 查询、切换默认层或移除已注册层 | `manage_layers`（`action: "list" \| "activate" \| "remove"`）；建连或进内层用 `connect_layer` |
 | CLI 限时查看输出 | `filaxis observe`，适用于只取一段观察结果 |
 
-预计超过两分钟的任务（如系统升级或长编译）优先用 `spawn_and_observe` 启动。Antigravity 实测曾在约三分钟终止单次 MCP 调用，工具的 `timeout_ms` 无法延长宿主的调用时限。按 [长跑任务剧本](./longrun-observe.md) 查看落盘日志并核实终态。
+预计超过两分钟的任务（如系统升级或长编译）优先用 `start_session` 启动。Antigravity 实测曾在约三分钟终止单次 MCP 调用，工具的 `timeout_ms` 无法延长宿主的调用时限。按 [长跑任务剧本](./longrun-observe.md) 查看落盘日志并核实终态。
 
 ## CLI 快速上手
 
@@ -54,8 +54,8 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 ```
 
 **MCP 形态实战指引**（第十二季盲测 B 组教训）：
-- 多个 SSH 目标可用一次 `push_ssh` 调用，例如 `{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`。字符串可用运行环境 SSH 配置里的别名。按输入顺序建连，单个目标失败后继续尝试。返回的 `layers` 只含建连成功或复用的实际层名，并已去重，非空时可直接传给 `run_batch.layer`。批量结果的 `active_layer` 是调用结束时的默认层。
-- **定位/巡检期用 `run_batch` 打包**——多个 read_file/run_command 一次调用并行
+- 多个 SSH 目标可用一次 `connect_layer` 调用，例如 `{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`；也可单台传 `host` 或传 `enter_cmd` 从既有层进入容器。字符串可用运行环境 SSH 配置里的别名。按输入顺序建连，单个目标失败后继续尝试。返回的 `layers` 只含建连成功或复用的实际层名，并已去重，非空时可直接传给 `run_batch.layer`。批量结果的 `active_layer` 是调用结束时的默认层。
+- **定位/巡检期用 `run_batch` 打包**——多个 `read` / `exec` 一次调用并行
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
 - `run_batch` 的顶层 `layer` 和步骤 `layer` 均支持传单个层名或层名数组（也可同时传：顶层是批次默认值，步骤的 `layer` 仅覆盖本步；两处都省略时使用调用时的默认层）。传多个层名数组时，步骤按 `id@layer` 展开并在 `max_parallel` 并发池内并行执行，下游 `after` 需等被依赖步骤的所有展开实例均 ok 后才启动（`kind: "get"` 不支持多层数组，防并发覆盖同一 `local_path`）；单元素数组保留原 `id`。结果逐步标明命名层。
 - CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。
@@ -64,10 +64,10 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 - `after` 引用当前批次计划里声明的原始步骤 ID。同一环境可能有多个层名，扇出按层名各执行一次。多个步骤或批次可能同时修改同一资源时，由调用方按实际资源串行化，例如用「环境身份 + 配置路径」作为互斥键。
 - `run_batch` 文本逐步展示状态、退出码、编辑的写入方式和锁状态，以及 stdout/stderr 预览。所有输出流共用 4 KiB，整个文本字段序列化后最多 8 KiB，超出时优先显示失败步骤和编辑保障。只看文本块的 MCP 客户端请传 `output: "text"`。需要完整输出时用默认的 `output: "full"`，从 `structuredContent` 取。`run_command` 的文本各流最多预览 8 KiB。
 - `output: "text"` 在本机和 SSH 层按预算采集 `exec` / `read` 预览，并继续读取完成哨兵来核实退出码。SSH 文件中转仍在磁盘接收完整输出，回读只取有界的首尾。其他层需要支持限量采集才能在文本模式下执行这些步骤。
-- 建链后立即干活，**不要**逐个 hostname/list_layers 验证——首个 run_command
+- 建链后立即干活，**不要**逐个 `hostname` / `manage_layers(action="list")` 验证——首个 `run_command`
   的退出码与命令输出就是执行凭证；
 - 巡检只读目标配置的相关行和最近 20–30 行关键日志，例如在批次的 `exec` 步骤中用 `sed -n '20,40p' <path>` 或 `docker logs --tail 30 <container>`。批量编辑时，把刚读到的原文连同能唯一定位的上下文直接填入 `old`，在 `new` 只改目标行，无需逐行默写全文。
-- 二进制或整文件传输用 `put_file` / `get_file`。`local_path` 位于 MCP 服务进程所在机器，`remote_path` 位于目标层。传 `layer` 指定目标，`transport: "sftp"` 可选用于文件系统可直达的 SSH 层。完整示例见 [文件同步剧本](./file-sync.md)。
+- 二进制或整文件传输用 `transfer_file`（`direction: "put" | "get"`）。`local_path` 位于 MCP 服务进程所在机器，`remote_path` 位于目标层。传 `layer` 指定目标，`transport: "sftp"` 可选用于文件系统可直达的 SSH 层。完整示例见 [文件同步剧本](./file-sync.md)。
 - 批量上传和下载用 `run_batch` 的 `kind: "put"` / `kind: "get"`，字段与单文件工具一致。多个步骤写同一个 `local_path` 或同一目标层文件时，用 `after` 排序，或为每个下载指定不同的本地路径。
 - 宿主拦截 SSH 匿名管道时，在建层前设 `FILAXIS_SSH_STDIO_MODE=inherit`。它支持直连、单跳 `-J` 和可非交互重放的进入步骤。逐跳 PTY、交互进入、持久转发和持续观察窗需要可用的匿名管道。若首轮已发出且终态未知，先核实远端状态再决定是否重发。
 - Windows 的 OpenSSH 子进程会继承现有配置，并由 Filaxis 补齐缺失的系统和账户变量，例如 `SystemRoot`、`windir`、`ProgramData` 和 `USERNAME`。成功补齐 `SystemRoot` 时，CLI 和 MCP 会在 stderr 告警一次，SDK 通过注入的 logger 记录。SSH 秒退且双流为空时，可检查启动器是否保留了系统环境。

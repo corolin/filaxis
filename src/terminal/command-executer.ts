@@ -361,10 +361,24 @@ export class CommandExecuter {
         // The nonce is split from the marker format so the echo isn't evidence.
         // A leading blank keeps dash-prefixed command names from being parsed as eval options.
         const safeCommand = `${SAFE_PREFIX} ${body}`;
+        const safeCmdBytes = Buffer.byteLength(safeCommand, "utf-8");
+        if (safeCmdBytes > 15_500) {
+            throw new Error(
+                `tmux 单条命令过长（包装后 ${safeCmdBytes} 字节，超出 15500 字节上限）；` +
+                `请改用 transfer_file 上传脚本后执行，或用 run_batch（先 kind="put" 上传脚本，再通过 after 依赖执行 kind="exec"）`,
+            );
+        }
 
         try {
             await this.sendKeys(id, safeCommand);
         } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (/command too long/i.test(msg)) {
+                throw new Error(
+                    `tmux 单条命令过长（${msg}）；` +
+                    `请改用 transfer_file 上传脚本后执行，或用 run_batch（先 kind="put" 上传脚本，再通过 after 依赖执行 kind="exec"）`,
+                );
+            }
             // **业务命令首次发送失败**（Sol 90 P1-4）：sendKeys=写文本+提交回车两段
             //——文本（或回车）送达与否不可知=执行结果未知。raw 抛曾直接放行队列，
             // 下一条已入队命令的文本照进本条前台任务。与哨兵失败（Sol 89 P1-2）
@@ -372,7 +386,7 @@ export class CommandExecuter {
             sessionDead.add(key);
             sessionSttyOff.delete(key);
             throw new CommandExecError(
-                `业务命令发送失败（${e instanceof Error ? e.message : String(e)}）——命令文本可能已送达且终态不可确认，会话已封存待重建`,
+                `业务命令发送失败（${msg}）——命令文本可能已送达且终态不可确认，会话已封存待重建`,
                 "", "unknown",
             );
         }

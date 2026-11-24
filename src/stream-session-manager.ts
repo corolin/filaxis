@@ -47,7 +47,7 @@ export interface StreamStartOptions {
     onScreen?: (snap: string, frames: number) => void;
 }
 
-export type SpawnImpl = (cmd: string, argv: string[], opts: { stdio: unknown[]; env?: NodeJS.ProcessEnv }) => ChildProcess;
+export type SpawnImpl = (cmd: string, argv: string[], opts: { stdio: unknown[]; env?: NodeJS.ProcessEnv; windowsHide?: boolean }) => ChildProcess;
 
 export interface StreamSessionManagerOptions {
     /** 禁用 ControlMaster（测试/平台受限） */
@@ -104,6 +104,7 @@ export class StreamSessionManager {
         const child = this.spawnImpl("ssh", argv, {
             stdio: [opts.stdinScript === undefined ? "ignore" : "pipe", "pipe", "pipe"],
             env: openSshEnvironment(process.env, this.log),
+            windowsHide: true,
         });
         // spawn 启动失败前置监听（Sol 87 P2-8）：error 事件异步到达——桥到 start
         // 的 reject（曾仅 finalizeStream→onExit→窗口 stale，open 照常返回零帧窗、

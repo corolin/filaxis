@@ -17,7 +17,19 @@
 
 import * as readline from "node:readline";
 import { version } from "../package.json" with { type: "json" };
-import { TOOL_DEFS, type AgentToolHandlers, type AgentToolkit, type PushSshBatchResult, type PushSshResult } from "./agent-toolkit.js";
+import {
+    TOOL_DEFS,
+    type AgentEditFileResult,
+    type AgentToolHandlers,
+    type AgentToolkit,
+    type ConnectIntoResult,
+    type ConnectSshBatchResult,
+    type ConnectSshResult,
+    type ManageLayersResult,
+    type ManagePathResult,
+    type ObserveStreamResult,
+    type ReadPathResult,
+} from "./agent-toolkit.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -140,11 +152,11 @@ export class McpServer {
                     // 在任何 schema 读取之前必达，是唯一可靠的发现面）
                     instructions: [
                         "【先看这行】多文件读取/多命令巡检/同命令发往多层/定位排查 → 优先 run_batch（一次调用并行打包，支持传 layer 数组自动扇出，不要逐个工具循环）；读工具 schema 时同轮并发读取（逐个读每步一趟 LLM）；",
-                        "管理后台任务或服务（等就绪、按错误模式停止、核实退出码）→ spawn_and_observe + stop_and_verify。",
-                        "实时查看日志或事件流 → observe_stream 开窗、read_stream 按游标读帧、close_stream 回收观察命令。",
-                        "edit_file 支持 write_mode:'inplace'（bind mount 保 inode 免重启）；",
-                        "在 MCP 服务主机与目标层之间传输文件用 put_file 和 get_file。",
-                        "契约：退出码是数据（非零不是异常）；终态三态 exited/stopped/unknown；unknown 后用 stop_and_verify 核实。",
+                        "建立或进入命名层（单台/批量 SSH 或 docker/kubectl 内层）→ connect_layer；查询、切换默认层或移除层 → manage_layers。",
+                        "管理后台任务或服务（等就绪、按错误模式停止、核实退出码）→ start_session + stop_session。",
+                        "实时查看日志或事件流 → observe_stream（传 command 开窗并可 wait_ms 带回首屏帧；传 window_id 按游标续读/回看），close_stream 回收流进程。",
+                        "只读查看文件或目录 → read_path；受控 CAS 编辑或直接新建文本 → edit_file（CAS 模式支持 write_mode:'inplace' 保 inode 免重启）；创建目录、移动/重命名或删除（含递归） → manage_path；主机与目标层间传文件 → transfer_file。",
+                        "契约：退出码是数据（非零不是异常）；终态三态 exited/stopped/unknown；unknown 后用 stop_session 核实。",
                     ].join("\n"),
                 });
                 return;
@@ -163,15 +175,16 @@ export class McpServer {
             case "tools/call": {
                 const name = String(params.name ?? "");
                 const args = (params.arguments ?? {}) as Record<string, unknown>;
-                const handler = (this.tk.handlers as unknown as Record<string, (a: Record<string, unknown>) => Promise<unknown>>)[name];
-                if (!TOOL_DEFS.some((d) => d.function.name === name) || typeof handler !== "function") {
+                const handlersRecord = this.tk.handlers as unknown as Record<string, unknown>;
+                const handler = Object.hasOwn(handlersRecord, name) ? handlersRecord[name] : undefined;
+                if (typeof handler !== "function") {
                     this.replyErr(id, -32602, `Unknown tool: ${name}`, { available: TOOL_DEFS.map((d) => d.function.name) });
                     return;
                 }
                 const textOnlyBatch = name === "run_batch" && args.output === "text";
                 try {
                     if (typeof args !== "object" || Array.isArray(args)) throw new Error(`${name} 的 arguments 需为对象`);
-                    const r = await handler(args);
+                    const r = await (handler as (a: Record<string, unknown>) => Promise<unknown>)(args);
                     // Some clients only expose content, so include bounded command output there.
                     this.reply(id, {
                         content: [{ type: "text", text: summarizeToolResult(name, r, textOnlyBatch) }],
@@ -199,13 +212,27 @@ export class McpServer {
                         exitCode: err.exitCode,
                     };
                     const evidence: string[] = [];
-                    if (err.outcome && (textOnlyBatch || name === "delete_file" || name === "spawn_and_observe")) {
+                    if (typeof err.outcome === "string" && err.outcome) {
                         evidence.push(`outcome=${singleLine(err.outcome)}`);
                     }
-                    if (name === "spawn_and_observe") {
-                        if (err.sessionId) evidence.push(`session_id=${singleLine(err.sessionId)}`);
-                        if (err.logBase) evidence.push(`log_base=${singleLine(err.logBase)}`);
-                        if (err.exitCode != null) evidence.push(`exit_code=${err.exitCode}`);
+                    if (typeof err.terminalId === "string" && err.terminalId) {
+                        evidence.push(`terminal_id=${singleLine(err.terminalId)}`);
+                    }
+                    if (typeof err.sessionId === "string" && err.sessionId) {
+                        evidence.push(`session_id=${singleLine(err.sessionId)}`);
+                    }
+                    if (typeof err.logBase === "string" && err.logBase) {
+                        evidence.push(`log_base=${singleLine(err.logBase)}`);
+                    }
+                    if (typeof err.exitCode === "number") {
+                        evidence.push(`exit_code=${err.exitCode}`);
+                    }
+                    if (Array.isArray(err.sessions) && err.sessions.length) {
+                        const handles = err.sessions
+                            .filter((s): s is { sessionId: string; logBase: string } =>
+                                Boolean(s && typeof s.sessionId === "string" && typeof s.logBase === "string"))
+                            .map((s) => `${singleLine(s.sessionId)} (${singleLine(s.logBase)})`);
+                        if (handles.length) evidence.push(`sessions=${handles.join(", ")}`);
                     }
                     const errorText = [...evidence, message].join("\n");
                     const overflow = name === "run_batch" && jsonStringBytes(errorText) > BATCH_TEXT_JSON_BYTES;
@@ -235,51 +262,77 @@ export class McpServer {
 
 }
 
+function summarizeFileContent(content: string): string {
+    if (!content.length) return "[空文件]";
+    if (content.length <= FILE_TEXT_JSON_BYTES && jsonStringBytes(content) <= FILE_TEXT_JSON_BYTES) return content;
+    return limitText(content, "\n[文件正文已截断，完整正文见 structuredContent.content]", FILE_TEXT_JSON_BYTES);
+}
+
 function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolean): string {
+    if (name === "manage_layers") {
+        const result = value as ManageLayersResult;
+        if (result.action === "list") return result.text;
+        if (result.action === "activate") return `active_layer=${singleLine(result.active_layer)}`;
+        return `removed=${singleLine(result.removed)}`;
+    }
     if (name === "list_layers") {
-        const result = value as Awaited<ReturnType<AgentToolHandlers["list_layers"]>>;
-        return result.text;
+        return (value as Awaited<ReturnType<AgentToolHandlers["list_layers"]>>).text;
     }
     if (name === "set_active_layer") {
-        const result = value as Awaited<ReturnType<AgentToolHandlers["set_active_layer"]>>;
-        return `active_layer=${singleLine(result.active_layer)}`;
+        return `active_layer=${singleLine((value as Awaited<ReturnType<AgentToolHandlers["set_active_layer"]>>).active_layer)}`;
+    }
+    if (name === "manage_path") {
+        const result = value as ManagePathResult;
+        if (result.action === "mkdir") return `created=true | path=${singleLine(result.path)}`;
+        if (result.action === "move") return `moved=true | path=${singleLine(result.path)} -> ${singleLine(result.destination)}`;
+        return `deleted=true | path=${singleLine(result.path)}${result.recursive ? " | recursive=true" : ""}`;
     }
     if (name === "delete_file") {
-        const result = value as Awaited<ReturnType<AgentToolHandlers["delete_file"]>>;
-        return `deleted=true | path=${singleLine(result.path)}`;
+        return `deleted=true | path=${singleLine((value as Awaited<ReturnType<AgentToolHandlers["delete_file"]>>).path)}`;
+    }
+    if (name === "read_path") {
+        const result = value as ReadPathResult;
+        if (result.type === "directory") return summarizeDirectory(result);
+        return summarizeFileContent(result.content);
     }
     if (name === "read_file") {
-        const { content } = value as Awaited<ReturnType<AgentToolHandlers["read_file"]>>;
-        if (!content.length) return "[空文件]";
-        if (content.length <= FILE_TEXT_JSON_BYTES && jsonStringBytes(content) <= FILE_TEXT_JSON_BYTES) return content;
-        return limitText(content, "\n[文件正文已截断，完整正文见 structuredContent.content]", FILE_TEXT_JSON_BYTES);
+        return summarizeFileContent((value as Awaited<ReturnType<AgentToolHandlers["read_file"]>>).content);
     }
-    if (name === "spawn_and_observe") {
-        const result = value as Awaited<ReturnType<AgentToolHandlers["spawn_and_observe"]>>;
+    if (name === "list_directory") {
+        return summarizeDirectory(value as Awaited<ReturnType<AgentToolHandlers["list_directory"]>>);
+    }
+    if (name === "edit_file") {
+        const result = value as AgentEditFileResult;
+        if (result.mode === "write") {
+            return `created=${result.created} | bytes=${result.bytes_after} | path=${singleLine(result.path)}`;
+        }
+        const bits = [`replaced=${result.occurrences}`];
+        if (result.write_mode) bits.push(`write_mode=${result.write_mode}`);
+        if (result.mutex) bits.push(`mutex=${result.mutex}`);
+        return bits.join(" | ");
+    }
+    if (name === "start_session" || name === "spawn_and_observe") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["start_session"]>>;
         const lines = [`session_id=${singleLine(result.session_id)}`, `log_base=${singleLine(result.log_base)}`];
         if (result.note) lines.push(`note=${singleLine(result.note)}`);
         return lines.join("\n");
     }
-    if (name === "stop_and_verify") {
-        const result = value as Awaited<ReturnType<AgentToolHandlers["stop_and_verify"]>>;
+    if (name === "stop_session" || name === "stop_and_verify") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["stop_session"]>>;
         const lines = [`status=${result.status}`];
         if (result.exit_code != null) lines.push(`exit_code=${result.exit_code}`);
         if (result.note) lines.push(`note=${singleLine(result.note)}`);
         return lines.join("\n");
     }
-    if (name === "list_directory") {
-        const result = value as Awaited<ReturnType<AgentToolHandlers["list_directory"]>>;
-        return summarizeDirectory(result);
-    }
     if (name === "run_command") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["run_command"]>>;
         return [`exit=${result.exit_code}`, ...outputPreviews(result, COMMAND_PREVIEW_BYTES)].join("\n");
     }
-    if (name === "read_stream") {
-        return summarizeStreamRead(value as Awaited<ReturnType<AgentToolHandlers["read_stream"]>>);
+    if (name === "observe_stream" || name === "read_stream") {
+        return summarizeStreamRead(value as ObserveStreamResult);
     }
-    if (name === "push_ssh") {
-        const result = value as PushSshResult | PushSshBatchResult;
+    if (name === "connect_layer" || name === "push_ssh") {
+        const result = value as ConnectSshResult | ConnectSshBatchResult | ConnectIntoResult;
         if ("results" in result) {
             const overview = `status=${result.status}${result.active_layer ? ` | active_layer=${singleLine(result.active_layer)}` : ""}`;
             const lines = result.results.map((target) => target.status === "ok"
@@ -288,6 +341,8 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
             const summary = [overview, ...lines].join("\n");
             return jsonStringBytes(summary) <= BATCH_TEXT_JSON_BYTES ? summary : limitBatchText(summary, FULL_OUTPUT_HINT);
         }
+        if ("reused" in result) return `layer=${singleLine(result.layer)} | reused=${result.reused}`;
+        return `layer=${singleLine(result.layer)}`;
     }
     if (name === "run_batch") {
         const result = value as Awaited<ReturnType<AgentToolHandlers["run_batch"]>>;
@@ -328,13 +383,16 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
         return limitBatchText([overview, ...prioritized].join("\n\n"), hint);
     }
     if (name === "put_file" || name === "get_file") {
-        const result = value as Awaited<ReturnType<AgentToolHandlers["put_file"]>>;
-        return transferSummary(result);
+        return transferSummary(value as Awaited<ReturnType<AgentToolHandlers["put_file"]>>);
+    }
+    if (name === "transfer_file") {
+        const result = value as Awaited<ReturnType<AgentToolHandlers["transfer_file"]>>;
+        return `direction=${result.direction} | ${transferSummary(result)}`;
     }
     return summarize(value);
 }
 
-function summarizeDirectory(result: Awaited<ReturnType<AgentToolHandlers["list_directory"]>>): string {
+function summarizeDirectory(result: { path: string; entries: Array<{ name: string; isDirectory: boolean }> }): string {
     const header = `path=${singleLine(result.path)} | entries=${result.entries.length}`;
     const omitted = "\n[目录文本达到上限，完整结果见 structuredContent]";
     const omittedBytes = jsonStringBytes(omitted) - 2;
@@ -354,7 +412,7 @@ function summarizeDirectory(result: Awaited<ReturnType<AgentToolHandlers["list_d
     return lines.join("\n");
 }
 
-function summarizeStreamRead(result: Awaited<ReturnType<AgentToolHandlers["read_stream"]>>): string {
+function summarizeStreamRead(result: ObserveStreamResult): string {
     const { frames, last_delivered_seq: cursor } = result;
     const status = [
         `window=${singleLine(result.window_id)}`, `frames=${frames.length}`,
@@ -426,7 +484,7 @@ function limitText(text: string, suffix: string, maxBytes: number): string {
     return text.slice(0, lo) + suffix;
 }
 
-function transferSummary(result: Awaited<ReturnType<AgentToolHandlers["put_file"]>>): string {
+function transferSummary(result: { bytes: number; transport: string; verification: string; write_mode: string }): string {
     return `bytes=${result.bytes} | transport=${result.transport} | verification=${result.verification} | write_mode=${result.write_mode}`;
 }
 

@@ -21,21 +21,29 @@ import type { RemoteDialect } from "./dialect.js";
 import { renderInplaceWrite, renderPreserveMode } from "./file-placement.js";
 import { sshFileStdioRequested, spawnWithFileRedirect } from "./ssh-file-stdio.js";
 import { openSshEnvironment } from "./openssh-environment.js";
-import { windowsCreatePrivateStage, windowsPlaceVerifiedPayload } from "./windows-upload-acl.js";
+import { windowsCreatePrivateStage, windowsPlaceExclusivePayload, windowsPlaceVerifiedPayload } from "./windows-upload-acl.js";
 import type { ExecOptions } from "./driver.js";
 
 /** Forward exec options when wrapping a driver so payload-bearing calls retain their audit policy. */
-export type TransferExec = (command: string, options?: Pick<ExecOptions, "auditLabel">) => Promise<{ stdout: string; exitCode: number }>;
+export type TransferExec = (
+    command: string,
+    options?: Pick<ExecOptions, "auditLabel">,
+) => Promise<{ stdout: string; stderr?: string; exitCode: number }>;
+
+/** Decode standard Base64 into raw bytes, allowing line wrapping but rejecting malformed output. */
+export function decodeFileBytes(output: string, path: string, expectedBytes?: number, opLabel = "readFile"): Buffer {
+    const encoded = output.replace(/[ \t\r\n]+/g, "");
+    const content = Buffer.from(encoded, "base64");
+    if (content.toString("base64") !== encoded) throw new Error(`${opLabel} 返回无效 Base64: ${path}`);
+    if (expectedBytes !== undefined && content.length !== expectedBytes) {
+        throw new Error(`${opLabel} 长度对账失败（解码 ${content.length}B，源 ${expectedBytes}B）: ${path}`);
+    }
+    return content;
+}
 
 /** Decode standard Base64, allowing line wrapping but rejecting malformed output. */
 export function decodeFileRead(output: string, path: string, expectedBytes?: number): string {
-    const encoded = output.replace(/[ \t\r\n]+/g, "");
-    const content = Buffer.from(encoded, "base64");
-    if (content.toString("base64") !== encoded) throw new Error(`readFile 返回无效 Base64: ${path}`);
-    if (expectedBytes !== undefined && content.length !== expectedBytes) {
-        throw new Error(`readFile 长度对账失败（解码 ${content.length}B，源 ${expectedBytes}B）: ${path}`);
-    }
-    return content.toString("utf-8");
+    return decodeFileBytes(output, path, expectedBytes, "readFile").toString("utf-8");
 }
 
 /** put 分块大小（base64 字符数——单条命令行安全长度内） */
@@ -84,7 +92,7 @@ export async function putFile(
     dialect: RemoteDialect,
     localPath: string,
     remotePath: string,
-    opts: { forceInplace?: boolean } = {},
+    opts: { chunkB64?: number; forceInplace?: boolean } = {},
 ): Promise<TransferResult> {
     return putContent(exec, dialect, await fs.readFile(localPath), remotePath, opts);
 }
@@ -95,6 +103,7 @@ export async function writeInplaceContent(
     content: Buffer,
     remotePath: string,
     chunkB64?: number,
+    opts: { exclusive?: boolean } = {},
 ): Promise<TransferResult> {
     const result = await exec("mktemp -d /tmp/filaxis-write.XXXXXXXXXX");
     const stageDir = result.stdout.trim();
@@ -102,7 +111,11 @@ export async function writeInplaceContent(
         throw new Error(`writeFile 无法创建暂存目录（目标未动）: ${remotePath}`);
     }
     try {
-        return await stageAndPlaceContent(exec, dialect, content, remotePath, { chunkB64, forceInplace: true }, `${stageDir}/payload`);
+        return await stageAndPlaceContent(
+            exec, dialect, content, remotePath,
+            { chunkB64, forceInplace: true, exclusive: opts.exclusive },
+            `${stageDir}/payload`,
+        );
     } finally {
         await exec(`rmdir ${q(stageDir)}`).catch(() => undefined);
     }
@@ -126,7 +139,7 @@ export async function putContent(
     dialect: RemoteDialect,
     content: Buffer,
     remotePath: string,
-    opts: { chunkB64?: number; forceInplace?: boolean } = {},
+    opts: { chunkB64?: number; forceInplace?: boolean; exclusive?: boolean } = {},
 ): Promise<TransferResult> {
     return stageAndPlaceContent(exec, dialect, content, remotePath, opts, remotePath);
 }
@@ -136,11 +149,17 @@ async function stageAndPlaceContent(
     dialect: RemoteDialect,
     content: Buffer,
     remotePath: string,
-    opts: { chunkB64?: number; forceInplace?: boolean },
+    opts: { chunkB64?: number; forceInplace?: boolean; exclusive?: boolean },
     stageBase: string,
 ): Promise<TransferResult> {
     if (!dialect.base64Decode.length) {
         throw new Error("远端 base64 原语不可用（方言探测 unknown）——该路径不支持文件传输");
+    }
+    if (opts.exclusive) {
+        const existsChk = await exec(`test -e ${q(remotePath)} || test -L ${q(remotePath)}`);
+        if (existsChk.exitCode === 0) {
+            throw Object.assign(new Error(`文件已存在，拒绝覆盖: ${remotePath}`), { code: "EEXIST" as const });
+        }
     }
     // 目标目录早拒绝（GPT Astra 八轮 #2）：mv 遇现存目录=把临时移进目录
     // （basename 保留），落位语义被偷换还报 verified——传输前显式拒绝
@@ -148,17 +167,15 @@ async function stageAndPlaceContent(
     if (dirChk.exitCode === 0) {
         throw new Error(`目标是现存目录（拒绝上传）：${remotePath}——putFile 落位语义是文件路径`);
     }
+    const chunkSize = opts.chunkB64 ?? CHUNK_B64;
+    if (!Number.isFinite(chunkSize) || chunkSize <= 0) {
+        throw new Error(`chunkB64 非法（${opts.chunkB64}）——须为正数（0/负曾使循环反复发空块永不前进）`);
+    }
     const b64 = content.toString("base64");
     const { stage, payload: out, windows } = await createUploadStage(exec, stageBase);
     const tmp = `${stage}/encoded`;
     const cleanup = () => exec(`rm -f ${q(tmp)} ${q(out)}`).catch(() => undefined);
     const localSha = createHash("sha256").update(content).digest("hex");
-    // 分块尺寸可调（真机实证：tmux server 单命令 ~16-24K 即 "command too long"——
-    // 键入通道的调用方须传小 chunk；ssh exec 通道 stdin 传命令不受限，缺省 48K）
-    const chunkSize = opts.chunkB64 ?? CHUNK_B64;
-    if (!Number.isFinite(chunkSize) || chunkSize <= 0) {
-        throw new Error(`chunkB64 非法（${opts.chunkB64}）——须为正数（0/负曾使循环反复发空块永不前进）`);
-    }
     let level: "sha256" | "size";
     try {
         if (!b64.length) {
@@ -189,7 +206,9 @@ async function stageAndPlaceContent(
         throw e;
     }
     try {
-        const writeMode = await placeVerifiedUpload(exec, out, remotePath, { forceInplace: opts.forceInplace, applyUmask: true, windows });
+        const writeMode = await placeVerifiedUpload(exec, out, remotePath, {
+            forceInplace: opts.forceInplace, applyUmask: true, windows, exclusive: opts.exclusive,
+        });
         return { bytes: content.length, sha256: localSha, verified: true, verification: level, writeMode };
     } finally {
         await exec(`rm -f ${q(tmp)}; rmdir ${q(stage)}`).catch(() => undefined);
@@ -197,9 +216,68 @@ async function stageAndPlaceContent(
 }
 
 async function placeVerifiedUpload(
-    exec: TransferExec, out: string, remotePath: string, { forceInplace = false, applyUmask = false, windows = false } = {},
+    exec: TransferExec, out: string, remotePath: string,
+    { forceInplace = false, applyUmask = false, windows = false, exclusive = false } = {},
 ): Promise<TransferResult["writeMode"]> {
     const cleanup = () => exec(`rm -f ${q(out)}`).catch(() => undefined);
+    if (exclusive) {
+        const exclusiveModeSetup = applyUmask
+            ? `__fx_mask=$(umask); case "$__fx_mask" in [0-7][0-7][0-7]|0[0-7][0-7][0-7]) ;; ` +
+              `*) exec 3>&- 2>/dev/null || true; rm -f -- "$__fx_seed" 2>/dev/null || true; echo FX_PERMISSIONS_FAIL; exit 1;; esac; ` +
+              `__fx_new_mode=$(printf '%03o' "$((0666 & ~(0$__fx_mask)))"); ` +
+              `chmod "$__fx_new_mode" "$__fx_seed" || { exec 3>&- 2>/dev/null || true; rm -f -- "$__fx_seed" 2>/dev/null || true; echo FX_PERMISSIONS_FAIL; exit 1; }; `
+            : "";
+        const exclusiveCmd = windows
+            ? `[ -f ${q(out)} ] || { echo FX_NO_PAYLOAD; exit 1; }; ` +
+              `__fx_src_win=$(cygpath -aw ${q(out)}) && __fx_tgt_win=$(cygpath -aw ${q(remotePath)}) || exit 1; ` +
+              `if FILAXIS_UPLOAD_SOURCE="$__fx_src_win" FILAXIS_UPLOAD_TARGET="$__fx_tgt_win" ${windowsPlaceExclusivePayload}; ` +
+              `then echo FX_MV_OK; else echo FX_WINDOWS_PLACEMENT_UNKNOWN; fi`
+            : `[ -f ${q(out)} ] || { echo FX_NO_PAYLOAD; exit 1; }; ` +
+              `if [ -e ${q(remotePath)} ] || [ -L ${q(remotePath)} ]; then echo FX_ALREADY_EXISTS; exit 1; fi; ` +
+              `__fx_dir=$(dirname -- ${q(remotePath)} && printf .) || exit 1; __fx_dir=\${__fx_dir%??}; ` +
+              `case "$__fx_dir" in /*) ;; *) __fx_dir="./$__fx_dir" ;; esac; ` +
+              `__fx_seed=$(mktemp "\${__fx_dir%/}/.filaxis-excl.XXXXXXXXXX" 2>/dev/null) || { echo FX_CREATE_FAIL; exit 1; }; ` +
+              `exec 3> "$__fx_seed" 2>/dev/null || { rm -f -- "$__fx_seed" 2>/dev/null || true; echo FX_CREATE_FAIL; exit 1; }; ` +
+              `${exclusiveModeSetup}` +
+              `if ! ln -T -- "$__fx_seed" ${q(remotePath)} 2>/dev/null; then ` +
+              `exec 3>&- 2>/dev/null || true; rm -f -- "$__fx_seed" 2>/dev/null || true; ` +
+              `if [ -e ${q(remotePath)} ] || [ -L ${q(remotePath)} ]; then echo FX_ALREADY_EXISTS; else echo FX_CREATE_FAIL; fi; exit 1; fi; ` +
+              `rm -f -- "$__fx_seed" 2>/dev/null || true; ` +
+              `if cat < ${q(out)} >&3 && exec 3>&-; then rm -f ${q(out)} 2>/dev/null || true; echo FX_MV_CAT; ` +
+              `else exec 3>&- 2>/dev/null || true; echo FX_INPLACE_FAIL; exit 1; fi`;
+        const res = await exec(`( ${exclusiveCmd} )`);
+        const resOut = (res.stdout || "").trim();
+        if (resOut.includes("FX_ALREADY_EXISTS")) {
+            await cleanup();
+            throw Object.assign(new Error(`文件已存在，拒绝覆盖: ${remotePath}`), { code: "EEXIST" as const });
+        }
+        if (resOut.includes("FX_WINDOWS_PLACEMENT_UNKNOWN")) {
+            throw Object.assign(new Error(`Windows 上传落位或 ACL 应用结果未知，请核实目标和暂存载荷：${remotePath}（${out}）`), { outcome: "unknown" as const });
+        }
+        if (resOut.includes("FX_PERMISSIONS_FAIL")) {
+            await cleanup();
+            throw new Error(`put 落位失败（无法设置文件权限，目标未动）: ${remotePath}`);
+        }
+        if (resOut.includes("FX_NO_PAYLOAD")) {
+            await cleanup();
+            throw new Error(`put 落位中止（载荷在落位前消失或无法打开，目标未动）: ${remotePath}`);
+        }
+        if (resOut.includes("FX_CREATE_FAIL")) {
+            await cleanup();
+            throw new Error(`put 落位失败（无法独占创建目标文件，目标未动）: ${remotePath}`);
+        }
+        if (resOut.includes("FX_INPLACE_FAIL")) {
+            throw new Error(
+                `put 落位失败（独占写入失败——请核实目标 ${remotePath}；` +
+                `完整载荷保留在 ${out} 可重试）`,
+            );
+        }
+        if (res.exitCode !== 0 || (!resOut.includes("FX_MV_OK") && !resOut.includes("FX_MV_CAT"))) {
+            await cleanup();
+            throw new Error(`put 落位异常（目标未动）: ${remotePath}（输出 ${resOut.slice(0, 80)}）`);
+        }
+        return resOut.includes("FX_MV_CAT") ? "inplace-write" : "atomic-replace";
+    }
     // 落位（GPT Astra 七轮 #3 + 八轮 #2 + bind mount 定案 + 十八轮 #2 三态 + 审计 H5）：
     // symlink 追踪（readlink -f 真身——mv 对链接路径会替换链接本身破坏拓扑）+ 属性
     // 保持（chmod/chown --reference best-effort）；mv 失败自动降级 cat 保留 inode；
@@ -298,6 +376,71 @@ async function placeVerifiedUpload(
 }
 
 /**
+ * 分页读取远端文件字节（供 tmux readFile 与 getFile 共用）：
+ * 小文件单次 Base64 直出；大文件先编码落盘到远端 0600 独占临时文件，再按 8KB Base64
+ * 分页读取，避开 tmux 滚动窗口与聚合缓冲截断。
+ */
+export async function readPagedFileBytes(
+    exec: TransferExec,
+    base64EncodeCmd: string,
+    remotePath: string,
+    opts: { maxDirectB64?: number; pageB64?: number; auditLabel?: string; opLabel?: string } = {},
+): Promise<Buffer> {
+    const maxDirectB64 = opts.maxDirectB64 ?? 12_000;
+    const pageB64 = Math.max(1, Math.min(8_000, opts.pageB64 ?? 8_000));
+    const op = opts.opLabel ?? "readFile";
+    const execOpts = opts.auditLabel ? { auditLabel: opts.auditLabel } : undefined;
+    const st = await exec(`wc -c < ${q(remotePath)} 2>/dev/null`, execOpts);
+    if (st.exitCode !== 0) {
+        const detail = (st.stderr || st.stdout || "").trim();
+        throw new Error(detail
+            ? `${op} 失败（wc 退出码 ${st.exitCode}）: ${remotePath}: ${detail}`
+            : `${op} 失败（wc 退出码 ${st.exitCode}）: ${remotePath}`);
+    }
+    const sizeText = st.stdout.trim();
+    const size = Number(sizeText);
+    if (!/^\d+$/.test(sizeText) || !Number.isSafeInteger(size)) {
+        throw new Error(`${op} 失败（文件大小无法核实）: ${remotePath}`);
+    }
+    if (size * 2 <= maxDirectB64) {
+        const r = await exec(`${base64EncodeCmd} < ${q(remotePath)}`, execOpts);
+        if (r.exitCode !== 0) {
+            const detail = (r.stderr || r.stdout || "").trim();
+            throw new Error(detail
+                ? `${op} 失败（base64 退出码 ${r.exitCode}）: ${remotePath}: ${detail}`
+                : `${op} 失败（base64 退出码 ${r.exitCode}）: ${remotePath}`);
+        }
+        return decodeFileBytes(r.stdout, remotePath, size, op);
+    }
+    const tmp = `/tmp/filaxis-read-${randomBytes(8).toString("hex")}.b64`;
+    try {
+        const tot = await exec(
+            `(umask 077; set -C; ${base64EncodeCmd} < ${q(remotePath)} > ${q(tmp)}) && wc -c < ${q(tmp)}`,
+            execOpts,
+        );
+        const totText = (tot.stdout || "").trim();
+        const total = Number(totText);
+        if (tot.exitCode !== 0 || !/^\d+$/.test(totText) || !Number.isSafeInteger(total)) {
+            const detail = (tot.stderr || tot.stdout || "").trim();
+            throw new Error(detail
+                ? `${op} 失败（base64 退出码 ${tot.exitCode}）: ${remotePath}: ${detail}`
+                : `${op} 失败（base64 退出码 ${tot.exitCode}）: ${remotePath}`);
+        }
+        const chunks: string[] = [];
+        for (let off = 1; off <= total; off += pageB64) {
+            const pg = await exec(`test -r ${q(tmp)} && tail -c +${off} ${q(tmp)} | head -c ${pageB64}`, execOpts);
+            if (pg.exitCode !== 0) {
+                throw new Error(`${op} 分页读失败（页偏移 ${off} 退出码 ${pg.exitCode}）: ${remotePath}`);
+            }
+            chunks.push(pg.stdout.replace(/[ \t\r\n]+/g, ""));
+        }
+        return decodeFileBytes(chunks.join(""), remotePath, size, op);
+    } finally {
+        await exec(`rm -f ${q(tmp)}`).catch(() => undefined);
+    }
+}
+
+/**
  * 下行 get：远端 → 本地。方言 base64 编码回传 → **校验先行** → 本地临时 +
  * rename 原子落位（GPT Astra 七轮 #2：旧实现先 writeFile 再校验——校验失败
  * 原文件已被覆盖；校验对象是远端回读的 size/sha vs 解码 content，与本地
@@ -308,6 +451,7 @@ export async function getFile(
     dialect: RemoteDialect,
     remotePath: string,
     localPath: string,
+    opts: { chunkB64?: number } = {},
 ): Promise<TransferResult> {
     if (!dialect.base64Encode.length) {
         throw new Error("远端 base64 原语不可用（方言探测 unknown）——该路径不支持文件传输");
@@ -322,9 +466,19 @@ export async function getFile(
         throw new Error(`本地目标是现存目录（拒绝下载落位）：${localPath}`);
     }
     const enc = dialect.base64Encode.join(" ");
-    const r = await exec(`${enc} < ${q(remotePath)}`, { auditLabel: "file download" });
-    if (r.exitCode !== 0) throw new Error(`get 编码回传失败（exit=${r.exitCode}）`);
-    const content = Buffer.from(r.stdout.replace(/\s+/g, ""), "base64");
+    let content: Buffer;
+    if (opts.chunkB64 !== undefined) {
+        content = await readPagedFileBytes(exec, enc, remotePath, {
+            maxDirectB64: opts.chunkB64,
+            pageB64: Math.min(8_000, opts.chunkB64),
+            auditLabel: "file download",
+            opLabel: "get",
+        });
+    } else {
+        const r = await exec(`${enc} < ${q(remotePath)}`, { auditLabel: "file download" });
+        if (r.exitCode !== 0) throw new Error(`get 编码回传失败（exit=${r.exitCode}）`);
+        content = Buffer.from(r.stdout.replace(/\s+/g, ""), "base64");
+    }
     const localSha = createHash("sha256").update(content).digest("hex");
     // 校验先行：不过 → 本地目标零接触（临时都不建）
     const v = await verify(exec, dialect, remotePath, content.length, localSha);
@@ -388,7 +542,9 @@ export type SftpSpawnImpl = (argv: string[], batch: string) => Promise<{ exitCod
 async function defaultSftpSpawn(argv: string[], batch: string, timeoutMs?: number): Promise<{ exitCode: number | null; stderr: string }> {
     if (sshFileStdioRequested()) return spawnWithFileRedirect(argv, batch, { executable: "sftp", timeoutMs });
     return new Promise((resolve, reject) => {
-        const p: ChildProcess = defaultSpawn("sftp", argv, { stdio: ["pipe", "ignore", "pipe"], env: openSshEnvironment() });
+        const p: ChildProcess = defaultSpawn("sftp", argv, {
+            stdio: ["pipe", "ignore", "pipe"], windowsHide: true, env: openSshEnvironment(),
+        });
         const timer = timeoutMs ? setTimeout(() => {
             stderr += `\nsftp 超时（${timeoutMs}ms）`;
             p.kill("SIGKILL");

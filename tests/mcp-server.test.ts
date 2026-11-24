@@ -47,7 +47,7 @@ async function waitId(f: { collect: () => Array<Record<string, unknown>> }, id: 
 }
 
 describe("MCP Server（REQ-0003）", () => {
-    test("directory listing, default-layer switching, and non-recursive deletion", async () => {
+    test("path reading, default-layer switching, and path management (mkdir/move/delete)", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-mcp-directory-"));
         const stack = new RuntimeStack();
         const fixture = mcpFixture(stack);
@@ -69,54 +69,79 @@ describe("MCP Server（REQ-0003）", () => {
             await stack.addLayer("previous", previousDriver);
             await stack.addLayer("current", new LocalRuntimeDriver({ cwd: current }));
 
-            expect(await call(1, "set_active_layer", { name: "unknown" })).toMatchObject({ isError: true });
+            expect(await call(1, "manage_layers", { action: "activate", name: "unknown" })).toMatchObject({ isError: true });
             expect(stack.activeLayer?.name).toBe("current");
-            expect(await call(2, "set_active_layer", { name: "previous" })).toMatchObject({
-                structuredContent: { active_layer: "previous" }, content: [{ text: "active_layer=previous" }],
+            expect(await call(2, "manage_layers", { action: "activate", name: "previous" })).toMatchObject({
+                structuredContent: { action: "activate", active_layer: "previous" }, content: [{ text: "active_layer=previous" }],
             });
-            expect(await call(3, "list_directory", { path: "." })).toMatchObject({
+            expect(await call(3, "read_path", { path: "." })).toMatchObject({
                 content: [{ text: expect.stringContaining("file .hidden") }],
-                structuredContent: { entries: expect.arrayContaining([
-                    expect.objectContaining({ name: "nested", isDirectory: true }),
-                    expect.objectContaining({ name: "-literal", isDirectory: false }),
-                ]) },
+                structuredContent: {
+                    type: "directory",
+                    entries: expect.arrayContaining([
+                        expect.objectContaining({ name: "nested", isDirectory: true }),
+                        expect.objectContaining({ name: "-literal", isDirectory: false }),
+                    ]),
+                },
             });
-            expect(await call(4, "list_directory", { path: "missing" })).toMatchObject({ isError: true });
-            expect(await call(5, "delete_file", { path: "nested", recursive: true })).toMatchObject({ isError: true });
-            expect(await call(6, "delete_file", { path: "nested" })).toMatchObject({ isError: true });
-            expect(await call(7, "delete_file", { path: "-literal" })).toMatchObject({
-                structuredContent: { deleted: true, path: "-literal" },
+            expect(await call(4, "read_path", { path: "missing" })).toMatchObject({ isError: true });
+            expect(await call(5, "manage_path", { action: "delete", path: "nested" })).toMatchObject({ isError: true });
+            expect(await call(6, "manage_path", { action: "delete", path: "/", recursive: true })).toMatchObject({ isError: true });
+            expect(await call(7, "manage_path", { action: "delete", path: "-literal" })).toMatchObject({
+                structuredContent: { action: "delete", deleted: true, path: "-literal", recursive: false },
             });
-            expect(await call(8, "delete_file", { path: "-literal" })).toMatchObject({ isError: true });
+            expect(await call(8, "manage_path", { action: "delete", path: "-literal" })).toMatchObject({ isError: true });
             if (process.platform !== "win32") {
                 mkdirSync(join(previous, "other", "deeper"), { recursive: true });
                 writeFileSync(join(previous, "other", "target"), "physical");
                 writeFileSync(join(previous, "target"), "lexical");
                 symlinkSync("other/deeper", join(previous, "alias"));
-                expect(await call(9, "delete_file", { path: "link/." })).toMatchObject({ isError: true });
-                expect(await call(10, "delete_file", { path: "link" })).toMatchObject({
-                    structuredContent: { deleted: true, path: "link" },
+                expect(await call(9, "manage_path", { action: "delete", path: "link/." })).toMatchObject({ isError: true });
+                expect(await call(10, "manage_path", { action: "delete", path: "link" })).toMatchObject({
+                    structuredContent: { action: "delete", deleted: true, path: "link", recursive: false },
                 });
-                expect(await call(12, "delete_file", { path: "alias/../target" })).toMatchObject({ isError: false });
+                expect(await call(12, "manage_path", { action: "delete", path: "alias/../target" })).toMatchObject({ isError: false });
                 expect(existsSync(join(previous, "other", "target"))).toBe(false);
                 expect(readFileSync(join(previous, "target"), "utf8")).toBe("lexical");
             }
             expect(existsSync(join(previous, "nested"))).toBe(true);
             expect(existsSync(join(previous, "-literal"))).toBe(false);
             expect(readFileSync(join(current, "-literal"), "utf8")).toBe("current");
+
+            // mkdir + edit_file(write) + move + recursive delete
+            expect(await call(14, "manage_path", { action: "mkdir", path: "created/sub" })).toMatchObject({
+                isError: false, content: [{ text: "created=true | path=created/sub" }],
+                structuredContent: { action: "mkdir", path: "created/sub", created: true },
+            });
+            expect(await call(15, "edit_file", { path: "created/sub/note.txt", content: "hello" })).toMatchObject({
+                isError: false, content: [{ text: "created=true | bytes=5 | path=created/sub/note.txt" }],
+                structuredContent: { mode: "write", path: "created/sub/note.txt", created: true, bytes_after: 5 },
+            });
+            expect(await call(16, "manage_path", { action: "move", path: "created/sub/note.txt", destination: "created/moved.txt" })).toMatchObject({
+                isError: false, content: [{ text: "moved=true | path=created/sub/note.txt -> created/moved.txt" }],
+                structuredContent: { action: "move", path: "created/sub/note.txt", destination: "created/moved.txt", moved: true },
+            });
+            expect(readFileSync(join(previous, "created", "moved.txt"), "utf8")).toBe("hello");
+            expect(await call(17, "manage_path", { action: "delete", path: "created", recursive: true })).toMatchObject({
+                isError: false, content: [{ text: "deleted=true | path=created | recursive=true" }],
+                structuredContent: { action: "delete", path: "created", deleted: true, recursive: true },
+            });
+            expect(existsSync(join(previous, "created"))).toBe(false);
+
             previousDriver.fs.rm = async () => {
                 throw Object.assign(new Error("connection lost"), { outcome: "unknown" });
             };
-            expect(await call(11, "delete_file", { path: ".hidden" })).toMatchObject({
+            expect(await call(11, "manage_path", { action: "delete", path: ".hidden" })).toMatchObject({
                 isError: true, content: [{ text: "outcome=unknown\nconnection lost" }],
                 structuredContent: { outcome: "unknown" },
             });
             const entries = Array.from({ length: 60 }, (_, i) => ({ name: `entry-${i}-${"雪".repeat(80)}-end`, isDirectory: false }));
             previousDriver.fs.readdir = async () => entries;
-            const listed = await call(13, "list_directory", { path: "." }) as {
-                content: Array<{ text: string }>; structuredContent: { entries: typeof entries };
+            const listed = await call(13, "read_path", { path: "." }) as {
+                content: Array<{ text: string }>; structuredContent: { type: "directory"; entries: typeof entries };
             };
             const listingText = listed.content[0]!.text;
+            expect(listed.structuredContent.type).toBe("directory");
             expect(listed.structuredContent.entries).toEqual(entries);
             expect(Buffer.byteLength(JSON.stringify(listingText))).toBeLessThanOrEqual(8192);
             expect(listingText).toContain("完整结果见 structuredContent");
@@ -130,7 +155,7 @@ describe("MCP Server（REQ-0003）", () => {
         }
     });
 
-    test("put_file and get_file transfer bytes on the selected layer and report verification", async () => {
+    test("transfer_file puts and gets bytes on the selected layer and report verification", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-mcp-transfer-"));
         const stack = new RuntimeStack();
         const f = mcpFixture(stack);
@@ -146,13 +171,13 @@ describe("MCP Server（REQ-0003）", () => {
                 return (await waitId(f, id, 20_000)).result;
             };
             const paths = { layer: "fixture", remote_path: "layer file.bin" };
-            expect(await call(1, "put_file", { ...paths, path: input })).toMatchObject({ isError: true });
+            expect(await call(1, "transfer_file", { direction: "put", ...paths, path: input })).toMatchObject({ isError: true });
             expect(existsSync(join(dir, paths.remote_path))).toBe(false);
-            for (const [id, name, local_path] of [[2, "put_file", input], [3, "get_file", output]] as const) {
-                expect(await call(id, name, { ...paths, local_path })).toMatchObject({
+            for (const [id, direction, local_path] of [[2, "put", input], [3, "get", output]] as const) {
+                expect(await call(id, "transfer_file", { direction, ...paths, local_path })).toMatchObject({
                     isError: false,
                     content: [{ text: expect.stringContaining("verification=sha256") }],
-                    structuredContent: { bytes: payload.length, transport: "exec", verification: "sha256", write_mode: "atomic-replace" },
+                    structuredContent: { direction, bytes: payload.length, transport: "exec", verification: "sha256", write_mode: "atomic-replace" },
                 });
             }
             expect(readFileSync(output)).toEqual(payload);
@@ -167,9 +192,11 @@ describe("MCP Server（REQ-0003）", () => {
         const f = mcpFixture();
         try {
             f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_batch", arguments: { commands: [] } } });
-            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "read_stream", arguments: { session: "demo" } } });
+            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "observe_stream", arguments: { window_id: "" } } });
+            f.write({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "observe_stream", arguments: { session: "demo" } } });
             expect((await waitId(f, 1)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("steps 需为非空数组") }] });
             expect((await waitId(f, 2)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("window_id 需为非空字符串") }] });
+            expect((await waitId(f, 3)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("observe_stream 需传 command") }] });
         } finally { f.close(); }
     });
 
@@ -246,13 +273,13 @@ describe("MCP Server（REQ-0003）", () => {
             expect(calls).toHaveLength(2);
         } finally { f.close(); }
     });
-    test("list_layers exposes the empty and populated layer lists in MCP text", async () => {
+    test("manage_layers(list) exposes the empty and populated layer lists in MCP text", async () => {
         const stack = new RuntimeStack();
         const f = mcpFixture(stack);
         async function listLayers(id: number) {
-            f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "list_layers" } });
+            f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "manage_layers", arguments: { action: "list" } } });
             const response = await waitId(f, id);
-            return response.result as { content: Array<{ type: string; text: string }>; structuredContent: { layers: Array<{ name: string }> } };
+            return response.result as { content: Array<{ type: string; text: string }>; structuredContent: { action: string; layers: Array<{ name: string }> } };
         }
         try {
             const empty = await listLayers(1);
@@ -340,7 +367,7 @@ describe("MCP Server（REQ-0003）", () => {
         } finally { fixture.close(); }
     });
 
-    test("read_file displays exact text and marks an oversized preview without changing the structured body", async () => {
+    test("read_path displays exact text and marks an oversized preview without changing the structured body", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-mcp-read-body-"));
         const stack = new RuntimeStack();
         const fixture = mcpFixture(stack);
@@ -348,11 +375,11 @@ describe("MCP Server（REQ-0003）", () => {
         const boundary = "x".repeat(8190);
         const large = 'File start\n' + '雪🧵\n"\\'.repeat(1200) + '\nFile end';
         const read = async (id: number, args: Record<string, unknown>) => {
-            fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "read_file", arguments: args } });
+            fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "read_path", arguments: args } });
             return (await waitId(fixture, id)).result as {
                 isError: boolean;
                 content: Array<{ text: string }>;
-                structuredContent?: { path: string; content: string; size: number; mtime_ms: number };
+                structuredContent?: { path: string; type: string; content: string; size: number; mtime_ms: number };
             };
         };
         try {
@@ -364,7 +391,7 @@ describe("MCP Server（REQ-0003）", () => {
             expect(exact.isError).toBe(false);
             expect(exact.content[0]?.text).toBe(small);
             expect(exact.structuredContent).toMatchObject({
-                path: "small.sources", content: small, size: Buffer.byteLength(small),
+                path: "small.sources", type: "file", content: small, size: Buffer.byteLength(small),
             });
             expect((await read(2, { path: "boundary" })).content[0]?.text).toBe(boundary);
             const clipped = await read(3, { path: "large" });
@@ -433,7 +460,7 @@ describe("MCP Server（REQ-0003）", () => {
         } finally { f.close(); }
     }, 15_000);
 
-    test.skipIf(process.platform !== "win32")("push_ssh reaches the jump port through native Windows OpenSSH", async () => {
+    test.skipIf(process.platform !== "win32")("connect_layer reaches the jump port through native Windows OpenSSH", async () => {
         let connections = 0;
         const proxy = createServer((socket) => { connections++; socket.destroy(); });
         await new Promise<void>((resolve, reject) => {
@@ -447,7 +474,7 @@ describe("MCP Server（REQ-0003）", () => {
             const jumps = [`localhost:${address.port}`, `probe@127.0.0.1:${address.port}`];
             for (const [index, jump] of jumps.entries()) {
                 const id = index + 1;
-                f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "push_ssh", arguments: { host: "127.0.0.1", jump } } });
+                f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "connect_layer", arguments: { host: "127.0.0.1", jump } } });
                 const response = await waitId(f, id);
                 // Reaching the listener proves the native client parsed the jump address.
                 expect(response.result).toMatchObject({ isError: true });
@@ -479,14 +506,20 @@ describe("MCP Server（REQ-0003）", () => {
         f.write({ jsonrpc: "2.0", id: 1, method: "tools/list" });
         const r = await waitId(f, 1);
         const tools = (r as { result: { tools: Array<{ name: string; description: string; inputSchema: unknown }> } }).result.tools;
+        expect(tools.length).toBe(12);
         expect(tools.length).toBe(TOOL_DEFS.length);
         expect(tools.map((t) => t.name)).toEqual(TOOL_DEFS.map((d) => d.function.name)); // 同序同名
+        expect(tools.every((t) => /^[a-z]+_[a-z]+$/.test(t.name))).toBe(true);
         // schema 同源断言：inputSchema 即 function.parameters（漂移即红）
         for (let i = 0; i < tools.length; i++) {
             expect(tools[i]!.inputSchema).toEqual(TOOL_DEFS[i]!.function.parameters);
         }
-        // 核心六工具在场
-        for (const n of ["run_command", "read_file", "edit_file", "put_file", "get_file", "observe_stream", "spawn_and_observe", "stop_and_verify"]) {
+        // 全量 12 工具在场
+        for (const n of [
+            "run_batch", "run_command", "start_session", "stop_session",
+            "observe_stream", "close_stream", "read_path", "edit_file",
+            "manage_path", "transfer_file", "connect_layer", "manage_layers",
+        ]) {
             expect(tools.map((t) => t.name)).toContain(n);
         }
         f.close();
@@ -561,15 +594,15 @@ describe("MCP Server（REQ-0003）", () => {
         f.close();
     });
 
-    test("AC-04 会话链跨调用：spawn→stop 按返回 session_id 串起", async () => {
+    test("AC-04 会话链跨调用：start_session→stop_session 按返回 session_id 串起", async () => {
         const f = mcpFixture();
-        f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "spawn_and_observe", arguments: { command: "echo READY; sleep 10", ready_marker: "READY", ready_timeout_ms: 6000 } } });
+        f.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "start_session", arguments: { command: "echo READY; sleep 10", ready_marker: "READY", ready_timeout_ms: 6000 } } });
         const spawnR = await waitId(f, 1, 20_000);
         const spawnRes = spawnR as { result: { structuredContent: { session_id: string; note?: string } } };
         const sid = spawnRes.result.structuredContent.session_id;
         expect(sid).toBeTruthy();
         expect(spawnRes.result.structuredContent.note).toBe("ready");
-        f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "stop_and_verify", arguments: { session_id: sid } } });
+        f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "stop_session", arguments: { session_id: sid } } });
         const stopR = await waitId(f, 2, 20_000);
         const stopRes = stopR as { result: { structuredContent: { status: string } } };
         expect(["stopped", "exited", "unknown"]).toContain(stopRes.result.structuredContent.status); // 三态可辨
@@ -588,7 +621,7 @@ describe("MCP Server（REQ-0003）", () => {
             };
         };
         try {
-            const launched = await call(1, "spawn_and_observe", {
+            const launched = await call(1, "start_session", {
                 command: "echo READY; sleep 1; exit 7", ready_marker: "READY", name: "long-session-name",
             });
             expect(launched.isError).toBe(false);
@@ -604,9 +637,9 @@ describe("MCP Server（REQ-0003）", () => {
                 terminal = await driver.verifySession(sessionId);
             }
             expect(terminal).toEqual({ status: "exited", exitCode: 7 });
-            const shortened = await call(2, "stop_and_verify", { session_id: sessionId.slice(0, 24) });
+            const shortened = await call(2, "stop_session", { session_id: sessionId.slice(0, 24) });
             expect(shortened.content[0]!.text).toContain("status=unknown\nnote=会话归属未知或已过期");
-            const result = await call(3, "stop_and_verify", { session_id: sessionId });
+            const result = await call(3, "stop_session", { session_id: sessionId });
             expect(result.structuredContent).toEqual({ status: "exited", exit_code: 7 });
             expect(result.content[0]!.text).toBe("status=exited\nexit_code=7");
         } finally {
@@ -628,7 +661,7 @@ describe("MCP Server（REQ-0003）", () => {
         const fixture = mcpFixture(stack, createAgentToolkit(stack, { driver, readyTimeoutMs: 5 }));
         try {
             fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
-                name: "spawn_and_observe", arguments: { command: "fixture", ready_marker: "READY" },
+                name: "start_session", arguments: { command: "fixture", ready_marker: "READY" },
             } });
             const { result } = await waitId(fixture, 1) as { result: {
                 isError: boolean; content: Array<{ text: string }>; structuredContent: Record<string, unknown>;
@@ -640,7 +673,7 @@ describe("MCP Server（REQ-0003）", () => {
     });
 });
 
-test("remove_layer returns all unresolved session handles via MCP", async () => {
+test("manage_layers(remove) returns all unresolved session handles via MCP", async () => {
     const stack = new RuntimeStack();
     const sessions = [{ sessionId: "fixture", logBase: "/tmp/fixture" }];
     const driver = {
@@ -652,13 +685,116 @@ test("remove_layer returns all unresolved session handles via MCP", async () => 
     const fixture = mcpFixture(stack);
     try {
         fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
-            name: "remove_layer", arguments: { name: "owned", destroy: true },
+            name: "manage_layers", arguments: { action: "remove", name: "owned", destroy: true },
         } });
         expect(await waitId(fixture, 1)).toMatchObject({
-            result: { isError: true, structuredContent: { outcome: "unknown", sessions } },
+            result: {
+                isError: true,
+                content: [{ text: "outcome=unknown\nsessions=fixture (/tmp/fixture)\ncleanup unknown" }],
+                structuredContent: { outcome: "unknown", sessions },
+            },
         });
     } finally {
         fixture.close();
+    }
+});
+
+test("MCP error text surfaces outcome=unknown and state handles for run_command, transfer_file, edit_file, and manage_layers", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fx-mcp-unknown-text-"));
+    const stack = new RuntimeStack();
+    const localSrc = join(dir, "upload.bin");
+    const localDst = join(dir, "download.bin");
+    writeFileSync(localSrc, "payload-data");
+
+    const drv = {
+        descriptor: { driver: "ssh", target: "mock-host" },
+        async exec(cmd: string) {
+            if (cmd === "printf filaxis | base64 -w 0") return { stdout: "ZmlsYXhpcw==\n", stderr: "", exitCode: 0 };
+            if (cmd === "printf ZmlsYXhpcw== | base64 -d") return { stdout: "filaxis", stderr: "", exitCode: 0 };
+            if (cmd === "printf filaxis | sha256sum") return { stdout: `${"0".repeat(64)}  -\n`, stderr: "", exitCode: 0 };
+            if (cmd.startsWith("test -d ")) return { stdout: "", stderr: "", exitCode: 1 };
+            if (cmd.startsWith("(umask 077; case ")) return { stdout: "", stderr: "", exitCode: 0 };
+            if (cmd.startsWith("rm -f ") || cmd.startsWith("rmdir ")) return { stdout: "", stderr: "", exitCode: 0 };
+            if (cmd.includes("printf %s ")) {
+                throw Object.assign(new Error("upload link lost"), { outcome: "unknown" as const });
+            }
+            if (cmd.startsWith("base64 -w 0 < ")) {
+                throw Object.assign(new Error("download link lost"), { outcome: "unknown" as const });
+            }
+            throw Object.assign(new Error("command timed out without sentinel"), { outcome: "unknown" as const });
+        },
+        async destroy() {
+            throw Object.assign(new Error("tmux destroy timed out"), { outcome: "unknown" as const, terminalId: "term-x" });
+        },
+        fs: {
+            readFile: async () => "before",
+            writeFile: async () => { throw Object.assign(new Error("write link lost"), { outcome: "unknown" as const }); },
+            createFile: async () => { throw Object.assign(new Error("create link lost"), { outcome: "unknown" as const }); },
+            exists: async () => true,
+            readdir: async () => [],
+            rm: async () => {},
+            mkdir: async () => {},
+            stat: async () => ({ mtimeMs: 100, size: 6, isDirectory: false }),
+        },
+    } as unknown as import("../src/driver.js").RuntimeDriver;
+
+    await stack.addLayer("mock", drv);
+    const f = mcpFixture(stack);
+    const call = async (id: number, name: string, args: Record<string, unknown>) => {
+        f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+        return (await waitId(f, id, 15_000)).result as {
+            isError: boolean;
+            content: Array<{ type: string; text: string }>;
+            structuredContent?: Record<string, unknown>;
+        };
+    };
+
+    try {
+        const cmdRes = await call(1, "run_command", { layer: "mock", command: "touch /tmp/flag" });
+        expect(cmdRes.isError).toBe(true);
+        expect(cmdRes.structuredContent).toMatchObject({ outcome: "unknown", error: "command timed out without sentinel" });
+        expect(cmdRes.content[0]!.text).toBe("outcome=unknown\ncommand timed out without sentinel");
+
+        const putRes = await call(2, "transfer_file", {
+            layer: "mock", direction: "put", local_path: localSrc, remote_path: "/remote/up.bin",
+        });
+        expect(putRes.isError).toBe(true);
+        expect(putRes.structuredContent).toMatchObject({ outcome: "unknown", error: "upload link lost" });
+        expect(putRes.content[0]!.text).toBe("outcome=unknown\nupload link lost");
+
+        const getRes = await call(3, "transfer_file", {
+            layer: "mock", direction: "get", remote_path: "/remote/down.bin", local_path: localDst,
+        });
+        expect(getRes.isError).toBe(true);
+        expect(getRes.structuredContent).toMatchObject({ outcome: "unknown", error: "download link lost" });
+        expect(getRes.content[0]!.text).toBe("outcome=unknown\ndownload link lost");
+
+        const legacyPut = await call(4, "put_file", {
+            layer: "mock", local_path: localSrc, remote_path: "/remote/legacy-up.bin",
+        });
+        expect(legacyPut.isError).toBe(true);
+        expect(legacyPut.content[0]!.text).toBe("outcome=unknown\nupload link lost");
+
+        const legacyGet = await call(5, "get_file", {
+            layer: "mock", remote_path: "/remote/legacy-down.bin", local_path: localDst,
+        });
+        expect(legacyGet.isError).toBe(true);
+        expect(legacyGet.content[0]!.text).toBe("outcome=unknown\ndownload link lost");
+
+        const editRes = await call(6, "edit_file", {
+            layer: "mock", path: "/remote/note.txt", content: "updated", overwrite: true,
+        });
+        expect(editRes.isError).toBe(true);
+        expect(editRes.structuredContent).toMatchObject({ outcome: "unknown", error: "write link lost" });
+        expect(editRes.content[0]!.text).toBe("outcome=unknown\nwrite link lost");
+
+        const rmLayerRes = await call(7, "manage_layers", { action: "remove", name: "mock", destroy: true });
+        expect(rmLayerRes.isError).toBe(true);
+        expect(rmLayerRes.structuredContent).toMatchObject({ outcome: "unknown", terminalId: "term-x" });
+        expect(rmLayerRes.content[0]!.text).toBe("outcome=unknown\nterminal_id=term-x\ntmux destroy timed out");
+    } finally {
+        f.close();
+        rmSync(dir, { recursive: true, force: true });
     }
 });
 
@@ -675,26 +811,28 @@ test("MCP opens, reads, and closes a continuous window by ID", async () => {
         const opened = await call(1, "observe_stream", { command: "echo MCP_WINDOW" });
         expect(opened.isError).toBe(false);
         const window_id = opened.structuredContent.window_id;
-        const read = await call(2, "read_stream", { window_id, since_seq: 0, wait_ms: 5000 });
+        const read = await call(2, "observe_stream", { window_id, since_seq: 0, wait_ms: 5000 });
         expect(read.structuredContent).toMatchObject({ frames: [{ text: "MCP_WINDOW", stream: "stdout", seq: 1 }] });
         expect(read.content[0]!.text).toContain("[1 stdout] MCP_WINDOW");
         expect(read.content[0]!.text).toContain("last_delivered_seq=1");
         const closed = await call(3, "close_stream", { window_id });
         expect(closed.structuredContent).toEqual({ window_id, closed: true });
-        expect((await call(4, "read_stream", { window_id })).isError).toBe(true);
+        expect((await call(4, "observe_stream", { window_id })).isError).toBe(true);
     } finally {
         fixture.close();
     }
 }, 20_000);
 
-test("read_stream text stays bounded and pages without skipping undisplayed frames", async () => {
+test("observe_stream text stays bounded and pages without skipping undisplayed frames", async () => {
     const stack = new RuntimeStack();
     const toolkit = createAgentToolkit(stack);
     const frames = Array.from({ length: 30 }, (_, index) => ({
         seq: index + 1, ts: 0, stream: index === 1 ? "stderr" as const : "stdout" as const,
         text: `line-${index + 1} ` + "雪".repeat(200) + "\u001b[0m",
     }));
-    toolkit.handlers.read_stream = async ({ window_id, since_seq, before_seq }) => {
+    toolkit.handlers.observe_stream = (async ({ window_id, since_seq, before_seq }: {
+        window_id: string; since_seq?: number; before_seq?: number;
+    }) => {
         const page = window_id === "oversized" ? [{ ...frames[0]!, text: "oversized " + "雪".repeat(4000) }, ...frames.slice(1)] : frames;
         const selected = page.filter(({ seq }) => seq > (since_seq ?? 0) && seq < (before_seq ?? Infinity));
         return {
@@ -702,15 +840,15 @@ test("read_stream text stays bounded and pages without skipping undisplayed fram
             ...(since_seq === undefined ? {} : { last_delivered_seq: selected.at(-1)?.seq ?? since_seq }),
             ...(selected.length ? {} : { timed_out: true }),
         };
-    };
+    }) as typeof toolkit.handlers.observe_stream;
     const fixture = mcpFixture(stack, toolkit);
     const read = async (id: number, args: Record<string, number>, window_id = "fixture") => {
         fixture.write({ jsonrpc: "2.0", id, method: "tools/call", params: {
-            name: "read_stream", arguments: { window_id, ...args },
+            name: "observe_stream", arguments: { window_id, ...args },
         } });
         const result = (await waitId(fixture, id)).result as {
             content: Array<{ text: string }>;
-            structuredContent: Awaited<ReturnType<typeof toolkit.handlers.read_stream>>;
+            structuredContent: Awaited<ReturnType<typeof toolkit.handlers.observe_stream>>;
         };
         const text = result.content[0]!.text;
         expect(Buffer.byteLength(JSON.stringify(text))).toBeLessThanOrEqual(8192);
@@ -749,7 +887,7 @@ test("read_stream text stays bounded and pages without skipping undisplayed fram
 });
 
 describe("MCP layer array fan-out", () => {
-    test("push_ssh validates all batch targets and reports usable layers after partial failure", async () => {
+    test("connect_layer validates all batch targets and reports usable layers after partial failure", async () => {
         const stack = new RuntimeStack();
         const addLayer = stack.addLayer.bind(stack);
         const attempted: Array<{ name: string; descriptor: Parameters<RuntimeStack["addLayer"]>[1] }> = [];
@@ -777,10 +915,10 @@ describe("MCP layer array fan-out", () => {
                 { hosts: ["web"] },
             ];
             for (const [index, args] of invalid.entries()) {
-                expect(await call(index, "push_ssh", args)).toMatchObject({ isError: true });
+                expect(await call(index, "connect_layer", args)).toMatchObject({ isError: true });
             }
             expect(attempted).toHaveLength(0);
-            expect(await call(10, "push_ssh", { targets: [
+            expect(await call(10, "connect_layer", { targets: [
                 "web", "unreachable", { host: "db", name: "database", port: 2222, user: "deploy", jump: "bastion" }, "same-host",
             ] })).toMatchObject({
                 isError: false,
@@ -801,10 +939,11 @@ describe("MCP layer array fan-out", () => {
                 name: "database",
                 descriptor: { driver: "ssh", target: "db", config: { connParams: { port: 2222, user: "deploy", jump: "bastion" } } },
             });
-            expect(await call(11, "push_ssh", { targets: ["unreachable"] })).toMatchObject({
+            expect(await call(11, "connect_layer", { targets: ["unreachable"] })).toMatchObject({
                 structuredContent: { status: "fail", layers: [], active_layer: "database" },
             });
-            expect(await call(12, "push_ssh", { host: "single" })).toMatchObject({
+            expect(await call(12, "connect_layer", { host: "single" })).toMatchObject({
+                content: [{ text: "layer=single | reused=false" }],
                 structuredContent: { layer: "single", reused: false },
             });
         } finally {
@@ -905,4 +1044,95 @@ describe("MCP layer array fan-out", () => {
             expect(res.content[0]!.text).toContain("run_batch");
         } finally { f.close(); }
     });
+
+    test("[P2] legacy 0.2.10 MCP tool names remain callable with original response shapes while hidden from tools/list", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "fx-mcp-legacy-"));
+        const stack = new RuntimeStack();
+        const local = new LocalRuntimeDriver({ cwd: dir });
+        writeFileSync(join(dir, "hello.txt"), "legacy-content");
+        writeFileSync(join(dir, "rm-me.txt"), "bye");
+        writeFileSync(join(dir, "upload-src.bin"), "BIN123");
+        await stack.addLayer("main", local);
+        const f = mcpFixture(stack);
+        const call = async (id: number, name: string, args: Record<string, unknown> = {}) => {
+            f.write({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+            return (await waitId(f, id, 20_000)).result as {
+                isError: boolean; content: Array<{ text: string }>; structuredContent?: Record<string, unknown>;
+            };
+        };
+        try {
+            f.write({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+            const listedTools = ((await waitId(f, 1)).result as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+            expect(listedTools).toHaveLength(12);
+            expect(listedTools).not.toContain("read_file");
+
+            // read_file / list_directory / delete_file
+            const rf = await call(2, "read_file", { path: "hello.txt" });
+            expect(rf.isError).toBe(false);
+            expect(rf.structuredContent).toMatchObject({ path: "hello.txt", content: "legacy-content" });
+            expect(rf.structuredContent).not.toHaveProperty("type");
+            expect((await call(3, "read_file", { path: "." })).isError).toBe(true);
+
+            const ld = await call(4, "list_directory", { path: "." });
+            expect(ld.isError).toBe(false);
+            expect(ld.structuredContent).not.toHaveProperty("type");
+            expect(ld.structuredContent!.entries).toEqual(expect.arrayContaining([expect.objectContaining({ name: "hello.txt" })]));
+
+            expect((await call(5, "delete_file", { path: "rm-me.txt", recursive: true })).isError).toBe(true);
+            const df = await call(6, "delete_file", { path: "rm-me.txt" });
+            expect(df.structuredContent).toEqual({ path: "rm-me.txt", deleted: true });
+            expect(df.content[0]!.text).toBe("deleted=true | path=rm-me.txt");
+
+            // put_file / get_file
+            const pf = await call(7, "put_file", { local_path: join(dir, "upload-src.bin"), remote_path: "uploaded.bin" });
+            expect(pf.isError).toBe(false);
+            expect(pf.structuredContent).toMatchObject({ bytes: 6, verification: "sha256", transport: "exec" });
+            expect(pf.structuredContent).not.toHaveProperty("direction");
+            const gf = await call(8, "get_file", { remote_path: "uploaded.bin", local_path: join(dir, "downloaded.bin") });
+            expect(gf.isError).toBe(false);
+            expect(gf.structuredContent).not.toHaveProperty("direction");
+
+            // observe_stream -> read_stream -> close_stream
+            const obs = await call(9, "observe_stream", { command: "echo LEGACY_FRAME" });
+            const wid = obs.structuredContent!.window_id as string;
+            const rs = await call(10, "read_stream", { window_id: wid, since_seq: 0, wait_ms: 5000 });
+            expect(rs.structuredContent).toMatchObject({ frames: [{ text: "LEGACY_FRAME", seq: 1 }] });
+            expect(rs.content[0]!.text).toContain("[1 stdout] LEGACY_FRAME");
+            expect((await call(11, "close_stream", { window_id: wid })).isError).toBe(false);
+
+            // spawn_and_observe -> stop_and_verify
+            const sp = await call(12, "spawn_and_observe", { command: "echo READY; sleep 5", ready_marker: "READY" });
+            const sid = sp.structuredContent!.session_id as string;
+            const sv = await call(13, "stop_and_verify", { session_id: sid });
+            expect(["stopped", "exited", "unknown"]).toContain(sv.structuredContent!.status as string);
+
+            // list_layers / set_active_layer / remove_layer + push_ssh / push_into
+            await stack.addLayer("alt", {
+                descriptor: { driver: "ssh", target: "alt-host" },
+                exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                init: async () => undefined,
+                destroy: async () => undefined,
+                pushInto: async (cmd: string) => ({
+                    descriptor: { driver: "ssh", target: "alt-host", config: { enterPipeline: [{ cmd }] } },
+                    init: async () => undefined,
+                    destroy: async () => undefined,
+                    exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+                }),
+            } as unknown as import("../src/driver.js").RuntimeDriver);
+            const ll = await call(14, "list_layers");
+            expect(ll.structuredContent).not.toHaveProperty("action");
+            expect(ll.content[0]!.text).toContain("alt");
+            const sal = await call(15, "set_active_layer", { name: "alt" });
+            expect(sal.structuredContent).toEqual({ active_layer: "alt" });
+            const pi = await call(16, "push_into", { enter_cmd: "docker exec -i web sh", name: "web-ctr" });
+            expect(pi.structuredContent).toMatchObject({ layer: "web-ctr" });
+            const rl = await call(17, "remove_layer", { name: "web-ctr" });
+            expect(rl.structuredContent).toEqual({ removed: "web-ctr" });
+            expect((await call(18, "push_ssh", { targets: [] })).isError).toBe(true);
+        } finally {
+            f.close();
+            await Promise.all([...stack.layers.keys()].map((name) => stack.removeLayer(name, { destroy: true })));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 30_000);
 });

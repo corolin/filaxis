@@ -16,7 +16,7 @@
 
 ## 剧本
 
-MCP 长跑任务用 `spawn_and_observe` 启动，保存文本块里的完整 `session_id`、`log_base` 和目标层。持续看日志时，用 `observe_stream` 在同一层跟随 `log_base` 对应的 `.out` 或 `.err`，然后用 `read_stream` 续读。关闭观察窗会回收观察命令。任务自然退出后，用完整 `session_id` 调 `stop_and_verify` 获取可核实的退出码。会话归属缓存过期时，使用原目标层的 `layer`。
+MCP 长跑任务用 `start_session` 启动，保存文本块里的完整 `session_id`、`log_base` 和目标层。持续看日志时，用 `observe_stream` 在同一层传 `command` 跟随 `log_base` 对应的 `.out` 或 `.err`（并可带 `wait_ms` 直接读首屏帧），后续再传同一 `window_id` 调 `observe_stream` 续读，用 `close_stream` 回收观察命令。任务自然退出后，用完整 `session_id` 调 `stop_session` 获取可核实的退出码。会话归属缓存过期时，使用原目标层的 `layer`。
 
 1. **启动即返，不要阻塞在 execSession**：长跑任务是会话不是 exec——`execSession` 返回句柄（`sessionId`/`logBase`/`pid`）后立刻挂 watcher，人再离开。
 2. **watcher 三态用法**：

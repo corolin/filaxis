@@ -54,3 +54,25 @@ if ([IO.File]::Exists($target)) {
     }
 }
 `);
+
+export const windowsPlaceExclusivePayload = powershell(`
+$source = $env:FILAXIS_UPLOAD_SOURCE
+$target = $env:FILAXIS_UPLOAD_TARGET
+if (Test-Path -LiteralPath $target) {
+    Write-Output 'FX_ALREADY_EXISTS'
+    exit 1
+}
+try {
+    [IO.File]::Move($source, $target)
+} catch [IO.IOException] {
+    if (Test-Path -LiteralPath $target) {
+        Write-Output 'FX_ALREADY_EXISTS'
+        exit 1
+    }
+    throw
+}
+& icacls.exe $target /reset | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw 'Upload was published but its inherited ACL could not be applied'
+}
+`);

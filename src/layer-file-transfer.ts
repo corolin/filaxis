@@ -45,11 +45,13 @@ export async function transferLayerFile(
     const auditLabel = operation === "put" ? "file upload" : "file download";
     const exec = (command: string) => driver.exec(command, { timeoutMs, auditLabel });
     const dialect = await probeDialect(exec);
+    const isTmux = driver.descriptor.driver === "tmux" || Boolean(driver.descriptor.terminalId) || "terminal" in driver;
+    const chunkB64 = isTmux ? 12_000 : undefined;
     const result = operation === "put"
         ? (sftp ? await sftpPutFile(exec, dialect, localPath, layerPath, sftp)
-            : await putFile(exec, dialect, localPath, layerPath, { forceInplace }))
+            : await putFile(exec, dialect, localPath, layerPath, { chunkB64, forceInplace }))
         : (sftp ? await sftpGetFile(exec, dialect, layerPath, localPath, sftp)
-            : await getFile(exec, dialect, layerPath, localPath));
+            : await getFile(exec, dialect, layerPath, localPath, { chunkB64 }));
     return { transport, ...result };
 }
 

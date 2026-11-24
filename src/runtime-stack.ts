@@ -368,7 +368,7 @@ export class RuntimeStack {
     //   - 派生：pushChild/pushInto（ssh PTY 原语，派生即 init）——父子关系由
     //     descriptor 继承天然记录（connParams/sshHops/enterPipeline 全量继承）
     //   - 回环检测幂等返回：同落点 identity 命中 → 返回既有层 reused:true（原版
-    //     push_ssh 判重语义的 Paramiko 化——报错是栈时代的脾气）+ 落点校验
+    //     SSH 连接判重语义的 Paramiko 化——报错是栈时代的脾气）+ 落点校验
     //     （hostname 实测 vs 期望，不符=撞了途经节点 → 拒绝，宁重连不错主机）
     //   - snapshot/restore：descriptor 即层身份（tmux 层 terminalId 零成本
     //     re-attach 现场全保；ssh 层重握手 + enterPipeline 逐条重放=位置确定性恢复）
@@ -679,7 +679,7 @@ export class RuntimeStack {
 
     /**
      * descriptor 落点 identity（路径末节点）比对既有层全部路径节点。
-     * 判重边界（原版 push_ssh 语义忠实平移）：**只在无 enter 管线的纯 ssh 落点层之间**——
+     * 判重边界（原版 SSH 建层语义忠实平移）：**只在无 enter 管线的纯 ssh 落点层之间**——
      * enter 层（容器/内层 shell）的落点是容器而非宿主机，hop identity 管不到（enter 管线
      * 不进 layerPathIdentities）：同宿主机两个不同容器层会撞 identity + hostname 同为宿主机
      * → 误幂等返回错容器。enter 层的身份与复用归 driverKey（含 enters 三列）。

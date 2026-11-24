@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.10"
+  version: "0.2.11"
 description: |
   Use Filaxis (@syrkos/filaxis) to run commands across layers, batch inspections, manage background jobs, follow logs, or operate on files.
   Also use it to diagnose SSH aliases and jump hosts or interpret unknown outcomes and write guarantees. Skip for simple local shell commands and tasks unrelated to Filaxis.
@@ -27,13 +27,13 @@ Match the task to an entry point and read the relevant playbook. After execution
 |---|---|
 | Wait for one finite command and collect its exit code | `run_command` |
 | Batch inspections or apply dependencies across layers | `run_batch`. For bastions or multi-host investigation, read [Cross-host diagnosis](./cross-host-diagnosis.md) |
-| Start a background service, wait for readiness, or verify its exit code | `spawn_and_observe` → `stop_and_verify`. Read [Long-running jobs](./longrun-observe.md) |
-| Follow logs with a cursor and close the view when finished | `observe_stream` → `read_stream` → `close_stream`. Read [Observation windows](./stream-window.md) |
-| List a directory, read, edit, transfer, or delete a file | `list_directory`, `read_file`, `edit_file`, `put_file`, `get_file`, `delete_file`. Read [File operations](./file-sync.md) |
-| Switch back to an existing layer as the default | Find its name with `list_layers` and call `set_active_layer`. Pass `layer` for a one-call override |
+| Start a background service, wait for readiness, or verify its exit code | `start_session` → `stop_session`. Read [Long-running jobs](./longrun-observe.md) |
+| Follow logs with a cursor and close the view when finished | `observe_stream` (open/read) → `close_stream`. Read [Observation windows](./stream-window.md) |
+| Read/list, edit/create, mkdir/move/delete, or transfer files | `read_path`, `edit_file`, `manage_path`, `transfer_file`. Read [File operations](./file-sync.md) |
+| List, activate, or remove registered layers | `manage_layers` (`action: "list" \| "activate" \| "remove"`); connect or enter inner layers with `connect_layer` |
 | Observe a command for a limited interval in the CLI | `filaxis observe` |
 
-For work expected to take over two minutes, such as an OS upgrade or a long build, start a session with `spawn_and_observe`. In one Antigravity run, the host ended an MCP call at about three minutes. A tool's `timeout_ms` cannot extend the host deadline. Follow the [long-running jobs playbook](./longrun-observe.md) to read the logs and verify the outcome.
+For work expected to take over two minutes, such as an OS upgrade or a long build, start a session with `start_session`. In one Antigravity run, the host ended an MCP call at about three minutes. A tool's `timeout_ms` cannot extend the host deadline. Follow the [long-running jobs playbook](./longrun-observe.md) to read the logs and verify the outcome.
 
 ## CLI quick start
 
@@ -66,16 +66,16 @@ filaxis exec --layer <name> --timeout 8000 -- "(printf 'PING\n'; sleep 1) | nc 1
 
 ## MCP Practical Guidelines
 
-- **Batch inspection and multi-step fixes with `run_batch`**: Combine multiple `read_file`, `run_command`, `edit_file`, `put`, and `get` steps into a single parallel `run_batch` call instead of sequential single-tool loops.
-- **Batch SSH connections**: Call `push_ssh` with `{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`. Strings can be SSH config aliases resolved in the runtime environment. Targets are attempted in order and individual connection failures are reported without stopping the batch. Pass the deduplicated `layers` from successful and reused connections directly to `run_batch.layer`. `active_layer` reports the default layer at the end of the call.
+- **Batch inspection and multi-step fixes with `run_batch`**: Combine multiple `read`, `exec`, `edit`, `put`, and `get` steps into a single parallel `run_batch` call instead of sequential single-tool loops.
+- **Layer connections (`connect_layer`)**: Connect a single SSH host (`host`), a batch (`{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`), or enter an inner container/shell (`enter_cmd`). Strings can be SSH config aliases resolved in the runtime environment. Batch targets are attempted in order and individual failures are reported without stopping the batch. Pass the deduplicated `layers` from successful and reused connections directly to `run_batch.layer`. `active_layer` reports the default layer at the end of the call.
 - **Layer targeting precedence & multi-layer fan-out**: Both top-level `layer` and per-step `layer` accept either a single layer name or a non-empty array of layer names (top-level sets the batch default; per-step overrides only that step; omitting both uses the active default layer). Multi-layer arrays expand each step into `id@layer` instances that run in parallel up to `max_parallel` (single-element arrays keep the original `id`), and downstream `after` dependencies wait for all expanded instances to succeed (`kind: "get"` rejects multi-layer arrays to avoid overwriting the same `local_path`). `filaxis batch --request-file plan.json` shares the same precedence and array expansion (step `layer` > plan `layer` > `--layer`/`--host` > local).
 - **Local targeting**: Layer arrays look up registered or saved names. SDK callers can register the local host with `stack.addLayer("local", { driver: "local" })`. The CLI and standalone MCP server leave the local default unnamed.
 - **Concurrency & ordering (`max_parallel` and `after`)**: Independent steps run in parallel up to `max_parallel`. Use `after: ["step-id"]` to serialize dependent steps (e.g., edit config -> validate -> reload service), even across layers.
 - **Resource coordination**: `after` references the original step IDs declared in the same batch. Fan-out executes once per layer name, and different names may point to the same environment. Serialize operations that modify the same resource using its environment identity and file path.
 - **Text vs. structured output**: `run_batch` text previews share 4 KiB across streams and cap at 8 KiB total (prioritizing failed steps and edit guarantees). Clients that only read text blocks can pass `output: "text"`; use the default `output: "full"` to read full `structuredContent`. `run_command` previews up to 8 KiB per stream.
-- **Start working right after connecting**: Do not waste turns running `hostname` or `list_layers` after `push_ssh`/`push_into` — the first `run_command`'s exit code and output confirm the layer.
-- **Targeted file reading & minimal edits**: Inspect specific line ranges or recent logs (`sed -n '20,40p' <path>` or `docker logs --tail 30 <container>`). For `edit_file`, copy only the exact target lines with minimal unique context into `old`.
-- **Single vs. batch file transfer**: Use `put_file` / `get_file` for individual files (`local_path` is on the MCP server host; `remote_path` is in the target layer; pass `transport: "sftp"` when the SSH server exposes the target filesystem directly). Use `kind: "put"` / `kind: "get"` steps in `run_batch` for multiple files, ordering concurrent writes to the same path with `after`.
+- **Start working right after connecting**: Do not waste turns running `hostname` or `manage_layers(action="list")` after `connect_layer` — the first `run_command`'s exit code and output confirm the layer.
+- **Targeted file reading & minimal edits**: Inspect specific line ranges or recent logs (`sed -n '20,40p' <path>` or `docker logs --tail 30 <container>`). For `edit_file`, copy only the exact target lines with minimal unique context into `old` (or pass `content` to create a new UTF-8 file).
+- **Single vs. batch file transfer**: Use `transfer_file` (`direction: "put" | "get"`) for individual files (`local_path` is on the MCP server host; `remote_path` is in the target layer; pass `transport: "sftp"` when the SSH server exposes the target filesystem directly). Use `kind: "put"` / `kind: "get"` steps in `run_batch` for multiple files, ordering concurrent writes to the same path with `after`.
 - **Restricted pipe environments & Windows OpenSSH**: If the host restricts anonymous pipes, set `FILAXIS_SSH_STDIO_MODE=inherit` before starting the CLI/MCP server or creating SSH layers in the SDK (supports direct SSH, single `-J` jump, and non-interactive entry steps; live stream windows and interactive PTY chains require pipes). On Windows, Filaxis restores missing `SystemRoot`, `windir`, `ProgramData`, and `USERNAME` for OpenSSH child processes and logs a single stderr warning when restoring `SystemRoot`.
 
 ---
@@ -135,10 +135,10 @@ await stack.removeLayer("prod", { destroy: true });
 
 | Contract | Rule |
 |---|---|
-| **Tri-state termination** | `stop_and_verify` / `stopSession` returns `exited` (verified exit code), `stopped` (verified termination), or `unknown` (verification unreachable — **neither success nor failure**). Verify with `verifySession(id)` / `stop_and_verify` instead of assuming cleanup succeeded. |
+| **Tri-state termination** | `stop_session` / `stopSession` returns `exited` (verified exit code), `stopped` (verified termination), or `unknown` (verification unreachable — **neither success nor failure**). Verify with `verifySession(id)` / `stop_session` instead of assuming cleanup succeeded. |
 | **Exit code is data** | Nonzero command exit codes do **not** throw in `exec` / `run_command`. Only execution failures (timeout, abort, dead transport) reject or error. |
 | **Completion sentinel required** | Missing completion markers (disconnect, remote kill, local abort) produce `outcome: "unknown"` — never fabricate exit code `0` and never blindly replay non-idempotent commands. |
-| **No never-ending commands in `exec`** | `exec` / `run_command` waits for completion — `tail -f` or `top` will time out. Use `observe_stream` (for streaming logs) or `spawn_and_observe` (for managed background jobs). |
+| **No never-ending commands in `exec`** | `exec` / `run_command` waits for completion — `tail -f` or `top` will time out. Use `observe_stream` (for streaming logs) or `start_session` (for managed background jobs). |
 | **Controlled edits** | CAS stands for compare-and-swap. Filaxis checks modification time, size, and a content fingerprint before writing and rejects a version conflict. Check `mutex` and `write_mode` separately. For file transfers, check `verification`. |
 | **PTY combines stderr** | `channel: "pty"` merges stdout and stderr by terminal semantics; default `exec` keeps them separate. |
 | **SSH aliases are host-local** | `--host` and `-J` / `jump` aliases resolve against the runtime host's `~/.ssh/config`. Use explicit `user@host[:port]` literals when running across containers or sandboxes. |
@@ -159,9 +159,9 @@ Additional detailed scenario playbooks in `docs/skills/`:
 
 ## Troubleshooting Checklist
 
-1. **Layer connection failure** — Check whether an SSH config alias is missing in the current container/runtime environment or whether a comma-chained `-J` hop needs `push_ssh` + `push_into` instead.
+1. **Layer connection failure** — Check whether an SSH config alias is missing in the current container/runtime environment or whether a comma-chained `-J` hop needs two `connect_layer` calls (`host` then `enter_cmd`) instead.
 2. **Missing log output** — Inspect on-disk `.out`/`.err` session logs if hot-window lines were evicted (`evictedCount > 0`), or check `dropped` / `gap` counters on observation streams.
-3. **Uncertain stop result** — Call `stop_and_verify` / `verifySession(id)` whenever `status === "unknown"`.
+3. **Uncertain stop result** — Call `stop_session` / `verifySession(id)` whenever `status === "unknown"`.
 4. **Uncertain file write guarantees** — Check `mutex`, `write_mode`, and `verification` in the structured result; pass `write_mode: "inplace"` upfront for Docker single-file bind mounts.
 
 ## Project Policy Tips
