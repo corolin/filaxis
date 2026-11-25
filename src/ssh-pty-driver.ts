@@ -33,6 +33,7 @@ import {
     sshArgsFor, renderExecChannel, shellQuote, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
 } from "./ssh-helpers.js";
 import { RemoteSessionManager } from "./remote-session-manager.js";
+import { SshForwardManager, type ForwardDeps, type OpenForwardSpec, type ForwardInfo, type CloseForwardResult } from "./ssh-forward.js";
 import { probeDialect, type RemoteDialect } from "./dialect.js";
 import { decodeFileRead, writeInplaceContent } from "./file-transfer.js";
 import { buildPosixRenameCmd, buildPosixRmGuardCmd, throwRemoteFsCmdError } from "./file-placement.js";
@@ -423,6 +424,8 @@ export function resolveLayerState(
 
 export interface SshPtyDriverOptions {
     logger?: FilaxisLogger;
+    /** @internal 测试注入转发依赖 */
+    _forwardDeps?: ForwardDeps;
 }
 
 /** SSH Transport driver：每层一条独立多跳 PTY + 双通道 exec + 远端会话/文件 */
@@ -447,6 +450,12 @@ export class SshPtyDriver implements RuntimeDriver {
     /** 在途重连定时器（Sol 88 P1-10）：exit() 显式清——到期复查之外的双保险 */
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly log: FilaxisLogger;
+    private readonly forwardDeps?: ForwardDeps;
+    private forwardManager?: SshForwardManager;
+    /** @internal 转发意外退出订阅集（供 RuntimeStack 桥接） */
+    readonly forwardControl = {
+        subs: new Set<(info: ForwardInfo) => void>(),
+    };
 
     private static readonly MAX_RECONNECT = 3;
     private static readonly RECONNECT_DELAYS_MS = [2_000, 5_000, 10_000];
@@ -459,6 +468,7 @@ export class SshPtyDriver implements RuntimeDriver {
         assertNoLikelyTypoKeys(descriptor.config as Record<string, unknown> | undefined, "ssh 层配置");
         this.descriptor = descriptor;
         this.log = opts.logger ?? noopLogger;
+        this.forwardDeps = opts._forwardDeps;
         const self = this;
         const fsExec = async (cmd: string) => self.execChannel(cmd, undefined);
         let writeDialect: Promise<RemoteDialect> | undefined;
@@ -745,6 +755,7 @@ export class SshPtyDriver implements RuntimeDriver {
         this.layerState = "dead";
         if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; } // 排程中的重连不再到期拉新进程（Sol 88 P1-10）
         this.link.kill();
+        await this.forwardManager?.closeAll().catch(() => undefined);
     }
 
     async destroy(): Promise<void> { await this.exit(); }
@@ -1021,6 +1032,56 @@ export class SshPtyDriver implements RuntimeDriver {
         return this.sessions.verify(sessionId);
     }
     listSessions() { return this.sessions.list(); }
+
+    // ── 动态端口转发（-L / -R / -D，REQ-0005）──
+    private ensureForwardManager(): SshForwardManager {
+        if (!this.forwardManager) {
+            const target = this.descriptor.target ?? "";
+            const connParams = this.descriptor.config?.connParams as SshConnParams | undefined;
+            const rootHop: SshHop = connParams ? { host: target, conn: connParams } : target;
+            const tunnelHop: SshHop = connParams
+                ? { host: target, conn: { ...connParams, forwards: undefined } }
+                : target;
+            this.forwardManager = new SshForwardManager({
+                destArgs: sshArgsFor(tunnelHop),
+                muxDestArgs: sshArgsFor(rootHop),
+                connParams,
+                enterSteps: enterStepsOf(this.descriptor.config as Record<string, unknown> | undefined),
+                execInLayer: (cmd, execOpts) => this.exec(cmd, execOpts),
+                logger: this.log,
+                onForwardExit: (info) => {
+                    for (const fn of this.forwardControl.subs) {
+                        try { fn(info); } catch { /* 订阅方异常不外溢 */ }
+                    }
+                },
+                _deps: this.forwardDeps,
+            });
+        }
+        return this.forwardManager;
+    }
+
+    async openForward(spec: OpenForwardSpec): Promise<ForwardInfo> {
+        if (this.useFileStdio) throw fileStdioUnsupported("动态端口转发");
+        if (!this.alive || this.layerShellGone || this.reconnecting) {
+            throw new Error("SSH 层当前不可用，无法打开动态端口转发");
+        }
+        const hops = this.descriptor.config?.sshHops;
+        if (Array.isArray(hops) && hops.length > 0) {
+            throw new Error("动态端口转发需要可直连或经 -J 跳板的 SSH 层，逐跳 PTY 登录链不可用");
+        }
+        return this.ensureForwardManager().openForward(spec);
+    }
+
+    async closeForward(forwardId: string): Promise<CloseForwardResult> {
+        if (!this.forwardManager) {
+            throw new Error(`转发 '${forwardId}' 不存在`);
+        }
+        return this.forwardManager.closeForward(forwardId);
+    }
+
+    listForwards(): ForwardInfo[] {
+        return this.forwardManager ? this.forwardManager.listForwards() : [];
+    }
 }
 
 /** shell 单引号安全引用 */

@@ -18,8 +18,10 @@ import { transferLayerFile, validateFileTransferFields, type FileTransferTranspo
 import type { TransferResult } from "./file-transfer.js";
 import { BATCH_STEP_KINDS, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
 import type { FileEntry, RuntimeDriver } from "./driver.js";
-import { SessionOwnership, type StopResult } from "./session-ownership.js";
+import type { SessionOwnership as _SessionOwnership, StopResult } from "./session-ownership.js";
+import { SessionOwnership } from "./session-ownership.js";
 import { sshArgsFor } from "./ssh-helpers.js";
+import type { ForwardInfo, OpenForwardSpec } from "./ssh-forward.js";
 
 export interface AgentToolDef {
     type: "function";
@@ -136,7 +138,10 @@ export type ManagePathResult =
 export type ManageLayersResult =
     | { action: "list"; text: string; layers: Array<{ name: string; driver: string; target?: string }> }
     | { action: "activate"; active_layer: string }
-    | { action: "remove"; removed: string };
+    | { action: "remove"; removed: string }
+    | { action: "forward_add"; forward: ForwardInfo }
+    | { action: "forward_list"; forwards: ForwardInfo[] }
+    | { action: "forward_remove"; forward_id: string; status: "stopped" | "already_closed" | "unknown"; detail?: string };
 
 export interface AgentToolHandlers {
     run_command(args: { command: string; timeout_ms?: number; layer?: string }): Promise<{
@@ -168,6 +173,19 @@ export interface AgentToolHandlers {
     manage_layers(args: { action: "list" }): Promise<Extract<ManageLayersResult, { action: "list" }>>;
     manage_layers(args: { action: "activate"; name: string }): Promise<Extract<ManageLayersResult, { action: "activate" }>>;
     manage_layers(args: { action: "remove"; name: string; destroy?: boolean }): Promise<Extract<ManageLayersResult, { action: "remove" }>>;
+    manage_layers(args: {
+        action: "forward_add";
+        kind: "local" | "remote" | "dynamic" | "L" | "R" | "D";
+        bind_port?: number;
+        bind_addr?: string;
+        target_host?: string;
+        target_port?: number;
+        forward_id?: string;
+        timeout_ms?: number;
+        layer?: string;
+    }): Promise<Extract<ManageLayersResult, { action: "forward_add" }>>;
+    manage_layers(args: { action: "forward_list"; layer?: string }): Promise<Extract<ManageLayersResult, { action: "forward_list" }>>;
+    manage_layers(args: { action: "forward_remove"; forward_id: string; layer?: string }): Promise<Extract<ManageLayersResult, { action: "forward_remove" }>>;
     // ── 兼容 0.2.10 旧工具名直调（不进入 tools/list，仅 handlers/MCP call 适配器）──
     spawn_and_observe(args: { command: string; ready_marker?: string; error_pattern?: string; name?: string; layer?: string }): Promise<{
         session_id: string; log_base: string; note?: string;
@@ -210,6 +228,8 @@ export interface AgentToolkitOptions {
     /** 层描述符（缺省 local）；也可直接传已连接的 driver */
     descriptor?: { driver: string; target?: string; config?: Record<string, unknown> };
     driver?: RuntimeDriver;
+    /** 外部共享观察窗注册表（Daemon/Proxy 共享现场时注入；省略则每工具集自建自销） */
+    windowRegistry?: StreamWindowRegistry;
     /** 就绪握手与 watcher 轮询的超时上限 */
     readyTimeoutMs?: number;
     /** Retain confirmed results after releasing their driver reference. */
@@ -717,16 +737,30 @@ export const TOOL_DEFS: AgentToolDef[] = [
         function: {
             name: "manage_layers",
             description:
-                "查询、切换或移除已注册命名层：action='list' 列出全部命名层及链路/状态/有效用户/默认标记；" +
+                "查询、切换、移除已注册命名层或管理动态端口转发：action='list' 列出全部命名层及链路/状态/有效用户/默认标记；" +
                 "action='activate' 将指定 name 设为默认层（保留所有连接）；" +
-                "action='remove' 移出指定层（缺省保留连接在指纹缓存以便零成本重建，传 destroy=true 才真销毁连接）。" +
+                "action='remove' 移出指定层（缺省保留连接在指纹缓存以便零成本重建，传 destroy=true 才真销毁连接）；" +
+                "action='forward_add' 在目标或默认 SSH 层动态开启 -L/-R/-D 端口转发（bind_port 不填或传 0 自动分配空闲端口）；" +
+                "action='forward_list' 查询动态端口转发列表；action='forward_remove' 关闭指定 forward_id。" +
                 "新建 SSH 或进入内层环境请用 connect_layer。",
             parameters: {
                 type: "object",
                 properties: {
-                    action: { type: "string", enum: ["list", "activate", "remove"], description: "层管理操作" },
+                    action: {
+                        type: "string",
+                        enum: ["list", "activate", "remove", "forward_add", "forward_list", "forward_remove"],
+                        description: "层与动态转发管理操作",
+                    },
                     name: { ...layerNameSchema, description: "目标层名（action=activate/remove 时必填）" },
                     destroy: { type: "boolean", description: "action=remove：是否真销毁底层连接（缺省 false=保留可复用）" },
+                    layer: { ...layerNameSchema, description: "action=forward_*：目标层名（缺省=默认层；forward_list 缺省=全部层）" },
+                    kind: { type: "string", enum: ["local", "remote", "dynamic", "L", "R", "D"], description: "action=forward_add：转发类型" },
+                    bind_addr: { type: "string", minLength: 1, description: "action=forward_add：绑定地址，缺省 127.0.0.1" },
+                    bind_port: { type: "integer", minimum: 0, maximum: 65535, description: "action=forward_add：绑定端口（省略或传 0=自动分配随机空闲端口）" },
+                    target_host: { type: "string", minLength: 1, description: "action=forward_add（local/remote 必填）：目标主机" },
+                    target_port: { type: "integer", minimum: 1, maximum: 65535, description: "action=forward_add（local/remote 必填）：目标端口" },
+                    forward_id: { type: "string", minLength: 1, description: "action=forward_add 可选自定义 ID；action=forward_remove 必填转发 ID" },
+                    timeout_ms: { type: "integer", minimum: 1, maximum: 2147483647, description: "action=forward_add：建链超时毫秒数，缺省 15000" },
                 },
                 oneOf: [
                     {
@@ -754,6 +788,41 @@ export const TOOL_DEFS: AgentToolDef[] = [
                         },
                         required: ["action", "name"],
                     },
+                    {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            action: { type: "string", const: "forward_add" },
+                            kind: { type: "string", enum: ["local", "remote", "dynamic", "L", "R", "D"] },
+                            bind_port: { type: "integer", minimum: 0, maximum: 65535 },
+                            bind_addr: { type: "string", minLength: 1 },
+                            target_host: { type: "string", minLength: 1 },
+                            target_port: { type: "integer", minimum: 1, maximum: 65535 },
+                            forward_id: { type: "string", minLength: 1 },
+                            timeout_ms: { type: "integer", minimum: 1, maximum: 2147483647 },
+                            layer: { ...layerNameSchema },
+                        },
+                        required: ["action", "kind"],
+                    },
+                    {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            action: { type: "string", const: "forward_list" },
+                            layer: { ...layerNameSchema },
+                        },
+                        required: ["action"],
+                    },
+                    {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            action: { type: "string", const: "forward_remove" },
+                            forward_id: { type: "string", minLength: 1 },
+                            layer: { ...layerNameSchema },
+                        },
+                        required: ["action", "forward_id"],
+                    },
                 ],
             },
         },
@@ -762,6 +831,10 @@ export const TOOL_DEFS: AgentToolDef[] = [
 
 /** 生成 Agent 工具集（定义层 + 执行层；宿主桥接到任意 LLM 框架） */
 export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOptions = {}): AgentToolkit {
+    const unregisteredDriver = () => {
+        const driver = opts.driver;
+        return driver && !stack.hasForwardDriver(driver) ? driver : undefined;
+    };
     // 初始层（Hydrogen R7 #4）：descriptor 形态注册进命名表（manage_layers list 可见、
     // connect_layer enter_cmd 无 from 时 activeLayer 有源）+ 失败不缓存（rejected Promise 永久
     // 复用=不自愈；每次工具调用重连）。driver 直注形态不注册（外部生命周期）
@@ -907,7 +980,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         validateFileTransferFields(operation, fields);
         return agentTransferResult(await transferLayerFile(await resolveDrv(layerName), operation, fields));
     };
-    let windowRegistry: StreamWindowRegistry | undefined;
+    let windowRegistry: StreamWindowRegistry | undefined = opts.windowRegistry;
     let observationDisposed = false;
     const requireWindow = (windowId: string) => {
         if (typeof windowId !== "string" || !windowId.trim()) throw new Error("window_id 需为非空字符串，请使用 observe_stream 返回的 window_id");
@@ -1135,7 +1208,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         tools: TOOL_DEFS,
         dispose() {
             observationDisposed = true;
-            windowRegistry?.dispose();
+            if (!opts.windowRegistry) windowRegistry?.dispose();
         },
         get layer(): Promise<RuntimeDriver> { return layer(); }, // 惰性 getter（失败不缓存+注册命名表——Hydrogen R7 #4）
         handlers: {
@@ -1441,7 +1514,78 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     await stack.removeLayer(name, { destroy: destroy === undefined ? undefined : Boolean(destroy) });
                     return { action: "remove" as const, removed: name };
                 }
-                throw new Error('manage_layers 的 action 须为 "list"、"activate" 或 "remove"');
+                if (action === "forward_add") {
+                    const {
+                        layer: layerName, kind, bind_addr, bind_port, target_host, target_port, forward_id, timeout_ms,
+                        ...extra
+                    } = rest;
+                    const unknown = Object.keys(extra);
+                    if (unknown.length) throw new Error(`manage_layers(forward_add) 未知参数：${unknown.join(", ")}`);
+                    assertOptionalLayerName(layerName);
+                    if (bind_addr !== undefined && typeof bind_addr !== "string") throw new Error("bind_addr 需为字符串");
+                    if (target_host !== undefined && typeof target_host !== "string") throw new Error("target_host 需为字符串");
+                    if (forward_id !== undefined && (typeof forward_id !== "string" || !forward_id.trim())) {
+                        throw new Error("forward_id 需为非空字符串");
+                    }
+                    const spec: OpenForwardSpec = {
+                        kind: kind as OpenForwardSpec["kind"],
+                        ...(bind_port !== undefined ? { bindPort: bind_port as number } : {}),
+                        ...(typeof bind_addr === "string" ? { bindAddr: bind_addr } : {}),
+                        ...(typeof target_host === "string" ? { targetHost: target_host } : {}),
+                        ...(target_port !== undefined ? { targetPort: target_port as number } : {}),
+                        ...(typeof forward_id === "string" ? { id: forward_id } : {}),
+                        ...(timeout_ms !== undefined ? { timeoutMs: timeout_ms as number } : {}),
+                    };
+                    const selectedLayer = layerName ?? stack.activeLayer?.name;
+                    if (selectedLayer !== undefined) {
+                        if (spec.id && unregisteredDriver()?.listForwards?.().some((f) => f.forwardId === spec.id)) {
+                            throw new Error(`转发 ID '${spec.id}' 已存在于注入驱动`);
+                        }
+                        return { action: "forward_add" as const, forward: await stack.openForward(spec, selectedLayer) };
+                    }
+                    const drv = await layer();
+                    if (stack.layers.get(INITIAL_LAYER_NAME)?.driver === drv) {
+                        return { action: "forward_add" as const, forward: await stack.openForward(spec, INITIAL_LAYER_NAME) };
+                    }
+                    if (typeof drv.openForward !== "function") {
+                        throw new Error(`层 '${drv.descriptor.driver}' 不支持动态端口转发`);
+                    }
+                    if (spec.id && stack.listForwards().some((f) => f.forwardId === spec.id)) {
+                        throw new Error(`转发 ID '${spec.id}' 已存在于已注册层`);
+                    }
+                    return { action: "forward_add" as const, forward: await drv.openForward(spec) };
+                }
+                if (action === "forward_list") {
+                    const { layer: layerName, ...extra } = rest;
+                    const unknown = Object.keys(extra);
+                    if (unknown.length) throw new Error(`manage_layers(forward_list) 未知参数：${unknown.join(", ")}`);
+                    assertOptionalLayerName(layerName);
+                    const registered = stack.listForwards(layerName);
+                    const external = layerName === undefined ? unregisteredDriver()?.listForwards?.() ?? [] : [];
+                    return { action: "forward_list" as const, forwards: [...registered, ...external] };
+                }
+                if (action === "forward_remove") {
+                    const { forward_id, layer: layerName, ...extra } = rest;
+                    const unknown = Object.keys(extra);
+                    if (unknown.length) throw new Error(`manage_layers(forward_remove) 未知参数：${unknown.join(", ")}`);
+                    assertOptionalLayerName(layerName);
+                    if (typeof forward_id !== "string" || !forward_id.trim()) throw new Error("forward_id 需为非空字符串");
+                    const external = layerName === undefined ? unregisteredDriver() : undefined;
+                    const registered = external && stack.listForwards().some((f) => f.forwardId === forward_id);
+                    if (registered && external?.listForwards?.().some((f) => f.forwardId === forward_id)) {
+                        throw new Error(`转发 ID '${forward_id}' 同时存在于命名层和注入驱动，请明确指定命名层`);
+                    }
+                    const res = !registered && typeof external?.closeForward === "function"
+                        ? await external.closeForward(forward_id)
+                        : await stack.closeForward(forward_id, layerName);
+                    return {
+                        action: "forward_remove" as const,
+                        forward_id: res.forwardId,
+                        status: res.status,
+                        ...(res.detail ? { detail: res.detail } : {}),
+                    };
+                }
+                throw new Error('manage_layers 的 action 须为 "list"、"activate"、"remove"、"forward_add"、"forward_list" 或 "forward_remove"');
             }) as AgentToolHandlers["manage_layers"],
             async run_batch({ steps, stop_on_fail, max_parallel, layer: layerName, output, ...unknownArgs }) {
                 if (!Array.isArray(steps) || !steps.length) throw new Error(`steps 需为非空数组，每步提供 id 和 kind（${BATCH_STEP_KINDS.join("、")}）`);

@@ -478,7 +478,7 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
                     ...(transport === "sftp" ? { FILAXIS_SSH_STDIO_MODE: "inherit" } : {}),
                 };
                 const cli = (command: "put" | "get", from: string, to: string) => JSON.parse(execFileSync(
-                    process.execPath, ["bin/filaxis.ts", command, ...options, "--", from, to], { encoding: "utf8", env },
+                    process.execPath, ["bin/filaxis.ts", command, ...options, "--", from, to], { encoding: "utf8", env, windowsHide: true },
                 ));
                 expect(cli("put", input, `${name} file.bin`)).toMatchObject({ transport, bytes: payload.length, verification: "sha256", writeMode: "atomic-replace" });
                 expect(cli("get", `${name} file.bin`, output)).toMatchObject({ transport, bytes: payload.length, verification: "sha256" });
@@ -613,7 +613,7 @@ describe("第四季：PTY 残影串台回归（CI 真机）", () => {
 // ── 第九季：CLI 路径描述透传（--enter 重放 / --docker 糖全链路 / --hop 拒绝）──
 describe("第九季：CLI 路径描述（CI 真机）", () => {
     integration("--enter sh：exec 通道进入管线重放（stdin 管道零嵌套引用）", async () => {
-        const out = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--host", TARGET, "--enter", "sh", "--", "echo ENTER_OK"], { encoding: "utf-8" });
+        const out = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--host", TARGET, "--enter", "sh", "--", "echo ENTER_OK"], { encoding: "utf-8", windowsHide: true });
         expect(out).toContain("ENTER_OK");
     }, 60_000);
 
@@ -625,14 +625,15 @@ describe("第九季：CLI 路径描述（CI 真机）", () => {
             if (started.exitCode !== 0) throw new Error(started.stderr);
             const args = ["bin/filaxis.ts"];
             const layer = ["--host", TARGET, "--docker", container];
-            const out = execFileSync(process.execPath, [...args, "exec", ...layer, "--", "echo DOCKER_OK; cat /etc/alpine-release"], { encoding: "utf-8" });
+            const out = execFileSync(process.execPath, [...args, "exec", ...layer, "--", "echo DOCKER_OK; cat /etc/alpine-release"], { encoding: "utf-8", windowsHide: true });
             expect(out).toContain("DOCKER_OK");
             expect(out).toMatch(/\d+\.\d+\.\d+/);
             const path = "/tmp/fx-cli-edit.json";
-            execFileSync(process.execPath, [...args, "exec", ...layer, "--", `printf '{"k": 1}' > ${path}`]);
+            execFileSync(process.execPath, [...args, "exec", ...layer, "--", `printf '{"k": 1}' > ${path}`], { windowsHide: true });
             const edited = execFileSync(process.execPath, [...args, "edit", ...layer, path, "--stdin-json"], {
                 input: JSON.stringify({ old: "1", new: "2" }),
                 encoding: "utf-8",
+                windowsHide: true,
             });
             expect(edited).toContain("1 处");
         } finally {
@@ -644,7 +645,7 @@ describe("第九季：CLI 路径描述（CI 真机）", () => {
     integration("--hop 链 exec 通道拒绝（不可直达语义自守——指引收敛 -J 或 pty 通道）", async () => {
         let errText = "";
         try {
-            execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--host", TARGET, "--hop", "user@bastion:2222", "--", "echo X"], { encoding: "utf-8", stdio: "pipe" });
+            execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--host", TARGET, "--hop", "user@bastion:2222", "--", "echo X"], { encoding: "utf-8", stdio: "pipe", windowsHide: true });
         } catch (e) {
             errText = String((e as { stderr?: string }).stderr ?? (e as Error).message);
         }
@@ -771,7 +772,7 @@ describe("第十一季：CLI 层快照（CI 真机）", () => {
             writeFileSync(planPath, JSON.stringify(plan));
             return execFileSync(process.execPath, [
                 "bin/filaxis.ts", "batch", "--layer", layer, "--request-file", planPath,
-            ], { encoding: "utf8", env });
+            ], { encoding: "utf8", env, windowsHide: true });
         };
         try {
             writeFileSync(layers, JSON.stringify({
@@ -797,11 +798,11 @@ describe("第十一季：CLI 层快照（CI 真机）", () => {
         const d = mkdtempSync(j(tmpdir(), "fx-cli-layer-"));
         const env = { ...process.env, FILAXIS_LAYERS: j(d, "layers.json") };
         try {
-            execFileSync(process.execPath, ["bin/filaxis.ts", "layer", "save", "lo", "--host", TARGET], { encoding: "utf-8", env });
+            execFileSync(process.execPath, ["bin/filaxis.ts", "layer", "save", "lo", "--host", TARGET], { encoding: "utf-8", env, windowsHide: true });
             // 第一条：建 master（一次握手）；第二条：CM 复用毫秒级
-            const o1 = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--layer", "lo", "--", "echo L1_OK"], { encoding: "utf-8", env });
+            const o1 = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--layer", "lo", "--", "echo L1_OK"], { encoding: "utf-8", env, windowsHide: true });
             expect(o1).toContain("L1_OK");
-            const o2 = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--layer", "lo", "--", "echo L2_OK"], { encoding: "utf-8", env });
+            const o2 = execFileSync(process.execPath, ["bin/filaxis.ts", "exec", "--layer", "lo", "--", "echo L2_OK"], { encoding: "utf-8", env, windowsHide: true });
             expect(o2).toContain("L2_OK");
         } finally {
             rmSync(d, { recursive: true, force: true });

@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-    sshArgsFor, hopLabel, enterStepsOf, renderExecChannel, envPrefixOf, parseJumpSpec,
+    sshArgsFor, hopSshCommand, hopLabel, enterStepsOf, renderExecChannel, envPrefixOf, parseJumpSpec,
 } from "../src/ssh-helpers.js";
 import { __testBrokenStdioExit, __testFileRedirect, resolveLayerState, SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { RemoteSessionManager } from "../src/remote-session-manager.js";
@@ -24,7 +24,7 @@ test.skipIf(process.platform !== "linux")("SSH writeFile 解码器写出一部�
     let fail = true;
     Object.assign(driver, {
         async execChannel(command: string) {
-            const result = Bun.spawnSync(["sh", "-c", (fail ? failDecode : "") + command]);
+            const result = Bun.spawnSync(["sh", "-c", (fail ? failDecode : "") + command], { windowsHide: true });
             return { stdout: result.stdout.toString(), stderr: result.stderr.toString(), exitCode: result.exitCode };
         },
     });
@@ -135,7 +135,7 @@ describe("ssh-helpers", () => {
         });
         // 产物作为命令行交给真实 sh 解析（模拟 PTY 发送）：set -- 拿 argv——命令替换
         // 若被展开会创建文件且 argv 不再字面
-        const p = Bun.spawn([shPath, "-c", `set -- ${line}; printf '%s' "$@"`], { stdout: "pipe" });
+        const p = Bun.spawn([shPath, "-c", `set -- ${line}; printf '%s' "$@"`], { stdout: "pipe", windowsHide: true });
         const out = await new Response(p.stdout).text();
         expect(await p.exited).toBe(0);
         expect(out).toContain("$(touch FXS_QUOTED_PWN)"); // 字面到达（未展开）
@@ -202,7 +202,7 @@ describe("ssh-helpers", () => {
         const sh = Bun.which("sh");
         if (!sh) return; // CI Linux / Git Bash 均有 sh
         const runSh = async (stdinCmd: string) => {
-            const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(stdinCmd);
             await p.stdin.end();
             const [out, err, code] = await Promise.all([
@@ -310,7 +310,7 @@ describe("ssh-helpers", () => {
         expect(r.kind).toBe("ok");
         if (r.kind !== "ok") return;
         // 首层 argv 形态 [sh, -s, sh, -s] 等价于本地：sh -s 吃 stdinCmd（含内层 heredoc）
-        const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+        const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
         p.stdin.write(r.stdinCmd);
         await p.stdin.end();
         const [out, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -340,7 +340,7 @@ describe("ssh-helpers", () => {
         const sh = Bun.which("sh") && Bun.which("printenv");
         if (!sh) return; // CI Linux / Git Bash
         const runSh = async (stdinCmd: string) => {
-            const p = Bun.spawn(["sh", "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn(["sh", "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(stdinCmd);
             await p.stdin.end(); // Bun FileSink：错误以 reject 形式从 end() 抛出（可捕获，无 uncaught 路径）
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -514,7 +514,7 @@ describe("RemoteSessionManager（mock 远端）", () => {
                     const script = `cat() { :; }; awk() { printf '%s\\n' "$FX_TEST_STAMP"; }; ` +
                         `pkill() { :; }; kill() { printf '%s\\n' "$1"; }; sleep() { :; }; ${cmd}`;
                     const r = Bun.spawnSync([shell, "-s"], {
-                        stdin: Buffer.from(script), env: { ...process.env, FX_TEST_STAMP: stamp },
+                        stdin: Buffer.from(script), env: { ...process.env, FX_TEST_STAMP: stamp }, windowsHide: true,
                     });
                     const signal = r.stdout.toString().trim().replace(/^-/, "");
                     if (signal) signals.push(signal);
@@ -664,7 +664,7 @@ describe("RemoteSessionManager（mock 远端）", () => {
         const logDir = join(dirG, "occupied"); // 普通文件（非目录）
         writeFileSync(logDir, "not a dir\n");
         const realExec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -684,7 +684,7 @@ describe("RemoteSessionManager（mock 远端）", () => {
         const dirX = mkdtempSync(join(tmpdir(), "fx-exit-"));
         const logDir = dirX.replace(/\\/g, "/");
         const realExec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -713,7 +713,7 @@ describe("RemoteSessionManager（mock 远端）", () => {
         const dirT = mkdtempSync(join(tmpdir(), "fx-tl-"));
         const logDir = dirT.replace(/\\/g, "/");
         const realExec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn(["sh", "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn(["sh", "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -740,6 +740,29 @@ describe("RemoteSessionManager（mock 远端）", () => {
 import { autonomousSshOpts } from "../src/ssh-helpers.js";
 
 describe("host key 策略可配（AC-12）", () => {
+    test("renders a known_hosts path with spaces as one OpenSSH config value", () => {
+        const path = process.platform === "win32" ? "C:\\SSH data\\known_hosts" : "/fixture/SSH data/known_hosts";
+        const expected = process.platform === "win32" ? "C:/SSH data/known_hosts" : path;
+        expect(autonomousSshOpts({ knownHostsFile: path })).toContain(`UserKnownHostsFile="${expected}"`);
+    });
+
+    test("PTY hop keeps file arguments intact and lets remote OpenSSH resolve its own home", () => {
+        const command = hopSshCommand({
+            host: "fixture.invalid",
+            conn: {
+                knownHostsFile: "~/SSH data/known_hosts",
+                keyFile: "~/SSH data/id_fixture",
+                jump: { host: "jump.invalid", keyFile: "~/SSH data/id_jump" },
+            },
+        });
+        const argv = Bun.spawnSync([resolveLocalShell(), "-c", `ssh() { printf '%s\\n' "$@"; }; ${command}`], { windowsHide: true });
+        expect(argv.exitCode).toBe(0);
+        const args = argv.stdout.toString().trimEnd().split(/\r?\n/);
+        expect(args).toContain('UserKnownHostsFile="~/SSH data/known_hosts"');
+        expect(args).toContain("~/SSH data/id_fixture");
+        expect(args.find((arg) => arg.startsWith("ProxyCommand="))).toContain("-i '~/SSH data/id_jump'");
+    }, 15_000);
+
     test("tofu 缺省=accept-new；strict=yes+known_hosts 路径展开", () => {
         const tofu = autonomousSshOpts();
         expect(tofu).toContain("StrictHostKeyChecking=accept-new");
@@ -800,7 +823,7 @@ describe("二十二期（真实 sh）", () => {
     const mkReal = (logDir: string, pollMs = 200) => {
         const shPath = Bun.which("sh")!;
         const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -841,7 +864,7 @@ describe("二十二期（真实 sh）", () => {
         const binSh = (logDir + "/bin").replace(/^([A-Za-z]):/, (_m, dr: string) => "/" + dr.toLowerCase());
         const shPath = Bun.which("sh")!;
         const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(`export PATH=${binSh}:$PATH; ${cmd}`);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -863,7 +886,7 @@ describe("终态尾行冲刷（二十三期）", () => {
         const logDir = d.replace(/\\/g, "/");
         const shPath = Bun.which("sh")!;
         const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -892,7 +915,7 @@ describe("reapIdle 事件单发（自审）", () => {
         const logDir = d.replace(/\\/g, "/");
         const shPath = Bun.which("sh")!;
         const exec = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -1202,7 +1225,7 @@ describe("Sol 71：readLog lines 字节保真", () => {
         const remote = fakeRemote();
         const shPath = Bun.which("sh")!;
         const realSh = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -1241,7 +1264,7 @@ describe("Sol 72：lines 临时副本落 TMPDIR", () => {
         let sawCmd = "";
         const realSh = async (cmd: string): Promise<{ stdout: string; exitCode: number }> => {
             const p = Bun.spawn([shell, "--posix", "-s"], {
-                stdin: "pipe", stdout: "pipe", stderr: "pipe",
+                stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true,
                 env: { ...process.env, TMPDIR: scratch.replaceAll("\\", "/") },
             });
             p.stdin.write(cmd);
@@ -1278,7 +1301,7 @@ describe("Sol 73：TMPDIR 失效回落", () => {
         const remote = fakeRemote();
         const shPath = Bun.which("sh")!;
         const realSh = async (cmd: string, env?: Record<string, string>): Promise<{ stdout: string; exitCode: number }> => {
-            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, ...env } });
+            const p = Bun.spawn([shPath, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, ...env } });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);

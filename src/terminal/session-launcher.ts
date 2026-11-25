@@ -6,6 +6,7 @@
  * 未知 driver 且无 launchCmd → 抛 /Unknown driver/；会话立即死亡 → 清 profile 抛带 hint 错。
  * FR-9 第一道防线：launchCmd 前置 env_hardening_prefix 关交互 Prompt。
  */
+import { randomBytes } from "node:crypto";
 import { SessionRegistry, type TerminalProfile } from "./session-registry.js";
 import { FILAXIS_PANE_OPTION, TmuxInvoker } from "./tmux-invoker.js";
 import { DEFAULT_TERMINAL_CONFIG, type TerminalConfig } from "./types.js";
@@ -38,7 +39,7 @@ export class SessionLauncher {
         config?: Record<string, unknown>,
         customId?: string,
     ): Promise<string> {
-        const id = customId || ("term_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 6));
+        const id = customId || `term_${Date.now().toString(36)}_${randomBytes(6).toString("hex")}`;
         const launchCmd = this.resolveLaunchCmd(driver, target, config);
 
         // customId 复用：会话仍存活直接返回（profile 按当前入参刷新）

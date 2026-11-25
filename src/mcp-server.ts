@@ -68,49 +68,38 @@ export interface McpServerOptions {
     stdin?: NodeJS.ReadableStream;
 }
 
-export class McpServer {
+export interface McpProtocolHandlerOptions {
+    toolkit: AgentToolkit;
+    serverName?: string;
+    serverVersion?: string;
+}
+
+function makeReply(id: number | string | null, result: Record<string, unknown>): Record<string, unknown> {
+    return { jsonrpc: JSONRPC_VERSION, id, result };
+}
+
+function makeReplyErr(id: number | string | null, code: number, message: string, data?: unknown): Record<string, unknown> {
+    return { jsonrpc: JSONRPC_VERSION, id, error: { code, message, ...(data !== undefined ? { data } : {}) } };
+}
+
+/** 传输无关的 MCP JSON-RPC 2.0 协议分发器（供 stdio McpServer 与 DaemonServer HTTP/SSE 共用） */
+export class McpProtocolHandler {
     private readonly tk: AgentToolkit;
     private readonly name: string;
     private readonly version: string;
-    private readonly log: FilaxisLogger;
-    private readonly out: NodeJS.WritableStream;
-    private initialized = false;
-    private rl?: readline.Interface;
 
-    constructor(opts: McpServerOptions) {
+    constructor(opts: McpProtocolHandlerOptions) {
         this.tk = opts.toolkit;
         this.name = opts.serverName ?? "@syrkos/filaxis";
         this.version = opts.serverVersion ?? version;
-        this.log = opts.logger ?? noopLogger;
-        this.out = opts.stdout ?? process.stdout;
-        const input = opts.stdin ?? process.stdin;
-        this.rl = readline.createInterface({ input, terminal: false });
-        this.rl.on("line", (line) => this.onLine(line));
-        this.rl.on("close", () => {
-            // 连接断开=客户端退出：进程内 toolkit 状态（会话句柄）交还内核 TTL 回收
-            this.tk.dispose?.();
-            this.log.info("[mcp] stdin 关闭——server 退出");
-        });
     }
 
-    private write(msg: Record<string, unknown>): void {
-        this.out.write(JSON.stringify(msg) + "\n");
-    }
-
-    private reply(id: number | string | null, result: Record<string, unknown>): void {
-        this.write({ jsonrpc: JSONRPC_VERSION, id, result });
-    }
-
-    private replyErr(id: number | string | null, code: number, message: string, data?: unknown): void {
-        this.write({ jsonrpc: JSONRPC_VERSION, id, error: { code, message, ...(data !== undefined ? { data } : {}) } });
-    }
-
-    private onLine(line: string): void {
+    async handleRawLine(line: string): Promise<Record<string, unknown> | null> {
         const trimmed = line.trim();
-        if (trimmed === "") return;
-        let msg: JsonRpcRequest | JsonRpcNotification;
+        if (trimmed === "") return null;
+        let msg: unknown;
         try {
-            msg = JSON.parse(trimmed) as JsonRpcRequest;
+            msg = JSON.parse(trimmed);
         } catch {
             // 解析失败：若可提取 id 则按规范回 Parse error（-32700）
             const idMatch = trimmed.match(/"id"\s*:\s*(\d+|"[^"]*")/);
@@ -120,30 +109,34 @@ export class McpServer {
             if (idMatch) {
                 try { id = JSON.parse(idMatch[1]!) as number | string; } catch { id = null; }
             }
-            this.replyErr(id, -32700, "Parse error: invalid JSON");
-            return;
+            return makeReplyErr(id, -32700, "Parse error: invalid JSON");
         }
+        return this.handleMessage(msg);
+    }
+
+    async handleMessage(msg: unknown): Promise<Record<string, unknown> | null> {
         if (msg === null || typeof msg !== "object") {
             // JSON null/标量防御（Sol 五十四期 P1-4）：null 是合法 JSON——解析成功
             // 后 `"id" in null` 抛 TypeError 逃出监听器崩进程
-            this.replyErr(null, -32600, `Invalid Request: expected object, got ${msg === null ? "null" : typeof msg}`);
-            return;
+            return makeReplyErr(null, -32600, `Invalid Request: expected object, got ${msg === null ? "null" : typeof msg}`);
         }
-        if (!("id" in msg) || msg.id === undefined || msg.id === null) return; // 通知（notifications/initialized 等）——无响应
-        const req = msg as JsonRpcRequest; // id 已非空（上方守卫）
-        this.dispatch(req).catch((e) => {
-            this.replyErr(req.id!, -32603, `Internal error: ${e instanceof Error ? e.message : String(e)}`);
-        });
+        const obj = msg as Record<string, unknown>;
+        if (!("id" in obj) || obj.id === undefined || obj.id === null) return null; // 通知（notifications/initialized 等）——无响应
+        const req = obj as unknown as JsonRpcRequest;
+        const id = (req.id ?? 0) as number | string;
+        try {
+            return await this.dispatch(req, id);
+        } catch (e) {
+            return makeReplyErr(id, -32603, `Internal error: ${e instanceof Error ? e.message : String(e)}`);
+        }
     }
 
-    private async dispatch(req: JsonRpcRequest): Promise<void> {
+    private async dispatch(req: JsonRpcRequest, id: number | string): Promise<Record<string, unknown>> {
         const { method } = req;
-        const id = (req.id ?? 0) as number | string; // 守卫后非空（通知已 return）
         const params = req.params ?? {};
         switch (method) {
             case "initialize":
-                this.initialized = true;
-                this.reply(id, {
+                return makeReply(id, {
                     protocolVersion: MCP_PROTOCOL_VERSION,
                     capabilities: { tools: { listChanged: false } },
                     serverInfo: { name: this.name, version: this.version },
@@ -152,25 +145,23 @@ export class McpServer {
                     // 在任何 schema 读取之前必达，是唯一可靠的发现面）
                     instructions: [
                         "【先看这行】多文件读取/多命令巡检/同命令发往多层/定位排查 → 优先 run_batch（一次调用并行打包，支持传 layer 数组自动扇出，不要逐个工具循环）；读工具 schema 时同轮并发读取（逐个读每步一趟 LLM）；",
-                        "建立或进入命名层（单台/批量 SSH 或 docker/kubectl 内层）→ connect_layer；查询、切换默认层或移除层 → manage_layers。",
+                        "建立或进入命名层（单台/批量 SSH 或 docker/kubectl 内层）→ connect_layer；查询、切换默认层、移除层或管理动态端口转发（-L/-R/-D） → manage_layers。",
                         "管理后台任务或服务（等就绪、按错误模式停止、核实退出码）→ start_session + stop_session。",
                         "实时查看日志或事件流 → observe_stream（传 command 开窗并可 wait_ms 带回首屏帧；传 window_id 按游标续读/回看），close_stream 回收流进程。",
                         "只读查看文件或目录 → read_path；受控 CAS 编辑或直接新建文本 → edit_file（CAS 模式支持 write_mode:'inplace' 保 inode 免重启）；创建目录、移动/重命名或删除（含递归） → manage_path；主机与目标层间传文件 → transfer_file。",
                         "契约：退出码是数据（非零不是异常）；终态三态 exited/stopped/unknown；unknown 后用 stop_session 核实。",
                     ].join("\n"),
                 });
-                return;
             case "tools/list": {
                 // 单一来源直序列化（AC-02 零漂移）：OpenAI function 形态 → MCP
                 // tools[].{name,description,inputSchema} 投影——字段名映射非复制
-                this.reply(id, {
+                return makeReply(id, {
                     tools: TOOL_DEFS.map((d) => ({
                         name: d.function.name,
                         description: d.function.description,
                         inputSchema: d.function.parameters,
                     })),
                 });
-                return;
             }
             case "tools/call": {
                 const name = String(params.name ?? "");
@@ -178,15 +169,14 @@ export class McpServer {
                 const handlersRecord = this.tk.handlers as unknown as Record<string, unknown>;
                 const handler = Object.hasOwn(handlersRecord, name) ? handlersRecord[name] : undefined;
                 if (typeof handler !== "function") {
-                    this.replyErr(id, -32602, `Unknown tool: ${name}`, { available: TOOL_DEFS.map((d) => d.function.name) });
-                    return;
+                    return makeReplyErr(id, -32602, `Unknown tool: ${name}`, { available: TOOL_DEFS.map((d) => d.function.name) });
                 }
                 const textOnlyBatch = name === "run_batch" && args.output === "text";
                 try {
                     if (typeof args !== "object" || Array.isArray(args)) throw new Error(`${name} 的 arguments 需为对象`);
                     const r = await (handler as (a: Record<string, unknown>) => Promise<unknown>)(args);
                     // Some clients only expose content, so include bounded command output there.
-                    this.reply(id, {
+                    return makeReply(id, {
                         content: [{ type: "text", text: summarizeToolResult(name, r, textOnlyBatch) }],
                         ...(textOnlyBatch ? {} : { structuredContent: r }),
                         isError: false,
@@ -197,6 +187,7 @@ export class McpServer {
                     const err = (e !== null && typeof e === "object" ? e : {}) as {
                         outcome?: string;
                         terminalId?: string;
+                        forwardId?: string;
                         sessionId?: string;
                         logBase?: string;
                         sessions?: Array<{ sessionId: string; logBase: string }>;
@@ -206,6 +197,7 @@ export class McpServer {
                     const details = {
                         outcome: err.outcome,
                         terminalId: err.terminalId,
+                        forwardId: err.forwardId,
                         sessionId: err.sessionId,
                         logBase: err.logBase,
                         sessions: err.sessions,
@@ -217,6 +209,9 @@ export class McpServer {
                     }
                     if (typeof err.terminalId === "string" && err.terminalId) {
                         evidence.push(`terminal_id=${singleLine(err.terminalId)}`);
+                    }
+                    if (typeof err.forwardId === "string" && err.forwardId) {
+                        evidence.push(`forward_id=${singleLine(err.forwardId)}`);
                     }
                     if (typeof err.sessionId === "string" && err.sessionId) {
                         evidence.push(`session_id=${singleLine(err.sessionId)}`);
@@ -236,7 +231,7 @@ export class McpServer {
                     }
                     const errorText = [...evidence, message].join("\n");
                     const overflow = name === "run_batch" && jsonStringBytes(errorText) > BATCH_TEXT_JSON_BYTES;
-                    this.reply(id, {
+                    return makeReply(id, {
                         content: [{ type: "text", text: overflow ? limitBatchText(errorText, textOnlyBatch ? "" : FULL_OUTPUT_HINT) : errorText }],
                         isError: true,
                         ...(!textOnlyBatch && (overflow || Object.values(details).some((value) => value !== undefined))
@@ -244,22 +239,53 @@ export class McpServer {
                             : {}),
                     });
                 }
-                return;
             }
             case "ping":
-                this.reply(id, {});
-                return;
+                return makeReply(id, {});
             default:
-                this.replyErr(id, -32601, `Method not found: ${method}`);
+                return makeReplyErr(id, -32601, `Method not found: ${method}`);
         }
+    }
+}
+
+export class McpServer {
+    private readonly tk: AgentToolkit;
+    private readonly log: FilaxisLogger;
+    private readonly out: NodeJS.WritableStream;
+    private readonly protocol: McpProtocolHandler;
+    private rl?: readline.Interface;
+
+    constructor(opts: McpServerOptions) {
+        this.tk = opts.toolkit;
+        this.log = opts.logger ?? noopLogger;
+        this.out = opts.stdout ?? process.stdout;
+        this.protocol = new McpProtocolHandler({
+            toolkit: opts.toolkit,
+            serverName: opts.serverName,
+            serverVersion: opts.serverVersion,
+        });
+        const input = opts.stdin ?? process.stdin;
+        this.rl = readline.createInterface({ input, terminal: false });
+        this.rl.on("line", (line) => {
+            void this.protocol.handleRawLine(line).then((resp) => {
+                if (resp) this.write(resp);
+            });
+        });
+        this.rl.on("close", () => {
+            // 连接断开=客户端退出：进程内 toolkit 状态（会话句柄）交还内核 TTL 回收
+            this.tk.dispose?.();
+            this.log.info("[mcp] stdin 关闭——server 退出");
+        });
+    }
+
+    private write(msg: Record<string, unknown>): void {
+        this.out.write(JSON.stringify(msg) + "\n");
     }
 
     /** 测试/优雅收尾：关闭输入监听 */
     close(): void {
         this.rl?.close();
     }
-
-
 }
 
 function summarizeFileContent(content: string): string {
@@ -273,7 +299,23 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
         const result = value as ManageLayersResult;
         if (result.action === "list") return result.text;
         if (result.action === "activate") return `active_layer=${singleLine(result.active_layer)}`;
-        return `removed=${singleLine(result.removed)}`;
+        if (result.action === "remove") return `removed=${singleLine(result.removed)}`;
+        if (result.action === "forward_add") {
+            const f = result.forward;
+            const dst = f.kind === "dynamic" ? "SOCKS5" : `${singleLine(f.targetHost ?? "")}:${f.targetPort}`;
+            return `forward=${singleLine(f.forwardId)} | layer=${singleLine(f.layer ?? "?")} | ${f.kind} ${singleLine(f.bindAddr)}:${f.bindPort} -> ${dst}`;
+        }
+        if (result.action === "forward_list") {
+            if (!result.forwards.length) return "forwards=0";
+            return [
+                `forwards=${result.forwards.length}`,
+                ...result.forwards.map((f) => {
+                    const dst = f.kind === "dynamic" ? "SOCKS5" : `${singleLine(f.targetHost ?? "")}:${f.targetPort}`;
+                    return `${singleLine(f.forwardId)} | layer=${singleLine(f.layer ?? "?")} | ${f.kind} ${singleLine(f.bindAddr)}:${f.bindPort} -> ${dst} | ${f.status}`;
+                }),
+            ].join("\n");
+        }
+        return `forward_id=${singleLine(result.forward_id)} | status=${result.status}${result.detail ? ` | ${singleLine(result.detail)}` : ""}`;
     }
     if (name === "list_layers") {
         return (value as Awaited<ReturnType<AgentToolHandlers["list_layers"]>>).text;

@@ -17,12 +17,12 @@ test("mcp-config emits one selected format without writing to the home or projec
         const original = '{"mcpServers":{"existing":{}}}';
         writeFileSync(config, original);
         const env = { ...process.env, HOME: home, USERPROFILE: home };
-        const runtime = Bun.spawnSync([process.execPath, "-e", 'console.log(require("node:os").homedir())'], { cwd: project, env });
+        const runtime = Bun.spawnSync([process.execPath, "-e", 'console.log(require("node:os").homedir())'], { cwd: project, env, windowsHide: true });
         expect(runtime.stdout.toString().trim()).toBe(home);
         const server = { command: process.execPath, args: [join(dirname(cli), "filaxis-mcp.ts")] };
 
         function run(...args: string[]) {
-            return Bun.spawnSync([process.execPath, cli, "mcp-config", ...args], { cwd: project, env });
+            return Bun.spawnSync([process.execPath, cli, "mcp-config", ...args], { cwd: project, env, windowsHide: true });
         }
 
         const json = run();

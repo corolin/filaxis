@@ -185,7 +185,7 @@ describe("toolkit run_batch + CLI batch 冒烟", () => {
                 { id: "r", kind: "read", path: p, after: ["e"] },
             ],
         }));
-        const out = execSync(`bun bin/filaxis.ts batch --request-file "${plan}"`, { encoding: "utf-8" });
+        const out = execSync(`bun bin/filaxis.ts batch --request-file "${plan}"`, { encoding: "utf-8", windowsHide: true });
         expect(out).toContain("[ok] w (exec");
         expect(out).toContain("替换 1 处");
         expect(out).toContain("[ok] r (read");
@@ -200,7 +200,7 @@ describe("toolkit run_batch + CLI batch 冒烟", () => {
         }));
         let errOut = "";
         try {
-            execSync(`bun bin/filaxis.ts batch --request-file "${plan2}"`, { encoding: "utf-8", stdio: "pipe" });
+            execSync(`bun bin/filaxis.ts batch --request-file "${plan2}"`, { encoding: "utf-8", stdio: "pipe", windowsHide: true });
         } catch (e) {
             errOut = String((e as { stdout?: string }).stdout ?? "");
         }

@@ -522,7 +522,7 @@ test.each([
         const script = `cat() { case "$1" in *.pid) printf 4242;; *.st) printf '%s' "$FX_TEST_STAMP";; esac; }; ` +
             `awk() { printf 11111; }; kill() { printf '%s\\n' "$1"; }; ${command}`;
         const run = Bun.spawnSync([shell, "--posix", "-s"], {
-            stdin: Buffer.from(script), env: { ...process.env, FX_TEST_STAMP: stamp },
+            stdin: Buffer.from(script), env: { ...process.env, FX_TEST_STAMP: stamp }, windowsHide: true,
         });
         const signal = run.stdout.toString().trim().replace(/^-/, "");
         if (signal) signals.push(signal);
@@ -921,7 +921,7 @@ describe("tmux execSession 启动握手（孪生对齐审计）", () => {
         // 真 Bash 执行整条握手链（Astra 同款复现手法）：注入目标零创建（主断言——
         // 链是否在慢 bash 环境跑完 3s 握手窗是环境变量〔Gemini 环境实测 exit 1〕，
         // 与注入封死无关——exitCode 弱断言仅排崩溃级）
-        const r = Bun.spawnSync(["bash", "-c", seen], { timeout: 15_000 });
+        const r = Bun.spawnSync(["bash", "-c", seen], { timeout: 15_000, windowsHide: true });
         expect(r.exitCode).not.toBeLessThan(0);
         expect(existsSync(probe)).toBe(false);           // 修前：$(touch) 每次求值都执行
     }, 15_000);
@@ -1017,7 +1017,7 @@ describe("Sol 74：tmux 会话语义", () => {
         spawnSession: async () => "fx74",
         runCommand: async (_id: string, cmd: string, _t?: number) => {
             hooks.onPage?.(cmd);
-            const p = Bun.spawn([shPath(), "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+            const p = Bun.spawn([shPath(), "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
             p.stdin.write(cmd);
             await p.stdin.end();
             const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -1039,7 +1039,7 @@ describe("Sol 74：tmux 会话语义", () => {
         const tok = `/tmp/fx-grp-tok-${Math.random().toString(36).slice(2, 8)}`;
         const g = Bun.spawnSync([sh, "-c",
             `setsid sh -c 'echo \$\$ > ${tok}; sleep 5 >/dev/null 2>&1 </dev/null & exit 0' >/dev/null 2>&1 </dev/null & ` +
-            "sleep 0.4; cat " + tok + " 2>/dev/null"]);
+            "sleep 0.4; cat " + tok + " 2>/dev/null"], { windowsHide: true });
         const pgid = g.stdout.toString().trim();
         if (!/^\d+$/.test(pgid)) return; // 无 setsid——环境不适用（CI Linux 矩阵覆盖）
         mkdirSync("/tmp/filaxis-sessions", { recursive: true });
@@ -1052,7 +1052,7 @@ describe("Sol 74：tmux 会话语义", () => {
             expect((await drv.verifySession(sid)).status).toBe("running"); // 修前：组长死组活被报 DEAD→unknown
             const st = await drv.stopSession(sid); // 组杀收口（TERM 组 → 核实窗 → 最多 KILL）
         } finally {
-            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code ${tok}; kill -TERM -- -${pgid} 2>/dev/null; true`]);
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code ${tok}; kill -TERM -- -${pgid} 2>/dev/null; true`], { windowsHide: true });
         }
     }, 20_000);
 
@@ -1068,7 +1068,7 @@ describe("Sol 74：tmux 会话语义", () => {
             const m = cmd.match(/tail -c \+\d+ (\S+)/);
             if (!m) return;
             if (!myTmp) { myTmp = m[1]!; return; } // 首页：捕获中转名
-            if (!hit) { hit = true; Bun.spawnSync([shPath(), "-c", `rm -f ${myTmp}`]); } // 次页前删它
+            if (!hit) { hit = true; Bun.spawnSync([shPath(), "-c", `rm -f ${myTmp}`], { windowsHide: true }); } // 次页前删它
         } });
         await expect(drv.fs.readFile(src)).rejects.toThrow(/分页读失败|长度对账|无效 Base64/); // 修前：~5922B 正常完成
     }, 20_000);
@@ -1154,7 +1154,7 @@ describe("Sol 75：持久 shell 语义/组长身份", () => {
     test.skipIf(!Bun.which("sh"))("P2-3 组长活但 .st 不符 → unknown（复用组拦截；修前组存活直信 running）", async () => {
         const sh = Bun.which("sh")!;
         // 自有活组长：exec setsid sleep——pid==pgid 且活着（stdio 全重定向防拖挂）
-        const g = Bun.spawnSync([sh, "-c", "setsid sh -c 'exec sleep 5 >/dev/null 2>&1 </dev/null' >/dev/null 2>&1 </dev/null & w=$!; sleep 0.3; echo $w"]);
+        const g = Bun.spawnSync([sh, "-c", "setsid sh -c 'exec sleep 5 >/dev/null 2>&1 </dev/null' >/dev/null 2>&1 </dev/null & w=$!; sleep 0.3; echo $w"], { windowsHide: true });
         const pid = g.stdout.toString().trim();
         if (!/^\d+$/.test(pid)) return; // 无 setsid——CI Linux 矩阵覆盖
         mkdirSync("/tmp/filaxis-sessions", { recursive: true });
@@ -1166,7 +1166,7 @@ describe("Sol 75：持久 shell 语义/组长身份", () => {
         const stubTerminal = {
             spawnSession: async () => "fx75",
             runCommand: async (_id: string, cmd: string, _t?: number) => {
-                const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+                const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
                 p.stdin.write(cmd);
                 await p.stdin.end();
                 const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -1181,7 +1181,7 @@ describe("Sol 75：持久 shell 语义/组长身份", () => {
             );
             expect((await drv.verifySession(sid)).status).toBe("unknown"); // 修前：running（组存活直信）
         } finally {
-            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st; kill -TERM ${pid} 2>/dev/null; true`]);
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st; kill -TERM ${pid} 2>/dev/null; true`], { windowsHide: true });
         }
     }, 20_000);
 });
@@ -1197,7 +1197,7 @@ describe("Sol 76：组长死放行组信号/registry 列表甄别", () => {
         const tok2 = `/tmp/fx-grp-tok-${Math.random().toString(36).slice(2, 8)}`;
         const g = Bun.spawnSync([sh, "-c",
             `setsid sh -c 'echo \$\$ > ${tok2}; sleep 8 >/dev/null 2>&1 </dev/null & exit 0' >/dev/null 2>&1 </dev/null & ` +
-            "sleep 0.4; cat " + tok2 + " 2>/dev/null"]);
+            "sleep 0.4; cat " + tok2 + " 2>/dev/null"], { windowsHide: true });
         const pgid = g.stdout.toString().trim();
         if (!/^\d+$/.test(pgid)) return;
         mkdirSync("/tmp/filaxis-sessions", { recursive: true });
@@ -1209,7 +1209,7 @@ describe("Sol 76：组长死放行组信号/registry 列表甄别", () => {
         const stubTerminal = {
             spawnSession: async () => "fx76",
             runCommand: async (_id: string, cmd: string, _t?: number) => {
-                const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+                const p = Bun.spawn([sh, "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
                 p.stdin.write(cmd);
                 await p.stdin.end();
                 const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -1227,11 +1227,11 @@ describe("Sol 76：组长死放行组信号/registry 列表甄别", () => {
             const st = await drv.stopSession(sid); // 修前：unknown（.st 卡死不放行）+孙进程照跑
             expect(["stopped", "unknown"]).toContain(st.status);
             // 组信号已放行——孙进程应死（组探不到了）
-            const probe = Bun.spawnSync([sh, "-c", `/bin/kill -0 -- -${pgid} 2>/dev/null && echo ALIVE || echo DEAD`]);
+            const probe = Bun.spawnSync([sh, "-c", `/bin/kill -0 -- -${pgid} 2>/dev/null && echo ALIVE || echo DEAD`], { windowsHide: true });
             expect(probe.stdout.toString().trim()).toBe("DEAD");
             void t0;
         } finally {
-            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code ${tok2}; /bin/kill -KILL -- -${pgid} 2>/dev/null; true`]);
+            Bun.spawnSync([sh, "-c", `rm -f ${base}.pid ${base}.pgid ${base}.st ${base}.code ${tok2}; /bin/kill -KILL -- -${pgid} 2>/dev/null; true`], { windowsHide: true });
         }
     }, 30_000);
 
@@ -2163,7 +2163,7 @@ describe("Sol 90：首发失败封存/跨进程锁/readdir 补全", () => {
                 `import { CommandExecuter } from ${JSON.stringify(source)}; ` +
                 `try { await new CommandExecuter({resolvePane: async id => ({target:id, lockPath:CommandExecuter.__testSessLockPath(id), assertIdle: async () => {}, setInput: async () => {}})}).execute("S90F", "true", { timeoutMs: 20 }); process.exitCode = 1; } ` +
                 `catch (e) { console.log(e.message); }`,
-            ], { stdout: "pipe", stderr: "inherit" });
+            ], { stdout: "pipe", stderr: "inherit", windowsHide: true });
             expect(await new Response(child.stdout).text()).toContain("已封存");
             expect(await child.exited).toBe(0);
         } finally {
@@ -2181,7 +2181,7 @@ describe("Sol 90：首发失败封存/跨进程锁/readdir 补全", () => {
         writeFileSync(lockPath, "");
         const child = Bun.spawn([process.execPath, "-e",
             'setTimeout(() => require("node:fs").rmSync(process.argv[1]), 1500);', "--", lockPath,
-        ], { stdout: "ignore", stderr: "ignore" });
+        ], { stdout: "ignore", stderr: "ignore", windowsHide: true });
         const realInvoke = TmuxInvoker.invoke.bind(TmuxInvoker);
         const realTry = TmuxInvoker.tryInvoke.bind(TmuxInvoker);
         let marker = "";

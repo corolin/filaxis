@@ -389,10 +389,11 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         const generation = "00000000-0000-4000-8000-000000000001";
         const run = () => Bun.spawnSync([process.execPath, "bin/filaxis.ts", "layer", "save", "probe", "--host", "web-01"], {
             env: { ...process.env, FILAXIS_LAYERS: store },
+            windowsHide: true,
         });
         try {
             mkdirSync(lock);
-            const dead = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+            const dead = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", windowsHide: true });
             await once(dead, "exit");
             expect(dead.pid).toBeDefined();
             writeFileSync(join(lock, `${dead.pid}-${generation}`), "");
@@ -412,15 +413,15 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         const p = join(d3, "x.env");
         writeFileSync(p, "K=1\n");
         const fwd = p.replace(/\\/g, "/");
-        const out1 = execSync('bun bin/filaxis.ts exec -- "echo CLI_OK" 2>&1', { encoding: "utf-8", cwd: process.cwd() });
+        const out1 = execSync('bun bin/filaxis.ts exec -- "echo CLI_OK" 2>&1', { encoding: "utf-8", cwd: process.cwd(), windowsHide: true });
         expect(out1).toContain("CLI_OK");
         expect(out1).toContain("exit=0");
-        const out2 = execSync(`bun bin/filaxis.ts cat "${fwd}"`, { encoding: "utf-8" });
+        const out2 = execSync(`bun bin/filaxis.ts cat "${fwd}"`, { encoding: "utf-8", windowsHide: true });
         expect(out2).toContain("K=1");
-        const out3 = execSync(`bun bin/filaxis.ts edit "${fwd}" "K=1" "K=2"`, { encoding: "utf-8" });
+        const out3 = execSync(`bun bin/filaxis.ts edit "${fwd}" "K=1" "K=2"`, { encoding: "utf-8", windowsHide: true });
         expect(out3).toContain("1 处");
         expect(readFileSync(p, "utf-8")).toBe("K=2\n");
-        const out4 = execSync('bun bin/filaxis.ts observe --stream stderr --duration 2000 -- "echo EO; echo EE 1>&2; sleep 2" 2>&1', { encoding: "utf-8" });
+        const out4 = execSync('bun bin/filaxis.ts observe --stream stderr --duration 2000 -- "echo EO; echo EE 1>&2; sleep 2" 2>&1', { encoding: "utf-8", windowsHide: true });
         expect(out4).toContain("[stderr] EE");
         expect(out4).not.toContain("[stdout] EO");
         rmSync(d3, { recursive: true, force: true });
@@ -440,7 +441,7 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
             old: '"timeout_ms": 3500,\n  "strip_prefix": false',
             new: '"timeout_ms": 3500,\n  "strip_prefix": true',
         }));
-        const out1 = execSync(`bun bin/filaxis.ts edit "${fwd(p)}" --request-file "${fwd(req)}"`, { encoding: "utf-8" });
+        const out1 = execSync(`bun bin/filaxis.ts edit "${fwd(p)}" --request-file "${fwd(req)}"`, { encoding: "utf-8", windowsHide: true });
         expect(out1).toContain("1 处");
         expect(readFileSync(p, "utf-8")).toContain('"strip_prefix": true');
         // stdin 管道通道（execSync input 直喂 stdin）
@@ -448,6 +449,7 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         const out2 = execSync(`bun bin/filaxis.ts edit "${fwd(p)}" --stdin-json`, {
             input: JSON.stringify({ old: "K=1", new: "K=2" }),
             encoding: "utf-8",
+            windowsHide: true,
         });
         expect(out2).toContain("1 处");
         expect(readFileSync(p, "utf-8")).toBe("K=2\n");
@@ -460,7 +462,7 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         const { execSync } = await import("node:child_process");
         let errText = "";
         try {
-            execSync('bun bin/filaxis.ts exec --docker web -- "echo X"', { encoding: "utf-8", stdio: "pipe" });
+            execSync('bun bin/filaxis.ts exec --docker web -- "echo X"', { encoding: "utf-8", stdio: "pipe", windowsHide: true });
         } catch (e) {
             errText = String((e as { stderr?: string }).stderr ?? (e as Error).message);
         }
@@ -475,30 +477,30 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         const env = { ...process.env, FILAXIS_LAYERS: store };
         const out1 = execSync(
             'bun bin/filaxis.ts layer save nginx --host web-01 -J jump-host --docker lab-nginx-b3',
-            { encoding: "utf-8", env },
+            { encoding: "utf-8", env, windowsHide: true },
         );
         expect(out1).toContain("nginx");
         expect(out1).toContain("--layer nginx");
         // 覆盖保存幂等
-        execSync('bun bin/filaxis.ts layer save nginx --host web-01', { encoding: "utf-8", env });
-        const out2 = execSync("bun bin/filaxis.ts layer list", { encoding: "utf-8", env });
+        execSync('bun bin/filaxis.ts layer save nginx --host web-01', { encoding: "utf-8", env, windowsHide: true });
+        const out2 = execSync("bun bin/filaxis.ts layer list", { encoding: "utf-8", env, windowsHide: true });
         expect(out2).toContain("nginx");
         expect(out2).toContain("web-01");
         // --layer 与 --host 互斥
         let err1 = "";
         try {
-            execSync('bun bin/filaxis.ts exec --layer nginx --host x -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe" });
+            execSync('bun bin/filaxis.ts exec --layer nginx --host x -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
         } catch (e) { err1 = String((e as { stderr?: string }).stderr ?? e); }
         expect(err1).toContain("互斥");
         // 未保存层报错
         let err2 = "";
         try {
-            execSync('bun bin/filaxis.ts exec --layer ghost -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe" });
+            execSync('bun bin/filaxis.ts exec --layer ghost -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
         } catch (e) { err2 = String((e as { stderr?: string }).stderr ?? e); }
         expect(err2).toContain("未保存");
         // rm 后清单空
-        execSync("bun bin/filaxis.ts layer rm nginx", { encoding: "utf-8", env });
-        const out3 = execSync("bun bin/filaxis.ts layer list", { encoding: "utf-8", env });
+        execSync("bun bin/filaxis.ts layer rm nginx", { encoding: "utf-8", env, windowsHide: true });
+        const out3 = execSync("bun bin/filaxis.ts layer list", { encoding: "utf-8", env, windowsHide: true });
         expect(out3).toContain("无已保存层");
         rmSync(d6, { recursive: true, force: true });
     }, 60_000);

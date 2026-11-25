@@ -375,7 +375,7 @@ describe("三十五期", () => {
 describe("CLI observe 冒烟（正常路径）", () => {
     test("observe 端到端：启动→挂流→tail 输出报告", async () => {
         const { execSync } = await import("node:child_process");
-        const r = execSync('bun bin/filaxis.ts observe --duration 800 -- "echo SELF_AUDIT_OK"', { encoding: "utf-8", timeout: 15_000 });
+        const r = execSync('bun bin/filaxis.ts observe --duration 800 -- "echo SELF_AUDIT_OK"', { encoding: "utf-8", timeout: 15_000, windowsHide: true });
         expect(r).toContain("SELF_AUDIT_OK");
     }, 20_000);
 });
@@ -1634,7 +1634,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
                             const argv = isRoot
                                 ? [setpriv!, "--reuid=65534", "--regid=65534", "--clear-groups", "sh", "-c", `cd ${JSON.stringify(pDir)} && eval "$1"`, "_", cmd]
                                 : ["sh", "-c", `cd ${JSON.stringify(pDir)} && eval "$1"`, "_", cmd];
-                            const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+                            const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", windowsHide: true });
                             const [stdout, stderr, exitCode] = await Promise.all([
                                 new Response(proc.stdout).text(),
                                 new Response(proc.stderr).text(),

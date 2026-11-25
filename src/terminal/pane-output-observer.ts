@@ -16,6 +16,7 @@ export async function observePaneOutput(
 ): Promise<PaneOutputObserver> {
     const client = spawn("tmux", ["-C", "attach-session", "-Er", "-t", session], {
         stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
     });
     // Latin-1 preserves byte values even when tmux splits a UTF-8 character across events.
     const lines = createInterface({ input: client.stdout.setEncoding("latin1"), crlfDelay: Infinity });

@@ -17,7 +17,7 @@ export class TmuxInvoker {
             let stdout = "";
             let stderr = "";
             let settled = false;
-            const p = spawn("tmux", args, { stdio: ["ignore", "pipe", "pipe"] });
+            const p = spawn("tmux", args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
             // StringDecoder 双流（Hydrogen R5 #4）：跨块多字节 UTF-8 撕裂防护
             const oDec = new StringDecoder("utf-8");
             const eDec = new StringDecoder("utf-8");

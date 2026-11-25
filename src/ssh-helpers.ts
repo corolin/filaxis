@@ -164,7 +164,13 @@ function quoteWindowsProxyArg(value: string): string {
     return `"${escaped}"`;
 }
 
-function renderSshArgs(hop: SshHop, windowsProxy: boolean): string[] {
+function knownHostsOption(file: string, windows: boolean): string {
+    const path = windows ? file.replaceAll("\\", "/") : file;
+    const quoted = /[\s"'\\#]/.test(path) ? '"' + path.replace(/["\\]/g, "\\$&") + '"' : path;
+    return `UserKnownHostsFile=${quoted}`;
+}
+
+function renderSshArgs(hop: SshHop, windowsProxy: boolean, remote = false): string[] {
     if (!isHopObj(hop) || !hop.conn) {
         assertBareHost(hopHost(hop));
         return [hopHost(hop)];
@@ -183,18 +189,16 @@ function renderSshArgs(hop: SshHop, windowsProxy: boolean): string[] {
         const policy = hop.conn.hostKeyPolicy === "strict" ? "yes" : "accept-new";
         let hk = `-o StrictHostKeyChecking=${policy} `;
         if (hop.conn.knownHostsFile) {
-            const file = expandHomePath(hop.conn.knownHostsFile);
-            // -o is parsed again as an ssh_config option, including its path quoting.
-            const fileArg = windowsProxy && /\s/.test(file) ? `"${file.replaceAll("\\", "/")}"` : file;
-            const option = windowsProxy ? proxyQuote(`UserKnownHostsFile=${fileArg}`) : `UserKnownHostsFile=${proxyQuote(file)}`;
-            hk += `-o ${option} `;
+            const file = remote ? hop.conn.knownHostsFile : expandHomePath(hop.conn.knownHostsFile);
+            hk += `-o ${proxyQuote(knownHostsOption(file, windowsProxy))} `;
         }
-        const keyOpt = js.keyFile ? `-i ${proxyQuote(js.keyFile)} ` : "";
+        const jumpKey = remote && typeof jump === "object" ? jump.keyFile : js.keyFile;
+        const keyOpt = jumpKey ? `-i ${proxyQuote(jumpKey)} ` : "";
         const portOpt = js.port ? `-p ${js.port} ` : "";
         const target = proxyQuote(js.user ? `${js.user}@${js.host}` : js.host);
         args.push("-o", `ProxyCommand=ssh ${hk}${keyOpt}${portOpt}-W %h:%p ${target}`);
     }
-    if (keyFile) args.push("-i", expandHomePath(keyFile));
+    if (keyFile) args.push("-i", remote ? keyFile : expandHomePath(keyFile));
     if (port) args.push("-p", String(port));
     for (const f of forwards ?? []) {
         args.push(f.kind === "L" ? "-L" : f.kind === "R" ? "-R" : "-D", renderForwardArg(f));
@@ -208,11 +212,12 @@ function renderSshArgs(hop: SshHop, windowsProxy: boolean): string[] {
 /** PTY 内单行发送所需的引用形式。**单引号包裹**（GPT Astra 十二轮 #1：双引号
  *  内 $()/反引号照常展开——且会让内层 ProxyCommand 的单引号防护失效，结构化
  *  jump.keyFile 的命令替换实测经此通道执行）；白名单裸串零引用开销。 */
+function quoteSshShellArg(arg: string): string {
+    return /^[A-Za-z0-9_@:./%=-]+$/.test(arg) ? arg : shellQuote(arg);
+}
+
 export function sshArgsQuoted(hop: SshHop): string {
-    // This command is sent to a remote POSIX shell, independent of the local host.
-    return renderSshArgs(hop, false)
-        .map((a) => (/^[A-Za-z0-9_@:./%=-]+$/.test(a) ? a : `'${a.replace(/'/g, "'\\''")}'`))
-        .join(" ");
+    return renderSshArgs(hop, false, true).map(quoteSshShellArg).join(" ");
 }
 
 /** `~` 展开——spawn 参数数组不经过 shell，tilde 不会被展开（生产实证：公钥认证被拒 exit 255） */
@@ -329,6 +334,10 @@ export function assertNoLikelyTypoKeys(config: Record<string, unknown> | undefin
  * 渲染只含密钥/known_hosts **路径**，永不包含其内容（AC-12 无泄漏红线）。
  */
 export function autonomousSshOpts(conn?: SshConnParams): string[] {
+    return renderAutonomousSshOpts(conn, false);
+}
+
+function renderAutonomousSshOpts(conn: SshConnParams | undefined, remote: boolean): string[] {
     // LogLevel=ERROR（第十二季 B 组实测）：跳板 UserKnownHostsFile 变更产生的
     // "Warning: Permanently added" 每次 run_command 重复灌 stderr——压到 ERROR 级
     const opts = ["-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"];
@@ -340,7 +349,8 @@ export function autonomousSshOpts(conn?: SshConnParams): string[] {
     // 独立信任锚（Hydrogen R6 #2）：knownHostsFile 与策略正交——tofu 模式下曾静默
     // 忽略（指纹仍写宿主 ~/.ssh/known_hosts，隔离意图失效）
     if (conn?.knownHostsFile) {
-        opts.push("-o", `UserKnownHostsFile=${expandHomePath(conn.knownHostsFile)}`);
+        const file = remote ? conn.knownHostsFile : expandHomePath(conn.knownHostsFile);
+        opts.push("-o", knownHostsOption(file, !remote && process.platform === "win32"));
     }
     return opts;
 }
@@ -389,7 +399,7 @@ export function rootSshSpawnArgs(destArgs: string[], conn?: SshConnParams): stri
 /** PTY 内 hop 登录命令（选项语义与 root 对齐） */
 export function hopSshCommand(hop: SshHop): string {
     const conn = typeof hop === "object" ? hop.conn : undefined;
-    return `ssh ${autonomousSshOpts(conn).join(" ")} ${sshArgsQuoted(hop)}`;
+    return `ssh ${renderAutonomousSshOpts(conn, true).map(quoteSshShellArg).join(" ")} ${sshArgsQuoted(hop)}`;
 }
 
 /** 「等待输入」感知特征：ssh 停在交互提示（密码/口令/yes-no）——检测到即失败交还原文 */
@@ -609,4 +619,40 @@ export function renderExecChannel(
         payload = `${innerLayers[i]!} <<'${tag}'\n${payload}\n${tag}`;
     }
     return { kind: "ok", remoteArgs, stdinCmd: payload };
+}
+
+export type EnterBridgeCommandRender =
+    | { kind: "ok"; command: string }
+    | { kind: "unreachable"; reason: string; step: string };
+
+/**
+ * 渲染穿层（enterPipeline）二进制安全的远端桥接命令：
+ * 逐层以 argv `-c` 包裹（绝不经 `sh -s` 消费 stdin），保证第 0 字节起即为干净双向 stdio 字节流。
+ */
+export function renderEnterBridgeCommand(steps: EnterStep[], innerCommand: string): EnterBridgeCommandRender {
+    let current = innerCommand;
+    for (let i = steps.length - 1; i >= 0; i--) {
+        const raw = steps[i]!.cmd;
+        const trimmed = raw.trim();
+        let tokens: string[];
+        if (/^ssh(\s|$)/.test(trimmed)) {
+            const stripped = trimmed.replace(/(^|\s)-+(tt|t)\b/g, "$1").replace(/\s+/g, " ").trim();
+            const parsed = tokenizeArgv(stripped);
+            if (!parsed.includes("-T")) parsed.splice(1, 0, "-T");
+            tokens = [...parsed, "sh", "-c", current];
+        } else {
+            const cleaned = trimmed.replace(/(^|\s)-(it|ti)\b/g, "$1-i").replace(/(^|\s)-t\b/g, "$1-i").trim();
+            const m = SHELL_TAIL_RE.exec(cleaned);
+            if (!m) {
+                return {
+                    kind: "unreachable",
+                    reason: "进入命令无法非交互透传 stdio 桥接（既非「… bash/sh」结尾、也非「ssh <目标>」形态）",
+                    step: raw,
+                };
+            }
+            tokens = [...tokenizeArgv(cleaned), "-c", current];
+        }
+        current = tokens.map(shellQuote).join(" ");
+    }
+    return { kind: "ok", command: current };
 }

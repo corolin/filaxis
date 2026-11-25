@@ -592,10 +592,7 @@ function withSuffix(p: string, suffix: string): string {
     const name = slash >= 0 ? p.slice(slash + 1) : p;
     const suffixBytes = Buffer.byteLength(suffix, "utf-8");
     if (Buffer.byteLength(name, "utf-8") + suffixBytes <= 255) return p + suffix;
-    const crypto = globalThis.crypto;
-    const h = crypto && "randomUUID" in crypto
-        ? crypto.randomUUID().slice(0, 8)
-        : Math.random().toString(16).slice(2, 10);
+    const h = randomBytes(4).toString("hex");
     const keep = Math.max(1, 255 - suffixBytes - 9);
     let cut = name.slice(0, keep);
     while (Buffer.byteLength(cut, "utf-8") > keep && cut.length > 0) cut = cut.slice(0, -1);

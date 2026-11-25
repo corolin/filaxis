@@ -119,6 +119,7 @@ import type {
 } from "./session-types.js";
 
 import type { ObservationWindowOptions, StreamWindow, StreamWindowRegistry } from "./stream-window.js";
+import type { OpenForwardSpec, ForwardInfo, CloseForwardResult } from "./ssh-forward.js";
 
 export interface RuntimeDriver {
     /** The non-interactive exec channel supports maxOutputBytes without collecting full output. */
@@ -157,6 +158,11 @@ export interface RuntimeDriver {
 
     // 强隔离文件系统
     fs: FileSystemDriver;
+
+    // 动态端口转发（-L / -R / -D，REQ-0005）
+    openForward?(spec: OpenForwardSpec): Promise<ForwardInfo>;
+    closeForward?(forwardId: string): Promise<CloseForwardResult>;
+    listForwards?(): ForwardInfo[];
 
     // 初始化与销毁
     init(): Promise<void>;

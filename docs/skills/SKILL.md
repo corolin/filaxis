@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.11"
+  version: "0.2.12"
 description: |
   使用 Filaxis（@syrkos/filaxis）执行跨层命令、批量巡检、管理后台任务、观察日志或操作目标层文件。
   也用于排查 SSH 别名与跳板、解读 unknown 终态或写入保障。纯本机一次性命令和与 Filaxis 无关的任务可跳过。
@@ -72,7 +72,9 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 - 宿主拦截 SSH 匿名管道时，在建层前设 `FILAXIS_SSH_STDIO_MODE=inherit`。它支持直连、单跳 `-J` 和可非交互重放的进入步骤。逐跳 PTY、交互进入、持久转发和持续观察窗需要可用的匿名管道。若首轮已发出且终态未知，先核实远端状态再决定是否重发。
 - Windows 的 OpenSSH 子进程会继承现有配置，并由 Filaxis 补齐缺失的系统和账户变量，例如 `SystemRoot`、`windir`、`ProgramData` 和 `USERNAME`。成功补齐 `SystemRoot` 时，CLI 和 MCP 会在 stderr 告警一次，SDK 通过注入的 logger 记录。SSH 秒退且双流为空时，可检查启动器是否保留了系统环境。
 
-**Agent 形态升级路径**：CLI 每条命令独立进程（连接不复用）。高频操作或脚本编排时换 SDK / `createAgentToolkit` 常驻形态——连接/PTY 复用 + 结构化参数（`editFile` 直接传字符串免临时 JSON 文件 + `runBatch` 直接传数组免 plan 文件），步数与 Token 双降（盲测实证阶段二 non_cache 省 17.7%）。
+用 `filaxis daemon start` 启动本机守护进程后，CLI 与未指定 SSH 启动目标的 MCP 服务可共享层、转发和观察窗。用 `filaxis daemon status` 查看状态，`filaxis daemon stop` 停止，或给单次命令传 `--no-daemon`。持续观察用 `filaxis stream open/peek/close`，转发用 `filaxis forward add/list/remove`，或在 MCP `manage_layers` 中使用 `forward_add`、`forward_list`、`forward_remove`。按返回的窗口 ID 或转发 ID 查询和关闭。
+
+SDK 的 `createAgentToolkit` 也可在宿主进程内复用连接和 PTY，并接受结构化参数。
 
 ### SDK 最小配方（Bun / Node 编码接入）
 
