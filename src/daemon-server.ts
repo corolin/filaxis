@@ -1006,7 +1006,7 @@ function serializeRpcError(err: unknown): Record<string, unknown> {
     };
     return {
         ok: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: err instanceof Error ? err.message : "Daemon RPC 执行失败",
         ...(err instanceof Error ? { name: err.name } : {}),
         ...(typeof obj.code === "string" || typeof obj.code === "number" ? { code: obj.code } : {}),
         ...(typeof obj.partialOutput === "string" ? { partialOutput: obj.partialOutput } : {}),

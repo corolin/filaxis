@@ -1052,6 +1052,11 @@ describe("CLI daemon / forward / stream E2E", () => {
             })).rejects.toMatchObject({
                 name: failure.name, code: failure.code, outcome: failure.outcome, partialOutput: failure.partialOutput,
             });
+
+            driver.exec = async () => { throw { toString: () => "internal error details" }; };
+            await expect(client.rpc("exec", {
+                target: { layer: "fixture" }, command: "fixture",
+            })).rejects.toMatchObject({ message: "Daemon RPC 执行失败" });
         } finally {
             await srv.stop();
         }
