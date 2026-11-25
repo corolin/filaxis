@@ -10,7 +10,7 @@
  *   4. 回退 "bash" + 诊断提示（用户可能真有 WSL 发行版）
  */
 import { existsSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const GIT_BASH_CANDIDATES = [
     "C:\\Program Files\\Git\\bin\\bash.exe",
@@ -21,7 +21,7 @@ const GIT_BASH_CANDIDATES = [
 /** PATH 上 bash 的解析结果（无则 undefined） */
 function bashOnPath(): string | undefined {
     try {
-        return execSync("where bash", { stdio: ["ignore", "pipe", "ignore"] })
+        return execFileSync("where", ["bash"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
             .toString().split("\n").map((l) => l.trim()).filter(Boolean)[0];
     } catch {
         return undefined;

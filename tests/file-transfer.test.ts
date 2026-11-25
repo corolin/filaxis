@@ -347,7 +347,7 @@ describe("putFile（真实 shell 回归）", () => {
         const target = "file with spaces.bin";
         const info = (path: string, operation: string) => execFileSync("powershell.exe", [
             "-NoProfile", "-NonInteractive", "-Command", operation,
-        ], { encoding: "utf8", env: { ...process.env, FX_TEST_ACL_PATH: path } }).trim();
+        ], { encoding: "utf8", windowsHide: true, env: { ...process.env, FX_TEST_ACL_PATH: path } }).trim();
         const snapshot = "([IO.File]::GetAccessControl($env:FX_TEST_ACL_PATH)).GetSecurityDescriptorSddlForm('Access')";
         const staged: string[] = [];
         const exec: TransferExec = async (command) => {
@@ -424,7 +424,7 @@ describe("putFile（真实 shell 回归）", () => {
     const realExec: TransferExec = async (command) => {
         // sh -s stdin 传命令（与 execChannel 同形态）——sh -c 走 argv，Windows
         // 32767 字符上限装不下 48K chunk（uv_spawn ENAMETOOLONG，本测试实测踩出）
-        const p = Bun.spawn(["sh", "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+        const p = Bun.spawn(["sh", "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
         p.stdin.write(command);
         await p.stdin.end();
         const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
@@ -874,7 +874,7 @@ describe("[P2] tmux 大文件分块下载（避开输出滚动窗口截断）", 
             const cappedTmuxDriver = {
                 descriptor: { driver: "tmux" as const },
                 async exec(cmd: string) {
-                    const p = Bun.spawn([shPath, "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+                    const p = Bun.spawn([shPath, "-c", cmd], { stdout: "pipe", stderr: "pipe", windowsHide: true });
                     const [stdout, stderr, exitCode] = await Promise.all([
                         new Response(p.stdout).text(),
                         new Response(p.stderr).text(),

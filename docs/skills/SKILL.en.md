@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.11"
+  version: "0.2.12"
 description: |
   Use Filaxis (@syrkos/filaxis) to run commands across layers, batch inspections, manage background jobs, follow logs, or operate on files.
   Also use it to diagnose SSH aliases and jump hosts or interpret unknown outcomes and write guarantees. Skip for simple local shell commands and tasks unrelated to Filaxis.
@@ -61,6 +61,8 @@ filaxis edit --layer <name> <path> --request-file edit.json
 # 5. Commands that may hang (nc/ping/tail) — always pass --timeout (CLI default is 120s)
 filaxis exec --layer <name> --timeout 8000 -- "(printf 'PING\n'; sleep 1) | nc 127.0.0.1 6379"
 ```
+
+Run `filaxis daemon start` to share layers, forwards, and observation windows between the CLI and MCP launchers without an explicit SSH target. Use `filaxis daemon status` to inspect the daemon, `filaxis daemon stop` to stop it, or `--no-daemon` for an individual call. Manage continuous observation with `filaxis stream open/peek/close`. Manage forwarding with `filaxis forward add/list/remove` or the MCP `manage_layers` actions `forward_add`, `forward_list`, and `forward_remove`. Use the returned window or forward ID to inspect and close it.
 
 ---
 

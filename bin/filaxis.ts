@@ -16,16 +16,23 @@
  * --known-hosts）+ sshHops 逐跳链（--hop 可重复）+ enterPipeline（--enter 可重复
  * + --docker 糖）。每跳独立密钥等极端拓扑走 SDK descriptor 全量描述。
  */
-import { RuntimeStack, LocalRuntimeDriver, SshPtyDriver, editFile, discoverLayer, layerDisplayName, runBatch, type BatchPlan } from "../src/index.js";
+import {
+    RuntimeStack, LocalRuntimeDriver, SshPtyDriver, editFile, discoverLayer, layerDisplayName, runBatch, type BatchPlan, type BatchReport,
+    DaemonServer, DaemonClient, probeDaemon, spawnDaemonBackground, parseAddrToUrl, urlRequestHost, urlRequestPort,
+    defaultDaemonDir, readDaemonLock, readDaemonConnection, cleanupDaemonFiles, isPidAlive,
+    normalizeForwardSpec, type CloseForwardResult, type OpenForwardSpec, type ForwardInfo, type CliTargetSpec,
+} from "../src/index.js";
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
-import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, extname, join } from "node:path";
+import { dirname, extname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
 import { transferLayerFile } from "../src/layer-file-transfer.js";
 import { noopLogger } from "../src/logger.js";
+import type { SshConnParams } from "../src/ssh-helpers.js";
+import { version as pkgVersion } from "../package.json" with { type: "json" };
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -45,19 +52,28 @@ function dockerArg(argv: string[], i: number): string {
     return v;
 }
 
-function numArg(argv: string[], i: number, opts: { positive?: boolean } = {}): number {
+function numArg(argv: string[], i: number, opts: { positive?: boolean; nonNegative?: boolean } = {}): number {
     const raw = argv[i + 1];
-    const n = raw === undefined ? NaN : parseInt(raw, 10);
-    if (!Number.isFinite(n) || (opts.positive && (n <= 0))) {
-        throw new Error(`参数 ${argv[i]} 需要一个${opts.positive ? "正" : ""}数字（收到: ${raw ?? "（缺失）"}）`);
+    const n = raw !== undefined && /^[+-]?\d+$/.test(raw) ? Number(raw) : NaN;
+    if (!Number.isSafeInteger(n) || (opts.positive && n <= 0) || (opts.nonNegative && n < 0)) {
+        const desc = opts.positive ? "正" : opts.nonNegative ? "非负" : "";
+        throw new Error(`参数 ${argv[i]} 需要一个${desc}数字（收到: ${raw ?? "（缺失）"}）`);
     }
     return n;
+}
+
+function strArg(argv: string[], i: number): string {
+    const v = argv[i + 1];
+    if (!v || /^-(?:-|[A-Za-z])/.test(v)) {
+        throw new Error(`参数 ${argv[i]} 需要参数值`);
+    }
+    return v;
 }
 
 const batchValueOptions = new Set([
     "--host", "--user", "--port", "--key", "-J", "--jump", "--hop", "--enter",
     "--docker", "--docker-shell", "--docker-runtime", "--forward", "--host-key", "--known-hosts",
-    "--layer", "--request-file",
+    "--layer", "--request-file", "--daemon-dir",
 ]);
 
 function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "default"): {
@@ -71,16 +87,23 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
     transport?: "exec" | "sftp";
     stdinJson?: boolean; requestFile?: string; pty?: boolean; help?: boolean;
     stdinScript?: boolean; scriptFile?: string; // exec 免 Shell 通道（盲测 #4）
+    noDaemon?: boolean; daemonDir?: string; json?: boolean;
+    addr?: string; foreground?: boolean; force?: boolean;
+    dynLocal: string[]; dynRemote: string[]; dynDynamic: string[];
+    id?: string; after?: number; before?: number; limit?: number; wait?: number; name?: string;
     positional: string[];
 } {
-    const o: ReturnType<typeof parseOpts> = { positional: [], hop: [], enter: [], forward: [] };
+    const o: ReturnType<typeof parseOpts> = {
+        positional: [], hop: [], enter: [], forward: [],
+        dynLocal: [], dynRemote: [], dynDynamic: [],
+    };
     let noMoreOpts = false; // `--` 后全 positional（Astra 二十五期 #2：业务命令里的 --layer 等字面量曾被吞成选项——错层/丢参数）
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
         if (noMoreOpts) { o.positional.push(a); continue; }
         if (a === "--") { noMoreOpts = true; continue; } // 命令分隔符：终止选项解析
         if (a === "--help" || a === "-h") return { ...o, help: true };
-        if (mode === "batch" && a.startsWith("-") && a !== "--stdin-json") {
+        if (mode === "batch" && a.startsWith("-") && a !== "--stdin-json" && a !== "--no-daemon") {
             if (!batchValueOptions.has(a)) throw new Error(`batch 不支持 ${a}`);
             const value = argv[i + 1];
             if (!value || value.startsWith("-")) throw new Error(`batch 的 ${a} 需要参数值`);
@@ -88,32 +111,40 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
         switch (a) {
             case "--host": {
                 const v = argv[++i];
-                if (!v) throw new Error("--host 需要目标（user@host 形态）");
+                if (!v || v.startsWith("-")) throw new Error("--host 需要目标（user@host 形态）");
                 o.host = v;
                 break;
             }
-            case "--user": o.user = argv[++i]; break;
+            case "--user": o.user = strArg(argv, i); i++; break;
             case "--port": o.port = numArg(argv, i); i++; break;
-            case "--key": o.key = argv[++i]; break;
-            case "-J": case "--jump": o.jump = argv[++i]; break;
-            case "--hop": o.hop.push(argv[++i]!); break;
-            case "--enter": o.enter.push(argv[++i]!); break;
+            case "--key": o.key = strArg(argv, i); i++; break;
+            case "-J": case "--jump": o.jump = strArg(argv, i); i++; break;
+            case "--hop": o.hop.push(strArg(argv, i)); i++; break;
+            case "--enter": o.enter.push(strArg(argv, i)); i++; break;
             case "--pty": o.pty = true; break;
             case "--docker": o.docker = dockerArg(argv, i); i++; break;
             case "--docker-shell": o.dockerShell = dockerArg(argv, i); i++; break;
             case "--docker-runtime": o.dockerRuntime = dockerArg(argv, i); i++; break;
-            case "--forward": o.forward.push(argv[++i]!); break;
-            case "--host-key": o.hostKey = argv[++i]; break;
-            case "--known-hosts": o.knownHosts = argv[++i]; break;
+            case "--forward": o.forward.push(strArg(argv, i)); i++; break;
+            case "--host-key": o.hostKey = strArg(argv, i); i++; break;
+            case "--known-hosts": o.knownHosts = strArg(argv, i); i++; break;
             case "--layer": {
                 const v = argv[++i];
-                if (!v) throw new Error(`--layer 需要层名（收到缺失——曾静默落本机执行）`); // Sol 57 P1-1
+                if (!v || v.startsWith("-")) throw new Error("--layer 需要层名");
                 o.layer = v;
                 break;
             }
             case "--timeout": o.timeout = numArg(argv, i, { positive: true }); i++; break; // 正数（Hydrogen R9 #4：0/负数曾静默禁用或立即杀）
             case "--duration": o.duration = numArg(argv, i, { positive: true }); i++; break;
-            case "--stream": o.stream = argv[++i]; break;
+            case "--stream": {
+                const stream = strArg(argv, i);
+                if (stream !== "stdout" && stream !== "stderr" && stream !== "both") {
+                    throw new Error("--stream 仅接受 stdout、stderr 或 both");
+                }
+                o.stream = stream;
+                i++;
+                break;
+            }
             case "--all": o.all = true; break;
             case "--write-mode": {
                 const v = argv[++i];
@@ -129,13 +160,38 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
             }
             case "--stdin-json": o.stdinJson = true; break;
             case "--stdin-script": o.stdinScript = true; break; // exec 免 Shell：命令从 stdin 读（盲测 #4）
-            case "--script-file": o.scriptFile = argv[++i]; break; // exec 免 Shell：命令从文件读
-            case "--request-file": o.requestFile = argv[++i]; break;
+            case "--script-file": o.scriptFile = strArg(argv, i); i++; break;
+            case "--request-file": o.requestFile = strArg(argv, i); i++; break;
+            case "--no-daemon": o.noDaemon = true; break;
+            case "--daemon-dir": o.daemonDir = strArg(argv, i); i++; break;
+            case "--json": o.json = true; break;
+            case "--addr": o.addr = strArg(argv, i); i++; break;
+            case "--foreground": o.foreground = true; break;
+            case "--force": o.force = true; break;
+            case "-L": o.dynLocal.push(strArg(argv, i)); i++; break;
+            case "-R": o.dynRemote.push(strArg(argv, i)); i++; break;
+            case "-D": {
+                const next = argv[i + 1];
+                if (next === undefined || (next.startsWith("-") && !/^-\d/.test(next))) {
+                    o.dynDynamic.push("0");
+                } else {
+                    o.dynDynamic.push(next);
+                    i++;
+                }
+                break;
+            }
+            case "--id": o.id = strArg(argv, i); i++; break;
+            case "--after": o.after = numArg(argv, i, { nonNegative: true }); i++; break;
+            case "--before": o.before = numArg(argv, i, { nonNegative: true }); i++; break;
+            case "--limit": o.limit = numArg(argv, i, { positive: true }); i++; break;
+            case "--wait": o.wait = numArg(argv, i, { nonNegative: true }); i++; break;
+            case "--name": o.name = strArg(argv, i); i++; break;
             default:
                 if (mode !== "default" && a.startsWith("-")) throw new Error(`未知参数 ${a}。以 - 开头的路径请放在 -- 之后`);
                 o.positional.push(a);
         }
     }
+    if (o.stdinScript && o.scriptFile) throw new Error("--stdin-script 与 --script-file 二选一");
     return o;
 }
 
@@ -295,20 +351,16 @@ function savedLayerDriver(name: string, layers: Record<string, RuntimeDescriptor
 }
 
 async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false): Promise<RuntimeDriver> {
+    validateCliTargetOptions(opts);
     // PTY link 按需建（审计 M1）：exec 通道独立 ssh 进程、观察流独立 spawn——都不依赖
     // PTY link，且不 init 能保留 execChannel 的「多跳不可直达」诚实拒绝语义（统一
     // init 会把假跳板名的错误提前成建链失败，改变错误落点）；--pty 走 link.execMarker
     // 必须先建链（修前恒抛「未就绪」）。
     const drv: RuntimeDriver = (() => {
         if (opts.layer) {
-            if (opts.host) throw new Error("--layer 与 --host 互斥（层路径已持久化——改路径请 filaxis layer save 覆盖）");
             return savedLayerDriver(opts.layer);
         }
         if (opts.host) return new SshPtyDriver(buildSshDescriptor(opts), { logger: sshLogger });
-        // local 层无路径概念——路径参数在场而 --host 缺席 = 防呆报错（静默忽略=错机器风险）
-        if (opts.jump || opts.hop.length || opts.enter.length || opts.docker || opts.forward.length || opts.hostKey || opts.knownHosts) {
-            throw new Error("路径描述参数（--jump/--hop/--enter/--docker/--forward/--host-key/--known-hosts）需要 --host（local 层无路径概念）");
-        }
         return new LocalRuntimeDriver();
     })();
     if (needPtyLink && drv instanceof SshPtyDriver) await drv.init();
@@ -340,7 +392,196 @@ async function readStdinAll(): Promise<string> {
     return text;
 }
 
-async function runCliBatch(o: ReturnType<typeof parseOpts>): Promise<void> {
+/** 拆分冒号同时保留方括号内 IPv6（如 [::1]:8080:[::1]:80） */
+function splitColonsRespectingBrackets(raw: string): string[] {
+    const parts: string[] = [];
+    let cur = "";
+    let inBracket = false;
+    for (const ch of raw) {
+        if (ch === "[") {
+            inBracket = true;
+            cur += ch;
+        } else if (ch === "]") {
+            inBracket = false;
+            cur += ch;
+        } else if (ch === ":" && !inBracket) {
+            parts.push(cur);
+            cur = "";
+        } else {
+            cur += ch;
+        }
+    }
+    if (inBracket) throw new Error(`端口转发规格括号未闭合: ${raw}`);
+    parts.push(cur);
+    return parts;
+}
+
+function parseStrictPort(raw: string, allowZero: boolean, spec: string): number {
+    if (allowZero && raw === "") return 0;
+    if (!/^\d+$/.test(raw)) throw new Error(`端口必须是数字 (${raw}): ${spec}`);
+    const port = Number(raw);
+    const min = allowZero ? 0 : 1;
+    if (!Number.isInteger(port) || port < min || port > 65535) {
+        throw new Error(`端口超出范围 ${min}-65535 (${raw}): ${spec}`);
+    }
+    return port;
+}
+
+function parseDynamicForwardCliSpec(kind: "L" | "R" | "D", raw: string, id?: string, timeoutMs?: number): OpenForwardSpec {
+    const parts = splitColonsRespectingBrackets(raw);
+    let spec: OpenForwardSpec;
+    if (kind === "D") {
+        if (parts.length === 1) {
+            spec = { kind, bindPort: parseStrictPort(parts[0]!, true, raw) };
+        } else if (parts.length === 2) {
+            spec = { kind, bindAddr: parts[0]!, bindPort: parseStrictPort(parts[1]!, true, raw) };
+        } else {
+            throw new Error(`-D 规格格式应为 [bindAddr:]bindPort，收到: ${raw}`);
+        }
+    } else {
+        if (parts.length === 2) {
+            spec = {
+                kind,
+                bindPort: 0,
+                targetHost: parts[0]!,
+                targetPort: parseStrictPort(parts[1]!, false, raw),
+            };
+        } else if (parts.length === 3) {
+            spec = {
+                kind,
+                bindPort: parseStrictPort(parts[0]!, true, raw),
+                targetHost: parts[1]!,
+                targetPort: parseStrictPort(parts[2]!, false, raw),
+            };
+        } else if (parts.length === 4) {
+            spec = {
+                kind,
+                bindAddr: parts[0]!,
+                bindPort: parseStrictPort(parts[1]!, true, raw),
+                targetHost: parts[2]!,
+                targetPort: parseStrictPort(parts[3]!, false, raw),
+            };
+        } else {
+            throw new Error(`-${kind} 规格格式应为 [[bindAddr:]bindPort:]targetHost:targetPort，收到: ${raw}`);
+        }
+    }
+    if (id !== undefined) spec.id = id;
+    if (timeoutMs !== undefined) spec.timeoutMs = timeoutMs;
+    normalizeForwardSpec(spec);
+    return spec;
+}
+
+function validateCliTargetOptions(opts: ReturnType<typeof parseOpts>): void {
+    if (opts.layer && opts.host) throw new Error("--layer 与 --host 互斥（层路径已持久化——改路径请 filaxis layer save 覆盖）");
+    if (!opts.host && (opts.user !== undefined || opts.port !== undefined || opts.key !== undefined ||
+        opts.jump || opts.hop.length || opts.enter.length || opts.docker || opts.dockerRuntime ||
+        opts.dockerShell || opts.forward.length || opts.hostKey || opts.knownHosts)) {
+        throw new Error("SSH 连接参数需要 --host（已保存层请修改快照）");
+    }
+}
+
+function resolveDaemonSshPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor {
+    if (descriptor?.driver !== "ssh") return descriptor;
+    const config = descriptor.config;
+    const conn = config?.connParams as SshConnParams | undefined;
+    if (!conn || typeof conn !== "object") return descriptor;
+
+    const fromCaller = (file: string | undefined): string | undefined => {
+        if (typeof file !== "string" || !file || file === "none" || isAbsolute(file) || /^(?:~|%|\$\{)/.test(file)) return file;
+        return resolvePath(file);
+    };
+    const jump = conn.jump;
+    return {
+        ...descriptor,
+        config: {
+            ...config,
+            connParams: {
+                ...conn,
+                keyFile: fromCaller(conn.keyFile),
+                knownHostsFile: fromCaller(conn.knownHostsFile),
+                ...(jump && typeof jump === "object"
+                    ? { jump: { ...jump, keyFile: fromCaller(jump.keyFile) } }
+                    : {}),
+            },
+        },
+    };
+}
+
+function buildCliTargetSpec(opts: ReturnType<typeof parseOpts>, allowSavedLayerLookup = true): CliTargetSpec {
+    validateCliTargetOptions(opts);
+    if (opts.layer) {
+        if (allowSavedLayerLookup) {
+            const layers = loadLayerStore();
+            if (Object.hasOwn(layers, opts.layer)) {
+                return { layer: opts.layer, descriptor: resolveDaemonSshPaths(layers[opts.layer]!) };
+            }
+        }
+        return { layer: opts.layer };
+    }
+    if (opts.host) {
+        return { descriptor: resolveDaemonSshPaths(buildSshDescriptor(opts)) };
+    }
+    return { descriptor: { driver: "local" }, cwd: process.cwd() };
+}
+
+async function tryDaemon(opts: ReturnType<typeof parseOpts>): Promise<DaemonClient | null> {
+    if (opts.noDaemon || process.env.FILAXIS_NO_DAEMON === "1") return null;
+    return probeDaemon(opts.daemonDir);
+}
+
+async function requireDaemon(opts: ReturnType<typeof parseOpts>): Promise<DaemonClient> {
+    if (opts.noDaemon) {
+        throw new Error("该命令依赖常驻 Daemon，不支持 --no-daemon");
+    }
+    const client = await probeDaemon(opts.daemonDir);
+    if (!client) {
+        throw new Error("未检测到活跃的 Filaxis Daemon，请先运行 filaxis daemon start");
+    }
+    return client;
+}
+
+function printBatchReport(r: BatchReport): void {
+    for (const s of r.steps) {
+        const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})${s.layer === undefined ? "" : ` layer=${s.layer}`}`;
+        if (s.status === "skipped") {
+            console.log(`${head} — ${s.skippedBecause}`);
+            continue;
+        }
+        if (s.kind === "exec") {
+            console.log(`${head} exit=${s.exitCode}${s.effectiveUser ? ` user=${s.effectiveUser}` : ""}${s.error ? ` ✗ ${s.error}` : ""}`);
+            if (s.stdout) process.stdout.write(s.stdout.endsWith("\n") ? s.stdout : s.stdout + "\n");
+            if (s.stderr) process.stderr.write(s.stderr.endsWith("\n") ? s.stderr : s.stderr + "\n");
+        } else if (s.kind === "edit" && s.edits) {
+            console.log(`${head} ${s.edits.path} 替换 ${s.edits.occurrences} 处，${s.edits.bytesBefore}B → ${s.edits.bytesAfter}B${s.edits.mutex === "degraded" ? "（无锁降级）" : ""}`);
+        } else if (s.transfer) {
+            const { bytes, transport, verification, writeMode } = s.transfer;
+            console.log(`${head} ${bytes} 字节 | transport=${transport} | verification=${verification} | writeMode=${writeMode}`);
+        } else {
+            console.log(`${head} ${((s.stdout ?? "").length)} 字符`);
+        }
+        if (s.error && s.kind !== "exec") console.error(`  ✗ ${s.error}`);
+    }
+    console.log(`batch ${r.status}${r.failedStep ? `（失败于 ${r.failedStep}）` : ""}`);
+    process.exitCode = r.status === "ok" ? 0 : 1;
+}
+
+function printObserveStopStatus(
+    stopStatus: "exited" | "stopped" | "unknown",
+    verifyStatus: string | undefined,
+    verifyError: string | undefined,
+    sessionId: string,
+    logBase: string,
+): void {
+    if (stopStatus !== "unknown") return;
+    if (verifyStatus === "unknown" || verifyStatus === "running") process.exitCode = 1;
+    if (verifyStatus === "running") {
+        console.error(`[filaxis] 停止结果未知且核实显示**任务仍在运行**——会话 ${sessionId} 日志 ${logBase}，勿盲目重试`);
+    } else if (verifyStatus === "unknown") {
+        console.error(`[filaxis] 停止与核实均为未知（${verifyError ? `核实失败: ${verifyError}` : "通道异常或会话失联"}）——会话 ${sessionId} 日志 ${logBase}，任务可能仍在运行：核实终态后再重试`);
+    }
+}
+
+async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient | null): Promise<void> {
     // 批次组合（第十一季）：计划 JSON 经 --request-file / --stdin-json 直达
     //（免 Shell 通道哲学——多行命令/hunk 绝不进 argv）
     if (o.positional.length) throw new Error(`batch 不接受位置参数：${o.positional.join(" ")}`);
@@ -363,6 +604,27 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>): Promise<void> {
     if (o.layer && plan && typeof plan === "object" && !Array.isArray(plan) && plan.layer === undefined) {
         plan = { ...plan, layer: o.layer };
     }
+    if (daemon) {
+        const savedLayers = Object.fromEntries(
+            Object.entries(loadLayerStore()).map(([name, descriptor]) => [name, resolveDaemonSshPaths(descriptor)]),
+        );
+        const target = !o.layer ? buildCliTargetSpec(o) : undefined;
+        const resolvedPlan: BatchPlan = (plan && typeof plan === "object" && !Array.isArray(plan) && Array.isArray(plan.steps))
+            ? {
+                ...plan,
+                steps: plan.steps.map((step) => {
+                    if (step && typeof step === "object" && (step.kind === "put" || step.kind === "get")
+                        && typeof step.localPath === "string" && step.localPath.length > 0 && !step.localPath.includes("\0")) {
+                        return { ...step, localPath: resolvePath(step.localPath) };
+                    }
+                    return step;
+                }),
+            }
+            : plan;
+        const r = await daemon.rpc<BatchReport>("batch", { target, plan: resolvedPlan, savedLayers, clientCwd: process.cwd() });
+        printBatchReport(r);
+        return;
+    }
     const drivers = new Map<string | undefined, RuntimeDriver>();
     let saved: Record<string, RuntimeDescriptor> | undefined;
     try {
@@ -373,31 +635,320 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>): Promise<void> {
             drivers.set(name, driver);
             return driver;
         }, plan);
-        for (const s of r.steps) {
-            const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})${s.layer === undefined ? "" : ` layer=${s.layer}`}`;
-            if (s.status === "skipped") {
-                console.log(`${head} — ${s.skippedBecause}`);
-                continue;
-            }
-            if (s.kind === "exec") {
-                console.log(`${head} exit=${s.exitCode}${s.effectiveUser ? ` user=${s.effectiveUser}` : ""}${s.error ? ` ✗ ${s.error}` : ""}`);
-                if (s.stdout) process.stdout.write(s.stdout.endsWith("\n") ? s.stdout : s.stdout + "\n");
-                if (s.stderr) process.stderr.write(s.stderr.endsWith("\n") ? s.stderr : s.stderr + "\n");
-            } else if (s.kind === "edit" && s.edits) {
-                console.log(`${head} ${s.edits.path} 替换 ${s.edits.occurrences} 处，${s.edits.bytesBefore}B → ${s.edits.bytesAfter}B${s.edits.mutex === "degraded" ? "（无锁降级）" : ""}`);
-            } else if (s.transfer) {
-                const { bytes, transport, verification, writeMode } = s.transfer;
-                console.log(`${head} ${bytes} 字节 | transport=${transport} | verification=${verification} | writeMode=${writeMode}`);
-            } else {
-                console.log(`${head} ${((s.stdout ?? "").length)} 字符`);
-            }
-            if (s.error && s.kind !== "exec") console.error(`  ✗ ${s.error}`);
-        }
-        console.log(`batch ${r.status}${r.failedStep ? `（失败于 ${r.failedStep}）` : ""}`);
-        process.exitCode = r.status === "ok" ? 0 : 1;
+        printBatchReport(r);
     } finally {
         await Promise.all([...drivers.values()].map(destroyDriver));
     }
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (!isPidAlive(pid)) return true;
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    return !isPidAlive(pid);
+}
+
+async function forceStopPid(pid: number, dir: string): Promise<boolean> {
+    try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
+    if (await waitForPidExit(pid, 2_000)) {
+        cleanupDaemonFiles(dir, pid);
+        return true;
+    }
+    try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+    if (await waitForPidExit(pid, 2_000)) {
+        cleanupDaemonFiles(dir, pid);
+        return true;
+    }
+    return false;
+}
+
+async function handleDaemonCmd(sub: string | undefined, o: ReturnType<typeof parseOpts>): Promise<void> {
+    if ((sub === "start" || sub === "status" || sub === "stop") && o.positional.length) {
+        throw new Error(`daemon ${sub} 不接受位置参数: ${o.positional.join(" ")}`);
+    }
+    const dir = o.daemonDir ?? defaultDaemonDir();
+    if (sub === "start") {
+        let host = "127.0.0.1";
+        let port = 0;
+        if (o.addr) {
+            const url = parseAddrToUrl(o.addr);
+            host = urlRequestHost(url);
+            port = urlRequestPort(url);
+        }
+        if (o.foreground) {
+            const srv = new DaemonServer({ daemonDir: dir, host, port, version: pkgVersion, logger: sshLogger });
+            const addr = await srv.start();
+            if (o.json) {
+                console.log(JSON.stringify({ running: true, pid: process.pid, addr, daemonDir: dir }));
+            } else {
+                console.log(`Filaxis Daemon 已启动 (foreground): pid=${process.pid} addr=${addr}`);
+            }
+            let closing = false;
+            const onSignal = () => {
+                if (closing) return;
+                closing = true;
+                void srv.stop();
+            };
+            process.on("SIGINT", onSignal);
+            process.on("SIGTERM", onSignal);
+            await srv.waitForStop();
+            process.removeListener("SIGINT", onSignal);
+            process.removeListener("SIGTERM", onSignal);
+            return;
+        }
+        const cliEntryPath = fileURLToPath(import.meta.url);
+        const info = await spawnDaemonBackground({ cliEntryPath, daemonDir: dir, addr: o.addr });
+        if (o.json) {
+            console.log(JSON.stringify({ running: true, ...info, daemonDir: dir }, null, 2));
+        } else {
+            console.log(`Filaxis Daemon 已启动: pid=${info.pid} addr=${info.addr} dir=${dir}`);
+        }
+        return;
+    }
+    if (sub === "status") {
+        const client = await probeDaemon(dir);
+        if (!client) {
+            if (o.json) console.log(JSON.stringify({ running: false, daemonDir: dir }));
+            else console.log(`Filaxis Daemon 未运行 (${dir})`);
+            process.exitCode = 1;
+            return;
+        }
+        const info = await client.status();
+        if (o.json) {
+            console.log(JSON.stringify({ running: true, ...info, daemonDir: dir }, null, 2));
+        } else {
+            console.log(`Filaxis Daemon 运行中: pid=${info.pid} addr=${info.addr} uptime=${Math.round(info.uptimeMs / 1000)}s`);
+            console.log(`  layers=${info.layers.length} forwards=${info.forwards.length} streams=${info.streams.length}`);
+        }
+        return;
+    }
+    if (sub === "stop") {
+        const client = await probeDaemon(dir);
+        if (client) {
+            let pid: number | undefined;
+            try { pid = (await client.status(1500)).pid; } catch { pid = readDaemonLock(dir)?.pid; }
+            await client.shutdown();
+            const deadline = Date.now() + 5000;
+            while (Date.now() < deadline) {
+                const stillConn = readDaemonConnection(dir);
+                const alive = pid ? isPidAlive(pid) : false;
+                if (!stillConn && !alive) break;
+                await new Promise((r) => setTimeout(r, 50));
+            }
+            if (pid && isPidAlive(pid)) {
+                if (!o.force) {
+                    process.exitCode = 1;
+                    if (o.json) console.log(JSON.stringify({ stopped: false, status: "unknown", pid }));
+                    else console.error(`[filaxis] Daemon 停机核实超时：进程仍存活 (pid=${pid})，终态未知（加 --force 可强制终止）`);
+                    return;
+                }
+                const killed = await forceStopPid(pid, dir);
+                if (!killed) {
+                    process.exitCode = 1;
+                    if (o.json) console.log(JSON.stringify({ stopped: false, status: "unknown", forced: true, pid }));
+                    else console.error(`[filaxis] 强制终止 Daemon 后仍未确认退出 (pid=${pid})，终态未知`);
+                    return;
+                }
+                if (o.json) console.log(JSON.stringify({ stopped: true, forced: true, pid }));
+                else console.log(`已强制停止 Filaxis Daemon (pid=${pid})`);
+                return;
+            }
+            if (o.json) console.log(JSON.stringify({ stopped: true, ...(pid ? { pid } : {}) }));
+            else console.log(`Filaxis Daemon 已停止${pid ? ` (pid=${pid})` : ""}`);
+            return;
+        }
+        const lock = readDaemonLock(dir);
+        if (lock && isPidAlive(lock.pid)) {
+            if (!o.force) {
+                throw new Error(`Daemon 控制面无响应但进程仍存活 (pid=${lock.pid})——加 --force 强制终止`);
+            }
+            const killed = await forceStopPid(lock.pid, dir);
+            if (!killed) {
+                process.exitCode = 1;
+                if (o.json) console.log(JSON.stringify({ stopped: false, status: "unknown", forced: true, pid: lock.pid }));
+                else console.error(`[filaxis] 强制终止 Daemon 后仍未确认退出 (pid=${lock.pid})，终态未知`);
+                return;
+            }
+            if (o.json) console.log(JSON.stringify({ stopped: true, forced: true, pid: lock.pid }));
+            else console.log(`已强制停止 Filaxis Daemon (pid=${lock.pid})`);
+            return;
+        }
+        if (lock) {
+            cleanupDaemonFiles(dir);
+            if (o.json) console.log(JSON.stringify({ stopped: true, staleCleaned: true }));
+            else console.log("未检测到活跃 Daemon（已清理陈旧锁文件）");
+            return;
+        }
+        if (o.json) console.log(JSON.stringify({ stopped: false, running: false }));
+        else console.log("Filaxis Daemon 未运行");
+        process.exitCode = 1;
+        return;
+    }
+    throw new Error("用法: filaxis daemon start [--addr host:port] [--foreground] [--daemon-dir dir] | status | stop [--force]");
+}
+
+async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof parseOpts>): Promise<void> {
+    if (sub === "list" && o.positional.length) throw new Error("forward list 不接受位置参数");
+    if ((sub === "remove" || sub === "rm") && (o.positional.length !== 1 || !o.positional[0])) {
+        throw new Error("forward remove 需要且只接受一个 forward_id");
+    }
+    const client = await requireDaemon(o);
+    if (sub === "add") {
+        if (o.positional.length) {
+            throw new Error(`forward add 不接受位置参数: ${o.positional.join(" ")}`);
+        }
+        const specs: Array<{ kind: "L" | "R" | "D"; raw: string }> = [
+            ...o.dynLocal.map((raw) => ({ kind: "L" as const, raw })),
+            ...o.dynRemote.map((raw) => ({ kind: "R" as const, raw })),
+            ...o.dynDynamic.map((raw) => ({ kind: "D" as const, raw })),
+        ];
+        if (specs.length !== 1) {
+            throw new Error("用法: filaxis forward add (--layer NAME | --host HOST) (-L SPEC | -R SPEC | -D SPEC) [--id ID]");
+        }
+        const spec = parseDynamicForwardCliSpec(specs[0]!.kind, specs[0]!.raw, o.id, o.timeout);
+        const target = buildCliTargetSpec(o);
+        const info = await client.rpc<ForwardInfo>("forward.add", { target, spec });
+        if (info.status !== "active") {
+            if (o.json) console.log(JSON.stringify(info, null, 2));
+            else console.error(`forward add: id=${info.forwardId} status=${info.status}${info.lastError ? ` (${info.lastError})` : ""}`);
+            process.exitCode = 1;
+            return;
+        }
+        if (o.json) {
+            console.log(JSON.stringify(info, null, 2));
+        } else {
+            const targetDesc = info.kind === "dynamic" ? "SOCKS5" : `${info.targetHost}:${info.targetPort}`;
+            console.log(`forward added: id=${info.forwardId} layer=${info.layer ?? "?"} ${info.kind} ${info.bindAddr}:${info.bindPort} -> ${targetDesc} (${info.transportMode})`);
+        }
+        return;
+    }
+    if (sub === "list") {
+        const res = await client.rpc<{ forwards: ForwardInfo[] }>("forward.list", { ...(o.layer ? { layer: o.layer } : {}) });
+        if (o.json) {
+            console.log(JSON.stringify(res.forwards, null, 2));
+            return;
+        }
+        if (res.forwards.length === 0) {
+            console.log("（无活跃动态端口转发）");
+            return;
+        }
+        for (const f of res.forwards) {
+            const dst = f.kind === "dynamic" ? "SOCKS5" : `${f.targetHost}:${f.targetPort}`;
+            console.log(`  ${f.forwardId} | layer=${f.layer ?? "?"} | ${f.kind} ${f.bindAddr}:${f.bindPort} -> ${dst} | ${f.transportMode} | ${f.status}`);
+        }
+        return;
+    }
+    if (sub === "remove" || sub === "rm") {
+        const res = await client.rpc<CloseForwardResult>("forward.remove", {
+            forwardId: o.positional[0]!,
+            ...(o.layer ? { layer: o.layer } : {}),
+        });
+        if (o.json) {
+            console.log(JSON.stringify(res, null, 2));
+        } else {
+            console.log(`forward remove: id=${res.forwardId} status=${res.status}${res.detail ? ` (${res.detail})` : ""}`);
+        }
+        if (res.status === "unknown") process.exitCode = 1;
+        return;
+    }
+    throw new Error("用法: filaxis forward add ... | list [--layer NAME] | remove <forward_id>");
+}
+
+type StreamRpcResult = {
+    window_id: string;
+    name?: string;
+    layer?: string;
+    oldest_seq: number;
+    newest_seq: number;
+    stale: boolean;
+    frames: Array<{ seq: number; ts: number; text: string; stream?: string }>;
+    last_delivered_seq?: number;
+    gap?: boolean;
+    exit_code?: number | null;
+    error?: string;
+};
+
+function printStreamRpcResult(res: StreamRpcResult): void {
+    const header = [
+        `window=${res.window_id}`,
+        ...(res.layer ? [`layer=${res.layer}`] : []),
+        `oldest=${res.oldest_seq}`,
+        `newest=${res.newest_seq}`,
+        `stale=${res.stale}`,
+        ...(res.last_delivered_seq !== undefined ? [`cursor=${res.last_delivered_seq}`] : []),
+        ...(res.gap ? ["gap=true"] : []),
+        ...(res.exit_code !== undefined ? [`exit=${res.exit_code}`] : []),
+    ].join(" | ");
+    console.log(header);
+    for (const f of res.frames) {
+        console.log(`[${f.seq} ${f.stream ?? "output"}] ${f.text}`);
+    }
+    if (res.error) console.error(`[filaxis] ${res.error}`);
+}
+
+async function handleStreamCmd(sub: string | undefined, o: ReturnType<typeof parseOpts>): Promise<void> {
+    if (sub === "list" && o.positional.length) throw new Error("stream list 不接受位置参数");
+    if ((sub === "peek" || sub === "close") && (o.positional.length !== 1 || !o.positional[0])) {
+        throw new Error(`stream ${sub} 需要且只接受一个 window_id`);
+    }
+    const client = await requireDaemon(o);
+    if (sub === "open") {
+        let command = o.positional.join(" ");
+        const sanitizeScript = (t: string): string =>
+            (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t).replace(/\r\n/g, "\n");
+        if (o.stdinScript) command = sanitizeScript(await readStdinAll());
+        else if (o.scriptFile) command = sanitizeScript(readFileSync(o.scriptFile, "utf-8"));
+        if (!command.trim()) throw new Error("用法: filaxis stream open [--layer NAME | --host HOST] [--stream stdout|stderr|both] [--wait MS] [--limit N] -- <command>");
+        const target = buildCliTargetSpec(o);
+        const res = await client.rpc<StreamRpcResult>("stream.open", {
+            target,
+            command,
+            ...(o.stream ? { stream: o.stream } : {}),
+            ...(o.name ? { name: o.name } : {}),
+            ...(o.limit !== undefined ? { limit: o.limit } : {}),
+            ...(o.wait !== undefined ? { waitMs: o.wait } : {}),
+        });
+        if (o.json) console.log(JSON.stringify(res, null, 2));
+        else printStreamRpcResult(res);
+        return;
+    }
+    if (sub === "peek") {
+        const res = await client.rpc<StreamRpcResult>("stream.peek", {
+            windowId: o.positional[0]!,
+            ...(o.after !== undefined ? { afterSeq: o.after } : {}),
+            ...(o.before !== undefined ? { beforeSeq: o.before } : {}),
+            ...(o.limit !== undefined ? { limit: o.limit } : {}),
+            ...(o.wait !== undefined ? { waitMs: o.wait } : {}),
+            ...(o.stream ? { stream: o.stream } : {}),
+        });
+        if (o.json) console.log(JSON.stringify(res, null, 2));
+        else printStreamRpcResult(res);
+        return;
+    }
+    if (sub === "close") {
+        const res = await client.rpc<{ window_id: string; closed: boolean }>("stream.close", { windowId: o.positional[0]! });
+        if (o.json) console.log(JSON.stringify(res, null, 2));
+        else console.log(`stream closed: ${res.window_id}`);
+        return;
+    }
+    if (sub === "list") {
+        const res = await client.rpc<{ streams: Array<{ window_id: string; name?: string; layer: string; command: string; oldest_seq: number; newest_seq: number; stale: boolean }> }>("stream.list");
+        if (o.json) {
+            console.log(JSON.stringify(res.streams, null, 2));
+            return;
+        }
+        if (res.streams.length === 0) {
+            console.log("（无活跃观察窗）");
+            return;
+        }
+        for (const w of res.streams) {
+            console.log(`  ${w.window_id} | layer=${w.layer} | seq=${w.oldest_seq}..${w.newest_seq} | stale=${w.stale} | ${w.command}`);
+        }
+        return;
+    }
+    throw new Error("用法: filaxis stream open ... | peek <window_id> | close <window_id> | list");
 }
 
 const generalHelp = `filaxis CLI — 千里一线，执行有迹
@@ -418,7 +969,13 @@ const generalHelp = `filaxis CLI — 千里一线，执行有迹
                   --stdin-json                                 # 计划及每步可用 layer 选择已保存层
   filaxis layer   save <name> --host ... [-J/--hop/--enter/--docker/...]   # 层路径持久化
                   list | rm <name>                                 # 层清单/移除
-  （全子命令 --layer <name> 用已存层一行直达；与 --host 互斥）
+  filaxis daemon  start [--addr host:port] [--foreground]          # 显式启停常驻 Daemon
+                  status | stop [--force]                          # 查看状态/优雅停机
+  filaxis forward add (--layer NAME|--host ...) (-L|-R|-D SPEC)    # 动态端口转发（需 Daemon）
+                  list [--layer NAME] | remove <forward_id>
+  filaxis stream  open [--layer NAME|--host ...] -- <command>      # 跨命令持续观察窗（需 Daemon）
+                  peek <window_id> [--after SEQ|--before SEQ] | close <window_id> | list
+  （全子命令 --layer <name> 用已存层一行直达；与 --host 互斥；检测到活跃 Daemon 时自动复用，--no-daemon 绕过）
 
 路径描述（需 --host；对齐内核三件套 connParams/sshHops/enterPipeline）:
   -J, --jump <j>          跳板（-J：途径机不占层，ssh 自身代理）
@@ -447,6 +1004,19 @@ async function main() {
         ["layer save", "filaxis layer save <name> --host HOST [--port N] [--key FILE] [-J JUMP] [--hop HOST] [--enter CMD] [--docker CTR] [--forward SPEC] [--host-key tofu|strict] [--known-hosts FILE]"],
         ["layer list", "filaxis layer list"],
         ["layer rm", "filaxis layer rm <name>"],
+        ["daemon", "filaxis daemon start [--addr host:port] [--foreground] [--daemon-dir dir] [--json] | status [--json] | stop [--force] [--json]"],
+        ["daemon start", "filaxis daemon start [--addr host:port] [--foreground] [--daemon-dir dir] [--json]"],
+        ["daemon status", "filaxis daemon status [--daemon-dir dir] [--json]"],
+        ["daemon stop", "filaxis daemon stop [--force] [--daemon-dir dir] [--json]"],
+        ["forward", "filaxis forward add (--layer NAME | --host HOST) (-L SPEC | -R SPEC | -D SPEC) [--id ID] [--json] | list [--layer NAME] [--json] | remove <forward_id> [--layer NAME] [--json]"],
+        ["forward add", "filaxis forward add (--layer NAME | --host HOST) (-L [[bind:]port:]host:port | -R [[bind:]port:]host:port | -D [[bind:]port]) [--id ID] [--json]"],
+        ["forward list", "filaxis forward list [--layer NAME] [--daemon-dir dir] [--json]"],
+        ["forward remove", "filaxis forward remove <forward_id> [--layer NAME] [--daemon-dir dir] [--json]"],
+        ["stream", "filaxis stream open (--layer NAME | --host HOST) [--stream stdout|stderr|both] [--limit N] [--wait MS] [--json] -- <command> | peek <window_id> [--after SEQ|--before SEQ] [--limit N] [--wait MS] [--json] | close <window_id> | list"],
+        ["stream open", "filaxis stream open [--layer NAME | --host HOST] [--stream stdout|stderr|both] [--limit N] [--wait MS] [--name NAME] [--json] -- <command>"],
+        ["stream peek", "filaxis stream peek <window_id> [--after SEQ | --before SEQ] [--limit N] [--wait MS] [--stream stdout|stderr|both] [--json]"],
+        ["stream close", "filaxis stream close <window_id> [--json]"],
+        ["stream list", "filaxis stream list [--json]"],
     ]);
     if (!cmd || (args.length === 1 && helpFlag(cmd))) {
         console.log(generalHelp);
@@ -481,15 +1051,25 @@ async function main() {
         handleLayerCmd(sub, o);
         return;
     }
+    if (cmd === "daemon" || cmd === "forward" || cmd === "stream") {
+        const sub = args[1];
+        const o = parseOpts(args.slice(2));
+        if (helpFlag(sub) || o.help || !sub) {
+            const specific = sub ? commandHelp.get(`${cmd} ${sub}`) : undefined;
+            console.log(`用法: ${specific ?? commandHelp.get(cmd)}`);
+            if (!sub) process.exitCode = 1;
+            return;
+        }
+        if (cmd === "daemon") await handleDaemonCmd(sub, o);
+        else if (cmd === "forward") await handleForwardCmd(sub, o);
+        else await handleStreamCmd(sub, o);
+        return;
+    }
     const transfer = cmd === "put" || cmd === "get" ? cmd : undefined;
     const o = parseOpts(args.slice(1), cmd === "batch" ? "batch" : transfer ? "strict" : "default");
     const help = commandHelp.get(cmd);
     if (o.help && help) {
         console.log(`用法: ${help}`);
-        return;
-    }
-    if (cmd === "batch") {
-        await runCliBatch(o);
         return;
     }
     if (transfer) {
@@ -498,6 +1078,15 @@ async function main() {
         if (o.positional.length !== 2 || o.positional.some((path) => !path || path.includes("\0"))) {
             throw new Error(transferUsage(transfer));
         }
+    }
+    const daemon = await tryDaemon(o);
+    if (cmd === "batch") {
+        await runCliBatch(o, daemon);
+        return;
+    }
+    if (daemon) {
+        await runViaDaemon(cmd, o, daemon);
+        return;
     }
     const drv = await driverFor(o, o.pty === true); // --pty 需先建 PTY link（审计 M1）
     try {
@@ -627,12 +1216,7 @@ async function main() {
                     let vStatus = "unknown";
                     let vErr = "";
                     try { vStatus = (await drv.verifySession(h.sessionId)).status; } catch (e) { vErr = (e as Error).message; }
-                    if (vStatus === "unknown" || vStatus === "running") process.exitCode = 1;
-                    if (vStatus === "running") {
-                        console.error(`[filaxis] 停止结果未知且核实显示**任务仍在运行**——会话 ${h.sessionId} 日志 ${h.logBase}，勿盲目重试`);
-                    } else if (vStatus === "unknown") {
-                        console.error(`[filaxis] 停止与核实均为未知（${vErr ? `核实失败: ${vErr}` : "通道异常或会话失联"}）——会话 ${h.sessionId} 日志 ${h.logBase}，任务可能仍在运行：核实终态后再重试`);
-                    }
+                    printObserveStopStatus(stopR.status, vStatus, vErr, h.sessionId, h.logBase);
                 }
                 break;
             }
@@ -650,7 +1234,120 @@ async function main() {
     }
 }
 
+async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon: DaemonClient): Promise<void> {
+    switch (cmd) {
+        case "put":
+        case "get": {
+            const target = buildCliTargetSpec(o);
+            const [source, destination] = o.positional as [string, string];
+            const result = await daemon.rpc("transfer", {
+                target,
+                direction: cmd,
+                localPath: resolvePath(cmd === "put" ? source : destination),
+                remotePath: cmd === "put" ? destination : source,
+                transport: o.transport,
+                timeoutMs: o.timeout,
+                writeMode: o.writeMode,
+            });
+            console.log(JSON.stringify(result));
+            break;
+        }
+        case "exec": {
+            const target = buildCliTargetSpec(o);
+            let execCmd = o.positional.join(" ");
+            const sanitizeScript = (t: string): string =>
+                (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t).replace(/\r\n/g, "\n");
+            if (o.stdinScript) execCmd = sanitizeScript(await readStdinAll());
+            else if (o.scriptFile) execCmd = sanitizeScript(readFileSync(o.scriptFile, "utf-8"));
+            const r = await daemon.rpc<{ stdout: string; stderr: string; exitCode: number; effectiveUser?: string }>("exec", {
+                target,
+                command: execCmd,
+                timeoutMs: o.timeout ?? 120_000,
+                pty: o.pty === true,
+            });
+            process.stdout.write(r.stdout);
+            if (r.stderr) process.stderr.write(r.stderr);
+            console.error(`\n[exit=${r.exitCode} user=${r.effectiveUser ?? "?"}]`);
+            process.exitCode = r.exitCode;
+            break;
+        }
+        case "cat": {
+            const [p] = o.positional;
+            if (!p || p === "--help" || p === "-h") {
+                console.log("用法: filaxis cat [--host ...] [--layer <名>] <path>\n输出远端/本地文件内容（UTF-8 文本；二进制走 SDK readBase64）");
+                break;
+            }
+            const target = buildCliTargetSpec(o);
+            const r = await daemon.rpc<{ content: string }>("cat", { target, path: p });
+            process.stdout.write(r.content);
+            break;
+        }
+        case "edit": {
+            const [p, oldArg, newArg] = o.positional;
+            let old = oldArg;
+            let newStr = newArg;
+            let all = o.all;
+            if (o.stdinJson || o.requestFile) {
+                if (o.stdinJson && o.requestFile) throw new Error("--stdin-json 与 --request-file 二选一");
+                if (oldArg !== undefined || newArg !== undefined) {
+                    throw new Error("--stdin-json/--request-file 与位置参数 <old> <new> 互斥（JSON 载荷已携带）");
+                }
+                const payload = o.requestFile ? readFileSync(o.requestFile, "utf-8") : await readStdinAll();
+                let req: { old?: unknown; new?: unknown; all?: unknown };
+                try { req = JSON.parse(payload) as typeof req; }
+                catch (e) { throw new Error(`JSON 载荷解析失败（${o.requestFile ?? "stdin"}）: ${(e as Error).message}`); }
+                if (!req || typeof req.old !== "string" || typeof req.new !== "string"
+                    || (req.all !== undefined && typeof req.all !== "boolean")) {
+                    throw new Error('JSON 载荷需含字符串字段 "old" 与 "new"（可选 "all": boolean）');
+                }
+                old = req.old;
+                newStr = req.new;
+                if (typeof req.all === "boolean") all = req.all;
+            }
+            if (!p || old === undefined || newStr === undefined) {
+                throw new Error("用法: filaxis edit [--host ...] <path> <old> <new> [--all] [--write-mode auto|inplace] 或 <path> (--stdin-json | --request-file <file>)\n提示：old/new 含引号/多行时优先 --request-file（免 Shell 通道，宿主引号规则零影响）");
+            }
+            const target = buildCliTargetSpec(o);
+            const r = await daemon.rpc<{ path: string; occurrences: number; bytesBefore: number; bytesAfter: number; mutex?: string }>("edit", {
+                target, path: p, old, new: newStr, all, writeMode: o.writeMode,
+            });
+            console.log(`edited: ${r.path} 替换 ${r.occurrences} 处，${r.bytesBefore}B → ${r.bytesAfter}B${r.mutex === "degraded" ? "（无锁降级）" : ""}`);
+            break;
+        }
+        case "observe": {
+            const target = buildCliTargetSpec(o);
+            const r = await daemon.rpc<{
+                lines: Array<{ stream: string; text: string }>;
+                stopStatus: "exited" | "stopped" | "unknown";
+                verifyStatus?: string;
+                verifyError?: string;
+                sessionId: string;
+                logBase: string;
+            }>("observe", {
+                target,
+                command: o.positional.join(" "),
+                stream: o.stream,
+                duration: o.duration ?? 8000,
+            });
+            for (const l of r.lines) console.log(`[${l.stream}] ${l.text}`);
+            printObserveStopStatus(r.stopStatus, r.verifyStatus, r.verifyError, r.sessionId, r.logBase);
+            break;
+        }
+        case "probe": {
+            const target = buildCliTargetSpec(o);
+            const r = await daemon.rpc<{ key: string; spec: unknown; note?: string }>("probe", { target });
+            console.log(JSON.stringify({ key: r.key, spec: r.spec, note: r.note }, null, 2));
+            break;
+        }
+        default:
+            console.error(generalHelp);
+            process.exitCode = 1;
+    }
+}
+
 void main().catch((err) => {
-    console.error(`[filaxis] ${(err as Error).message}`);
+    const { message, outcome, forwardId } = err as Error & { outcome?: string; forwardId?: string };
+    const detail = outcome === "unknown" && !message.includes("outcome=unknown") ? " (outcome=unknown)" : "";
+    console.error(`[filaxis] ${message}${detail}${forwardId ? ` forward_id=${forwardId}` : ""}`);
     process.exit(1);
 });

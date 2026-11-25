@@ -174,6 +174,7 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                 env,
                 cwd,
                 stdio: ["pipe", "pipe", "pipe"],
+                windowsHide: true,
             });
             // stdin 管道错误必须监听（GPT Astra 九轮 P1）：shell 提前退出（流式解析
             // 撞语法错即死）时继续写管道抛 write EOF——无 error 监听器则 uncaught

@@ -143,19 +143,25 @@ export class StreamWindow {
     }
 
     /** 最近 n 帧 */
-    peekLast(n = 20): PeekResult {
+    peekLast(n = 20, stream?: StreamFrame["stream"]): PeekResult {
         // n=0=显式请求零帧（Sol 五十二期 #3：Math.max(0,n) 后 slice(-0) 曾返回
         // 全部帧）——0/负数返回空（与「无缓冲」一致）
         if (n <= 0) return this.snapshot([]);
-        return this.snapshot(this.frames.slice(-n));
+        const frames = stream === undefined ? this.frames : this.frames.filter((f) => f.stream === stream);
+        return this.snapshot(frames.slice(-n));
     }
 
     /** Return the most recent retained frames strictly before the cursor. */
-    peekBefore(beforeSeq: number, n = 20): PeekResult {
+    peekBefore(beforeSeq: number, n = 20, stream?: StreamFrame["stream"]): PeekResult {
         if (n <= 0) return this.snapshot([]);
-        const result = this.snapshot(this.frames.filter((frame) => frame.seq < beforeSeq).slice(-n));
+        const frames = this.frames
+            .filter((frame) => frame.seq < beforeSeq && (stream === undefined || frame.stream === stream))
+            .slice(-n);
+        const result = this.snapshot(frames);
         const through = Math.min(beforeSeq - 1, this.allocated);
-        if (through > 0 && (!this.frames.length || this.oldestSeq > Math.max(1, through - n + 1))) result.gap = true;
+        const missingHistory = stream === undefined ? this.oldestSeq > Math.max(1, through - n + 1)
+            : frames.length < n && this.oldestSeq > 1;
+        if (through > 0 && (!this.frames.length || missingHistory)) result.gap = true;
         return result;
     }
 
@@ -170,8 +176,10 @@ export class StreamWindow {
      * 增量断点续读：返回 > sinceSeq 的帧（上限 n 兜底）。
      * 带 consumerId 时推进该消费者游标；中间覆盖（oldestSeq > sinceSeq+1）置 gap。
      */
-    peekSince(sinceSeq: number, n = 50, consumerId?: string): PeekResult {
-        const frames = this.frames.filter((f) => f.seq > sinceSeq).slice(0, Math.max(0, n));
+    peekSince(sinceSeq: number, n = 50, consumerId?: string, stream?: StreamFrame["stream"]): PeekResult {
+        const frames = this.frames
+            .filter((f) => f.seq > sinceSeq && (stream === undefined || f.stream === stream))
+            .slice(0, Math.max(0, n));
         const result = this.snapshot(frames);
         result.lastDeliveredSeq = frames.length ? frames[frames.length - 1]!.seq : sinceSeq;
         // 空洞双形态（五十期 #1 补）：①环形覆盖（oldestSeq > since+1）②游标超前
@@ -493,7 +501,7 @@ export class StreamWindowRegistry {
                 const shell = opts.shell ?? this.shell;
                 const supervised = this.spawnImpl ? undefined : startLocalObservation(shell, opts.command, opts.cwd);
                 const child = supervised ? supervised.child : this.spawnImpl!(shell, ["-c", opts.command], {
-                    cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32",
+                    cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true,
                 });
                 const push = (stream: "stdout" | "stderr", line: string) => {
                     if (!opts.stream || opts.stream === "both" || opts.stream === stream) win.push(line, stream);

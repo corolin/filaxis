@@ -19,9 +19,13 @@ import {
     hopHost, type SshHop, type SshConnParams,
 } from "./ssh-helpers.js";
 import type { SessionEvent } from "./session-types.js";
+import type { OpenForwardSpec, ForwardInfo, CloseForwardResult } from "./ssh-forward.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 
-export type FilaxisEvents = SessionEvent | { type: "layerState"; layer: string; state: string };
+export type FilaxisEvents =
+    | SessionEvent
+    | { type: "layerState"; layer: string; state: string }
+    | { type: "forwardExit"; layer?: string; forward: ForwardInfo };
 
 export interface StackFeatures {
     /** ControlMaster 多路复用可用（非 Windows + ssh 二进制存在） */
@@ -72,6 +76,9 @@ export class RuntimeStack {
      *  两个 stack 各注册同名 driver 的不同实现不再串用连接（B 拿到 A 的实例） */
     private cacheNs: string;
     private featuresCache: StackFeatures | null = null;
+    private readonly pendingForwardIds = new Map<string, string>();
+    private readonly pendingForwards = new WeakMap<RuntimeDriver, number>();
+    private readonly detachedForwardDrivers = new Set<RuntimeDriver>();
 
     constructor(opts: RuntimeStackOptions = {}) {
         this.factory = opts.factory ?? new RuntimeFactory();
@@ -93,7 +100,33 @@ export class RuntimeStack {
      *  this（每 stack 一份、引用稳定）——重复 connect 时 Set.add 幂等去重）；
      *  evictDriver 清空登记并恢复原回调 */
     private sessionForward?: (e: SessionEvent) => void;
+    private readonly forwardEventCbs = new WeakMap<RuntimeDriver, (info: ForwardInfo) => void>();
+
+    private bridgeForwardEvents(drv: RuntimeDriver): void {
+        const fc = (drv as { forwardControl?: { subs?: Set<(info: ForwardInfo) => void> } }).forwardControl;
+        if (!fc?.subs) return;
+        let cb = this.forwardEventCbs.get(drv);
+        if (!cb) {
+            cb = (info: ForwardInfo) => {
+                let layerName = info.layer;
+                if (!layerName) {
+                    for (const h of this.namedLayers.values()) {
+                        if (h.driver === drv) { layerName = h.name; break; }
+                    }
+                }
+                this.events.emit({
+                    type: "forwardExit",
+                    ...(layerName ? { layer: layerName } : {}),
+                    forward: layerName ? { ...info, layer: layerName } : info,
+                });
+            };
+            this.forwardEventCbs.set(drv, cb);
+        }
+        fc.subs.add(cb);
+    }
+
     private bridgeSessionEvents(drv: RuntimeDriver): void {
+        this.bridgeForwardEvents(drv);
         const sm = (drv as {
             sessions?: {
                 onEvent?: (e: SessionEvent) => void;
@@ -350,6 +383,8 @@ export class RuntimeStack {
             sm.__fxSubs.clear();
             if (sm.__fxOrig) sm.onEvent = sm.__fxOrig;
         }
+        const fc = (drv as { forwardControl?: { subs?: Set<unknown> } }).forwardControl;
+        fc?.subs?.clear();
     }
 
     /** 开放注册（透传 factory；AC-09 第三方 Transport 同权）。注册即退出共享缓存
@@ -417,6 +452,7 @@ export class RuntimeStack {
     async addLayer(
         name: string,
         descriptorOrDriver: RuntimeDescriptor | RuntimeDriver,
+        opts?: { activate?: boolean },
     ): Promise<{ handle: LayerHandle; reused: boolean; reusedFrom?: string }> {
         this.assertNotDupName(name);
         if (this.isDriver(descriptorOrDriver)) {
@@ -424,16 +460,20 @@ export class RuntimeStack {
             const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
             this.trackDriver(handle);
             this.namedLayers.set(name, handle);
-            this.activeName = name;
+            if (opts?.activate !== false) this.activeName = name;
             return { handle, reused: false };
         }
         const descriptor = descriptorOrDriver;
         // 名称预留（二十七期 #2）：统一经 withNameReservation（二十八期 #1 起
         // layerInto/sshInto 同款——所有异步建层入口共用的并发同名防线）
-        return this.withNameReservation(name, () => this.addLayerInner(name, descriptor));
+        return this.withNameReservation(name, () => this.addLayerInner(name, descriptor, opts));
     }
 
-    private async addLayerInner(name: string, descriptor: RuntimeDescriptor): Promise<{ handle: LayerHandle; reused: boolean; reusedFrom?: string }> {
+    private async addLayerInner(
+        name: string,
+        descriptor: RuntimeDescriptor,
+        opts?: { activate?: boolean },
+    ): Promise<{ handle: LayerHandle; reused: boolean; reusedFrom?: string }> {
         // 回环检测幂等（descriptor 形态）：新落点 identity ∈ 既有层路径 identity 集。
         // 末节点命中=同落点构造性成立（canonical identity 相同）→ 直接复用；
         // 途经节点命中（identity 撞了某层的中间跳）→ hostname 落点校验把关（宁重连不错主机）。
@@ -460,7 +500,7 @@ export class RuntimeStack {
         const handle: LayerHandle = { name, descriptor: driver.descriptor, driver };
         this.trackDriver(handle); // 登记计数（Sol 70 #1 复归：claim 无释放出口曾堵死最后一层）
         this.namedLayers.set(name, handle);
-        this.activeName = name;
+        if (opts?.activate !== false) this.activeName = name;
         return { handle, reused: false };
     }
 
@@ -545,9 +585,129 @@ export class RuntimeStack {
         return h;
     }
 
+    private resolveForwardLayer(layerName?: string): LayerHandle {
+        if (layerName !== undefined) return this.requireLayer(layerName);
+        if (!this.activeName) {
+            throw new Error(`未指定层名且当前无默认层（既有：${[...this.namedLayers.keys()].join(", ") || "空"}）——请先 addLayer 或显式指定层名`);
+        }
+        return this.requireLayer(this.activeName);
+    }
+
+    /** 在指定或默认层打开动态端口转发（-L / -R / -D，REQ-0005） */
+    async openForward(spec: OpenForwardSpec, layerName?: string): Promise<ForwardInfo> {
+        const h = this.resolveForwardLayer(layerName);
+        if (typeof h.driver.openForward !== "function") {
+            throw new Error(`层 '${h.name}' (${h.descriptor.driver}) 不支持动态端口转发`);
+        }
+        if (spec.id) {
+            const pendingLayer = this.pendingForwardIds.get(spec.id);
+            if (pendingLayer !== undefined) {
+                throw new Error(`转发 ID '${spec.id}' 正在层 '${pendingLayer}' 中建立，拒绝并发重复创建`);
+            }
+            for (const other of this.forwardDrivers()) {
+                if (other.driver === h.driver) continue;
+                if (other.driver.listForwards?.().some((f) => f.forwardId === spec.id
+                    && (other.layer !== undefined || f.status === "active" || f.status === "unknown"))) {
+                    throw new Error(other.layer
+                        ? `转发 ID '${spec.id}' 已在层 '${other.layer}' 中存在`
+                        : `转发 ID '${spec.id}' 已存在于已移出层的驱动`);
+                }
+            }
+            this.pendingForwardIds.set(spec.id, h.name);
+        }
+        this.pendingForwards.set(h.driver, (this.pendingForwards.get(h.driver) ?? 0) + 1);
+        try {
+            this.bridgeForwardEvents(h.driver);
+            const info = await h.driver.openForward(spec);
+            return { ...info, layer: h.name };
+        } finally {
+            const remaining = this.pendingForwards.get(h.driver)! - 1;
+            if (remaining === 0) this.pendingForwards.delete(h.driver);
+            else this.pendingForwards.set(h.driver, remaining);
+            if (spec.id && this.pendingForwardIds.get(spec.id) === h.name) {
+                this.pendingForwardIds.delete(spec.id);
+            }
+        }
+    }
+
+    /** Whether replacing this layer could make a pending or live forward unreachable. */
+    hasLiveForwards(layerName: string): boolean {
+        return this.driverHasLiveForwards(this.requireLayer(layerName).driver);
+    }
+
+    private driverHasLiveForwards(driver: RuntimeDriver): boolean {
+        return this.pendingForwards.has(driver)
+            || (driver.listForwards?.().some((f) => f.status === "active" || f.status === "unknown") ?? false);
+    }
+
+    hasForwardDriver(driver: RuntimeDriver): boolean {
+        return [...this.namedLayers.values()].some((layer) => layer.driver === driver)
+            || (this.detachedForwardDrivers.has(driver) && this.driverHasLiveForwards(driver));
+    }
+
+    private *forwardDrivers(): Iterable<{ driver: RuntimeDriver; layer?: string }> {
+        const seen = new Set<RuntimeDriver>();
+        for (const { driver, name } of this.namedLayers.values()) {
+            if (seen.has(driver)) continue;
+            seen.add(driver);
+            yield { driver, layer: name };
+        }
+        for (const driver of this.detachedForwardDrivers) {
+            if (seen.has(driver) || !this.driverHasLiveForwards(driver)) {
+                this.detachedForwardDrivers.delete(driver);
+            } else {
+                yield { driver };
+            }
+        }
+    }
+
+    /** 关闭指定或跨层检索到的动态端口转发，遵循 stopped / already_closed / unknown 三态 */
+    async closeForward(forwardId: string, layerName?: string): Promise<CloseForwardResult> {
+        if (layerName !== undefined) {
+            const h = this.requireLayer(layerName);
+            if (typeof h.driver.closeForward !== "function") {
+                throw new Error(`层 '${h.name}' (${h.descriptor.driver}) 不支持动态端口转发`);
+            }
+            return h.driver.closeForward(forwardId);
+        }
+        for (const { driver, layer } of this.forwardDrivers()) {
+            if (typeof driver.closeForward === "function") {
+                if (driver.listForwards?.().some((f) => f.forwardId === forwardId
+                    && (layer !== undefined || f.status === "active" || f.status === "unknown"))) {
+                    return driver.closeForward(forwardId);
+                }
+            }
+        }
+        throw new Error(`转发 '${forwardId}' 不存在`);
+    }
+
+    /** 查询指定层或所有已注册层的动态端口转发列表 */
+    listForwards(layerName?: string): ForwardInfo[] {
+        if (layerName !== undefined) {
+            const h = this.requireLayer(layerName);
+            return (h.driver.listForwards?.() ?? []).map((f) => ({ ...f, layer: h.name }));
+        }
+        const out: ForwardInfo[] = [];
+        for (const { driver, layer } of this.forwardDrivers()) {
+            for (const f of driver.listForwards?.() ?? []) {
+                if (layer !== undefined) {
+                    out.push({ ...f, layer: f.layer ?? layer });
+                } else if (f.status === "active" || f.status === "unknown") {
+                    const { layer: _formerLayer, ...forward } = f;
+                    out.push(forward);
+                }
+            }
+        }
+        return out;
+    }
+
     /** 移出注册表（缺省连接保留在指纹缓存可复用；destroy=true 才真销毁） */
     async removeLayer(name: string, opts: { destroy?: boolean } = {}): Promise<void> {
         const h = this.requireLayer(name);
+        if (this.driverHasLiveForwards(h.driver) && ![...this.namedLayers.values()]
+            .some((other) => other.name !== name && other.driver === h.driver)) {
+            this.detachedForwardDrivers.add(h.driver);
+        }
         this.namedLayers.delete(name);
         // 默认层回落在异步销毁**之前**（Sol 68 P1）：destroy 暂停期间缺省命令
         //（未显式指定层的 run_command）曾落到初始 driver——销毁完才切到存活层
@@ -565,26 +725,34 @@ export class RuntimeStack {
         if (refs === 0) RuntimeStack.driverRefs.delete(h.driver);
         else RuntimeStack.driverRefs.set(h.driver, refs);
         if (opts.destroy && refs === 0) {
-            // 缓存同步逐出（Sol 71 #2 → Sol 73 #3 homeKey）：按本 driver 实际
-            // 挂载键实例核对清——按描述符算键曾因 init 补写 terminalId 键不匹配
-            // （旧缓存残留、重连拿回已销毁实例）；定时器只复核+销毁本代（不逐出）
-            RuntimeStack.evictDriverHome(h.driver, true);
-            let disposal = RuntimeStack.destroyScheduled.get(h.driver);
-            if (!disposal) {
-                disposal = new Promise<void>((resolve) => setTimeout(resolve, 0)).then(async () => {
-                    if ((RuntimeStack.driverRefs.get(h.driver) ?? 0) > 0) return;
-                    RuntimeStack.destroyingDrivers.add(h.driver);
-                    try {
-                        await h.driver.destroy();
-                    } finally {
-                        RuntimeStack.unbridgeSessionEvents(h.driver);
-                        RuntimeStack.destroyingDrivers.delete(h.driver);
-                    }
-                }).finally(() => RuntimeStack.destroyScheduled.delete(h.driver));
-                RuntimeStack.destroyScheduled.set(h.driver, disposal);
-            }
-            await disposal;
+            await this.destroyUnreferencedDriver(h.driver);
         }
+    }
+
+    async destroyDetachedForwardDrivers(): Promise<void> {
+        const detached = [...this.detachedForwardDrivers].filter((driver) =>
+            (RuntimeStack.driverRefs.get(driver) ?? 0) === 0 && this.driverHasLiveForwards(driver));
+        await Promise.allSettled(detached.map((driver) => this.destroyUnreferencedDriver(driver)));
+    }
+
+    private destroyUnreferencedDriver(driver: RuntimeDriver): Promise<void> {
+        // 缓存同步逐出，销毁前复核当前引用，避免误销毁已重新挂载的连接。
+        RuntimeStack.evictDriverHome(driver, true);
+        let disposal = RuntimeStack.destroyScheduled.get(driver);
+        if (!disposal) {
+            disposal = new Promise<void>((resolve) => setTimeout(resolve, 0)).then(async () => {
+                if ((RuntimeStack.driverRefs.get(driver) ?? 0) > 0) return;
+                RuntimeStack.destroyingDrivers.add(driver);
+                try {
+                    await driver.destroy();
+                } finally {
+                    RuntimeStack.unbridgeSessionEvents(driver);
+                    RuntimeStack.destroyingDrivers.delete(driver);
+                }
+            }).finally(() => RuntimeStack.destroyScheduled.delete(driver));
+            RuntimeStack.destroyScheduled.set(driver, disposal);
+        }
+        return disposal;
     }
 
     /** 层清单纯文本（零 ANSI/零表格——npm 零依赖红线；彩色表格留消费方） */
@@ -770,7 +938,7 @@ export class RuntimeStack {
         const has = (bin: string) =>
             new Promise<boolean>((resolve) => {
                 const probe = process.platform === "win32"
-                    ? spawn("where", [bin], { stdio: "ignore" })
+                    ? spawn("where", [bin], { stdio: "ignore", windowsHide: true })
                     : spawn("which", [bin], { stdio: "ignore" });
                 probe.on("close", (code) => resolve(code === 0));
                 probe.on("error", () => resolve(false));

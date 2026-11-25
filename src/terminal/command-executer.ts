@@ -152,7 +152,7 @@ async function resolveExecutionPane(id: string): Promise<ExecutionPane> {
             if (state.stdout.trim() !== `${panePid}\t1\t1`) {
                 throw new CommandExecError(`tmux 窗格 '${target}' 无法确认由 Filaxis 独占且处于待命状态，请新建会话`);
             }
-            const { stdout: groups } = await execFileAsync("ps", ["-o", "pgid=,tpgid=", "-p", panePid]);
+            const { stdout: groups } = await execFileAsync("ps", ["-o", "pgid=,tpgid=", "-p", panePid], { windowsHide: true });
             const [group, foreground] = groups.trim().split(/\s+/);
             if (!group || !/^[1-9]\d*$/.test(group) || group !== foreground) {
                 throw new CommandExecError(`tmux 窗格 '${target}' 的前台正在被占用或无法核实，拒绝发送`);

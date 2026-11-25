@@ -11,18 +11,30 @@
  *   filaxis-mcp --enter "ssh remote-vm" --host user@bastion  # 多跳
  */
 import { McpServer } from "../src/mcp-server.js";
+import { McpStdioProxy } from "../src/mcp-proxy.js";
+import { probeDaemon } from "../src/daemon-client.js";
 import { RuntimeStack } from "../src/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import type { RuntimeDescriptor } from "../src/driver.js";
 import { noopLogger } from "../src/logger.js";
 
 // argv 解析（零依赖手写——与 bin/filaxis.ts 同哲学；子集：--host/--port/--user/
-// --key/-J/--enter/--hop/--layer/--docker）
+// --key/-J/--enter/--hop/--layer/--docker/--no-daemon/--daemon-dir）
 const argv = process.argv.slice(2);
 const o: {
     host?: string; port?: number; user?: string; key?: string; jump?: string;
     hop: string[]; enter: string[]; layer?: string; docker?: string;
+    noDaemon?: boolean; daemonDir?: string;
 } = { hop: [], enter: [] };
+function optionValue(index: number): string {
+    const value = argv[index + 1];
+    if (!value || value.startsWith("-")) {
+        console.error(`filaxis-mcp: ${argv[index]} 需要参数值`);
+        process.exit(2);
+    }
+    return value;
+}
+
 for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     switch (a) {
@@ -32,15 +44,31 @@ for (let i = 0; i < argv.length; i++) {
             o.host = v;
             break;
         }
-        case "--port": o.port = parseInt(argv[++i]!, 10); break;
-        case "--user": o.user = argv[++i]; break;
-        case "--key": o.key = argv[++i]; break;
-        case "-J": case "--jump": o.jump = argv[++i]; break;
-        case "--hop": o.hop.push(argv[++i]!); break;
-        case "--enter": o.enter.push(argv[++i]!); break;
-        case "--layer": o.layer = argv[++i]; break;
-        case "--docker": o.docker = argv[++i]; break;
-        default: console.error(`filaxis-mcp: 未知参数 ${a}（支持 --host/--port/--user/--key/-J/--hop/--enter/--docker）`);
+        case "--port": {
+            const raw = argv[++i];
+            const p = raw === undefined ? NaN : Number(raw);
+            if (!raw || !/^\d+$/.test(raw) || !Number.isInteger(p) || p < 1 || p > 65535) {
+                console.error(`filaxis-mcp: --port 需要 1-65535 整数（收到: ${raw ?? "（缺失）"}）`);
+                process.exit(2);
+            }
+            o.port = p;
+            break;
+        }
+        case "--user": o.user = optionValue(i); i++; break;
+        case "--key": o.key = optionValue(i); i++; break;
+        case "-J": case "--jump": o.jump = optionValue(i); i++; break;
+        case "--hop": o.hop.push(optionValue(i)); i++; break;
+        case "--enter": o.enter.push(optionValue(i)); i++; break;
+        case "--layer": o.layer = optionValue(i); i++; break;
+        case "--docker": o.docker = optionValue(i); i++; break;
+        case "--no-daemon": o.noDaemon = true; break;
+        case "--daemon-dir": {
+            const v = argv[++i];
+            if (!v || v.startsWith("-")) { console.error("filaxis-mcp: --daemon-dir 需要目录路径"); process.exit(2); }
+            o.daemonDir = v;
+            break;
+        }
+        default: console.error(`filaxis-mcp: 未知参数 ${a}（支持 --host/--port/--user/--key/-J/--hop/--enter/--docker/--no-daemon/--daemon-dir）`);
         process.exit(2);
     }
 }
@@ -50,14 +78,23 @@ async function main(): Promise<void> {
     // Keep diagnostics separate from MCP JSON-RPC stdout.
     const stderr = (message: string) => console.error(`[mcp] ${message}`);
     const logger = { ...noopLogger, warn: stderr, error: stderr };
-    const stack = new RuntimeStack({ logger });
-    let opts: Parameters<typeof createAgentToolkit>[1];
+    const hasSshPathOpts = Boolean(o.port !== undefined || o.user || o.key || o.jump || o.hop.length || o.enter.length || o.docker);
     if (o.layer) {
         throw new Error("filaxis-mcp 暂不支持 --layer 快照寻址（FEAT-04 后续）——用 --host/--enter");
     }
-    if (!o.host && argv.length > 0) {
+    if (!o.host && hasSshPathOpts) {
         throw new Error("SSH 路径参数需要 --host");
     }
+    const useDaemonAllowed = !o.noDaemon && process.env.FILAXIS_NO_DAEMON !== "1" && !o.host && !hasSshPathOpts;
+    if (useDaemonAllowed) {
+        const activeDaemon = await probeDaemon(o.daemonDir);
+        if (activeDaemon) {
+            new McpStdioProxy({ daemonDir: o.daemonDir, logger }).start();
+            return;
+        }
+    }
+    const stack = new RuntimeStack({ logger });
+    let opts: Parameters<typeof createAgentToolkit>[1];
     if (o.host) {
         const config: Record<string, unknown> = {};
         const conn: Record<string, unknown> = {};

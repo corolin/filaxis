@@ -82,7 +82,7 @@ export interface LocalSessionManagerOptions {
     /** 执行 shell（缺省 "bash"；Windows 需 Git Bash/WSL 提供 bash——平台差异显式声明，不静默切换） */
     shell?: string;
     /** spawn 注入（缺省 node:child_process.spawn）——消费方沙箱包装/测试 mock 注入点 */
-    spawnImpl?: (cmd: string, argv: string[], opts: { env: NodeJS.ProcessEnv; cwd?: string; stdio: unknown[] }) => ChildProcess;
+    spawnImpl?: (cmd: string, argv: string[], opts: { env: NodeJS.ProcessEnv; cwd?: string; stdio: unknown[]; windowsHide?: boolean }) => ChildProcess;
     /** 可注入日志（缺省 noop——SDK 不替调用方往 stdout 喷日志） */
     logger?: FilaxisLogger;
 }
@@ -153,6 +153,7 @@ export class LocalSessionManager {
             proc = entry.supervisor?.child ?? this.spawnImpl!(this.shell, ["-c", command], {
                 env, cwd,
                 stdio: ["ignore", "pipe", "pipe"],
+                windowsHide: true,
                 ...(process.platform !== "win32" ? { detached: true } : {}),
             });
         } catch (e) {
@@ -449,7 +450,7 @@ export class LocalSessionManager {
                 // error 监听兜底（二十五期模式散点）：fire-and-forget spawn 无监听，
                 // ENOENT 时异步 error = uncaughtException 崩宿主（taskkill 系统自带，
                 // 防御性一行）
-                spawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore" }).on("error", () => undefined);
+                spawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true }).on("error", () => undefined);
             } else {
                 try { process.kill(-pid, "SIGTERM"); } catch { try { entry.proc.kill("SIGTERM"); } catch { /* gone */ } }
             }
@@ -458,7 +459,7 @@ export class LocalSessionManager {
                 // 高并发下 PID 快速复用时误杀同号新进程
                 if (!entry.running) return;
                 if (process.platform === "win32") {
-                    spawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore" }).on("error", () => undefined);
+                    spawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true }).on("error", () => undefined);
                 } else {
                     try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
                 }
