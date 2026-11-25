@@ -200,6 +200,24 @@ describe("DaemonServer & DaemonClient RPC", () => {
         }
     });
 
+    test("returns stable validation messages for invalid HTTP JSON bodies", async () => {
+        const srv = new DaemonServer({ writeFiles: false });
+        try {
+            const addr = await srv.start();
+            for (const path of ["/rpc", "/mcp/message"]) {
+                const res = await fetch(`${addr}${path}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${srv.token}` },
+                    body: "{invalid JSON",
+                });
+                expect(res.status).toBe(400);
+                expect(await res.json()).toEqual({ ok: false, error: "JSON 解析失败" });
+            }
+        } finally {
+            await srv.stop();
+        }
+    });
+
     test("shares a pending listen and does not reopen a stopped server instance", async () => {
         const srv = new DaemonServer({ writeFiles: false });
         const starting = srv.start();
