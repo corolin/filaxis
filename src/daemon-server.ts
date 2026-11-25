@@ -334,8 +334,7 @@ export class DaemonServer {
             try {
                 payload = await readJsonBody(req);
             } catch (err) {
-                const status = err instanceof HttpStatusError ? err.statusCode : 400;
-                this.sendJson(res, status, { ok: false, error: err instanceof Error ? err.message : String(err) });
+                this.sendJsonBodyError(res, err);
                 return;
             }
             const method = typeof payload.method === "string" ? payload.method : "";
@@ -422,8 +421,7 @@ export class DaemonServer {
         try {
             body = await readRawJsonBody(req);
         } catch (err) {
-            const status = err instanceof HttpStatusError ? err.statusCode : 400;
-            this.sendJson(res, status, { ok: false, error: err instanceof Error ? err.message : String(err) });
+            this.sendJsonBodyError(res, err);
             return;
         }
 
@@ -448,6 +446,14 @@ export class DaemonServer {
         } else {
             this.sendJson(res, 202, { ok: true });
         }
+    }
+
+    private sendJsonBodyError(res: http.ServerResponse, err: unknown): void {
+        if (err instanceof HttpStatusError) {
+            this.sendJson(res, err.statusCode, { ok: false, error: err.message });
+            return;
+        }
+        this.sendJson(res, 400, { ok: false, error: "读取 JSON 请求体失败" });
     }
 
     private sendJson(res: http.ServerResponse, status: number, body: unknown): void {
@@ -1039,8 +1045,8 @@ async function readRawJsonBody(req: http.IncomingMessage): Promise<unknown> {
     if (!raw) throw new HttpStatusError(400, "空 JSON 请求体");
     try {
         return JSON.parse(raw);
-    } catch (e) {
-        throw new HttpStatusError(400, `JSON 解析失败: ${(e as Error).message}`);
+    } catch {
+        throw new HttpStatusError(400, "JSON 解析失败");
     }
 }
 
