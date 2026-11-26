@@ -151,6 +151,16 @@ async function main(): Promise<void> {
         toolkit: tk,
         logger,
     });
+    // 进程内形态：客户端断开即退出。McpServer 在 stdin 关闭时只销毁观察窗注册表；SSH 层的
+    // PTY 子进程（或还在跑的会话）会撑住事件循环——客户端退出后这个进程连同它的子进程
+    // 一直留着，每个客户端会话泄漏一个（0.2.13 即如此）。收尾、等 stdout 排空后退出。
+    // 经 Daemon 的缺省形态没有这个问题：代理进程随 stdin 关闭退出，现场留在 Daemon 里。
+    process.stdin.once("end", () => {
+        void middle.shutdown()
+            .catch(() => undefined)
+            .then(() => new Promise<void>((resolve) => process.stdout.write("", () => resolve())))
+            .then(() => { process.exit(0); });
+    });
 }
 
 main().catch((e) => {

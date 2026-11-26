@@ -24,6 +24,7 @@
 - **[自挖]** CLI 每个子命令只剩一份实现：原来「经 Daemon」与「一次性模式」两条路径有 8 处行为差异（本机文件路径、相对的密钥路径只在经 Daemon 时解析等），现在一致。本机层上的相对路径以层自己的工作目录为基准，没有则取调用方的；批次把调用方眼里的层表随请求带给中层，重新保存过的层立刻生效，不必等 Daemon 重启。
 - **[自挖]** SDK 新增导出：`createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及各操作的结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`。`createAgentToolkit(stack, opts)` 签名不变（内部代建中层，也可用 `opts.middle` 传入已建好的）。`src/runtime-stack.ts`、`layer-store.ts`、`session-ownership.ts` 迁入 `src/operations/`，原有导出名不变。
 - **[自挖]** `bun run check:boundaries` 新增第四道断言——三层依赖方向：内核只依赖内核；中层可依赖内核但不得依赖界面层；界面层从内核只能取类型，且不得经 SDK 总出口取符号。
+- **[自挖]** 进程内形态的 `filaxis-mcp`（带绑定参数或 `--no-daemon`）在客户端断开后即退出。此前只销毁观察窗注册表，绑定 SSH 层时 PTY 子进程撑住事件循环，客户端退出后这个进程连同它的 ssh 一直留着，每个客户端会话泄漏一个（0.2.13 即如此）。经 Daemon 的缺省形态没有这个问题。
 - **[自挖]** 本机层的工作目录不存在时，命令不再报成 `ENOENT … uv_spawn 'bash'`（看着像没装 bash，其实与 bash 无关），而是直接说明「本机层的工作目录不存在」并点名目录。已存层的工作目录被删或填错时最常见。
 - **[自挖]** 同构用例集：30 条与语言无关的声明式用例（`tests/isomorphism-corpus.ts`），在即弃进程内、SDK 长驻、Daemon 远程三种宿主上同参同果。1.x 的 Rust 内核将来拿同一份语料对照。
 

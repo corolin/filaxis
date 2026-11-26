@@ -586,11 +586,11 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
     }, 8_000);
 
     /** 起一个 filaxis-mcp 子进程并收齐它的 JSON-RPC 响应 */
-    function spawnMcp(args: string[]) {
+    function spawnMcp(args: string[], extraEnv: Record<string, string> = {}) {
         const child = spawn(process.execPath, ["bin/filaxis-mcp.ts", ...args], {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
-            env: { ...process.env, FILAXIS_NO_DAEMON: "0" },
+            env: { ...process.env, FILAXIS_NO_DAEMON: "0", ...extraEnv },
         });
         const responses: Array<Record<string, unknown>> = [];
         let acc = "";
@@ -690,6 +690,39 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             expect(existsSync(tokenFile)).toBe(false);
         } finally {
             if (child.exitCode === null) child.kill("SIGTERM");
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 60_000);
+
+    test("进程内形态：客户端断开后进程退出，不陪还在跑的会话与 SSH 子进程一起滞留", async () => {
+        // 真机复验踩出（0.2.13 即如此）：McpServer 在 stdin 关闭时只销毁观察窗注册表；
+        // 绑定 SSH 层时 PTY 子进程撑住事件循环，客户端退出后这个进程连同它的 ssh 一直留着，
+        // 每个客户端会话泄漏一个。这里用一个还在跑的会话制造同样的「事件循环被撑住」：
+        // 修复前进程至少要陪它等到会话结束（25s），修复后断开即退
+        const dir = makeTempDir("fx-mcp-bin-exit-");
+        const cwd = join(dir, "layer-cwd");
+        mkdirSync(cwd);
+        const store = join(dir, "layers.json");
+        writeFileSync(store, JSON.stringify({ bound: { driver: "local", cwd } }));
+        const { child, responses } = spawnMcp(["--no-daemon", "--layer", "bound"], { FILAXIS_LAYERS: store });
+        try {
+            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } }) + "\n");
+            child.stdin.write(JSON.stringify({
+                jsonrpc: "2.0", id: 2, method: "tools/call",
+                params: { name: "start_session", arguments: { command: "sleep 25" } },
+            }) + "\n");
+            const r2 = await waitForResponse(responses, 2, 30_000);
+            expect(JSON.stringify(r2.result)).toContain("session_id");
+            child.stdin.end();
+            const t0 = Date.now();
+            const exitCode = await new Promise<number | null>((resolve) => {
+                const timer = setTimeout(() => resolve(null), 10_000);
+                child.once("close", (code) => { clearTimeout(timer); resolve(code); });
+            });
+            expect(exitCode).toBe(0);
+            expect(Date.now() - t0).toBeLessThan(10_000);
+        } finally {
+            if (child.exitCode === null) child.kill("SIGKILL");
             rmSync(dir, { recursive: true, force: true });
         }
     }, 60_000);
