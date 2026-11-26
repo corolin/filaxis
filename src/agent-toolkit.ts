@@ -17,7 +17,7 @@ import { editFile } from "./file-edit.js";
 import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
 import type { TransferResult } from "./file-transfer.js";
 import { BATCH_STEP_KINDS, expandBatchLayerWildcards, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
-import type { FileEntry, RuntimeDriver } from "./driver.js";
+import type { FileEntry, RuntimeDescriptor, RuntimeDriver } from "./driver.js";
 import type { SessionOwnership as _SessionOwnership, StopResult } from "./session-ownership.js";
 import { SessionOwnership } from "./session-ownership.js";
 import { sshArgsFor } from "./ssh-helpers.js";
@@ -238,6 +238,10 @@ export interface AgentToolkitOptions {
     sessionResultTtlMs?: number;
     /** Interval for checking tracked sessions and expiring results. */
     sessionCheckIntervalMs?: number;
+    /** 已存层表（`filaxis layer save` 的产物）的读取函数，按需调用、不缓存——入口注入
+     *  （filaxis-mcp 与 Daemon 传 loadLayerStore）。工具集自身不读用户目录：未注入时
+     *  行为与从前一致。未注册的层名或层通配命中这里的条目时按需注册（不抢默认层）。 */
+    savedLayers?: () => Record<string, RuntimeDescriptor>;
 }
 
 const fileTransferProperties = {
@@ -446,7 +450,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                                 ...fileTransferProperties,
                                 id: { type: "string", description: "步骤唯一 id（after 引用用）" },
                                 kind: { type: "string", enum: BATCH_STEP_KINDS },
-                                layer: batchLayerSchema("覆盖批次默认层。多个层名按 id@layer 展开，单元素数组保留原 id；kind=get 只接受单层。可写通配（如 \"q-*\"），按已注册层名展开"),
+                                layer: batchLayerSchema("覆盖批次默认层。多个层名按 id@layer 展开，单元素数组保留原 id；kind=get 只接受单层。可写通配（如 \"q-*\"），按本会话已注册的层名与已存层表（filaxis layer save 的产物）展开，命中未注册的已存层时自动加载"),
                                 command: { type: "string", description: "kind=exec：shell 命令（或改用 command_file 引用脚本文件）" },
                                 command_file: {
                                     type: "string", minLength: 1,
@@ -476,7 +480,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                     },
                     stop_on_fail: { type: "boolean", description: "失败即停（缺省 true：某步失败后未启动的步骤标 skipped）。巡检/批量只读请传 false——一台失败其余照看" },
                     max_parallel: { type: "number", description: "并行度上限（缺省 3）" },
-                    layer: batchLayerSchema("批次默认目标层名或层名数组（缺省=默认层；传数组时未覆盖 layer 的步骤自动展开到各层并行执行）。可写通配（如 \"q-*\"），按已注册层名展开"),
+                    layer: batchLayerSchema("批次默认目标层名或层名数组（缺省=默认层；传数组时未覆盖 layer 的步骤自动展开到各层并行执行）。可写通配（如 \"q-*\"），按本会话已注册的层名与已存层表（filaxis layer save 的产物）展开，命中未注册的已存层时自动加载"),
                     output: { type: "string", enum: ["text", "full"], description: "MCP 输出模式。text 适合只读文本块的客户端，保留简短预览；full（默认）另在 structuredContent 保留完整输出" },
                 },
                 required: ["steps"],
@@ -874,10 +878,43 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
     const readyTimeoutMs = opts.readyTimeoutMs ?? 15_000;
     /** 层寻址（第十季注册表）：显式层名 > 注册表默认层（最近 push）> 初始层——
      *  未用层族时与旧行为逐字节一致（零破坏），push 后六工具自动落新默认层 */
+    // 已存层：未注册的层名命中入口注入的层表时按需注册。同名并发只建一次（名字预留
+    // 会把第二次 addLayer 判成重名）；加载后与 connect_layer 注册的层无差别。
+    // activate:false——被顺带加载的层不抢默认层。
+    const loadingSaved = new Map<string, Promise<RuntimeDriver>>();
+    const savedDescriptor = (name: string): RuntimeDescriptor | undefined => {
+        if (!opts.savedLayers) return undefined;
+        const entry = opts.savedLayers()[name];
+        return entry && typeof entry === "object" ? entry : undefined;
+    };
+    const loadSaved = (name: string): Promise<RuntimeDriver> => {
+        const inflight = loadingSaved.get(name);
+        if (inflight) return inflight;
+        const p = (async () => {
+            const descriptor = savedDescriptor(name);
+            if (!descriptor) throw new Error(`层 '${name}' 未注册，也不在已存层表里`);
+            try {
+                return (await stack.addLayer(name, descriptor, { activate: false })).handle.driver;
+            } catch (e) {
+                throw new Error(`已存层 '${name}' 加载失败: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        })().finally(() => loadingSaved.delete(name));
+        loadingSaved.set(name, p);
+        return p;
+    };
+    /** 层名解析范围：已注册的在前，其后是已存层表里尚未注册的 */
+    const knownLayerNames = (): string[] => {
+        const names = [...stack.layers.keys()];
+        if (opts.savedLayers) {
+            for (const name of Object.keys(opts.savedLayers())) if (!names.includes(name)) names.push(name);
+        }
+        return names;
+    };
     const resolveDrv = async (layerName?: string): Promise<RuntimeDriver> => {
         if (layerName !== undefined) {
             if (typeof layerName !== "string" || !layerName.trim()) throw new Error("layer 需为非空层名");
-            return stack.layer(layerName).driver;
+            if (stack.layers.has(layerName)) return stack.layer(layerName).driver;
+            return loadSaved(layerName);
         }
         return stack.active ?? await layer();
     };
@@ -1623,7 +1660,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     layer: layerName === undefined ? stack.activeLayer?.name : layerName,
                     stopOnFail: stop_on_fail,
                     maxParallel: max_parallel,
-                }, [...stack.layers.keys()], "已注册层");
+                }, knownLayerNames(), "已注册层或已存层");
                 const r = await runBatch(resolveDrv, plan, output === "text" ? { previewBudgetBytes: 4096 } : {});
                 return {
                     status: r.status,

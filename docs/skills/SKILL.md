@@ -65,7 +65,7 @@ filaxis exec --layer <名> --json -- "<command>"     # 单行 JSON {exitCode, ef
 - **少写转义**：`exec` 步骤可用 `command_file` 引用脚本文件，替代 `command`——命令原样进文件，JSON 里的引号和换行不必再转义，同一脚本可被多个步骤复用（二者互斥；读不出或内容为空则整批拒绝）。相对路径相对服务进程的工作目录，经 Daemon 执行时建议给绝对路径。
 - `run_batch` 的顶层 `layer` 和步骤 `layer` 均支持传单个层名或层名数组（也可同时传：顶层是批次默认值，步骤的 `layer` 仅覆盖本步；两处都省略时使用调用时的默认层）。传多个层名数组时，步骤按 `id@layer` 展开并在 `max_parallel` 并发池内并行执行，下游 `after` 需等被依赖步骤的所有展开实例均 ok 后才启动（`kind: "get"` 不支持多层数组，防并发覆盖同一 `local_path`）；单元素数组保留原 `id`。结果逐步标明命名层。
 - CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。计划文件里的字段是驼峰写法（`command` 或 `commandFile`、`maxParallel`、`stopOnFail`）；命令行开关 `--max-parallel N` 与 `--no-stop-on-fail` 覆盖计划里的对应字段。
-- 层名可写通配：`*` 匹配任意字符序列，`?` 匹配单个字符（如 `"q-*"`），按已注册或已保存的层名展开，免去逐个罗列。没有任何匹配时整批拒绝，不会改用默认层。
+- 层名可写通配：`*` 匹配任意字符序列，`?` 匹配单个字符（如 `"q-*"`），按已注册或已保存的层名展开（MCP、SDK 与 CLI 认同一份已存层表：`filaxis layer save` 保存的层不必先 `connect_layer`，按名寻址或被通配命中时自动加载；`filaxis-mcp --layer NAME` 可直接绑定已存层），免去逐个罗列。没有任何匹配时整批拒绝，不会改用默认层。
 - 层名数组只查已注册或保存的层。SDK 可用 `stack.addLayer("local", { driver: "local" })` 把本机加入命名层；CLI 和独立 MCP 服务的本机默认目标不会自动注册为 `local`。
 - `max_parallel` 是整个批次的并发上限。无依赖的步骤可以并行，包括同层的独立巡检。需要先改配置、再验证、最后重载时，用 `after` 引用前置步骤的 `id`。依赖可以跨层，前置步骤成功后才会启动后续步骤。
 - `after` 引用当前批次计划里声明的原始步骤 ID。同一环境可能有多个层名，扇出按层名各执行一次。多个步骤或批次可能同时修改同一资源时，由调用方按实际资源串行化，例如用「环境身份 + 配置路径」作为互斥键。

@@ -9,6 +9,8 @@
  *   filaxis-mcp                                    # local 层
  *   filaxis-mcp --host root@192.0.2.10 --port 2222  # ssh 层
  *   filaxis-mcp --enter "ssh remote-vm" --host user@bastion  # 多跳
+ *   filaxis-mcp --layer web-01                                 # 已存层（filaxis layer save）
+ *   # 不论用哪种方式绑定，run_command 的 layer 参数与 run_batch 的层通配都认已存层
  */
 import { McpServer } from "../src/mcp-server.js";
 import { McpStdioProxy } from "../src/mcp-proxy.js";
@@ -17,6 +19,7 @@ import { RuntimeStack } from "../src/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import type { RuntimeDescriptor } from "../src/driver.js";
 import { noopLogger } from "../src/logger.js";
+import { loadLayerStore } from "../src/layer-store.js";
 
 // argv 解析（零依赖手写——与 bin/filaxis.ts 同哲学；子集：--host/--port/--user/
 // --key/-J/--enter/--hop/--layer/--docker/--no-daemon/--daemon-dir）
@@ -79,8 +82,12 @@ async function main(): Promise<void> {
     const stderr = (message: string) => console.error(`[mcp] ${message}`);
     const logger = { ...noopLogger, warn: stderr, error: stderr };
     const hasSshPathOpts = Boolean(o.port !== undefined || o.user || o.key || o.jump || o.hop.length || o.enter.length || o.docker);
+    // --layer 与 --host 族互斥（快照寻址 = 整个连接参数都在快照里）
     if (o.layer) {
-        throw new Error("filaxis-mcp 暂不支持 --layer 快照寻址（FEAT-04 后续）——用 --host/--enter");
+        if (o.host || hasSshPathOpts) throw new Error("filaxis-mcp: --layer 与 --host 族互斥");
+        if (!Object.hasOwn(loadLayerStore(), o.layer)) {
+            throw new Error(`filaxis-mcp: 层 '${o.layer}' 未保存（filaxis layer list 查看；filaxis layer save ${o.layer} --host ... 创建）`);
+        }
     }
     if (!o.host && hasSshPathOpts) {
         throw new Error("SSH 路径参数需要 --host");
@@ -114,7 +121,9 @@ async function main(): Promise<void> {
     } else {
         opts = {}; // local 缺省
     }
-    const tk = createAgentToolkit(stack, opts);
+    // 已存层表注入：run_command 等工具按层名寻址、run_batch 的层通配都认 filaxis layer
+    // save 保存的层（与 CLI 一致）。按需读取，进程存活期间新保存的层也认。
+    const tk = createAgentToolkit(stack, o.layer ? { descriptor: loadLayerStore()[o.layer]! } : { ...opts, savedLayers: loadLayerStore });
     new McpServer({
         toolkit: tk,
         logger,

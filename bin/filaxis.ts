@@ -26,12 +26,12 @@ import {
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
 import { transferLayerFile } from "../src/layer-file-transfer.js";
 import { noopLogger } from "../src/logger.js";
+import { layerStorePath, loadLayerStore } from "../src/layer-store.js";
 import type { SshConnParams } from "../src/ssh-helpers.js";
 import { version as pkgVersion } from "../package.json" with { type: "json" };
 
@@ -283,19 +283,7 @@ function buildSshDescriptor(opts: ReturnType<typeof parseOpts>): RuntimeDescript
 }
 
 // ── 层快照存储（CLI 跨调用共享——A 方案；FILAXIS_LAYERS 可覆盖路径） ──
-function layerStorePath(): string {
-    return process.env.FILAXIS_LAYERS ?? (homedir() + "/.filaxis/layers.json");
-}
-function loadLayerStore(): Record<string, RuntimeDescriptor> {
-    try {
-        const parsed = JSON.parse(readFileSync(layerStorePath(), "utf-8"));
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("层快照必须是对象");
-        return Object.assign(Object.create(null), parsed);
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return Object.create(null);
-        throw error;
-    }
-}
+// 读取在 src/layer-store.ts（MCP 入口与 Daemon 同源——三路对层名与层通配的解析一致）
 function updateLayerStore<T>(update: (store: Record<string, RuntimeDescriptor>) => T): T {
     const path = layerStorePath();
     mkdirSync(dirname(path), { recursive: true });

@@ -24,6 +24,7 @@ import { isForwardActive, type OpenForwardSpec, type ForwardInfo } from "./ssh-f
 import { createAgentToolkit, type AgentToolkit } from "./agent-toolkit.js";
 import { McpProtocolHandler } from "./mcp-server.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
+import { loadLayerStore } from "./layer-store.js";
 import {
     acquireDaemonLock,
     assertLoopbackHost,
@@ -137,7 +138,7 @@ export class DaemonServer {
         this.log = opts.logger ?? noopLogger;
         this.stack = opts.stack ?? new RuntimeStack({ logger: this.log });
         this.windowRegistry = opts.windowRegistry ?? new StreamWindowRegistry({ logger: this.log });
-        this.toolkit = opts.toolkit ?? createAgentToolkit(this.stack, { windowRegistry: this.windowRegistry });
+        this.toolkit = opts.toolkit ?? createAgentToolkit(this.stack, { windowRegistry: this.windowRegistry, savedLayers: loadLayerStore });
         this.mcpHandler = new McpProtocolHandler({ toolkit: this.toolkit, serverVersion: this.version });
         this.sseKeepaliveMs = opts.sseKeepaliveMs ?? DEFAULT_SSE_KEEPALIVE_MS;
         this.writeFiles = opts.writeFiles !== false;

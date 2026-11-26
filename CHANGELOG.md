@@ -20,6 +20,7 @@
 - **[DeepSeek]** `filaxis exec --json` 输出单行结构化结果；文本模式的完成标记在正文排空后输出，`2>&1` 合流时位于末尾。
 - **[自挖]** 一次性模式（`--no-daemon`）按层文件里的 `driver` 加载已存层，不再把任何条目都当作 SSH 目标。
 - **[自挖]** 修复穿层转发（`-L` 经 enterPipeline 进入内层）在 `ssh <目标>` 形态的进入步骤上全部静默失效：转发建立成功，但任何连接立刻被关闭且无报错。原因是给嵌套 ssh 的命令少包一层引号，内层桥接命令在目标机上没有被执行。docker / bash 结尾形态不受影响。
+- **[自挖]** MCP 与 SDK 现在和 CLI 认同一份已存层表：`run_command` 等工具的 `layer` 参数与 `run_batch` 的层通配可以直接写 `filaxis layer save` 保存的层名，命中时尚未注册的层会自动加载（不抢默认层）。`filaxis-mcp --layer NAME` 不再报「暂不支持」，可直接绑定已存层；经 Daemon 的 MCP 同样生效。SDK：新增 `createAgentToolkit` 的 `savedLayers` 入参与 `loadLayerStore` 导出，工具集自身仍不读用户目录。
 - **[自挖]** 穿层转发的桥接子进程未送出数据就退出时，死因写入转发记录（`filaxis forward list` 与 `--json` 的 `last_error`）并记日志，不再丢弃。
 - **[自挖]** `batch` 计划里出现未知顶层字段（例如把 `layer` 写成 `layers`）时当场拒绝，不再静默忽略后落回默认层执行。
 
