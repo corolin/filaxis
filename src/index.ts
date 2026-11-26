@@ -16,6 +16,13 @@ export * from "./factory.js";
 export * from "./operations/runtime-stack.js";
 export * from "./operations/layer-store.js";
 export { PROTOCOL_VERSION } from "./operations/protocol.js";
+export { createMiddle, assertSshTargetRoutable } from "./operations/middle.js";
+export type { LocalMiddle, MiddleOptions } from "./operations/middle.js";
+export type {
+    LayerRef, Middle, MiddleOps, MiddleHost, ExecResult, SessionHandle, SessionStopResult, ObserveLine, ObserveResult,
+    ReadPathResult as MiddleReadPathResult, WriteFileResult, ManagePathResult as MiddleManagePathResult,
+    StreamFilter, StreamName, StreamResult, StreamSummary, LayerInfo,
+} from "./operations/types.js";
 export * from "./dialect.js";
 export * from "./ssh-helpers.js";
 export * from "./ssh-forward.js";
