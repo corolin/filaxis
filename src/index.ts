@@ -16,7 +16,7 @@ export * from "./factory.js";
 export * from "./operations/runtime-stack.js";
 export * from "./operations/layer-store.js";
 export { PROTOCOL_VERSION, REMOTE_OP_NAMES } from "./operations/protocol.js";
-export { createMiddle, assertSshTargetRoutable, describeLayer } from "./operations/middle.js";
+export { createMiddle, assertSshTargetRoutable, describeLayer, BATCH_STEP_KINDS as MIDDLE_BATCH_STEP_KINDS } from "./operations/middle.js";
 export type { LocalMiddle, MiddleOptions } from "./operations/middle.js";
 export type {
     LayerRef, Middle, MiddleOps, MiddleHost, ExecResult, SessionHandle, SessionStopResult, ObserveLine, ObserveResult,
@@ -45,7 +45,8 @@ export { transferLayerFile } from "./layer-file-transfer.js";
 export type { FileTransferTransport, LayerFileTransferOptions, LayerFileTransferResult } from "./layer-file-transfer.js";
 export * from "./layer-env.js";
 export { resolveLocalShell } from "./shell-discovery.js";
-export { createAgentToolkit, TOOL_DEFS } from "./agent-toolkit.js";
+export { createAgentToolkit, TOOL_DEFS, forwardInfoToPublic, closeForwardResultToPublic } from "./agent-toolkit.js";
+export type { PublicForwardInfo, PublicCloseForwardResult } from "./agent-toolkit.js";
 export type {
     AgentToolkit, AgentToolDef, AgentToolHandlers, AgentToolkitOptions,
     ConnectSshTarget, ConnectSshResult, ConnectSshBatchArgs, ConnectSshBatchResult,

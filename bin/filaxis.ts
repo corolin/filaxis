@@ -16,12 +16,16 @@
  * --known-hosts）+ sshHops 逐跳链（--hop 可重复）+ enterPipeline（--enter 可重复
  * + --docker 糖）。每跳独立密钥等极端拓扑走 SDK descriptor 全量描述。
  */
+import { DaemonServer } from "../src/daemon-server.js";
 import {
-    DaemonServer, DaemonClient, probeDaemon, spawnDaemonBackground, parseAddrToUrl, urlRequestHost, urlRequestPort, assertDaemonProtocol,
-    defaultDaemonDir, readDaemonLock, readDaemonConnection, cleanupDaemonFiles, isPidAlive,
-    createMiddle, connectRemoteMiddle, describeLayer,
-    type BatchPlan, type BatchReport, type ExecResult, type LayerRef, type Middle, type OpenForwardSpec, type StreamResult,
-} from "../src/index.js";
+    DaemonClient, assertDaemonProtocol, connectRemoteMiddle, parseAddrToUrl, probeDaemon, spawnDaemonBackground,
+    urlRequestHost, urlRequestPort,
+} from "../src/daemon-client.js";
+import { cleanupDaemonFiles, defaultDaemonDir, isPidAlive, readDaemonConnection, readDaemonLock } from "../src/daemon-files.js";
+import { createMiddle, describeLayer } from "../src/operations/middle.js";
+import type { LayerRef, Middle, StreamResult } from "../src/operations/types.js";
+import type { OpenForwardSpec } from "../src/ssh-forward.js";
+import type { BatchPlan, BatchReport } from "../src/batch.js";
 import type { RuntimeDescriptor } from "../src/driver.js";
 import type { FilaxisLogger } from "../src/logger.js";
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";

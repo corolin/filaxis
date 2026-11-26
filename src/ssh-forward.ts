@@ -63,66 +63,6 @@ export function isForwardActive(info: Pick<ForwardInfo, "status">): boolean {
     return info.status !== "stopped" && info.status !== "exited";
 }
 
-/**
- * 对外转发记录（CLI --json 与 MCP 结果；DSH 评估 2026-11-26 #5b）：snake_case——
- * 与工具参数（forward_id、bind_addr…）和流观察窗的 window_id 同一命名风格。
- * SDK 类型 ForwardInfo 保持驼峰不动。
- */
-export interface PublicForwardInfo {
-    forward_id: string;
-    /** 兼容别名（将移除）——请读 forward_id */
-    forwardId: string;
-    layer?: string;
-    kind: DynamicForwardKind;
-    bind_addr: string;
-    bind_port: number;
-    target_host?: string;
-    target_port?: number;
-    transport_mode: ForwardTransportMode;
-    status: ForwardStatus;
-    created_at: number;
-    pid?: number;
-    exit_code?: number | null;
-    last_error?: string;
-}
-
-export interface PublicCloseForwardResult {
-    forward_id: string;
-    /** 兼容别名（将移除）——请读 forward_id */
-    forwardId: string;
-    status: CloseForwardResult["status"];
-    detail?: string;
-}
-
-export function forwardInfoToPublic(info: ForwardInfo): PublicForwardInfo {
-    return {
-        forward_id: info.forwardId,
-        forwardId: info.forwardId,
-        ...(info.layer !== undefined ? { layer: info.layer } : {}),
-        kind: info.kind,
-        bind_addr: info.bindAddr,
-        bind_port: info.bindPort,
-        ...(info.targetHost !== undefined ? { target_host: info.targetHost } : {}),
-        ...(info.targetPort !== undefined ? { target_port: info.targetPort } : {}),
-        transport_mode: info.transportMode,
-        status: info.status,
-        created_at: info.createdAt,
-        ...(info.pid !== undefined ? { pid: info.pid } : {}),
-        ...(info.exitCode !== undefined ? { exit_code: info.exitCode } : {}),
-        ...(info.lastError !== undefined ? { last_error: info.lastError } : {}),
-    };
-}
-
-/** closeForward 结果的对外投影（同 forwardInfoToPublic） */
-export function closeForwardResultToPublic(res: CloseForwardResult): PublicCloseForwardResult {
-    return {
-        forward_id: res.forwardId,
-        forwardId: res.forwardId,
-        status: res.status,
-        ...(res.detail !== undefined ? { detail: res.detail } : {}),
-    };
-}
-
 export interface NormalizedForwardSpec {
     kind: DynamicForwardKind;
     flag: "-L" | "-R" | "-D";

@@ -16,15 +16,71 @@ import type { TransferResult } from "./file-transfer.js";
 import type { FileEntry, RuntimeDescriptor, RuntimeDriver } from "./driver.js";
 import type { StopResult } from "./operations/session-ownership.js";
 import type { BatchLayerTarget, BatchPlan, BatchStepWithDeps } from "./batch.js";
-import { BATCH_STEP_KINDS } from "./batch.js";
-import { forwardInfoToPublic, type OpenForwardSpec, type PublicForwardInfo } from "./ssh-forward.js";
-import { assertSshTargetRoutable, createMiddle, type LocalMiddle } from "./operations/middle.js";
+import type { CloseForwardResult, DynamicForwardKind, ForwardInfo, ForwardStatus, ForwardTransportMode, OpenForwardSpec } from "./ssh-forward.js";
+import { assertSshTargetRoutable, BATCH_STEP_KINDS, createMiddle, type LocalMiddle } from "./operations/middle.js";
 import type {
     ConnectSshBatchResult as MiddleConnectSshBatchResult,
     ConnectSshResult as MiddleConnectSshResult,
     StreamResult,
 } from "./operations/types.js";
 
+// ── 转发记录的工具面投影（REQ-0004 §5.2）──
+// snake_case 只属于 MCP 工具面：中层的记录与 CLI --json 是 camelCase，这里是唯一的
+// 转换点。forwardId 保留为兼容别名（0.2.13 引入；工具名与 schema 在 0.3.0 不变）。
+export interface PublicForwardInfo {
+    forward_id: string;
+    /** 兼容别名（将移除）——请读 forward_id */
+    forwardId: string;
+    layer?: string;
+    kind: DynamicForwardKind;
+    bind_addr: string;
+    bind_port: number;
+    target_host?: string;
+    target_port?: number;
+    transport_mode: ForwardTransportMode;
+    status: ForwardStatus;
+    created_at: number;
+    pid?: number;
+    exit_code?: number | null;
+    last_error?: string;
+}
+
+export interface PublicCloseForwardResult {
+    forward_id: string;
+    /** 兼容别名（将移除）——请读 forward_id */
+    forwardId: string;
+    status: CloseForwardResult["status"];
+    detail?: string;
+}
+
+export function forwardInfoToPublic(info: ForwardInfo): PublicForwardInfo {
+    return {
+        forward_id: info.forwardId,
+        forwardId: info.forwardId,
+        ...(info.layer !== undefined ? { layer: info.layer } : {}),
+        kind: info.kind,
+        bind_addr: info.bindAddr,
+        bind_port: info.bindPort,
+        ...(info.targetHost !== undefined ? { target_host: info.targetHost } : {}),
+        ...(info.targetPort !== undefined ? { target_port: info.targetPort } : {}),
+        transport_mode: info.transportMode,
+        status: info.status,
+        created_at: info.createdAt,
+        ...(info.pid !== undefined ? { pid: info.pid } : {}),
+        ...(info.exitCode !== undefined ? { exit_code: info.exitCode } : {}),
+        ...(info.lastError !== undefined ? { last_error: info.lastError } : {}),
+    };
+}
+
+/** closeForward 结果的对外投影（同 forwardInfoToPublic） */
+export function closeForwardResultToPublic(res: CloseForwardResult): PublicCloseForwardResult {
+    return {
+        forward_id: res.forwardId,
+        forwardId: res.forwardId,
+        status: res.status,
+        ...(res.detail !== undefined ? { detail: res.detail } : {}),
+    };
+}
 export interface AgentToolDef {
     type: "function";
     function: {

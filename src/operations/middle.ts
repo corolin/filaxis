@@ -26,6 +26,9 @@ import { LocalRuntimeDriver } from "../local-driver.js";
 import { SshPtyDriver } from "../ssh-pty-driver.js";
 import type { RuntimeDescriptor, RuntimeDriver } from "../driver.js";
 import { expandBatchLayerWildcards, runBatch } from "../batch.js";
+
+/** 批次步骤种类的词表——工具面的参数 schema 与报错文案从这里取，不直接依赖内核 */
+export { BATCH_STEP_KINDS } from "../batch.js";
 import { editFile as coreEditFile, type EditFileResult } from "../file-edit.js";
 import { noopLogger, type FilaxisLogger } from "../logger.js";
 import { isForwardActive, type CloseForwardResult, type ForwardInfo, type OpenForwardSpec } from "../ssh-forward.js";
