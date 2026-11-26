@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
 import { McpServer } from "../src/mcp-server.js";
 import { createAgentToolkit, TOOL_DEFS } from "../src/agent-toolkit.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";

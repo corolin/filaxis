@@ -9,7 +9,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { RuntimeDescriptor } from "./driver.js";
+import type { RuntimeDescriptor } from "../driver.js";
 
 export function layerStorePath(): string {
     return process.env.FILAXIS_LAYERS ?? join(homedir(), ".filaxis", "layers.json");

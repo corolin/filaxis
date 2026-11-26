@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
 import { editFile, editFileMulti, EditConflictError } from "../src/file-edit.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 import type { RuntimeDriver } from "../src/driver.js";
 
 const dir = mkdtempSync(join(tmpdir(), "fx-edit-"));

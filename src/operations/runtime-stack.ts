@@ -10,17 +10,17 @@
 import { spawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as os from "node:os";
-import type { RuntimeDriver, RuntimeDescriptor } from "./driver.js";
-import { RuntimeFactory } from "./factory.js";
-import { EventBus } from "./events.js";
-import { settleRejection } from "./async-guard.js";
+import type { RuntimeDriver, RuntimeDescriptor } from "../driver.js";
+import { RuntimeFactory } from "../factory.js";
+import { EventBus } from "../events.js";
+import { settleRejection } from "../async-guard.js";
 import {
     enterStepsOf, layerDisplayName, layerPathIdentities, resolveSshIdentity, resolveSshReuseKey, ENTER_ALIAS_KEYS,
     hopHost, type SshHop, type SshConnParams,
-} from "./ssh-helpers.js";
-import type { SessionEvent } from "./session-types.js";
-import type { OpenForwardSpec, ForwardInfo, CloseForwardResult } from "./ssh-forward.js";
-import { noopLogger, type FilaxisLogger } from "./logger.js";
+} from "../ssh-helpers.js";
+import type { SessionEvent } from "../session-types.js";
+import type { OpenForwardSpec, ForwardInfo, CloseForwardResult } from "../ssh-forward.js";
+import { noopLogger, type FilaxisLogger } from "../logger.js";
 
 export type FilaxisEvents =
     | SessionEvent

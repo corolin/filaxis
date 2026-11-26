@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import { enterStepsOf } from "../src/ssh-helpers.js";
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";

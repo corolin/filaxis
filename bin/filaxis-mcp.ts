@@ -15,11 +15,11 @@
 import { McpServer } from "../src/mcp-server.js";
 import { McpStdioProxy } from "../src/mcp-proxy.js";
 import { probeDaemon } from "../src/daemon-client.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import type { RuntimeDescriptor } from "../src/driver.js";
 import { noopLogger } from "../src/logger.js";
-import { loadLayerStore } from "../src/layer-store.js";
+import { loadLayerStore } from "../src/operations/layer-store.js";
 
 // argv 解析（零依赖手写——与 bin/filaxis.ts 同哲学；子集：--host/--port/--user/
 // --key/-J/--enter/--hop/--layer/--docker/--no-daemon/--daemon-dir）

@@ -18,7 +18,7 @@ import {
 import { renderEnterBridgeCommand, sshArgsFor } from "../src/ssh-helpers.js";
 import { SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 
 class MockChild extends EventEmitter {
     stdout = new PassThrough();

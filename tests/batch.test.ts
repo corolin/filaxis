@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
 import { runBatch, expandBatchLayerWildcards, expandLayerPattern, hasLayerWildcard, editFileMulti, type RuntimeDriver, type BatchPlan } from "../src/index.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 
 const dir = mkdtempSync(join(tmpdir(), "fx-batch-"));
 

@@ -12,14 +12,14 @@
 import { randomUUID } from "node:crypto";
 import nodePath from "node:path";
 import { StreamWindowRegistry, type StreamFrame } from "./stream-window.js";
-import type { LayerHandle, RuntimeStack } from "./runtime-stack.js";
+import type { LayerHandle, RuntimeStack } from "./operations/runtime-stack.js";
 import { editFile } from "./file-edit.js";
 import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
 import type { TransferResult } from "./file-transfer.js";
 import { BATCH_STEP_KINDS, expandBatchLayerWildcards, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
 import type { FileEntry, RuntimeDescriptor, RuntimeDriver } from "./driver.js";
-import type { SessionOwnership as _SessionOwnership, StopResult } from "./session-ownership.js";
-import { SessionOwnership } from "./session-ownership.js";
+import type { SessionOwnership as _SessionOwnership, StopResult } from "./operations/session-ownership.js";
+import { SessionOwnership } from "./operations/session-ownership.js";
 import { sshArgsFor } from "./ssh-helpers.js";
 import { forwardInfoToPublic, isForwardActive, type ForwardInfo, type OpenForwardSpec, type PublicForwardInfo } from "./ssh-forward.js";
 

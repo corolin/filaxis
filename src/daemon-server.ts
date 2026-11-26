@@ -11,7 +11,7 @@
 import * as crypto from "node:crypto";
 import * as http from "node:http";
 import * as path from "node:path";
-import { RuntimeStack, type LayerHandle } from "./runtime-stack.js";
+import { RuntimeStack, type LayerHandle } from "./operations/runtime-stack.js";
 import type { RuntimeDescriptor, RuntimeDriver } from "./driver.js";
 import { LocalRuntimeDriver } from "./local-driver.js";
 import { SshPtyDriver } from "./ssh-pty-driver.js";
@@ -24,7 +24,7 @@ import { isForwardActive, type OpenForwardSpec, type ForwardInfo } from "./ssh-f
 import { createAgentToolkit, type AgentToolkit } from "./agent-toolkit.js";
 import { McpProtocolHandler } from "./mcp-server.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
-import { loadLayerStore } from "./layer-store.js";
+import { loadLayerStore } from "./operations/layer-store.js";
 import { PROTOCOL_VERSION } from "./operations/protocol.js";
 import {
     acquireDaemonLock,

@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
 import { transferLayerFile } from "../src/layer-file-transfer.js";
 import { noopLogger } from "../src/logger.js";
-import { layerStorePath, loadLayerStore } from "../src/layer-store.js";
+import { layerStorePath, loadLayerStore } from "../src/operations/layer-store.js";
 import type { SshConnParams } from "../src/ssh-helpers.js";
 import { version as pkgVersion } from "../package.json" with { type: "json" };
 

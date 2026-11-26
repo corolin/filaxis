@@ -1,4 +1,4 @@
-import type { RuntimeDriver } from "./driver.js";
+import type { RuntimeDriver } from "../driver.js";
 
 export type StopResult = {
     status: "exited" | "stopped" | "unknown";

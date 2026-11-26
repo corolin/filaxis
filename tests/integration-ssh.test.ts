@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { shellQuote } from "../src/ssh-helpers.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 import { StreamWindowRegistry } from "../src/stream-window.js";
 
 const IT = process.env.FILAXIS_IT === "1";
@@ -314,7 +314,7 @@ describe("SSH 真机集成（AC-02/04/15 远端面）", () => {
     }, 60_000);
 
     integration("Agent 持续观察窗在 SSH 进入管线中继承 cwd 并回看双流", async () => {
-        const { RuntimeStack } = await import("../src/runtime-stack.js");
+        const { RuntimeStack } = await import("../src/operations/runtime-stack.js");
         const { createAgentToolkit } = await import("../src/agent-toolkit.js");
         const stack = new RuntimeStack();
         const descriptor = { driver: "ssh", target: TARGET, cwd: "/tmp", config: { enterPipeline: [{ cmd: "sh" }] } };
@@ -658,7 +658,7 @@ describe("第九季：CLI 路径描述（CI 真机）", () => {
 // ── 第十季：命名层注册表真机链（回环幂等 + 派生 + snapshot/restore）──
 describe("第十季：命名层注册表（CI 真机）", () => {
     integration("addLayer 回环幂等（末节点命中免探测复用）+ layerInto 派生 + snapshot/restore", async () => {
-        const { RuntimeStack } = await import("../src/runtime-stack.js");
+        const { RuntimeStack } = await import("../src/operations/runtime-stack.js");
         const { enterStepsOf } = await import("../src/ssh-helpers.js");
         const stack = new RuntimeStack();
         const a = await stack.addLayer("lo", { driver: "ssh", target: TARGET });

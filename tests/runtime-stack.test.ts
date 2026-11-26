@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { EventBus } from "../src/events.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+import { RuntimeStack } from "../src/operations/runtime-stack.js";
 import { createAgentToolkit } from "../src/agent-toolkit.js";
 import { RuntimeFactory } from "../src/factory.js";
 import { LocalRuntimeDriver } from "../src/local-driver.js";
@@ -15,7 +15,7 @@ import { TmuxSessionDriver } from "../src/tmux-driver.js";
 import { SshPtyDriver } from "../src/ssh-pty-driver.js";
 import { enterStepsOf } from "../src/ssh-helpers.js";
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
-import type { LayerHandle } from "../src/runtime-stack.js";
+import type { LayerHandle } from "../src/operations/runtime-stack.js";
 
 type Ev = { type: "a" | "b"; v: number };
 
