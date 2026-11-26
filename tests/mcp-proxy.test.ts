@@ -1,6 +1,7 @@
 /**
  * mcp-proxy.test.ts — Phase 3 测试：manage_layers 动态转发、MCP SSE 共享控制面、
- * Proxy 重连保活、Watchdog/Token 轮换、零自动重放与零隐式拉起（REQ-0005）
+ * Proxy 重连保活、Watchdog/Token 轮换、零自动重放（REQ-0005）；filaxis-mcp 的宿主策略
+ * （缺省经 Daemon、没有就自动启动；--no-daemon 与绑定参数走进程内）见 REQ-0004 §6.3
  */
 import { describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -23,6 +24,11 @@ import {
     SshPtyDriver,
     TOOL_DEFS,
     writePrivateFileAtomic,
+    cleanupDaemonFiles,
+    isPidAlive,
+    probeDaemon,
+    readDaemonConnection,
+    readDaemonLock,
 } from "../src/index.js";
 
 class MockChild extends EventEmitter {
@@ -579,11 +585,12 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         }
     }, 8_000);
 
-    test("filaxis-mcp process stays standalone and never spawns daemon implicitly when daemonDir is empty", async () => {
-        const dir = makeTempDir("fx-mcp-bin-nod-");
-        const child = spawn(process.execPath, ["bin/filaxis-mcp.ts", "--daemon-dir", dir], {
+    /** 起一个 filaxis-mcp 子进程并收齐它的 JSON-RPC 响应 */
+    function spawnMcp(args: string[]) {
+        const child = spawn(process.execPath, ["bin/filaxis-mcp.ts", ...args], {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
+            env: { ...process.env, FILAXIS_NO_DAEMON: "0" },
         });
         const responses: Array<Record<string, unknown>> = [];
         let acc = "";
@@ -596,13 +603,79 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
                 if (line) responses.push(JSON.parse(line) as Record<string, unknown>);
             }
         });
+        let stderr = "";
+        child.stderr.on("data", (d: Buffer) => { stderr += d.toString("utf-8"); });
+        return { child, responses, stderrText: () => stderr };
+    }
 
+    async function stopDaemonIn(dir: string): Promise<void> {
+        const client = await probeDaemon(dir);
+        if (client) await client.shutdown().catch(() => undefined);
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline && (readDaemonConnection(dir) || (readDaemonLock(dir)?.pid && isPidAlive(readDaemonLock(dir)!.pid)))) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        const pid = readDaemonLock(dir)?.pid;
+        if (pid && isPidAlive(pid)) { try { process.kill(pid, "SIGTERM"); } catch { /* 已退出 */ } }
+        cleanupDaemonFiles(dir);
+    }
+
+    test("filaxis-mcp 缺省经 Daemon：没有在跑就自动启动；客户端退出后 Daemon 仍在，别的客户端接得上同一份现场", async () => {
+        // REQ-0004 §6.3 / AC-05：0.2.x 的「MCP 绝不隐式启动 Daemon」是有意推翻的——
+        // 两个 MCP 客户端之间、CLI 与 MCP 之间要共享层、连接、转发、观察窗
+        const dir = makeTempDir("fx-mcp-bin-autostart-");
+        const { child, responses, stderrText } = spawnMcp(["--daemon-dir", dir]);
         try {
-            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) + "\n");
-            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n");
+            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) + "\n");
+            const r1 = await waitForResponse(responses, 1, 60_000);
+            expect((r1.result as { tools: unknown[] }).tools).toHaveLength(12);
 
-            const r2 = await waitForResponse(responses, 2, 10_000);
-            expect((r2.result as { tools: unknown[] }).tools).toHaveLength(12);
+            child.stdin.write(JSON.stringify({
+                jsonrpc: "2.0", id: 2, method: "tools/call",
+                params: { name: "run_command", arguments: { command: "printf MCP_VIA_DAEMON" } },
+            }) + "\n");
+            const r2 = await waitForResponse(responses, 2, 30_000);
+            expect(JSON.stringify(r2.result)).toContain("MCP_VIA_DAEMON");
+
+            // Daemon 是这个 MCP 进程启动的；另一个客户端（这里是 DaemonClient）连的是同一个它
+            const client = await probeDaemon(dir);
+            expect(client).not.toBeNull();
+            const viaCli = await client!.rpc<{ stdout: string }>("runCommand", { command: "printf CLI_SAME_SITE" });
+            expect(viaCli.stdout).toBe("CLI_SAME_SITE");
+
+            child.stdin.end();
+            const exitCode = await new Promise<number | null>((resolve) => {
+                if (child.exitCode !== null) resolve(child.exitCode);
+                else child.once("close", (code) => resolve(code));
+            });
+            expect(exitCode).toBe(0);
+            // 客户端退出后 Daemon 仍在（现场不随某一个客户端的退出而消失）
+            const { lockFile, addrFile, tokenFile } = daemonPaths(dir);
+            expect(existsSync(lockFile)).toBe(true);
+            expect(existsSync(addrFile)).toBe(true);
+            expect(existsSync(tokenFile)).toBe(true);
+            expect(await probeDaemon(dir)).not.toBeNull();
+        } finally {
+            if (child.exitCode === null) child.kill("SIGTERM");
+            await stopDaemonIn(dir);
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 90_000);
+
+    test("filaxis-mcp --no-daemon：不启动 Daemon，在本进程内服务", async () => {
+        const dir = makeTempDir("fx-mcp-bin-nod-");
+        const { child, responses, stderrText } = spawnMcp(["--daemon-dir", dir, "--no-daemon"]);
+        try {
+            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) + "\n");
+            const r1 = await waitForResponse(responses, 1, 30_000);
+            expect((r1.result as { tools: unknown[] }).tools).toHaveLength(12);
+
+            child.stdin.write(JSON.stringify({
+                jsonrpc: "2.0", id: 2, method: "tools/call",
+                params: { name: "run_command", arguments: { command: "printf MCP_INPROCESS" } },
+            }) + "\n");
+            const r2 = await waitForResponse(responses, 2, 30_000);
+            expect(JSON.stringify(r2.result)).toContain("MCP_INPROCESS");
 
             child.stdin.end();
             const exitCode = await new Promise<number | null>((resolve) => {
@@ -619,7 +692,7 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             if (child.exitCode === null) child.kill("SIGTERM");
             rmSync(dir, { recursive: true, force: true });
         }
-    }, 15_000);
+    }, 60_000);
 
     test("filaxis-mcp --layer honors the saved target while a daemon is running", async () => {
         const dir = makeTempDir("fx-mcp-bin-layer-");
