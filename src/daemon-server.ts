@@ -25,6 +25,7 @@ import { createAgentToolkit, type AgentToolkit } from "./agent-toolkit.js";
 import { McpProtocolHandler } from "./mcp-server.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 import { loadLayerStore } from "./layer-store.js";
+import { PROTOCOL_VERSION } from "./operations/protocol.js";
 import {
     acquireDaemonLock,
     assertLoopbackHost,
@@ -65,6 +66,8 @@ export interface DaemonStatusInfo {
     startedAt: number;
     uptimeMs: number;
     version: string;
+    /** 线协议版本（REQ-0004 §6.2）：客户端连上先核对这个，不一致即拒绝 */
+    protocolVersion: number;
     addr: string;
     layers: DaemonLayerSummary[];
     forwards: ForwardInfo[];
@@ -250,6 +253,7 @@ export class DaemonServer {
             startedAt: this.startedAt,
             uptimeMs: Math.max(0, Date.now() - this.startedAt),
             version: this.version,
+            protocolVersion: PROTOCOL_VERSION,
             addr: this.listenAddr ?? "",
             layers,
             forwards: this.stack.listForwards(),

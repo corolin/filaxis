@@ -18,7 +18,7 @@
  */
 import {
     RuntimeStack, LocalRuntimeDriver, SshPtyDriver, editFile, discoverLayer, layerDisplayName, runBatch, type BatchPlan, type BatchReport,
-    DaemonServer, DaemonClient, probeDaemon, spawnDaemonBackground, parseAddrToUrl, urlRequestHost, urlRequestPort,
+    DaemonServer, DaemonClient, probeDaemon, spawnDaemonBackground, parseAddrToUrl, urlRequestHost, urlRequestPort, assertDaemonProtocol,
     defaultDaemonDir, readDaemonLock, readDaemonConnection, cleanupDaemonFiles, isPidAlive,
     normalizeForwardSpec, type CloseForwardResult, type OpenForwardSpec, type ForwardInfo, type CliTargetSpec,
     forwardInfoToPublic, closeForwardResultToPublic, isForwardActive, expandBatchLayerWildcards,
@@ -537,7 +537,11 @@ function buildCliTargetSpec(opts: ReturnType<typeof parseOpts>, allowSavedLayerL
 
 async function tryDaemon(opts: ReturnType<typeof parseOpts>): Promise<DaemonClient | null> {
     if (opts.noDaemon || process.env.FILAXIS_NO_DAEMON === "1") return null;
-    return probeDaemon(opts.daemonDir);
+    const client = await probeDaemon(opts.daemonDir);
+    // 线协议不一致的 Daemon 不用（REQ-0004 §6.2）：不能退回一次性模式装没事——
+    // 那样「有 Daemon 却走了另一条路」对调用方是不可见的
+    if (client) await assertDaemonProtocol(client);
+    return client;
 }
 
 async function requireDaemon(opts: ReturnType<typeof parseOpts>): Promise<DaemonClient> {
@@ -548,6 +552,7 @@ async function requireDaemon(opts: ReturnType<typeof parseOpts>): Promise<Daemon
     if (!client) {
         throw new Error("未检测到活跃的 Filaxis Daemon，请先运行 filaxis daemon start");
     }
+    await assertDaemonProtocol(client);
     return client;
 }
 
@@ -856,7 +861,7 @@ async function handleDaemonCmd(sub: string | undefined, o: ReturnType<typeof par
         if (o.json) {
             console.log(JSON.stringify({ running: true, ...info, daemonDir: dir }, null, 2));
         } else {
-            console.log(`Filaxis Daemon 运行中: pid=${info.pid} addr=${info.addr} uptime=${Math.round(info.uptimeMs / 1000)}s`);
+            console.log(`Filaxis Daemon 运行中: pid=${info.pid} addr=${info.addr} uptime=${Math.round(info.uptimeMs / 1000)}s protocol=${info.protocolVersion ?? "未上报（0.2.x）"}`);
             console.log(`  layers=${info.layers.length} forwards=${info.forwards.length} streams=${info.streams.length}`);
         }
         return;

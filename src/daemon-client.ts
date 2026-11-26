@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import * as http from "node:http";
 import { defaultDaemonDir, isPidAlive, readDaemonConnection } from "./daemon-files.js";
 import type { DaemonStatusInfo } from "./daemon-server.js";
+import { PROTOCOL_VERSION } from "./operations/protocol.js";
 
 export function urlRequestHost(url: URL): string {
     const h = url.hostname;
@@ -170,6 +171,38 @@ export class DaemonClient {
             }
         });
     }
+}
+
+/** Daemon 的线协议与本客户端不一致（REQ-0004 §6.2）。绝不向错配的 Daemon 发操作。 */
+export class ProtocolMismatchError extends Error {
+    readonly code = "E_PROTOCOL_MISMATCH";
+    readonly expected = PROTOCOL_VERSION;
+    readonly actual: number | undefined;
+    readonly daemonPid: number | undefined;
+    readonly daemonVersion: string | undefined;
+    constructor(actual: number | undefined, status: Partial<DaemonStatusInfo>) {
+        const theirs = actual === undefined ? "（未上报——0.2.x 的 Daemon）" : String(actual);
+        super(
+            `Filaxis Daemon 线协议版本不一致，已拒绝执行：本客户端 protocol=${PROTOCOL_VERSION}，Daemon protocol=${theirs}` +
+            `（pid=${status.pid ?? "?"}，版本 ${status.version ?? "?"}）。升级后旧 Daemon 仍在运行；请先 filaxis daemon stop，再重新发起命令`,
+        );
+        this.name = "ProtocolMismatchError";
+        this.actual = actual;
+        this.daemonPid = status.pid;
+        this.daemonVersion = status.version;
+    }
+}
+
+/**
+ * 核对 Daemon 的线协议版本，不一致即抛 ProtocolMismatchError。
+ * 调用方在向 Daemon 发任何操作之前必须先过这一关。
+ */
+export async function assertDaemonProtocol(client: DaemonClient, timeoutMs = 3000): Promise<DaemonStatusInfo> {
+    const status = await client.status(timeoutMs);
+    if (status.protocolVersion !== PROTOCOL_VERSION) {
+        throw new ProtocolMismatchError(status.protocolVersion, status);
+    }
+    return status;
 }
 
 /** 仅探测已存在的活跃 Daemon；无文件、PID 已死或连通失败均返回 null（绝不自动拉起） */

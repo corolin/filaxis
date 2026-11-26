@@ -17,6 +17,7 @@ import {
     daemonPaths,
     generateDaemonToken,
     LocalRuntimeDriver,
+    PROTOCOL_VERSION,
     parseAddrToUrl,
     probeDaemon,
     readDaemonConnection,
@@ -141,6 +142,11 @@ describe("DaemonServer & DaemonClient RPC", () => {
         const requests: unknown[] = [];
         const stub = http.createServer(async (req, res) => {
             let result: Record<string, unknown> = {};
+            if (req.method === "GET" && req.url === "/status") {
+                // 合规的 Daemon 会上报线协议版本（REQ-0004 §6.2）；不上报的会被客户端拒绝
+                const { PROTOCOL_VERSION } = await import("../src/operations/protocol.js");
+                result = { pid: 1, protocolVersion: PROTOCOL_VERSION, version: "stub", layers: [], forwards: [], streams: [] };
+            }
             if (req.method === "POST") {
                 const chunks: Buffer[] = [];
                 for await (const chunk of req) chunks.push(chunk);
@@ -1002,8 +1008,9 @@ describe("CLI daemon / forward / stream E2E", () => {
         const dir = makeTempDir("fx-daemon-rpc-drop-");
         const stub = http.createServer((req, res) => {
             if (req.method === "GET" && req.url === "/status") {
+                // 上报线协议版本（REQ-0004 §6.2）：CLI 过了握手才会发 RPC，这条用例测的才是 RPC 中途断连
                 res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ ok: true, result: {} }));
+                res.end(JSON.stringify({ ok: true, result: { pid: 1, version: "stub", protocolVersion: PROTOCOL_VERSION, layers: [], forwards: [], streams: [] } }));
                 return;
             }
             req.on("data", () => undefined);
@@ -1169,4 +1176,53 @@ describe("CLI forward list（DSH 评估 2026-11-26 #5a/#5b）", () => {
             rmSync(dir, { recursive: true, force: true });
         }
     }, 60_000); // 本机实测 ~25s（起停 Daemon + 三次 CLI）
+});
+
+// ---------------------------------------------------------------------------
+// REQ-0004 §6.2 版本握手（M0）：升级后旧 Daemon 仍在运行时，新客户端必须明确拒绝，
+// 不能把请求交给旧代码执行，也不能悄悄退回另一条执行路径。
+// ---------------------------------------------------------------------------
+describe("REQ-0004 M0：Daemon 线协议版本握手", () => {
+    test("status 上报协议版本，与 PROTOCOL_VERSION 一致", async () => {
+        const { DaemonServer } = await import("../src/daemon-server.js");
+        const { PROTOCOL_VERSION } = await import("../src/operations/protocol.js");
+        const dir = mkdtempSync(join(tmpdir(), "fx-proto-"));
+        const srv = new DaemonServer({ daemonDir: dir, version: "0.3.0-test" });
+        try {
+            await srv.start();
+            const status = srv.status();
+            expect(status.protocolVersion).toBe(PROTOCOL_VERSION);
+            expect(status.version).toBe("0.3.0-test");
+        } finally {
+            await srv.stop();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("旧 Daemon（不上报协议版本）或不同协议版本 → ProtocolMismatchError，带 pid 与处置办法", async () => {
+        const { DaemonClient, assertDaemonProtocol, ProtocolMismatchError } = await import("../src/daemon-client.js");
+        const { PROTOCOL_VERSION } = await import("../src/operations/protocol.js");
+        type Status = Record<string, unknown> & { protocolVersion?: number };
+        const fake = (status: Status) => ({ status: async () => status }) as unknown as DaemonClient;
+
+        // 0.2.x 的 Daemon：status 里没有 protocolVersion
+        let caught: unknown;
+        try { await assertDaemonProtocol(fake({ pid: 4242, version: "0.2.13" })); } catch (e) { caught = e; }
+        expect(caught).toBeInstanceOf(ProtocolMismatchError);
+        const err = caught as InstanceType<typeof ProtocolMismatchError>;
+        expect(err.code).toBe("E_PROTOCOL_MISMATCH");
+        expect(err.daemonPid).toBe(4242);
+        expect(err.daemonVersion).toBe("0.2.13");
+        expect(err.message).toContain("protocol=" + PROTOCOL_VERSION);
+        expect(err.message).toContain("0.2.x");
+        expect(err.message).toContain("filaxis daemon stop");
+
+        // 不同协议版本
+        await expect(assertDaemonProtocol(fake({ pid: 1, version: "9.9.9", protocolVersion: PROTOCOL_VERSION + 1 })))
+            .rejects.toThrow(ProtocolMismatchError);
+
+        // 一致 → 放行并返回 status
+        const ok = await assertDaemonProtocol(fake({ pid: 7, version: "0.3.0", protocolVersion: PROTOCOL_VERSION }));
+        expect(ok.pid).toBe(7);
+    });
 });

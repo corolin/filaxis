@@ -15,6 +15,7 @@ export * from "./events.js";
 export * from "./factory.js";
 export * from "./runtime-stack.js";
 export * from "./layer-store.js";
+export { PROTOCOL_VERSION } from "./operations/protocol.js";
 export * from "./dialect.js";
 export * from "./ssh-helpers.js";
 export * from "./ssh-forward.js";
