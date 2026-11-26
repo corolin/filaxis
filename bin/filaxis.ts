@@ -902,6 +902,11 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
         for (const f of shown) {
             const dst = f.kind === "dynamic" ? "SOCKS5" : `${f.targetHost}:${f.targetPort}`;
             console.log(`  ${f.forwardId} | layer=${f.layer ?? "?"} | ${f.kind} ${f.bindAddr}:${f.bindPort} -> ${dst} | ${f.transportMode} | ${f.status}`);
+            if (f.lastError) {
+                // 最近一次异常的尾行（完整内容在 --json 的 last_error）——穿层转发连接即断时死因在这里
+                const lines = f.lastError.trim().split(/\r?\n/);
+                console.log(`      ↳ ${lines[0]!.trim()}${lines.length > 1 ? ` …${lines[lines.length - 1]!.trim()}` : ""}`.slice(0, 240));
+            }
         }
         return;
     }

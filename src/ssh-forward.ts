@@ -892,8 +892,32 @@ export class SshForwardManager {
             });
             child.stdin?.on("error", teardownConn);
             child.stdout?.on("error", teardownConn);
-            child.stderr?.on("data", () => undefined);
+            // 桥接子进程的 stderr 不是数据面（不进隧道），但也不能丢：内层连不上
+            // 目标端口、桥工具启动失败等原因全写在这里。真机排查时连接只会「立刻
+            // 断开、零报错」，死因只能手工复现 spawn 才看得见。留尾部一段，子进程
+            // 没送出任何数据就退出时记日志并挂到转发记录上。
+            let relayedBytes = 0;
+            let stderrTail = "";
+            child.stdout?.on("data", (d: Buffer) => { relayedBytes += d.length; });
+            child.stderr?.on("data", (d: Buffer) => {
+                stderrTail = (stderrTail + d.toString("utf-8")).slice(-2048);
+            });
             child.stderr?.on("error", () => undefined);
+            const bridgeDied = (code: number | null, signal: NodeJS.Signals | null): string => {
+                const why = stderrTail.trim().split(/\r?\n/).filter(Boolean).slice(-4).join(" | ");
+                return `穿层桥接子进程未送出数据即退出 (code=${code ?? signal})${why ? `: ${why}` : ""}`;
+            };
+            child.once("close", (code, signal) => {
+                if (entry.closing || relayedBytes > 0) return;
+                const failed = code !== 0 || signal !== null;
+                if (code === 0 && signal === null && !stderrTail.trim()) {
+                    // 客户端连上不发数据就断开也会走到这里，不当作故障
+                    this.log.debug(`[filaxis] 转发 ${entry.info.forwardId} ${bridgeDied(code, signal)}`);
+                    return;
+                }
+                entry.info.lastError = bridgeDied(code, signal);
+                this.log[failed ? "warn" : "info"](`[filaxis] 转发 ${entry.info.forwardId} ${entry.info.lastError}`);
+            });
 
             if (child.stdin) socket.pipe(child.stdin);
             if (child.stdout) child.stdout.pipe(socket);

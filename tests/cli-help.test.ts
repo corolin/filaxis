@@ -85,4 +85,4 @@ test("CLI treats --help after -- as command data", () => {
     const result = Bun.spawnSync([process.execPath, "bin/filaxis.ts", "exec", "--no-daemon", "--", "printf '%s' --help"], { stderr: "pipe", windowsHide: true, timeout: 30000 });
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toBe("--help");
-}, 30000);
+}, 45000); // 比子进程超时宽 15s：超时要以断言失败呈现，不是用例自身超时
