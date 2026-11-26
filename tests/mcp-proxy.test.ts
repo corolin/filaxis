@@ -322,14 +322,14 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
 
             // CLI DaemonClient sees the MCP-opened stream window and adds a forward
             const cli = new DaemonClient({ addr, token: srv.token });
-            const peekedByCli = await cli.rpc<{ window_id: string; frames: Array<{ text: string }> }>("stream.peek", {
+            const peekedByCli = await cli.rpc<{ windowId: string; frames: Array<{ text: string }> }>("peekStream", {
                 windowId,
                 limit: 10,
             });
             expect(peekedByCli.frames.map((f) => f.text)).toContain("frame-one");
 
-            await cli.rpc("forward.add", {
-                target: { layer: "shared-ssh" },
+            await cli.rpc("openForward", {
+                layer: "shared-ssh",
                 spec: { id: "cli-fwd", kind: "L", bindPort: 19090, targetHost: "127.0.0.1", targetPort: 80 },
             });
 

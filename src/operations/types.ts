@@ -161,12 +161,22 @@ export interface MiddleOps {
     /** 等完成拿退出码。非零退出码是数据不是异常；pty 走终端通道 */
     runCommand(args: { layer?: LayerRef; command: string; timeoutMs?: number; pty?: boolean; cwd?: string }): Promise<ExecResult>;
     /** 计划校验、层通配展开、commandFile 内联都在这里做完，再交内核 */
-    runBatch(args: { plan: BatchPlan; layer?: BatchLayerTarget; previewBudgetBytes?: number }): Promise<BatchReport>;
+    runBatch(args: {
+        plan: BatchPlan;
+        layer?: BatchLayerTarget;
+        previewBudgetBytes?: number;
+        /** 未指定层的步骤落在哪一层（缺省=中层的默认层）。CLI 传本机层——命令行没写目标就是本机 */
+        defaultLayer?: LayerRef;
+        /** 调用方已知的层描述符（已存层表的当前内容，路径已按调用方解析）：命中时优先于中层自己的层表 */
+        layers?: Record<string, RuntimeDescriptor>;
+        /** 默认层是本机层时的命令工作目录 */
+        cwd?: string;
+    }): Promise<BatchReport>;
     startSession(args: { layer?: LayerRef; command: string; name?: string; cwd?: string; readyMarker?: string; errorPattern?: string }): Promise<SessionHandle>;
     /** 停止是请求、死亡须核实；unknown 不是成功也不是失败 */
     stopSession(args: { sessionId: string; layer?: string }): Promise<SessionStopResult>;
     /** 限时观察：起会话 → 等 durationMs → 读日志 → 停 → 必要时核实 */
-    observe(args: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number }): Promise<ObserveResult>;
+    observe(args: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number; cwd?: string }): Promise<ObserveResult>;
 
     // ── 文件 ──
     readFile(args: { layer?: LayerRef; path: string }): Promise<{ content: string }>;
@@ -210,6 +220,8 @@ export interface MiddleHost {
 export interface Middle {
     readonly host: MiddleHost;
     readonly ops: MiddleOps;
-    /** 即弃实例与 SDK 实例用：销毁观察窗、会话跟踪与自建的观察窗注册表 */
+    /** 销毁观察窗、会话跟踪与自建的观察窗注册表（同步部分） */
     dispose(): void;
+    /** 宿主退出前的收尾：销毁本实例拥有的 driver。远程形态是空操作（状态在 Daemon 进程里） */
+    shutdown(): Promise<void>;
 }

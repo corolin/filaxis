@@ -15,8 +15,8 @@ export * from "./events.js";
 export * from "./factory.js";
 export * from "./operations/runtime-stack.js";
 export * from "./operations/layer-store.js";
-export { PROTOCOL_VERSION } from "./operations/protocol.js";
-export { createMiddle, assertSshTargetRoutable } from "./operations/middle.js";
+export { PROTOCOL_VERSION, REMOTE_OP_NAMES } from "./operations/protocol.js";
+export { createMiddle, assertSshTargetRoutable, describeLayer } from "./operations/middle.js";
 export type { LocalMiddle, MiddleOptions } from "./operations/middle.js";
 export type {
     LayerRef, Middle, MiddleOps, MiddleHost, ExecResult, SessionHandle, SessionStopResult, ObserveLine, ObserveResult,

@@ -9,7 +9,8 @@ import { spawn } from "node:child_process";
 import * as http from "node:http";
 import { defaultDaemonDir, isPidAlive, readDaemonConnection } from "./daemon-files.js";
 import type { DaemonStatusInfo } from "./daemon-server.js";
-import { PROTOCOL_VERSION } from "./operations/protocol.js";
+import { PROTOCOL_VERSION, REMOTE_OP_NAMES } from "./operations/protocol.js";
+import type { Middle, MiddleOps } from "./operations/types.js";
 
 export function urlRequestHost(url: URL): string {
     const h = url.hostname;
@@ -81,8 +82,9 @@ export class DaemonClient {
         return this.unwrap<{ ok: true }>(response);
     }
 
-    async rpc<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
-        const response = await this.rawRequest("POST", "/rpc", { method, params }, timeoutMs, true);
+    /** 调用一个中层操作。信封带线协议版本：Daemon 与本客户端不一致时会被明确拒绝，不执行 */
+    async rpc<T = unknown>(op: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+        const response = await this.rawRequest("POST", "/rpc", { protocol: PROTOCOL_VERSION, op, params }, timeoutMs, true);
         return this.unwrap<T>(response);
     }
 
@@ -203,6 +205,22 @@ export async function assertDaemonProtocol(client: DaemonClient, timeoutMs = 300
         throw new ProtocolMismatchError(status.protocolVersion, status);
     }
     return status;
+}
+
+/**
+ * 经 Daemon 的同形中层（REQ-0004 §5.1）：与进程内 createMiddle 返回的对象同一个接口——
+ * 方法签名一致，界面层不必关心中层在哪。连上先过线协议握手；之后每个操作是一次 RPC。
+ * 这里不给 HTTP 请求设超时：长操作的超时由操作自己的参数管（如 runCommand 的 timeoutMs）。
+ */
+export async function connectRemoteMiddle(client: DaemonClient, timeoutMs = 3000): Promise<Middle> {
+    const status = await assertDaemonProtocol(client, timeoutMs);
+    const ops = Object.fromEntries(REMOTE_OP_NAMES.map((name) => [name, (params: Record<string, unknown> = {}) => client.rpc(name, params)])) as unknown as MiddleOps;
+    return {
+        host: { kind: "daemon", version: status.version, protocolVersion: status.protocolVersion, pid: status.pid },
+        ops,
+        dispose() { /* 状态在 Daemon 进程里，不随客户端销毁 */ },
+        async shutdown() { /* 同上；停 Daemon 用 filaxis daemon stop */ },
+    } as Middle;
 }
 
 /** 仅探测已存在的活跃 Daemon；无文件、PID 已死或连通失败均返回 null（绝不自动拉起） */

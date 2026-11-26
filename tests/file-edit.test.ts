@@ -497,7 +497,7 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         try {
             execSync('bun bin/filaxis.ts exec --no-daemon --layer ghost -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
         } catch (e) { err2 = String((e as { stderr?: string }).stderr ?? e); }
-        expect(err2).toContain("未保存");
+        expect(err2).toContain("未注册，也不在已存层表里");
         // rm 后清单空
         execSync("bun bin/filaxis.ts layer rm nginx", { encoding: "utf-8", env, windowsHide: true });
         const out3 = execSync("bun bin/filaxis.ts layer list", { encoding: "utf-8", env, windowsHide: true });

@@ -618,7 +618,7 @@ describe("CLI batch：开关 / 层通配 / commandFile（DSH 评估 2026-11-26 #
         const r = cli(["--layer", "zz-*"], snap);
         expect(r.code).toBe(1);
         expect(r.out).toBe("");
-        expect(r.err).toContain("未匹配任何已存层");
+        expect(r.err).toContain("未匹配任何已注册层或已存层");
     }, 30_000);
 
     test("CLI batch keeps plan validation errors after wildcard support", () => {
@@ -831,7 +831,7 @@ describe("CLI exec 输出（DSH 评估 2026-11-26 #5c）", () => {
 // 无条件包成 SSH 驱动——driver:"local" 的条目变成对空主机名的 ssh 连接
 // ---------------------------------------------------------------------------
 describe("CLI 已存层分派（一次性模式）", () => {
-    test("按 descriptor 的 driver 分派：local 层本地执行；不认识的 driver 明确报错——不再一律当 SSH", () => {
+    test("按 descriptor 的 driver 分派：local 层本地执行；不认识的 driver 由中层明确报错——不再一律当 SSH", () => {
         const d = mkdtempSync(join(tmpdir(), "fx-batch-saved-"));
         const store = join(d, "layers.json");
         writeFileSync(store, JSON.stringify({ loc: { driver: "local" }, odd: { driver: "tmux" } }));
@@ -848,7 +848,9 @@ describe("CLI 已存层分派（一次性模式）", () => {
             const odd = run("odd");
             expect(odd.exitCode).toBe(1);
             expect(odd.stdout.toString()).toBe("");
-            expect(odd.stderr.toString()).toContain("一次性模式");
+            // 0.3.0：层由中层统一登记，不认识的 driver 由中层（层栈）报错并指出补法——
+            // 经 Daemon 与一次性模式不再是两句不同的提示
+            expect(odd.stderr.toString()).toContain("Unknown driver 'tmux'");
             expect(odd.stderr.toString()).not.toContain("Permission denied");
         } finally {
             rmSync(d, { recursive: true, force: true });

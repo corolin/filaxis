@@ -17,20 +17,18 @@
  * + --docker 糖）。每跳独立密钥等极端拓扑走 SDK descriptor 全量描述。
  */
 import {
-    RuntimeStack, LocalRuntimeDriver, SshPtyDriver, editFile, discoverLayer, layerDisplayName, runBatch, type BatchPlan, type BatchReport,
     DaemonServer, DaemonClient, probeDaemon, spawnDaemonBackground, parseAddrToUrl, urlRequestHost, urlRequestPort, assertDaemonProtocol,
     defaultDaemonDir, readDaemonLock, readDaemonConnection, cleanupDaemonFiles, isPidAlive,
-    normalizeForwardSpec, type CloseForwardResult, type OpenForwardSpec, type ForwardInfo, type CliTargetSpec,
-    forwardInfoToPublic, closeForwardResultToPublic, isForwardActive, expandBatchLayerWildcards,
+    createMiddle, connectRemoteMiddle, describeLayer,
+    type BatchPlan, type BatchReport, type ExecResult, type LayerRef, type Middle, type OpenForwardSpec, type StreamResult,
 } from "../src/index.js";
-import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
+import type { RuntimeDescriptor } from "../src/driver.js";
+import type { FilaxisLogger } from "../src/logger.js";
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, extname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
-import { transferLayerFile } from "../src/layer-file-transfer.js";
-import { noopLogger } from "../src/logger.js";
 import { layerStorePath, loadLayerStore } from "../src/operations/layer-store.js";
 import type { SshConnParams } from "../src/ssh-helpers.js";
 import { version as pkgVersion } from "../package.json" with { type: "json" };
@@ -85,7 +83,7 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
     docker?: string; dockerShell?: string; dockerRuntime?: string;
     forward: string[]; hostKey?: string; knownHosts?: string;
     layer?: string;
-    timeout?: number; duration?: number; stream?: string; all?: boolean;
+    timeout?: number; duration?: number; stream?: "stdout" | "stderr" | "both"; all?: boolean;
     /** batch 开关（DSH 评估 2026-11-26 #6）：覆盖计划里的 maxParallel / stopOnFail */
     maxParallel?: number; noStopOnFail?: boolean;
     /** 完整输出落盘（exec --out <文件>；batch --out-dir <目录>）：终端只打头几行和路径 */
@@ -317,7 +315,7 @@ function handleLayerCmd(sub: string | undefined, rest: ReturnType<typeof parseOp
             store[name] = desc;
             return existed;
         });
-        console.log(`${existed ? "layer 覆盖" : "layer 保存"}: ${name} → ${layerDisplayName(desc)}`);
+        console.log(`${existed ? "layer 覆盖" : "layer 保存"}: ${name} → ${describeLayer(desc)}`);
         console.log(`后续一行直达: filaxis exec --layer ${name} -- "<command>"`);
     } else if (sub === "list") {
         const store = loadLayerStore();
@@ -327,7 +325,7 @@ function handleLayerCmd(sub: string | undefined, rest: ReturnType<typeof parseOp
             return;
         }
         for (const [i, name] of names.entries()) {
-            console.log(`  ${i}: ${name} → ${layerDisplayName(store[name]!)}`);
+            console.log(`  ${i}: ${name} → ${describeLayer(store[name]!)}`);
         }
     } else if (sub === "rm") {
         const [name] = rest.positional;
@@ -342,50 +340,81 @@ function handleLayerCmd(sub: string | undefined, rest: ReturnType<typeof parseOp
     }
 }
 
-const sshLogger = { ...noopLogger, warn: (message: string) => console.error(`[filaxis] ${message}`) };
+/** 界面层的日志器：中层与 Daemon 的告警打到 stderr（不直接依赖内核的 logger 模块） */
+const sshLogger: FilaxisLogger = {
+    debug() { /* CLI 不输出调试日志 */ },
+    info() { /* 同上 */ },
+    warn: (message: string) => console.error(`[filaxis] ${message}`),
+    error: (message: string) => console.error(`[filaxis] ${message}`),
+};
 
-function savedLayerDriver(name: string, layers: Record<string, RuntimeDescriptor> = loadLayerStore()): RuntimeDriver {
-    if (!Object.hasOwn(layers, name)) throw new Error(`层 '${name}' 未保存（filaxis layer list 查看；filaxis layer save ${name} --host ... 创建）`);
-    const descriptor = layers[name]!;
-    // 按 descriptor 的 driver 分派，与 Daemon 路径的 resolveTarget 一致。已存层按约定由
-    // `layer save --host` 产生（SSH），但层文件可被手改：这里曾无条件包成 SshPtyDriver
-    //——非 SSH 条目（driver:"local"）会变成对空主机名的 ssh 连接（落到 localhost 的 sshd）
-    if (descriptor.driver === "ssh") return new SshPtyDriver(descriptor, { logger: sshLogger });
-    if (descriptor.driver === "local") {
-        const shell = descriptor.config?.shell;
-        return new LocalRuntimeDriver({
-            cwd: descriptor.cwd,
-            shell: typeof shell === "string" ? shell : undefined,
-        });
+/**
+ * 装配点（REQ-0004 §3.2、§6.3）：有 Daemon 在跑就经它执行（层、连接、转发、观察窗全机
+ * 共享），否则在本进程内建一个即弃的中层。两种宿主对下面每个子命令是同一个接口——
+ * 界面层不再有「经 Daemon」与「一次性」两套实现。
+ */
+async function openMiddle(opts: ReturnType<typeof parseOpts>): Promise<{ middle: Middle; close(): Promise<void> }> {
+    const client = await tryDaemon(opts);
+    if (client) {
+        const middle = await connectRemoteMiddle(client);
+        return { middle, async close() { /* 状态在 Daemon 进程里，不随本次调用销毁 */ } };
     }
-    throw new Error(`层 '${name}' 的 driver '${descriptor.driver}' 在一次性模式（--no-daemon）下不可用——去掉 --no-daemon 经 Daemon 执行`);
+    const local = createMiddle({ savedLayers: loadLayerStore, logger: sshLogger, version: pkgVersion });
+    return { middle: local, close: () => local.shutdown() };
 }
 
-async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false): Promise<RuntimeDriver> {
+/** 转发与观察窗的存活跨进程：没有 Daemon 就明确报错，不悄悄退化成进程内的一次性对象 */
+async function requireDaemonMiddle(opts: ReturnType<typeof parseOpts>): Promise<Middle> {
+    return connectRemoteMiddle(await requireDaemon(opts));
+}
+
+/**
+ * CLI 目标选项 → 中层的层引用（REQ-0004 §5.4）。已存层带上当前描述符：重新 save 过的层
+ * 会替换 Daemon 里的旧登记。
+ */
+function layerRefFor(opts: ReturnType<typeof parseOpts>): LayerRef {
     validateCliTargetOptions(opts);
-    // PTY link 按需建（审计 M1）：exec 通道独立 ssh 进程、观察流独立 spawn——都不依赖
-    // PTY link，且不 init 能保留 execChannel 的「多跳不可直达」诚实拒绝语义（统一
-    // init 会把假跳板名的错误提前成建链失败，改变错误落点）；--pty 走 link.execMarker
-    // 必须先建链（修前恒抛「未就绪」）。
-    const drv: RuntimeDriver = (() => {
-        if (opts.layer) {
-            return savedLayerDriver(opts.layer);
+    if (opts.layer) {
+        const layers = loadLayerStore();
+        if (Object.hasOwn(layers, opts.layer)) {
+            return { descriptor: resolveCallerSshPaths(layers[opts.layer]!), name: opts.layer };
         }
-        if (opts.host) return new SshPtyDriver(buildSshDescriptor(opts), { logger: sshLogger });
-        return new LocalRuntimeDriver();
-    })();
-    if (needPtyLink && drv instanceof SshPtyDriver) await drv.init();
-    return drv;
-}
-
-async function destroyDriver(driver: RuntimeDriver): Promise<void> {
-    try { await driver.destroy(); }
-    catch (error) {
-        console.error(`[filaxis] 连接销毁失败: ${error instanceof Error ? error.message : String(error)}`);
-        if (!process.exitCode) process.exitCode = 1;
+        return opts.layer;
     }
+    if (opts.host) return { descriptor: resolveCallerSshPaths(buildSshDescriptor(opts)) };
+    // 命令行没写目标 = 本机。显式说成本机层，不去落中层的默认层——Daemon 里若有人把一个
+    // SSH 层登记成默认层（甚至就叫 local），无目标的 CLI 命令也不该被它吸走
+    return { descriptor: { driver: "local" } };
 }
 
+/** 已存层表的当前内容，密钥 / known_hosts 的相对路径按调用方工作目录展开（随批次请求带给中层） */
+function callerLayerDescriptors(): Record<string, RuntimeDescriptor> {
+    return Object.fromEntries(
+        Object.entries(loadLayerStore()).map(([name, descriptor]) => [name, resolveCallerSshPaths(descriptor)]),
+    );
+}
+
+/**
+ * 本机层上相对路径的基准目录（REQ-0004 §5.5）：层自己的工作目录，没有则取调用方的。
+ * 经 Daemon 时它的工作目录与本进程无关，所以由界面层解析成绝对路径再交给中层；
+ * 一次性模式下驱动本来也按这个目录解析，结果相同。非本机层返回 undefined（路径原样）。
+ */
+function layerPathBase(opts: ReturnType<typeof parseOpts>): string | undefined {
+    if (opts.host) return undefined;
+    if (!opts.layer) return process.cwd();
+    const saved = loadLayerStore()[opts.layer];
+    return saved !== undefined && saved.driver === "local" ? (saved.cwd ?? process.cwd()) : undefined;
+}
+
+/** 本机层的命令工作目录 = 调用方的工作目录（只在没指定 --layer / --host 时；已存层用它自己的） */
+function defaultCwd(opts: ReturnType<typeof parseOpts>): string | undefined {
+    return opts.host || opts.layer ? undefined : process.cwd();
+}
+
+function layerPathFor(opts: ReturnType<typeof parseOpts>, p: string): string {
+    const base = layerPathBase(opts);
+    return p && base !== undefined && !isAbsolute(p) ? resolvePath(base, p) : p;
+}
 /** 读尽管道 stdin（TTY 直接报用法——绝不挂起等输入；process.stdin 双运行时兼容） */
 async function readStdinAll(): Promise<string> {
     if (process.stdin.isTTY) {
@@ -478,7 +507,6 @@ function parseDynamicForwardCliSpec(kind: "L" | "R" | "D", raw: string, id?: str
     }
     if (id !== undefined) spec.id = id;
     if (timeoutMs !== undefined) spec.timeoutMs = timeoutMs;
-    normalizeForwardSpec(spec);
     return spec;
 }
 
@@ -491,7 +519,7 @@ function validateCliTargetOptions(opts: ReturnType<typeof parseOpts>): void {
     }
 }
 
-function resolveDaemonSshPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor {
+function resolveCallerSshPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor {
     if (descriptor?.driver !== "ssh") return descriptor;
     const config = descriptor.config;
     const conn = config?.connParams as SshConnParams | undefined;
@@ -516,23 +544,6 @@ function resolveDaemonSshPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor
             },
         },
     };
-}
-
-function buildCliTargetSpec(opts: ReturnType<typeof parseOpts>, allowSavedLayerLookup = true): CliTargetSpec {
-    validateCliTargetOptions(opts);
-    if (opts.layer) {
-        if (allowSavedLayerLookup) {
-            const layers = loadLayerStore();
-            if (Object.hasOwn(layers, opts.layer)) {
-                return { layer: opts.layer, descriptor: resolveDaemonSshPaths(layers[opts.layer]!) };
-            }
-        }
-        return { layer: opts.layer };
-    }
-    if (opts.host) {
-        return { descriptor: resolveDaemonSshPaths(buildSshDescriptor(opts)) };
-    }
-    return { descriptor: { driver: "local" }, cwd: process.cwd() };
 }
 
 async function tryDaemon(opts: ReturnType<typeof parseOpts>): Promise<DaemonClient | null> {
@@ -713,7 +724,7 @@ function printObserveStopStatus(
     }
 }
 
-async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient | null): Promise<void> {
+async function runCliBatch(o: ReturnType<typeof parseOpts>, middle: Middle): Promise<void> {
     // 批次组合（第十一季）：计划 JSON 经 --request-file / --stdin-json 直达
     //（免 Shell 通道哲学——多行命令/hunk 绝不进 argv）
     if (o.positional.length) throw new Error(`batch 不接受位置参数：${o.positional.join(" ")}`);
@@ -733,7 +744,6 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
     } catch (e) {
         throw new Error(`batch 计划 JSON 解析失败: ${(e as Error).message}`);
     }
-    let saved: Record<string, RuntimeDescriptor> | undefined;
     if (o.layer && plan && typeof plan === "object" && !Array.isArray(plan) && plan.layer === undefined) {
         plan = { ...plan, layer: o.layer };
     }
@@ -743,44 +753,36 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
     if (plan && typeof plan === "object" && !Array.isArray(plan)) {
         if (o.maxParallel !== undefined) plan = { ...plan, maxParallel: o.maxParallel };
         if (o.noStopOnFail) plan = { ...plan, stopOnFail: false };
-        // 层通配（"q-*"）按已存层名展开——只在此入口做：内核的层解析只认具体名。
-        // 无匹配即拒绝（把 "q-*" 原样交下去会被当成一个不存在的层名）
-        plan = expandBatchLayerWildcards(plan, () => Object.keys(saved ??= loadLayerStore()), "已存层");
-    }
-    if (daemon) {
-        const savedLayers = Object.fromEntries(
-            Object.entries(saved ??= loadLayerStore()).map(([name, descriptor]) => [name, resolveDaemonSshPaths(descriptor)]),
-        );
-        const target = !o.layer ? buildCliTargetSpec(o) : undefined;
-        const resolvedPlan: BatchPlan = (plan && typeof plan === "object" && !Array.isArray(plan) && Array.isArray(plan.steps))
-            ? {
+        // 与调用方机器相关的路径在这里解析成绝对路径（REQ-0004 §5.5）：传输的本地文件、
+        // exec 步骤引用的脚本。经 Daemon 时它的工作目录与本进程无关。层通配的展开与
+        // commandFile 的内联在中层做（展开范围 = 已注册层 + 已存层，与 MCP 一致）
+        if (Array.isArray(plan.steps)) {
+            plan = {
                 ...plan,
                 steps: plan.steps.map((step) => {
-                    if (step && typeof step === "object" && (step.kind === "put" || step.kind === "get")
-                        && typeof step.localPath === "string" && step.localPath.length > 0 && !step.localPath.includes("\0")) {
-                        return { ...step, localPath: resolvePath(step.localPath) };
+                    if (!step || typeof step !== "object") return step;
+                    const s = step as unknown as Record<string, unknown>;
+                    if ((s.kind === "put" || s.kind === "get")
+                        && typeof s.localPath === "string" && s.localPath.length > 0 && !s.localPath.includes("\0")) {
+                        return { ...step, localPath: resolvePath(s.localPath) };
+                    }
+                    if (s.kind === "exec" && typeof s.commandFile === "string" && s.commandFile.trim()) {
+                        return { ...step, commandFile: resolvePath(s.commandFile) };
                     }
                     return step;
                 }),
-            }
-            : plan;
-        const r = await daemon.rpc<BatchReport>("batch", { target, plan: resolvedPlan, savedLayers, clientCwd: process.cwd() });
-        printBatchReport(r, o.outDir);
-        return;
+            };
+        }
     }
-    const drivers = new Map<string | undefined, RuntimeDriver>();
-    try {
-        const r = await runBatch(async (name) => {
-            const existing = drivers.get(name);
-            if (existing) return existing;
-            const driver = name === undefined ? await driverFor(o) : savedLayerDriver(name, saved ??= loadLayerStore());
-            drivers.set(name, driver);
-            return driver;
-        }, plan);
-        printBatchReport(r, o.outDir);
-    } finally {
-        await Promise.all([...drivers.values()].map(destroyDriver));
-    }
+    const r = await middle.ops.runBatch({
+        plan,
+        // 命令行没写目标时未指定层的步骤落在本机（不是 Daemon 当前的默认层）
+        defaultLayer: o.layer ? undefined : { descriptor: o.host ? resolveCallerSshPaths(buildSshDescriptor(o)) : { driver: "local" } },
+        // 调用方眼里的层表：与 Daemon 自己读到的可能不同（FILAXIS_LAYERS 指向别处、层刚重新保存）
+        layers: callerLayerDescriptors(),
+        cwd: defaultCwd(o),
+    });
+    printBatchReport(r, o.outDir);
 }
 
 async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
@@ -936,7 +938,7 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
     if ((sub === "remove" || sub === "rm") && (o.positional.length !== 1 || !o.positional[0])) {
         throw new Error("forward remove 需要且只接受一个 forward_id");
     }
-    const client = await requireDaemon(o);
+    const middle = await requireDaemonMiddle(o);
     if (sub === "add") {
         if (o.positional.length) {
             throw new Error(`forward add 不接受位置参数: ${o.positional.join(" ")}`);
@@ -950,16 +952,15 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
             throw new Error("用法: filaxis forward add (--layer NAME | --host HOST) (-L SPEC | -R SPEC | -D SPEC) [--id ID]");
         }
         const spec = parseDynamicForwardCliSpec(specs[0]!.kind, specs[0]!.raw, o.id, o.timeout);
-        const target = buildCliTargetSpec(o);
-        const info = await client.rpc<ForwardInfo>("forward.add", { target, spec });
+        const info = await middle.ops.openForward({ layer: layerRefFor(o), spec });
         if (info.status !== "active") {
-            if (o.json) console.log(JSON.stringify(forwardInfoToPublic(info), null, 2));
+            if (o.json) console.log(JSON.stringify(info, null, 2));
             else console.error(`forward add: id=${info.forwardId} status=${info.status}${info.lastError ? ` (${info.lastError})` : ""}`);
             process.exitCode = 1;
             return;
         }
         if (o.json) {
-            console.log(JSON.stringify(forwardInfoToPublic(info), null, 2));
+            console.log(JSON.stringify(info, null, 2));
         } else {
             const targetDesc = info.kind === "dynamic" ? "SOCKS5" : `${info.targetHost}:${info.targetPort}`;
             console.log(`forward added: id=${info.forwardId} layer=${info.layer ?? "?"} ${info.kind} ${info.bindAddr}:${info.bindPort} -> ${targetDesc} (${info.transportMode})`);
@@ -971,25 +972,23 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
         // 留在表里做幂等判定——曾照样列出，与「无活跃转发」的空表文案自相矛盾。
         // --all 连同已停止/已退出的一并列出（--json 同受 --all 控制）
         const all = o.all === true;
-        const res = await client.rpc<{ forwards: ForwardInfo[] }>("forward.list", {
+        const res = await middle.ops.listForwards({
             ...(o.layer ? { layer: o.layer } : {}),
             includeClosed: all,
         });
-        // 本地再滤一次：对上不认 includeClosed 的旧 daemon，行为不变
-        const shown = all ? res.forwards : res.forwards.filter(isForwardActive);
         if (o.json) {
-            console.log(JSON.stringify(shown.map(forwardInfoToPublic), null, 2));
+            console.log(JSON.stringify(res.forwards, null, 2));
             return;
         }
-        if (shown.length === 0) {
+        if (res.forwards.length === 0) {
             console.log(all ? "（无动态端口转发）" : "（无活跃动态端口转发）");
             return;
         }
-        for (const f of shown) {
+        for (const f of res.forwards) {
             const dst = f.kind === "dynamic" ? "SOCKS5" : `${f.targetHost}:${f.targetPort}`;
             console.log(`  ${f.forwardId} | layer=${f.layer ?? "?"} | ${f.kind} ${f.bindAddr}:${f.bindPort} -> ${dst} | ${f.transportMode} | ${f.status}`);
             if (f.lastError) {
-                // 最近一次异常的尾行（完整内容在 --json 的 last_error）——穿层转发连接即断时死因在这里
+                // 最近一次异常的尾行（完整内容在 --json 的 lastError）——穿层转发连接即断时死因在这里
                 const lines = f.lastError.trim().split(/\r?\n/);
                 console.log(`      ↳ ${lines[0]!.trim()}${lines.length > 1 ? ` …${lines[lines.length - 1]!.trim()}` : ""}`.slice(0, 240));
             }
@@ -997,12 +996,12 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
         return;
     }
     if (sub === "remove" || sub === "rm") {
-        const res = await client.rpc<CloseForwardResult>("forward.remove", {
+        const res = await middle.ops.closeForward({
             forwardId: o.positional[0]!,
             ...(o.layer ? { layer: o.layer } : {}),
         });
         if (o.json) {
-            console.log(JSON.stringify(closeForwardResultToPublic(res), null, 2));
+            console.log(JSON.stringify(res, null, 2));
         } else {
             console.log(`forward remove: id=${res.forwardId} status=${res.status}${res.detail ? ` (${res.detail})` : ""}`);
         }
@@ -1012,30 +1011,16 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
     throw new Error("用法: filaxis forward add ... | list [--layer NAME] | remove <forward_id>");
 }
 
-type StreamRpcResult = {
-    window_id: string;
-    name?: string;
-    layer?: string;
-    oldest_seq: number;
-    newest_seq: number;
-    stale: boolean;
-    frames: Array<{ seq: number; ts: number; text: string; stream?: string }>;
-    last_delivered_seq?: number;
-    gap?: boolean;
-    exit_code?: number | null;
-    error?: string;
-};
-
-function printStreamRpcResult(res: StreamRpcResult): void {
+function printStreamResult(res: StreamResult): void {
     const header = [
-        `window=${res.window_id}`,
+        `window=${res.windowId}`,
         ...(res.layer ? [`layer=${res.layer}`] : []),
-        `oldest=${res.oldest_seq}`,
-        `newest=${res.newest_seq}`,
+        `oldest=${res.oldestSeq}`,
+        `newest=${res.newestSeq}`,
         `stale=${res.stale}`,
-        ...(res.last_delivered_seq !== undefined ? [`cursor=${res.last_delivered_seq}`] : []),
+        ...(res.lastDeliveredSeq !== undefined ? [`cursor=${res.lastDeliveredSeq}`] : []),
         ...(res.gap ? ["gap=true"] : []),
-        ...(res.exit_code !== undefined ? [`exit=${res.exit_code}`] : []),
+        ...(res.exitCode !== undefined ? [`exit=${res.exitCode}`] : []),
     ].join(" | ");
     console.log(header);
     for (const f of res.frames) {
@@ -1049,7 +1034,10 @@ async function handleStreamCmd(sub: string | undefined, o: ReturnType<typeof par
     if ((sub === "peek" || sub === "close") && (o.positional.length !== 1 || !o.positional[0])) {
         throw new Error(`stream ${sub} 需要且只接受一个 window_id`);
     }
-    const client = await requireDaemon(o);
+    if (o.limit !== undefined && o.limit > 200) throw new Error("limit 须在 1–200 之间");
+    if (o.wait !== undefined && o.wait > 30_000) throw new Error("waitMs 须在 0–30000 之间");
+    if (o.wait && o.before !== undefined) throw new Error("waitMs 仅可用于 --after 增量续读");
+    const middle = await requireDaemonMiddle(o);
     if (sub === "open") {
         let command = o.positional.join(" ");
         const sanitizeScript = (t: string): string =>
@@ -1057,9 +1045,8 @@ async function handleStreamCmd(sub: string | undefined, o: ReturnType<typeof par
         if (o.stdinScript) command = sanitizeScript(await readStdinAll());
         else if (o.scriptFile) command = sanitizeScript(readFileSync(o.scriptFile, "utf-8"));
         if (!command.trim()) throw new Error("用法: filaxis stream open [--layer NAME | --host HOST] [--stream stdout|stderr|both] [--wait MS] [--limit N] -- <command>");
-        const target = buildCliTargetSpec(o);
-        const res = await client.rpc<StreamRpcResult>("stream.open", {
-            target,
+        const res = await middle.ops.openStream({
+            layer: layerRefFor(o),
             command,
             ...(o.stream ? { stream: o.stream } : {}),
             ...(o.name ? { name: o.name } : {}),
@@ -1067,11 +1054,11 @@ async function handleStreamCmd(sub: string | undefined, o: ReturnType<typeof par
             ...(o.wait !== undefined ? { waitMs: o.wait } : {}),
         });
         if (o.json) console.log(JSON.stringify(res, null, 2));
-        else printStreamRpcResult(res);
+        else printStreamResult(res);
         return;
     }
     if (sub === "peek") {
-        const res = await client.rpc<StreamRpcResult>("stream.peek", {
+        const res = await middle.ops.peekStream({
             windowId: o.positional[0]!,
             ...(o.after !== undefined ? { afterSeq: o.after } : {}),
             ...(o.before !== undefined ? { beforeSeq: o.before } : {}),
@@ -1080,27 +1067,27 @@ async function handleStreamCmd(sub: string | undefined, o: ReturnType<typeof par
             ...(o.stream ? { stream: o.stream } : {}),
         });
         if (o.json) console.log(JSON.stringify(res, null, 2));
-        else printStreamRpcResult(res);
+        else printStreamResult(res);
         return;
     }
     if (sub === "close") {
-        const res = await client.rpc<{ window_id: string; closed: boolean }>("stream.close", { windowId: o.positional[0]! });
+        const res = await middle.ops.closeStream({ windowId: o.positional[0]! });
         if (o.json) console.log(JSON.stringify(res, null, 2));
-        else console.log(`stream closed: ${res.window_id}`);
+        else console.log(`stream closed: ${res.windowId}`);
         return;
     }
     if (sub === "list") {
-        const res = await client.rpc<{ streams: Array<{ window_id: string; name?: string; layer: string; command: string; oldest_seq: number; newest_seq: number; stale: boolean }> }>("stream.list");
+        const { streams } = await middle.ops.listStreams();
         if (o.json) {
-            console.log(JSON.stringify(res.streams, null, 2));
+            console.log(JSON.stringify(streams, null, 2));
             return;
         }
-        if (res.streams.length === 0) {
+        if (streams.length === 0) {
             console.log("（无活跃观察窗）");
             return;
         }
-        for (const w of res.streams) {
-            console.log(`  ${w.window_id} | layer=${w.layer} | seq=${w.oldest_seq}..${w.newest_seq} | stale=${w.stale} | ${w.command}`);
+        for (const w of streams) {
+            console.log(`  ${w.windowId} | layer=${w.layer} | seq=${w.oldestSeq}..${w.newestSeq} | stale=${w.stale} | ${w.command}`);
         }
         return;
     }
@@ -1180,7 +1167,7 @@ async function main() {
         ["daemon stop", "filaxis daemon stop [--force] [--daemon-dir dir] [--json]"],
         ["forward", "filaxis forward add (--layer NAME | --host HOST) (-L SPEC | -R SPEC | -D SPEC) [--id ID] [--json] | list [--layer NAME] [--all] [--json] | remove <forward_id> [--layer NAME] [--json]"],
         ["forward add", "filaxis forward add (--layer NAME | --host HOST) (-L [[bind:]port:]host:port | -R [[bind:]port:]host:port | -D [[bind:]port]) [--id ID] [--json]"],
-        ["forward list", "filaxis forward list [--layer NAME] [--all] [--daemon-dir dir] [--json]\n默认只报仍在用的转发（已停止/已退出的条目用 --all 查看）。--json 字段为 snake_case（forward_id、bind_addr…），forwardId 保留为兼容别名。"],
+        ["forward list", "filaxis forward list [--layer NAME] [--all] [--daemon-dir dir] [--json]\n默认只报仍在用的转发（已停止/已退出的条目用 --all 查看）。--json 输出与中层记录同形（camelCase：forwardId、bindAddr…）。"],
         ["forward remove", "filaxis forward remove <forward_id> [--layer NAME] [--daemon-dir dir] [--json]"],
         ["stream", "filaxis stream open (--layer NAME | --host HOST) [--stream stdout|stderr|both] [--limit N] [--wait MS] [--json] -- <command> | peek <window_id> [--after SEQ|--before SEQ] [--limit N] [--wait MS] [--json] | close <window_id> | list"],
         ["stream open", "filaxis stream open [--layer NAME | --host HOST] [--stream stdout|stderr|both] [--limit N] [--wait MS] [--name NAME] [--json] -- <command>"],
@@ -1249,169 +1236,50 @@ async function main() {
             throw new Error(transferUsage(transfer));
         }
     }
-    const daemon = await tryDaemon(o);
     if (cmd === "batch") {
-        await runCliBatch(o, daemon);
-        return;
-    }
-    if (daemon) {
-        await runViaDaemon(cmd, o, daemon);
-        return;
-    }
-    const drv = await driverFor(o, o.pty === true); // --pty 需先建 PTY link（审计 M1）
-    try {
-        switch (cmd) {
-            case "put":
-            case "get": {
-                const [source, destination] = o.positional as [string, string];
-                const result = await transferLayerFile(drv, cmd, {
-                    localPath: cmd === "put" ? source : destination,
-                    remotePath: cmd === "put" ? destination : source,
-                    transport: o.transport,
-                    timeoutMs: o.timeout,
-                    writeMode: o.writeMode,
-                });
-                console.log(JSON.stringify(result));
-                break;
-            }
-            case "exec": {
-                // 免 Shell 命令通道（盲测痛点 #4）：复杂脚本（内嵌引号/多行/Python -c）
-                // 经宿主 Shell 转义常被拦死（PowerShell ParserError 实测）——脚本从
-                // stdin 或文件直达，与 edit --stdin-json 同哲学
-                let execCmd = o.positional.join(" ");
-                // BOM 剥+CRLF 归一（第十二季 C 组）：管道/文件来源的脚本体在 Windows
-                // 侧常带 \uFEFF 前导与 \r\n 行尾——bash 视 \r 为命令名一部分
-                const sanitizeScript = (t: string): string =>
-                    (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t).replace(/\r\n/g, "\n");
-                if (o.stdinScript) execCmd = sanitizeScript(await readStdinAll());
-                else if (o.scriptFile) execCmd = sanitizeScript((await import("node:fs")).readFileSync(o.scriptFile, "utf-8"));
-                // --pty：交互式层（su -/二次登录类）走 PTY 通道——stderr 与 stdout 混流（终端物理行为）
-                const r = await drv.exec(execCmd, {
-                    timeoutMs: o.timeout ?? 120_000,
-                    channel: o.pty ? "pty" : undefined,
-                });
-                await printExecResult(r, o.json === true, o.out);
-                break;
-            }
-            case "cat": {
-                const [p] = o.positional;
-                if (!p || p === "--help" || p === "-h") {
-                    // 子命令 help 拦截（盲测 B 组实测：--help 曾被当文件名报 ENOENT）
-                    console.log("用法: filaxis cat [--host ...] [--layer <名>] <path>\n输出远端/本地文件内容（UTF-8 文本；二进制走 SDK readBase64）");
-                    break;
-                }
-                process.stdout.write(await drv.fs.readFile(p));
-                break;
-            }
-            case "edit": {
-                const [p, oldArg, newArg] = o.positional;
-                let old = oldArg;
-                let newStr = newArg;
-                let all = o.all;
-                // 免 Shell 通道（第八季盲测实锤：Windows CommandLineToArgvW 剥引号、
-                // 多行 argv 要数缩进空格——Agent 卡 32 轮。JSON 载荷经 stdin/文件直达，
-                // 多行/引号/缩进 100% 保真；载荷字段与 toolkit edit_file 工具同一词汇表）
-                if (o.stdinJson || o.requestFile) {
-                    if (o.stdinJson && o.requestFile) {
-                        throw new Error("--stdin-json 与 --request-file 二选一");
-                    }
-                    if (oldArg !== undefined || newArg !== undefined) {
-                        throw new Error("--stdin-json/--request-file 与位置参数 <old> <new> 互斥（JSON 载荷已携带）");
-                    }
-                    const payload = o.requestFile
-                        ? readFileSync(o.requestFile, "utf-8")
-                        : await readStdinAll();
-                    let req: { old?: unknown; new?: unknown; all?: unknown };
-                    try {
-                        req = JSON.parse(payload) as typeof req;
-                    } catch (e) {
-                        throw new Error(`JSON 载荷解析失败（${o.requestFile ?? "stdin"}）: ${(e as Error).message}`);
-                    }
-                    if (!req || typeof req.old !== "string" || typeof req.new !== "string"
-                        || (req.all !== undefined && typeof req.all !== "boolean")) {
-                        throw new Error('JSON 载荷需含字符串字段 "old" 与 "new"（可选 "all": boolean）');
-                    }
-                    old = req.old;
-                    newStr = req.new;
-                    if (typeof req.all === "boolean") all = req.all;
-                }
-                if (!p || old === undefined || newStr === undefined) {
-                    throw new Error("用法: filaxis edit [--host ...] <path> <old> <new> [--all] [--write-mode auto|inplace] 或 <path> (--stdin-json | --request-file <file>)\n提示：old/new 含引号/多行时优先 --request-file（免 Shell 通道，宿主引号规则零影响）");
-                }
-                const r = await editFile(drv, p, old, newStr, { all, writeMode: o.writeMode }); // --write-mode auto|inplace → SDK 词汇（Gemini #8）
-                console.log(`edited: ${r.path} 替换 ${r.occurrences} 处，${r.bytesBefore}B → ${r.bytesAfter}B${r.mutex === "degraded" ? "（无锁降级）" : ""}`);
-                break;
-            }
-            case "observe": {
-                const h = await drv.execSession(o.positional.join(" "), { name: "cli-observe" });
-                const dur = o.duration ?? 8000;
-                await new Promise((r) => setTimeout(r, dur));
-                // 读取异常也走停止（自审·三十六期同类：CLI observe 旧形态读取抛错
-                // 跳过 stop 裸抛——同 toolkit observe_stream 修前形态）
-                let lines: Array<{ stream: string; text: string }>;
-                try {
-                    // 双形态统一 await（第八季盲测 bug 实锤：local tailLines 同步返回数组、
-                    // ssh 层 RemoteSessionManager.tailLines 是 async——漏 await 时 Promise
-                    // 恒 truthy，?? 兜底短路，lines.filter 直接 TypeError）
-                    // 行数归一（Hydrogen R7 #3）：统一 readSessionLog（local 热窗 50 vs remote 1000 的 20 倍差根治）
-                    const streams: Array<"stdout" | "stderr"> = o.stream === "stderr" ? ["stderr"] : o.stream === "stdout" ? ["stdout"] : ["stdout", "stderr"];
-                    lines = [];
-                    for (const st of streams) {
-                        const log = await drv.readSessionLog(h.sessionId, { lines: 500, stream: st });
-                        for (const text of (log ?? "").split("\n")) {
-                            if (text !== "") lines.push({ stream: st, text });
-                        }
-                    }
-                } catch (e) {
-                    await drv.stopSession(h.sessionId).catch(() => undefined);
-                    const err = new Error(
-                        `观察输出读取失败（${(e as Error).message}）——已尝试停止。` +
-                        `会话线索 session_id=${h.sessionId} log_base=${h.logBase}（任务可能仍在运行，核实后再重试）`,
-                    ) as Error & { outcome: string; sessionId: string; logBase: string };
-                    err.outcome = "unknown";
-                    err.sessionId = h.sessionId;
-                    err.logBase = h.logBase;
-                    throw err;
-                }
-                const filtered = (o.stream && o.stream !== "both") ? lines.filter((l) => l.stream === o.stream) : lines;
-                for (const l of filtered) console.log(`[${l.stream}] ${l.text}`);
-                const stopR = await drv.stopSession(h.sessionId).catch(() => ({ status: "unknown" }) as { status: "unknown" }); // 异常归 unknown（Sol 58 P2-6）
-                // stop unknown 接核实（Sol 57 P2-7 同 toolkit——吞掉改带终态警示）。
-                // 双未知不静默（Sol 59 P2-3）：修前仅核实 running 时提示——verify
-                // 也 unknown/抛错时 CLI 零输出收场，调用者拿不到会话与日志线索
-                if (stopR && stopR.status === "unknown") {
-                    let vStatus = "unknown";
-                    let vErr = "";
-                    try { vStatus = (await drv.verifySession(h.sessionId)).status; } catch (e) { vErr = (e as Error).message; }
-                    printObserveStopStatus(stopR.status, vStatus, vErr, h.sessionId, h.logBase);
-                }
-                break;
-            }
-            case "probe": {
-                const r = await discoverLayer(drv, { skipStage2: false });
-                console.log(JSON.stringify({ key: r.key, spec: r.spec, note: r.probeNote }, null, 2));
-                break;
-            }
-            default:
-                console.error(generalHelp);
-                process.exitCode = 1;
+        const { middle, close } = await openMiddle(o);
+        try {
+            await runCliBatch(o, middle);
+        } finally {
+            await close();
         }
-    } finally {
-        await destroyDriver(drv);
+        return;
     }
+    if (transfer || cmd === "exec" || cmd === "cat" || cmd === "edit" || cmd === "observe" || cmd === "probe") {
+        const { middle, close } = await openMiddle(o);
+        try {
+            await runTargetCommand(middle, cmd, o, transfer);
+        } finally {
+            await close();
+        }
+        return;
+    }
+    console.error(generalHelp);
+    process.exitCode = 1;
 }
 
-async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon: DaemonClient): Promise<void> {
+/**
+ * 目标类子命令的唯一实现。经 Daemon 与一次性模式走的是同一段代码——区别只在传进来的
+ * middle 是哪一种宿主（REQ-0004 §3.2）。--json 的输出与中层的记录同形（camelCase）。
+ */
+async function runTargetCommand(
+    middle: Middle,
+    cmd: string,
+    o: ReturnType<typeof parseOpts>,
+    transfer: "put" | "get" | undefined,
+): Promise<void> {
+    const { ops } = middle;
+    const layer = layerRefFor(o);
+    const layerPath = (p: string): string => layerPathFor(o, p);
     switch (cmd) {
         case "put":
         case "get": {
-            const target = buildCliTargetSpec(o);
             const [source, destination] = o.positional as [string, string];
-            const result = await daemon.rpc("transfer", {
-                target,
-                direction: cmd,
+            const result = await ops.transferFile({
+                layer,
+                direction: cmd as "put" | "get",
                 localPath: resolvePath(cmd === "put" ? source : destination),
-                remotePath: cmd === "put" ? destination : source,
+                remotePath: layerPath(cmd === "put" ? destination : source),
                 transport: o.transport,
                 timeoutMs: o.timeout,
                 writeMode: o.writeMode,
@@ -1420,17 +1288,23 @@ async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon
             break;
         }
         case "exec": {
-            const target = buildCliTargetSpec(o);
+            // 免 Shell 命令通道（盲测痛点 #4）：复杂脚本（内嵌引号/多行/Python -c）
+            // 经宿主 Shell 转义常被拦死（PowerShell ParserError 实测）——脚本从
+            // stdin 或文件直达，与 edit --stdin-json 同哲学
             let execCmd = o.positional.join(" ");
+            // BOM 剥+CRLF 归一（第十二季 C 组）：管道/文件来源的脚本体在 Windows
+            // 侧常带 \uFEFF 前导与 \r\n 行尾——bash 视 \r 为命令名一部分
             const sanitizeScript = (t: string): string =>
                 (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t).replace(/\r\n/g, "\n");
             if (o.stdinScript) execCmd = sanitizeScript(await readStdinAll());
             else if (o.scriptFile) execCmd = sanitizeScript(readFileSync(o.scriptFile, "utf-8"));
-            const r = await daemon.rpc<{ stdout: string; stderr: string; exitCode: number; effectiveUser?: string }>("exec", {
-                target,
+            // --pty：交互式层（su -/二次登录类）走 PTY 通道——stderr 与 stdout 混流（终端物理行为）
+            const r = await ops.runCommand({
+                layer,
                 command: execCmd,
                 timeoutMs: o.timeout ?? 120_000,
                 pty: o.pty === true,
+                cwd: defaultCwd(o),
             });
             await printExecResult(r, o.json === true, o.out);
             break;
@@ -1438,12 +1312,12 @@ async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon
         case "cat": {
             const [p] = o.positional;
             if (!p || p === "--help" || p === "-h") {
+                // 子命令 help 拦截（盲测 B 组实测：--help 曾被当文件名报 ENOENT）
                 console.log("用法: filaxis cat [--host ...] [--layer <名>] <path>\n输出远端/本地文件内容（UTF-8 文本；二进制走 SDK readBase64）");
                 break;
             }
-            const target = buildCliTargetSpec(o);
-            const r = await daemon.rpc<{ content: string }>("cat", { target, path: p });
-            process.stdout.write(r.content);
+            const { content } = await ops.readFile({ layer, path: layerPath(p) });
+            process.stdout.write(content);
             break;
         }
         case "edit": {
@@ -1451,15 +1325,23 @@ async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon
             let old = oldArg;
             let newStr = newArg;
             let all = o.all;
+            // 免 Shell 通道（第八季盲测实锤：Windows CommandLineToArgvW 剥引号、
+            // 多行 argv 要数缩进空格——Agent 卡 32 轮。JSON 载荷经 stdin/文件直达，
+            // 多行/引号/缩进 100% 保真；载荷字段与 toolkit edit_file 工具同一词汇表）
             if (o.stdinJson || o.requestFile) {
-                if (o.stdinJson && o.requestFile) throw new Error("--stdin-json 与 --request-file 二选一");
+                if (o.stdinJson && o.requestFile) {
+                    throw new Error("--stdin-json 与 --request-file 二选一");
+                }
                 if (oldArg !== undefined || newArg !== undefined) {
                     throw new Error("--stdin-json/--request-file 与位置参数 <old> <new> 互斥（JSON 载荷已携带）");
                 }
                 const payload = o.requestFile ? readFileSync(o.requestFile, "utf-8") : await readStdinAll();
                 let req: { old?: unknown; new?: unknown; all?: unknown };
-                try { req = JSON.parse(payload) as typeof req; }
-                catch (e) { throw new Error(`JSON 载荷解析失败（${o.requestFile ?? "stdin"}）: ${(e as Error).message}`); }
+                try {
+                    req = JSON.parse(payload) as typeof req;
+                } catch (e) {
+                    throw new Error(`JSON 载荷解析失败（${o.requestFile ?? "stdin"}）: ${(e as Error).message}`);
+                }
                 if (!req || typeof req.old !== "string" || typeof req.new !== "string"
                     || (req.all !== undefined && typeof req.all !== "boolean")) {
                     throw new Error('JSON 载荷需含字符串字段 "old" 与 "new"（可选 "all": boolean）');
@@ -1469,37 +1351,26 @@ async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon
                 if (typeof req.all === "boolean") all = req.all;
             }
             if (!p || old === undefined || newStr === undefined) {
-                throw new Error("用法: filaxis edit [--host ...] <path> <old> <new> [--all] [--write-mode auto|inplace] 或 <path> (--stdin-json | --request-file <file>)\n提示：old/new 含引号/多行时优先 --request-file（免 Shell 通道，宿主引号规则零影响）");
+                throw new Error("用法: filaxis edit [--host ...] <path> <old> <new> [--all] [--write-mode auto|inplace] 或 <path> (--stdin-json | --request-file <f>)\n提示：old/new 含引号/多行时优先 --request-file（免 Shell 通道，宿主引号规则零影响）");
             }
-            const target = buildCliTargetSpec(o);
-            const r = await daemon.rpc<{ path: string; occurrences: number; bytesBefore: number; bytesAfter: number; mutex?: string }>("edit", {
-                target, path: p, old, new: newStr, all, writeMode: o.writeMode,
-            });
+            const r = await ops.editFile({ layer, path: layerPath(p), old, new: newStr, all, writeMode: o.writeMode });
             console.log(`edited: ${r.path} 替换 ${r.occurrences} 处，${r.bytesBefore}B → ${r.bytesAfter}B${r.mutex === "degraded" ? "（无锁降级）" : ""}`);
             break;
         }
         case "observe": {
-            const target = buildCliTargetSpec(o);
-            const r = await daemon.rpc<{
-                lines: Array<{ stream: string; text: string }>;
-                stopStatus: "exited" | "stopped" | "unknown";
-                verifyStatus?: string;
-                verifyError?: string;
-                sessionId: string;
-                logBase: string;
-            }>("observe", {
-                target,
+            const r = await ops.observe({
+                layer,
                 command: o.positional.join(" "),
                 stream: o.stream,
-                duration: o.duration ?? 8000,
+                durationMs: o.duration ?? 8000,
+                cwd: defaultCwd(o),
             });
             for (const l of r.lines) console.log(`[${l.stream}] ${l.text}`);
             printObserveStopStatus(r.stopStatus, r.verifyStatus, r.verifyError, r.sessionId, r.logBase);
             break;
         }
         case "probe": {
-            const target = buildCliTargetSpec(o);
-            const r = await daemon.rpc<{ key: string; spec: unknown; note?: string }>("probe", { target });
+            const r = await ops.probeLayer({ layer });
             console.log(JSON.stringify({ key: r.key, spec: r.spec, note: r.note }, null, 2));
             break;
         }

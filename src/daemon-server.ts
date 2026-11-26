@@ -1,31 +1,26 @@
 /**
- * daemon-server.ts — Filaxis 显式常驻守护进程 HTTP 控制面与共享工作现场
+ * daemon-server.ts — Filaxis 常驻守护进程：中层的宿主进程（REQ-0004 §6）
  *
- * 设计要点（REQ-0005）：
- * - 零第三方依赖：仅基于 node:http / node:crypto / node:path 等标准库；
+ * 设计要点（REQ-0005 / REQ-0004）：
+ * - 零第三方依赖：仅基于 node:http / node:crypto 等标准库；
  * - 仅监听本地回环（缺省 127.0.0.1），除 GET /health 外全端点强制 Bearer Token 常量时间鉴权（401）；
- * - 惰性层解析：SSH 非交互 exec/stream/forward 不强迫预建 PTY link（保持 OPNsense 与多跳诚实拒绝语义），
- *   仅在 --pty 调用时按需初始化 PTY link；
- * - 内部持有统一 RuntimeStack 与 StreamWindowRegistry，供 CLI 与后续 MCP Proxy 共享现场。
+ * - 进程内只有一个中层（createMiddle）；/rpc 与 MCP 两个界面端点都调用同一个它，
+ *   层、连接、转发、观察窗、会话天然共享；
+ * - /rpc 是薄转发：取操作 → 调用 → 回结果，不含任何操作逻辑（校验、目标解析、
+ *   路径解析、结果整形都在中层或界面层）；
+ * - 信封带线协议版本，与自身不一致即拒绝、不执行（REQ-0004 §6.2）。
  */
 import * as crypto from "node:crypto";
 import * as http from "node:http";
-import * as path from "node:path";
-import { RuntimeStack, type LayerHandle } from "./operations/runtime-stack.js";
-import type { RuntimeDescriptor, RuntimeDriver } from "./driver.js";
-import { LocalRuntimeDriver } from "./local-driver.js";
-import { SshPtyDriver } from "./ssh-pty-driver.js";
-import { StreamWindowRegistry, type StreamFrame } from "./stream-window.js";
-import { editFile } from "./file-edit.js";
-import { transferLayerFile, type FileTransferTransport } from "./layer-file-transfer.js";
-import { discoverLayer } from "./layer-discovery.js";
-import { runBatch, type BatchPlan } from "./batch.js";
-import { isForwardActive, type OpenForwardSpec, type ForwardInfo } from "./ssh-forward.js";
+import type { RuntimeStack } from "./operations/runtime-stack.js";
+import type { StreamWindowRegistry } from "./stream-window.js";
 import { createAgentToolkit, type AgentToolkit } from "./agent-toolkit.js";
 import { McpProtocolHandler } from "./mcp-server.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
 import { loadLayerStore } from "./operations/layer-store.js";
-import { PROTOCOL_VERSION } from "./operations/protocol.js";
+import { createMiddle, type LocalMiddle } from "./operations/middle.js";
+import { PROTOCOL_VERSION, REMOTE_OP_NAMES } from "./operations/protocol.js";
+import type { StreamSummary } from "./operations/types.js";
 import {
     acquireDaemonLock,
     assertLoopbackHost,
@@ -37,28 +32,11 @@ import {
     writePrivateFileAtomic,
 } from "./daemon-files.js";
 
-export interface CliTargetSpec {
-    layer?: string;
-    descriptor?: RuntimeDescriptor;
-    cwd?: string;
-}
-
 export interface DaemonLayerSummary {
     name: string;
     driver: string;
     target?: string;
     active: boolean;
-}
-
-export interface DaemonStreamSummary {
-    window_id: string;
-    name?: string;
-    layer: string;
-    command: string;
-    oldest_seq: number;
-    newest_seq: number;
-    stale: boolean;
-    closed: boolean;
 }
 
 export interface DaemonStatusInfo {
@@ -70,8 +48,8 @@ export interface DaemonStatusInfo {
     protocolVersion: number;
     addr: string;
     layers: DaemonLayerSummary[];
-    forwards: ForwardInfo[];
-    streams: DaemonStreamSummary[];
+    forwards: unknown[];
+    streams: StreamSummary[];
 }
 
 export interface DaemonServerOptions {
@@ -82,6 +60,8 @@ export interface DaemonServerOptions {
     logger?: FilaxisLogger;
     stack?: RuntimeStack;
     windowRegistry?: StreamWindowRegistry;
+    /** 已建好的中层；省略则按 stack / windowRegistry 代建（并注入已存层表读取） */
+    middle?: LocalMiddle;
     toolkit?: AgentToolkit;
     sseKeepaliveMs?: number;
     writeFiles?: boolean;
@@ -104,6 +84,8 @@ class HttpStatusError extends Error {
 }
 
 export class DaemonServer {
+    /** 本进程唯一的中层——/rpc 与 MCP 两个界面都调用它 */
+    readonly middle: LocalMiddle;
     readonly stack: RuntimeStack;
     readonly windowRegistry: StreamWindowRegistry;
     readonly toolkit: AgentToolkit;
@@ -119,12 +101,6 @@ export class DaemonServer {
     private readonly mcpHandler: McpProtocolHandler;
     private readonly mcpSseClients = new Map<string, McpSseClient>();
     private readonly startedAt = Date.now();
-    private readonly ptyInitialized = new WeakSet<RuntimeDriver>();
-    private readonly ptyInitInflight = new WeakMap<RuntimeDriver, Promise<void>>();
-    private readonly resolvingLayers = new Map<string, { key: string; promise: Promise<LayerHandle> }>();
-    private readonly ephemeralLayers = new Map<string, string>();
-    private readonly streamMeta = new Map<string, { displayName?: string; layer: string; implicitLocal: boolean }>();
-    private implicitLocal?: LayerHandle;
 
     private server?: http.Server;
     private listenAddr?: string;
@@ -139,9 +115,17 @@ export class DaemonServer {
         this.port = opts.port ?? 0;
         this.version = opts.version ?? "0.0.0";
         this.log = opts.logger ?? noopLogger;
-        this.stack = opts.stack ?? new RuntimeStack({ logger: this.log });
-        this.windowRegistry = opts.windowRegistry ?? new StreamWindowRegistry({ logger: this.log });
-        this.toolkit = opts.toolkit ?? createAgentToolkit(this.stack, { windowRegistry: this.windowRegistry, savedLayers: loadLayerStore });
+        this.middle = opts.middle ?? createMiddle({
+            stack: opts.stack,
+            windowRegistry: opts.windowRegistry,
+            // Daemon 是这台机器上的常驻宿主：已存层表在这里注入（界面层不必再随请求下发）
+            savedLayers: loadLayerStore,
+            logger: this.log,
+            version: this.version,
+        });
+        this.stack = this.middle.stack;
+        this.windowRegistry = this.middle.windowRegistry();
+        this.toolkit = opts.toolkit ?? createAgentToolkit(this.stack, { middle: this.middle });
         this.mcpHandler = new McpProtocolHandler({ toolkit: this.toolkit, serverVersion: this.version });
         this.sseKeepaliveMs = opts.sseKeepaliveMs ?? DEFAULT_SSE_KEEPALIVE_MS;
         this.writeFiles = opts.writeFiles !== false;
@@ -209,14 +193,6 @@ export class DaemonServer {
         }
     }
 
-    private pruneStreamMeta(): void {
-        for (const id of [...this.streamMeta.keys()]) {
-            if (!this.windowRegistry.get(id)) {
-                this.streamMeta.delete(id);
-            }
-        }
-    }
-
     waitForStop(): Promise<void> {
         if (this.stopped) return Promise.resolve();
         return new Promise<void>((resolve) => {
@@ -225,7 +201,6 @@ export class DaemonServer {
     }
 
     status(): DaemonStatusInfo {
-        this.pruneStreamMeta();
         const activeName = this.stack.activeLayer?.name;
         const layers: DaemonLayerSummary[] = [...this.stack.layers.values()].map((h) => ({
             name: h.name,
@@ -233,21 +208,6 @@ export class DaemonServer {
             ...(h.descriptor.target !== undefined ? { target: h.descriptor.target } : {}),
             active: h.name === activeName,
         }));
-        const streams: DaemonStreamSummary[] = [];
-        for (const w of this.windowRegistry.list()) {
-            const win = this.windowRegistry.get(w.name);
-            const meta = this.streamMeta.get(w.name);
-            streams.push({
-                window_id: w.name,
-                ...(meta?.displayName ? { name: meta.displayName } : {}),
-                layer: meta?.layer ?? w.layer,
-                command: w.command,
-                oldest_seq: win?.oldestSeq ?? 0,
-                newest_seq: win?.newestSeq ?? 0,
-                stale: w.stale,
-                closed: win?.closed ?? false,
-            });
-        }
         return {
             pid: process.pid,
             startedAt: this.startedAt,
@@ -257,7 +217,7 @@ export class DaemonServer {
             addr: this.listenAddr ?? "",
             layers,
             forwards: this.stack.listForwards(),
-            streams,
+            streams: this.middle.listStreamsSync(),
         };
     }
 
@@ -281,14 +241,7 @@ export class DaemonServer {
             await Promise.all(activeWindows.map((id) => this.windowRegistry.stopConfirmed(id).catch(() => undefined)));
             this.toolkit.dispose?.();
             this.windowRegistry.dispose();
-            this.streamMeta.clear();
-            await this.stack.destroyDetachedForwardDrivers();
-            for (const name of [...this.stack.layers.keys()]) {
-                await this.stack.removeLayer(name, { destroy: true }).catch(() => undefined);
-            }
-            this.ephemeralLayers.clear();
-            await this.implicitLocal?.driver.destroy().catch(() => undefined);
-            this.implicitLocal = undefined;
+            await this.middle.shutdown();
             this.listenAddr = undefined;
             if (this.writeFiles) {
                 cleanupDaemonFiles(this.daemonDir, process.pid);
@@ -335,24 +288,35 @@ export class DaemonServer {
         }
 
         if (req.method === "POST" && reqPath === "/rpc") {
-            let payload: { method?: unknown; params?: unknown };
+            let payload: { protocol?: unknown; op?: unknown; params?: unknown };
             try {
                 payload = await readJsonBody(req);
             } catch (err) {
                 this.sendJsonBodyError(res, err);
                 return;
             }
-            const method = typeof payload.method === "string" ? payload.method : "";
+            // 线协议握手（REQ-0004 §6.2）：信封不带或带着别的协议版本（0.2.x 的客户端不带这个
+            // 字段）一律拒绝、不执行——旧客户端的请求若交给新代码或反过来，行为都不可预期
+            if (payload.protocol !== PROTOCOL_VERSION) {
+                const theirs = payload.protocol === undefined ? "（缺失）" : String(payload.protocol);
+                this.sendJson(res, 200, {
+                    ok: false,
+                    error: `Daemon 线协议版本不一致，已拒绝执行：请求 protocol=${theirs}，Daemon protocol=${PROTOCOL_VERSION}（pid=${process.pid}）。请把客户端与 Daemon 升级到同一版本后重试`,
+                    code: "E_PROTOCOL_MISMATCH",
+                });
+                return;
+            }
+            const op = typeof payload.op === "string" ? payload.op : "";
             const params = (payload.params && typeof payload.params === "object" && !Array.isArray(payload.params))
                 ? payload.params as Record<string, unknown>
                 : {};
-            if (!method) {
-                this.sendJson(res, 400, { ok: false, error: "RPC 请求缺少 method 字段" });
+            if (!op) {
+                this.sendJson(res, 400, { ok: false, error: "RPC 请求缺少 op 字段" });
                 return;
             }
             try {
-                const result = await this.dispatchRpc(method, params);
-                this.sendJson(res, 200, { ok: true, result });
+                const result = await this.dispatchOp(op, params);
+                this.sendJson(res, 200, { ok: true, protocol: PROTOCOL_VERSION, result });
             } catch (err) {
                 this.sendJson(res, 200, serializeRpcError(err));
             }
@@ -360,6 +324,18 @@ export class DaemonServer {
         }
 
         this.sendJson(res, 404, { ok: false, error: `Not Found: ${req.method ?? "UNKNOWN"} ${reqPath}` });
+    }
+
+    /**
+     * 薄转发：取操作 → 调用 → 回结果。这里不认识任何具体操作——参数校验、目标解析、
+     * 路径解析与结果整形都在中层（operations/）或界面层。
+     */
+    private dispatchOp(op: string, params: Record<string, unknown>): Promise<unknown> {
+        if (!isRemoteOp(op)) {
+            return Promise.reject(new Error(`未知 Daemon 操作: ${op}（可用：${REMOTE_OP_NAMES.join("、")}）`));
+        }
+        const fn = (this.middle.ops as unknown as Record<string, (p: Record<string, unknown>) => Promise<unknown>>)[op]!;
+        return fn.call(this.middle.ops, params);
     }
 
     private handleMcpSse(req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -470,547 +446,10 @@ export class DaemonServer {
         });
         res.end(json);
     }
-
-    private instantiateDriver(descriptor: RuntimeDescriptor): RuntimeDriver | null {
-        if (descriptor.driver === "local") {
-            const cfg = (descriptor.config ?? {}) as Record<string, unknown>;
-            const drv = new LocalRuntimeDriver({
-                ...(descriptor.cwd ? { cwd: descriptor.cwd } : {}),
-                ...(typeof cfg.shell === "string" ? { shell: cfg.shell } : {}),
-                logger: this.log,
-            });
-            drv.descriptor = { ...descriptor };
-            return drv;
-        }
-        if (descriptor.driver === "ssh") {
-            return new SshPtyDriver(descriptor, { logger: this.log });
-        }
-        return null;
-    }
-
-    private hasActiveStreamsForLayer(layerName: string): boolean {
-        this.pruneStreamMeta();
-        for (const w of this.windowRegistry.list()) {
-            const win = this.windowRegistry.get(w.name);
-            if (!win || win.closed) continue;
-            const meta = this.streamMeta.get(w.name);
-            if (meta?.implicitLocal) continue;
-            const ownerLayer = meta?.layer ?? w.layer;
-            if (ownerLayer === layerName) return true;
-        }
-        return false;
-    }
-
-    private resolveClientLocalPath(filePath: string, clientCwd?: string): string {
-        if (clientCwd && filePath && !filePath.includes("\0") && !path.isAbsolute(filePath)) {
-            return path.resolve(clientCwd, filePath);
-        }
-        return filePath;
-    }
-
-    private resolveBatchPlanLocalPaths(plan: BatchPlan, clientCwd?: string): BatchPlan {
-        if (!clientCwd || !plan || typeof plan !== "object" || Array.isArray(plan) || !Array.isArray(plan.steps)) {
-            return plan;
-        }
-        return {
-            ...plan,
-            steps: plan.steps.map((step) => {
-                if (step && typeof step === "object" && (step.kind === "put" || step.kind === "get")
-                    && typeof step.localPath === "string") {
-                    return { ...step, localPath: this.resolveClientLocalPath(step.localPath, clientCwd) };
-                }
-                // commandFile（exec 步骤引用的脚本文件，DSH 评估 2026-11-26 #6）同款按调用方
-                // 工作目录解析——Daemon 进程自己的工作目录与 CLI 调用方无关
-                if (step && typeof step === "object" && step.kind === "exec" && typeof step.commandFile === "string" && step.commandFile.trim()) {
-                    return { ...step, commandFile: this.resolveClientLocalPath(step.commandFile, clientCwd) };
-                }
-                return step;
-            }),
-        };
-    }
-
-    private async registerLazyLayer(name: string, descriptor: RuntimeDescriptor, opts: { activate?: boolean } = {}): Promise<LayerHandle> {
-        const direct = this.instantiateDriver(descriptor);
-        if (direct) {
-            const res = await this.stack.addLayer(name, direct, { activate: opts.activate });
-            return res.handle;
-        }
-        const res = await this.stack.addLayer(name, descriptor, { activate: opts.activate });
-        return res.handle;
-    }
-
-    private async ensureLayerOnce(
-        dedupKey: string,
-        descriptorKey: string,
-        create: () => Promise<LayerHandle>,
-    ): Promise<LayerHandle> {
-        const inflight = this.resolvingLayers.get(dedupKey);
-        if (inflight) {
-            if (inflight.key !== descriptorKey) {
-                throw new Error(
-                    `层 '${dedupKey.replace(/^named:/, "")}' 正在并发注册或更新为另一份配置，拒绝合并不同描述符的并发请求`,
-                );
-            }
-            return inflight.promise;
-        }
-        const task = create().finally(() => {
-            if (this.resolvingLayers.get(dedupKey)?.promise === task) {
-                this.resolvingLayers.delete(dedupKey);
-            }
-        });
-        this.resolvingLayers.set(dedupKey, { key: descriptorKey, promise: task });
-        return task;
-    }
-
-    private getImplicitLocalHandle(): LayerHandle {
-        if (!this.implicitLocal) {
-            const drv = new LocalRuntimeDriver({ logger: this.log });
-            this.implicitLocal = { name: "local", descriptor: drv.descriptor, driver: drv };
-        }
-        return this.implicitLocal;
-    }
-
-    private getEphemeralLayer(key: string): LayerHandle | undefined {
-        const name = this.ephemeralLayers.get(key);
-        const handle = name === undefined ? undefined : this.stack.layers.get(name);
-        if (handle && RuntimeStack.driverKey(handle.descriptor) === key) return handle;
-        this.ephemeralLayers.delete(key);
-        return undefined;
-    }
-
-    private async resolveTarget(target?: CliTargetSpec, opts: { needPty?: boolean } = {}): Promise<LayerHandle> {
-        let handle: LayerHandle;
-
-        if (!target || (!target.layer && (!target.descriptor || (target.descriptor.driver === "local" && !target.descriptor.cwd && !target.descriptor.config)))) {
-            handle = this.getImplicitLocalHandle();
-        } else if (target.layer) {
-            if (target.descriptor) {
-                const layerName = target.layer;
-                const descriptor = target.descriptor;
-                const desiredKey = RuntimeStack.driverKey(descriptor);
-                const fastExisting = this.stack.layers.has(layerName) ? this.stack.layer(layerName) : undefined;
-                if (fastExisting && RuntimeStack.driverKey(fastExisting.descriptor) === desiredKey) {
-                    handle = fastExisting;
-                } else {
-                    handle = await this.ensureLayerOnce(`named:${layerName}`, desiredKey, async () => {
-                        if (this.stack.layers.has(layerName)) {
-                            const existing = this.stack.layer(layerName);
-                            if (RuntimeStack.driverKey(existing.descriptor) === desiredKey) {
-                                return existing;
-                            }
-                            const hasActiveForwards = this.stack.hasLiveForwards(layerName);
-                            const hasActiveStreams = this.hasActiveStreamsForLayer(layerName);
-                            if (hasActiveForwards || hasActiveStreams) {
-                                throw new Error(
-                                    `层 '${layerName}' 已在 Daemon 注册且配置与新描述符不一致，当前仍有${hasActiveForwards ? "正在建立或未确认关闭的动态端口转发" : "活跃观察窗"}，拒绝静默覆盖——请先清理该层资源或移除旧层后重试`,
-                                );
-                            }
-                            const wasActive = this.stack.activeLayer?.name === layerName;
-                            await this.stack.removeLayer(layerName, { destroy: false });
-                            return this.registerLazyLayer(layerName, descriptor, { activate: wasActive });
-                        }
-                        return this.registerLazyLayer(layerName, descriptor, { activate: false });
-                    });
-                }
-            } else if (this.stack.layers.has(target.layer)) {
-                handle = this.stack.layer(target.layer);
-            } else {
-                throw new Error(`层 '${target.layer}' 未在 Daemon 注册（可先 filaxis layer save ${target.layer} --host ...）`);
-            }
-        } else {
-            const descriptor = target.descriptor!;
-            const key = RuntimeStack.driverKey(descriptor);
-            const existing = this.getEphemeralLayer(key);
-            if (existing) {
-                handle = existing;
-            } else {
-                handle = await this.ensureLayerOnce(`ephemeral:${key}`, key, async () => {
-                    const again = this.getEphemeralLayer(key);
-                    if (again) return again;
-                    const shortHash = crypto.createHash("sha256").update(key).digest("hex").slice(0, 6);
-                    const base = (descriptor.target ?? descriptor.driver).replace(/[^A-Za-z0-9._@-]/g, "_").slice(0, 24) || "layer";
-                    let candidate = `${base}#${shortHash}`;
-                    if (this.stack.layers.has(candidate)) {
-                        candidate = `${candidate}-${crypto.randomBytes(2).toString("hex")}`;
-                    }
-                    const created = await this.registerLazyLayer(candidate, descriptor, { activate: false });
-                    this.ephemeralLayers.set(key, created.name);
-                    return created;
-                });
-            }
-        }
-
-        if (opts.needPty && handle.driver instanceof SshPtyDriver && !this.ptyInitialized.has(handle.driver)) {
-            const sshDrv = handle.driver;
-            let initTask = this.ptyInitInflight.get(sshDrv);
-            if (!initTask) {
-                initTask = sshDrv.init().then(() => {
-                    this.ptyInitialized.add(sshDrv);
-                }).finally(() => {
-                    if (this.ptyInitInflight.get(sshDrv) === initTask) {
-                        this.ptyInitInflight.delete(sshDrv);
-                    }
-                });
-                this.ptyInitInflight.set(sshDrv, initTask);
-            }
-            await initTask;
-        }
-        return handle;
-    }
-
-    private resolveLayerFilePath(drv: RuntimeDriver, filePath: string, clientCwd?: string): string {
-        if (drv.descriptor.driver === "local" && clientCwd && !path.isAbsolute(filePath)) {
-            return path.resolve(clientCwd, filePath);
-        }
-        return filePath;
-    }
-
-    private async dispatchRpc(method: string, params: Record<string, unknown>): Promise<unknown> {
-        switch (method) {
-            case "status":
-                return this.status();
-
-            case "exec": {
-                const target = params.target as CliTargetSpec | undefined;
-                const command = String(params.command ?? "");
-                const timeoutMs = typeof params.timeoutMs === "number" ? params.timeoutMs : 120_000;
-                const pty = params.pty === true;
-                const h = await this.resolveTarget(target, { needPty: pty });
-                const isLocal = h.descriptor.driver === "local";
-                const r = await h.driver.exec(command, {
-                    timeoutMs,
-                    channel: pty ? "pty" : undefined,
-                    ...(isLocal && target?.cwd ? { cwd: target.cwd } : {}),
-                });
-                return {
-                    stdout: r.stdout,
-                    stderr: r.stderr,
-                    exitCode: r.exitCode,
-                    ...(r.effectiveUser !== undefined ? { effectiveUser: r.effectiveUser } : {}),
-                };
-            }
-
-            case "cat": {
-                const target = params.target as CliTargetSpec | undefined;
-                const rawPath = String(params.path ?? "");
-                if (!rawPath) throw new Error("cat 缺少 path 参数");
-                const h = await this.resolveTarget(target);
-                const resolved = this.resolveLayerFilePath(h.driver, rawPath, target?.cwd);
-                return { content: await h.driver.fs.readFile(resolved) };
-            }
-
-            case "edit": {
-                const target = params.target as CliTargetSpec | undefined;
-                const rawPath = String(params.path ?? "");
-                const old = params.old;
-                const newStr = params.new;
-                if (!rawPath || typeof old !== "string" || typeof newStr !== "string") {
-                    throw new Error("edit 需要 path、old 与 new 字符串参数");
-                }
-                const h = await this.resolveTarget(target);
-                const resolved = this.resolveLayerFilePath(h.driver, rawPath, target?.cwd);
-                return editFile(h.driver, resolved, old, newStr, {
-                    all: params.all === true,
-                    writeMode: params.writeMode as "auto" | "inplace" | undefined,
-                });
-            }
-
-            case "transfer": {
-                const target = params.target as CliTargetSpec | undefined;
-                const direction = params.direction === "get" ? "get" : params.direction === "put" ? "put" : undefined;
-                if (!direction) throw new Error("transfer 需要 direction=put|get");
-                const h = await this.resolveTarget(target);
-                const clientCwd = typeof params.clientCwd === "string" && params.clientCwd ? params.clientCwd : target?.cwd;
-                const remotePath = this.resolveLayerFilePath(h.driver, String(params.remotePath ?? ""), target?.cwd);
-                return transferLayerFile(h.driver, direction, {
-                    localPath: this.resolveClientLocalPath(String(params.localPath ?? ""), clientCwd),
-                    remotePath,
-                    transport: params.transport as FileTransferTransport | undefined,
-                    timeoutMs: typeof params.timeoutMs === "number" ? params.timeoutMs : undefined,
-                    writeMode: params.writeMode as "auto" | "inplace" | undefined,
-                });
-            }
-
-            case "observe": {
-                const target = params.target as CliTargetSpec | undefined;
-                const command = String(params.command ?? "");
-                const streamArg = typeof params.stream === "string" ? params.stream : undefined;
-                const duration = typeof params.duration === "number" ? params.duration : 8000;
-                const h = await this.resolveTarget(target);
-                const isLocal = h.descriptor.driver === "local";
-                const session = await h.driver.execSession(command, {
-                    name: "cli-observe",
-                    ...(isLocal && target?.cwd ? { cwd: target.cwd } : {}),
-                });
-                await new Promise((r) => setTimeout(r, duration));
-                const streams: Array<"stdout" | "stderr"> = streamArg === "stderr"
-                    ? ["stderr"]
-                    : streamArg === "stdout"
-                        ? ["stdout"]
-                        : ["stdout", "stderr"];
-                const lines: Array<{ stream: string; text: string }> = [];
-                try {
-                    for (const st of streams) {
-                        const log = await h.driver.readSessionLog(session.sessionId, { lines: 500, stream: st });
-                        for (const text of (log ?? "").split("\n")) {
-                            if (text !== "") lines.push({ stream: st, text });
-                        }
-                    }
-                } catch (e) {
-                    await h.driver.stopSession(session.sessionId).catch(() => undefined);
-                    const err = new Error(
-                        `观察输出读取失败（${(e as Error).message}）——已尝试停止。` +
-                        `会话线索 session_id=${session.sessionId} log_base=${session.logBase}（任务可能仍在运行，核实后再重试）`,
-                    ) as Error & { outcome: string; sessionId: string; logBase: string };
-                    err.outcome = "unknown";
-                    err.sessionId = session.sessionId;
-                    err.logBase = session.logBase;
-                    throw err;
-                }
-                const filtered = (streamArg && streamArg !== "both")
-                    ? lines.filter((l) => l.stream === streamArg)
-                    : lines;
-                const stopR = await h.driver.stopSession(session.sessionId).catch(() => ({ status: "unknown" as const }));
-                let verifyStatus: string | undefined;
-                let verifyError: string | undefined;
-                if (stopR.status === "unknown") {
-                    verifyStatus = "unknown";
-                    try {
-                        verifyStatus = (await h.driver.verifySession(session.sessionId)).status;
-                    } catch (e) {
-                        verifyError = (e as Error).message;
-                    }
-                }
-                return {
-                    lines: filtered,
-                    stopStatus: stopR.status,
-                    ...(verifyStatus !== undefined ? { verifyStatus } : {}),
-                    ...(verifyError !== undefined ? { verifyError } : {}),
-                    sessionId: session.sessionId,
-                    logBase: session.logBase,
-                };
-            }
-
-            case "probe": {
-                const target = params.target as CliTargetSpec | undefined;
-                const h = await this.resolveTarget(target);
-                const r = await discoverLayer(h.driver, { skipStage2: false });
-                return { key: r.key, spec: r.spec, note: r.probeNote };
-            }
-
-            case "batch": {
-                const target = params.target as CliTargetSpec | undefined;
-                const plan = params.plan as BatchPlan;
-                const savedLayers = (params.savedLayers ?? {}) as Record<string, RuntimeDescriptor>;
-                const clientCwd = typeof params.clientCwd === "string" && params.clientCwd ? params.clientCwd : target?.cwd;
-                const resolvedPlan = this.resolveBatchPlanLocalPaths(plan, clientCwd);
-                let scopedLocal: LocalRuntimeDriver | undefined;
-                try {
-                    return await runBatch(async (layerName) => {
-                        if (layerName === undefined) {
-                            if ((!target || (!target.layer && (!target.descriptor || target.descriptor.driver === "local"))) && target?.cwd) {
-                                scopedLocal ??= new LocalRuntimeDriver({ cwd: target.cwd, logger: this.log });
-                                return scopedLocal;
-                            }
-                            return (await this.resolveTarget(target)).driver;
-                        }
-                        if (Object.hasOwn(savedLayers, layerName)) {
-                            return (await this.resolveTarget({ layer: layerName, descriptor: savedLayers[layerName]! })).driver;
-                        }
-                        if (this.stack.layers.has(layerName)) {
-                            return this.stack.layer(layerName).driver;
-                        }
-                        throw new Error(`层 '${layerName}' 未保存（filaxis layer list 查看；filaxis layer save ${layerName} --host ... 创建）`);
-                    }, resolvedPlan);
-                } finally {
-                    await scopedLocal?.destroy().catch(() => undefined);
-                }
-            }
-
-            case "forward.add": {
-                const target = params.target as CliTargetSpec | undefined;
-                const spec = params.spec as OpenForwardSpec;
-                if (!spec || typeof spec !== "object") throw new Error("forward.add 需要 spec 参数");
-                const h = await this.resolveTarget(target);
-                if (typeof h.driver.openForward !== "function") {
-                    throw new Error(`层 '${h.name}' (${h.descriptor.driver}) 不支持动态端口转发`);
-                }
-                if (this.stack.layers.get(h.name) !== h) {
-                    throw new Error(`层 '${h.name}' 已变更，请重新指定目标层`);
-                }
-                return this.stack.openForward(spec, h.name);
-            }
-
-            case "forward.list": {
-                const layer = typeof params.layer === "string" ? params.layer : undefined;
-                // includeClosed（DSH 评估 2026-11-26 #5a）：缺省 true 保持协议兼容；调用方
-                // 显式传 false 时只报仍在用的转发（stopped/exited 是墓碑，见 isForwardActive）
-                const includeClosed = params.includeClosed !== false;
-                const forwards = this.stack.listForwards(layer);
-                return { forwards: includeClosed ? forwards : forwards.filter(isForwardActive) };
-            }
-
-            case "forward.remove": {
-                const forwardId = typeof params.forwardId === "string" ? params.forwardId : "";
-                if (!forwardId) throw new Error("forward.remove 需要 forwardId");
-                const layer = typeof params.layer === "string" ? params.layer : undefined;
-                return this.stack.closeForward(forwardId, layer);
-            }
-
-            case "stream.open": {
-                const target = params.target as CliTargetSpec | undefined;
-                const command = typeof params.command === "string" ? params.command : "";
-                if (!command.trim()) throw new Error("stream.open 需要非空 command");
-                const stream = params.stream as "stdout" | "stderr" | "both" | undefined;
-                if (stream !== undefined && stream !== "stdout" && stream !== "stderr" && stream !== "both") {
-                    throw new Error(`stream 无效: ${String(stream)}（支持 stdout|stderr|both）`);
-                }
-                const displayName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : undefined;
-                const limit = typeof params.limit === "number" ? params.limit : 20;
-                const waitMs = typeof params.waitMs === "number" ? params.waitMs : 0;
-                if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("limit 须在 1–200 之间");
-                if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 30_000) throw new Error("waitMs 须在 0–30000 之间");
-
-                this.pruneStreamMeta();
-                const h = await this.resolveTarget(target);
-                const openDriver = (h.descriptor.driver === "local" && target?.cwd)
-                    ? new LocalRuntimeDriver({ cwd: target.cwd, logger: this.log })
-                    : h.driver;
-                if (typeof openDriver.openStreamWindow !== "function") {
-                    throw new Error(`层 '${h.name}' (${h.descriptor.driver}) 不支持持续观察窗`);
-                }
-                const id = crypto.randomUUID();
-                const win = await openDriver.openStreamWindow(this.windowRegistry, {
-                    name: id,
-                    command,
-                    stream,
-                    retainSequence: false,
-                });
-                this.streamMeta.set(id, { displayName, layer: h.name, implicitLocal: h === this.implicitLocal });
-
-                const deadline = Date.now() + waitMs;
-                let res = win.peekSince(0, limit);
-                while (!res.frames.length && !res.gap && !res.stale && Date.now() < deadline) {
-                    await new Promise((r) => setTimeout(r, Math.max(0, Math.min(50, deadline - Date.now()))));
-                    const cur = this.windowRegistry.get(id);
-                    if (!cur || cur.closed) throw new Error(`观察窗 '${id}' 在等待首屏期间已关闭`);
-                    res = cur.peekSince(0, limit);
-                }
-                return formatDaemonStreamResult(id, res, h.name, displayName);
-            }
-
-            case "stream.peek": {
-                const windowId = typeof params.windowId === "string" ? params.windowId : "";
-                if (!windowId.trim()) throw new Error("stream.peek 需要非空 windowId");
-                const afterSeq = params.afterSeq as number | undefined;
-                const beforeSeq = params.beforeSeq as number | undefined;
-                const limit = typeof params.limit === "number" ? params.limit : 20;
-                const waitMs = typeof params.waitMs === "number" ? params.waitMs : 0;
-                const streamFilter = params.stream as "stdout" | "stderr" | "both" | undefined;
-                if (afterSeq !== undefined && beforeSeq !== undefined) {
-                    throw new Error("afterSeq 与 beforeSeq 互斥");
-                }
-                for (const v of [afterSeq, beforeSeq]) {
-                    if (v !== undefined && (!Number.isSafeInteger(v) || v < 0)) {
-                        throw new Error("afterSeq / beforeSeq 须为非负整数");
-                    }
-                }
-                if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("limit 须在 1–200 之间");
-                if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 30_000) throw new Error("waitMs 须在 0–30000 之间");
-                if (waitMs > 0 && afterSeq === undefined) throw new Error("waitMs 仅可用于 --after 增量续读");
-                if (streamFilter !== undefined && streamFilter !== "stdout" && streamFilter !== "stderr" && streamFilter !== "both") {
-                    throw new Error(`stream 无效: ${String(streamFilter)}`);
-                }
-                const selectedStream = streamFilter === "both" ? undefined : streamFilter;
-
-                const requireActiveWin = () => {
-                    const w = this.windowRegistry.get(windowId);
-                    if (!w || w.closed) throw new Error(`观察窗 '${windowId}' 不存在或已关闭`);
-                    return w;
-                };
-                const readOnce = () => {
-                    const w = requireActiveWin();
-                    return afterSeq !== undefined
-                        ? w.peekSince(afterSeq, limit, undefined, selectedStream)
-                        : beforeSeq !== undefined
-                            ? w.peekBefore(beforeSeq, limit, selectedStream)
-                            : w.peekLast(limit, selectedStream);
-                };
-
-                const deadline = Date.now() + waitMs;
-                let res = readOnce();
-                while (afterSeq !== undefined && !res.frames.length && !res.gap && !res.stale && Date.now() < deadline) {
-                    await new Promise((r) => setTimeout(r, Math.max(0, Math.min(50, deadline - Date.now()))));
-                    res = readOnce();
-                }
-
-                const meta = this.streamMeta.get(windowId);
-                return formatDaemonStreamResult(windowId, res, meta?.layer, meta?.displayName);
-            }
-
-            case "stream.close": {
-                const windowId = typeof params.windowId === "string" ? params.windowId : "";
-                if (!windowId.trim()) throw new Error("stream.close 需要非空 windowId");
-                const w = this.windowRegistry.get(windowId);
-                if (!w || w.closed) throw new Error(`观察窗 '${windowId}' 不存在或已关闭`);
-                await this.windowRegistry.stopConfirmed(windowId);
-                this.streamMeta.delete(windowId);
-                return { window_id: windowId, closed: true };
-            }
-
-            case "stream.list":
-                return { streams: this.status().streams };
-
-            case "layer.list":
-                return {
-                    layers: this.status().layers,
-                    text: this.stack.layerText(),
-                };
-
-            case "layer.remove": {
-                const name = typeof params.name === "string" ? params.name : "";
-                if (!name) throw new Error("layer.remove 需要 name");
-                await this.stack.removeLayer(name, { destroy: params.destroy === true });
-                for (const [key, mappedName] of [...this.ephemeralLayers.entries()]) {
-                    if (mappedName === name) this.ephemeralLayers.delete(key);
-                }
-                return { removed: name };
-            }
-
-            default:
-                throw new Error(`未知 Daemon RPC 方法: ${method}`);
-        }
-    }
 }
 
-function formatDaemonStreamResult(
-    windowId: string,
-    res: {
-        oldestSeq: number;
-        newestSeq: number;
-        stale: boolean;
-        frames: StreamFrame[];
-        exitCode?: number | null;
-        error?: string;
-        lastDeliveredSeq?: number;
-        gap?: boolean;
-    },
-    layer?: string,
-    name?: string,
-) {
-    return {
-        window_id: windowId,
-        ...(name ? { name } : {}),
-        ...(layer ? { layer } : {}),
-        oldest_seq: res.oldestSeq,
-        newest_seq: res.newestSeq,
-        stale: res.stale,
-        frames: res.frames,
-        ...(res.lastDeliveredSeq !== undefined ? { last_delivered_seq: res.lastDeliveredSeq } : {}),
-        ...(res.gap ? { gap: true } : {}),
-        ...(res.exitCode !== undefined ? { exit_code: res.exitCode } : {}),
-        ...(res.error !== undefined ? { error: res.error } : {}),
-    };
+function isRemoteOp(name: string): name is (typeof REMOTE_OP_NAMES)[number] {
+    return (REMOTE_OP_NAMES as readonly string[]).includes(name);
 }
 
 function serializeRpcError(err: unknown): Record<string, unknown> {
@@ -1064,10 +503,10 @@ async function readRawJsonBody(req: http.IncomingMessage): Promise<unknown> {
     }
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<{ method?: unknown; params?: unknown }> {
+async function readJsonBody(req: http.IncomingMessage): Promise<{ protocol?: unknown; op?: unknown; params?: unknown }> {
     const parsed = await readRawJsonBody(req);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new HttpStatusError(400, "RPC 请求体必须是 JSON 对象");
     }
-    return parsed as { method?: unknown; params?: unknown };
+    return parsed as { protocol?: unknown; op?: unknown; params?: unknown };
 }

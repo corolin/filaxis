@@ -29,7 +29,7 @@ import { expandBatchLayerWildcards, runBatch } from "../batch.js";
 import { editFile as coreEditFile, type EditFileResult } from "../file-edit.js";
 import { noopLogger, type FilaxisLogger } from "../logger.js";
 import { isForwardActive, type CloseForwardResult, type ForwardInfo, type OpenForwardSpec } from "../ssh-forward.js";
-import { sshArgsFor } from "../ssh-helpers.js";
+import { layerDisplayName, sshArgsFor } from "../ssh-helpers.js";
 import type {
     ConnectIntoResult, ConnectSshBatchResult, ConnectSshResult, ConnectSshTarget,
     LayerInfo, LayerRef, ManagePathResult, Middle, MiddleOps, ObserveResult, ProbeLayerResult, ReadPathResult,
@@ -64,7 +64,14 @@ export interface LocalMiddle extends Middle {
     readonly resolveLayerRef: (ref: LayerRef) => Promise<RuntimeDriver>;
     /** 观察窗注册表（惰性创建） */
     windowRegistry(): StreamWindowRegistry;
+    /** 观察窗清单（同步版，Daemon 状态汇总用） */
+    listStreamsSync(): StreamSummary[];
+    /** 宿主退出前的收尾：销毁全部 driver（见 createMiddle 返回值上的说明） */
+    shutdown(): Promise<void>;
 }
+
+/** 层的人类可读名称（层清单显示用；界面层经这里取，不直接依赖内核） */
+export const describeLayer: (descriptor: RuntimeDescriptor) => string = layerDisplayName;
 
 /** connect 目标 → SSH 连接参数（字段缺省即不传，交给运行环境的 ssh 配置） */
 function sshConnParams(target: ConnectSshTarget) {
@@ -102,6 +109,9 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         }
         layerPromise ??= (async () => {
             const drv = await stack.connect(opts.descriptor ?? { driver: "local" });
+            if (opts.driver === undefined && drv.descriptor?.driver === "local") {
+                implicitLocal ??= { name: "local", descriptor: drv.descriptor, driver: drv };
+            }
             if (opts.descriptor && opts.descriptor.driver !== "local") {
                 const existing = stack.layers.get(INITIAL_LAYER_NAME);
                 if (!existing) await stack.addLayer(INITIAL_LAYER_NAME, drv);
@@ -130,7 +140,7 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         if (inflight) return inflight;
         const p = (async () => {
             const descriptor = savedDescriptor(name);
-            if (!descriptor) throw new Error(`层 '${name}' 未注册，也不在已存层表里`);
+            if (!descriptor) throw new Error(`层 '${name}' 未注册，也不在已存层表里（filaxis layer list 查看已有层；filaxis layer save ${name} --host ... 创建）`);
             try {
                 const driver = await stack.connect(descriptor);
                 return (await stack.addLayer(name, driver, { activate: false })).handle.driver;
@@ -277,10 +287,11 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         if ("layer" in ref) return resolveNamed((ref as { layer?: string }).layer);
         throw new Error("layer 需为非空层名");
     };
+    /** 报错里怎么称呼这个层引用：命名层用名字；临时目标用登记名、目标或驱动名 */
     const layerLabel = (ref: LayerRef): string => {
         if (typeof ref === "string") return ref;
         if (ref && "layer" in ref) return ref.layer;
-        if (ref && ref.name) return ref.name;
+        if (ref && "descriptor" in ref) return ref.name ?? ref.descriptor.target ?? ref.descriptor.driver;
         return "默认层";
     };
 
@@ -292,7 +303,8 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         windowRegistry ??= new StreamWindowRegistry({ logger: log });
         return windowRegistry;
     };
-    const streamMeta = new Map<string, { displayName?: string; layer?: string }>();
+    // implicitLocal：开在未登记的本机 driver 上的窗——不属于任何命名层（哪怕恰好有层叫 local）
+    const streamMeta = new Map<string, { displayName?: string; layer?: string; implicitLocal?: boolean }>();
     const pruneStreamMeta = (): void => {
         for (const id of [...streamMeta.keys()]) if (!windowRegistry?.get(id)) streamMeta.delete(id);
     };
@@ -301,6 +313,7 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         for (const w of windowRegistry?.list() ?? []) {
             const win = windowRegistry?.get(w.name);
             if (!win || win.closed) continue;
+            if (streamMeta.get(w.name)?.implicitLocal) continue;
             const ownerLayer = streamMeta.get(w.name)?.layer ?? w.layer;
             if (ownerLayer === layerName) return true;
         }
@@ -396,6 +409,27 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
     };
     const isWinLocalDriver = (drv: RuntimeDriver) => drv.descriptor.driver === "local" && process.platform === "win32";
 
+    /** 观察窗清单（同步——Daemon 的 status 是同步接口，要在这里汇总） */
+    const listStreamsSync = (): StreamSummary[] => {
+        pruneStreamMeta();
+        const streams: StreamSummary[] = [];
+        for (const w of windows().list()) {
+            const win = windowRegistry!.get(w.name);
+            const meta = streamMeta.get(w.name);
+            streams.push({
+                windowId: w.name,
+                ...(meta?.displayName ? { name: meta.displayName } : {}),
+                layer: meta?.layer ?? w.layer,
+                command: w.command,
+                oldestSeq: win?.oldestSeq ?? 0,
+                newestSeq: win?.newestSeq ?? 0,
+                stale: w.stale,
+                closed: win?.closed ?? false,
+            });
+        }
+        return streams;
+    };
+
     // ── 操作集 ──
     const ops: MiddleOps = {
         async features() { return stack.features(); },
@@ -488,14 +522,42 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
                 ...(cwd && drv.descriptor?.driver === "local" ? { cwd } : {}),
             });
         },
-        async runBatch({ plan, layer, previewBudgetBytes }) {
+        async runBatch({ plan, layer, previewBudgetBytes, defaultLayer, layers, cwd }) {
             assertOpen();
+            const known = (): string[] => {
+                const names = [...stack.layers.keys()];
+                for (const name of [...Object.keys(layers ?? {}), ...Object.keys(opts.savedLayers?.() ?? {})]) {
+                    if (!names.includes(name)) names.push(name);
+                }
+                return names;
+            };
             const expanded = expandBatchLayerWildcards(
-                { ...plan, layer: plan.layer ?? layer ?? stack.activeLayer?.name },
-                knownLayerNames,
-                savedLayersLabel(),
+                { ...plan, layer: plan.layer ?? layer ?? (defaultLayer === undefined ? stack.activeLayer?.name : undefined) },
+                known,
+                layers || opts.savedLayers ? "已注册层或已存层" : "已注册层",
             );
-            return runBatch(resolveNamed, expanded, previewBudgetBytes !== undefined ? { previewBudgetBytes } : {});
+            let scoped: RuntimeDriver | undefined;
+            const resolver = async (name?: string): Promise<RuntimeDriver> => {
+                if (name !== undefined) {
+                    // 调用方带来的描述符优先（重新保存过的层要立刻生效，不必等 Daemon 重启）
+                    if (layers && Object.hasOwn(layers, name)) {
+                        return (await descriptorHandle({ descriptor: layers[name]!, name })).driver;
+                    }
+                    return resolveNamed(name);
+                }
+                if (defaultLayer !== undefined) {
+                    const drv = await resolveLayerRef(defaultLayer);
+                    // 工作目录只作用于本机层，且不登记进层栈（调用方的工作目录不是一台环境）
+                    if (cwd && drv.descriptor?.driver === "local") scoped ??= instantiateDriver({ driver: "local", cwd })!;
+                    return scoped ?? drv;
+                }
+                return resolveNamed();
+            };
+            try {
+                return await runBatch(resolver, expanded, previewBudgetBytes !== undefined ? { previewBudgetBytes } : {});
+            } finally {
+                if (scoped) await scoped.destroy().catch(() => undefined);
+            }
         },
         async startSession({ layer, command, name, cwd, readyMarker, errorPattern }): Promise<SessionHandle> {
             assertOpen();
@@ -588,9 +650,9 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
                 note: stillRunningNote ?? "未取得可核实的终态。重连后，用完整会话 ID 和原目标层再次调用 stop_session，或上报结果未知。",
             };
         },
-        async observe({ layer, command, stream, durationMs = 8000 }: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number }): Promise<ObserveResult> {
+        async observe({ layer, command, stream, durationMs = 8000, cwd }: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number; cwd?: string }): Promise<ObserveResult> {
             const drv = await resolveLayerRef(layer);
-            const session = await drv.execSession(command, { name: "observe" });
+            const session = await drv.execSession(command, cwd && drv.descriptor?.driver === "local" ? { name: "observe", cwd } : { name: "observe" });
             await new Promise((r) => setTimeout(r, durationMs));
             const streams: StreamName[] = stream === "stderr" ? ["stderr"] : stream === "stdout" ? ["stdout"] : ["stdout", "stderr"];
             const lines: ObserveResult["lines"] = [];
@@ -786,7 +848,11 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
             const id = crypto.randomUUID();
             const owner = [...stack.layers.values()].find((h) => h.driver === drv);
             const win = await drv.openStreamWindow(registry, { name: id, command, stream, retainSequence: false });
-            streamMeta.set(id, { displayName: name, layer: owner?.name ?? (drv.descriptor.driver === "local" ? "local" : undefined) });
+            streamMeta.set(id, {
+                displayName: name,
+                layer: owner?.name ?? (drv.descriptor?.driver === "local" ? "local" : undefined),
+                ...(owner ? {} : { implicitLocal: true }),
+            });
             const deadline = Date.now() + waitMs;
             let res = win.peekSince(0, limit);
             while (!res.frames.length && !res.gap && !res.stale && Date.now() < deadline) {
@@ -818,23 +884,7 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
             return { windowId, closed: true };
         },
         async listStreams() {
-            pruneStreamMeta();
-            const streams: StreamSummary[] = [];
-            for (const w of windows().list()) {
-                const win = windowRegistry!.get(w.name);
-                const meta = streamMeta.get(w.name);
-                streams.push({
-                    windowId: w.name,
-                    ...(meta?.displayName ? { name: meta.displayName } : {}),
-                    layer: meta?.layer ?? w.layer,
-                    command: w.command,
-                    oldestSeq: win?.oldestSeq ?? 0,
-                    newestSeq: win?.newestSeq ?? 0,
-                    stale: w.stale,
-                    closed: win?.closed ?? false,
-                });
-            }
-            return { streams };
+            return { streams: listStreamsSync() };
         },
 
         // 转发
@@ -892,10 +942,23 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         resolveLayerRef,
         /** 观察窗注册表（惰性创建；Daemon 用它汇总与收尾） */
         windowRegistry(): StreamWindowRegistry { return windows(); },
+        listStreamsSync,
         dispose() {
             disposed = true;
             observationDisposed = true;
             if (!opts.windowRegistry) windowRegistry?.dispose();
+        },
+        /** 宿主退出前的收尾（Daemon 停机、一次性 CLI 进程结束）：销毁层栈里的 driver 与
+         *  未登记的本机 driver——连接复用的主进程、PTY 链都是 driver 的子进程，不销毁会滞留 */
+        async shutdown() {
+            this.dispose();
+            await stack.destroyDetachedForwardDrivers().catch(() => undefined);
+            for (const name of [...stack.layers.keys()]) {
+                await stack.removeLayer(name, { destroy: true }).catch(() => undefined);
+            }
+            const local = implicitLocal;
+            implicitLocal = undefined;
+            await local?.driver.destroy().catch(() => undefined);
         },
     };
 }
