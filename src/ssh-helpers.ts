@@ -329,18 +329,26 @@ export function assertNoLikelyTypoKeys(config: Record<string, unknown> | undefin
  * 自治建链选项（AC-12：host key 策略显式可配）：
  * - ConnectTimeout=10（先于握手超时暴露真相）；ServerAlive 30×3（静默死亡 ~90s 内暴露）
  * - hostKeyPolicy：tofu（缺省，accept-new）/ strict（yes + 可选 UserKnownHostsFile）
- * 不加 BatchMode：禁交互提示会抹掉「等待输入」这个可感知状态——感知到 prompt 后
- * 把原文直交调用方，而不是假装它不存在。
+ * - **BatchMode=yes（非交互子进程的缺省，2026-11-26）**：exec 通道/观察窗/转发/文件传输
+ *   都是没有终端的一次性 ssh——遇到口令/密码提示时它应答不了，也不会失败。Windows 上
+ *   无控制台的进程直接停在提示上、零输出，直到调用方超时且终态 unknown 不可重试
+ *  （实测：缺密钥时挂满 timeoutMs；加 BatchMode 后 414ms 报 Permission denied）。
+ *   agent 认证不受影响；带口令的私钥须先装入 ssh-agent。文件中转模式早已自带。
+ * - **PTY 登录链例外**（`interactive: true`，见 rootSshSpawnArgs / hopSshCommand）：那边
+ *   交互提示会回显进 PTY，是「等待输入」的可感知状态——要原样直交调用方，而不是
+ *   让它当场失败。逐跳登录（su -/密码类）只有这条路能走。
  * 渲染只含密钥/known_hosts **路径**，永不包含其内容（AC-12 无泄漏红线）。
  */
-export function autonomousSshOpts(conn?: SshConnParams): string[] {
-    return renderAutonomousSshOpts(conn, false);
+export function autonomousSshOpts(conn?: SshConnParams, opts: { interactive?: boolean } = {}): string[] {
+    return renderAutonomousSshOpts(conn, false, opts.interactive === true);
 }
 
-function renderAutonomousSshOpts(conn: SshConnParams | undefined, remote: boolean): string[] {
+function renderAutonomousSshOpts(conn: SshConnParams | undefined, remote: boolean, interactive = remote): string[] {
     // LogLevel=ERROR（第十二季 B 组实测）：跳板 UserKnownHostsFile 变更产生的
     // "Warning: Permanently added" 每次 run_command 重复灌 stderr——压到 ERROR 级
     const opts = ["-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"];
+    // remote（PTY 内再嵌一层 ssh 做逐跳登录）同属交互链——缺省即 interactive
+    if (!interactive) opts.push("-o", "BatchMode=yes");
     if (conn?.hostKeyPolicy === "strict") {
         opts.push("-o", "StrictHostKeyChecking=yes");
     } else {
@@ -360,7 +368,7 @@ function renderAutonomousSshOpts(conn: SshConnParams | undefined, remote: boolea
  * （第一条命令付握手建 master，后续任何进程同 dest 毫秒级复用）。
  */
 export function muxSocketPath(destArgs: string[], dir?: string): string {
-    const destKey = crypto.createHash("sha256").update(destArgs.join(" ")).digest("hex").slice(0, 16);
+    const destKey = crypto.createHash("sha256").update(destArgs.join("\0")).digest("hex").slice(0, 16);
     const muxDir = dir ?? join(tmpdir(), "filaxis-mux");
     try { if (!existsSync(muxDir)) mkdirSync(muxDir, { recursive: true }); } catch { /* 并发竞态容忍 */ }
     return join(muxDir, `cm-${destKey}`);
@@ -391,9 +399,9 @@ export function muxFlagsFor(destArgs: string[], opts: { disable?: boolean; dir?:
     ];
 }
 
-/** root 层 spawn 全参数（含 -tt 强制 PTY） */
+/** root 层 spawn 全参数（含 -tt 强制 PTY）。PTY 登录链保留交互提示（不加 BatchMode） */
 export function rootSshSpawnArgs(destArgs: string[], conn?: SshConnParams): string[] {
-    return ["-tt", ...autonomousSshOpts(conn), ...destArgs];
+    return ["-tt", ...autonomousSshOpts(conn, { interactive: true }), ...destArgs];
 }
 
 /** PTY 内 hop 登录命令（选项语义与 root 对齐） */
@@ -459,6 +467,232 @@ async function lookupSshIdentity(hop: SshHop, logger?: FilaxisLogger): Promise<S
     } catch {
         return undefined;
     }
+}
+
+/** 认证用到的身份与配置来源（`ssh -v -G` 本地解析，不连网） */
+export interface SshIdentitySource {
+    /** ssh 实际读取的配置文件（含 Include 带入的），按读取顺序 */
+    configFiles: string[];
+    user: string;
+    hostname: string;
+    port: string;
+    /** 解析出的身份文件及是否在场（默认密钥名也在此列——缺席即看到） */
+    identityFiles: Array<{ path: string; exists: boolean }>;
+}
+
+/** MSYS（Git Bash）ssh 输出的 POSIX 形态盘符路径转回本机形态（文件在场的判定用） */
+function nativePath(p: string): string {
+    return process.platform === "win32" ? p.replace(/^\/([a-zA-Z])\//, (_m, d: string) => `${d.toUpperCase()}:\/`) : p;
+}
+
+/** 身份与配置来源探测（认证失败诊断用，DSH 评估 2026-11-26 #1b）：与真实连接共用
+ *  sshArgsFor 渲染——解析结果就是连接时生效的那份。失败返回 null（诊断退化为不含
+ *  来源段：探测自身不得掩盖原始错误）。 */
+export async function describeSshIdentitySource(hop: SshHop, logger?: FilaxisLogger): Promise<SshIdentitySource | null> {
+    let stdout = "";
+    let stderr = "";
+    try {
+        // argv 构造也在 try 内：非法主机（前导 -）会让 sshArgsFor 抛错——同样按「探测失败」处理
+        const argv = ["-v", "-G", ...sshArgsFor(hop)];
+        if (sshFileStdioRequested()) {
+            const r = await spawnWithFileRedirect(argv, "", { timeoutMs: 5000, logger });
+            if (r.exitCode !== 0) return null;
+            stdout = r.stdout;
+            stderr = r.stderr;
+        } else {
+            const { execFile } = await import("node:child_process");
+            const { promisify } = await import("node:util");
+            ({ stdout, stderr } = await promisify(execFile)("ssh", argv, {
+                timeout: 5000, windowsHide: true, env: openSshEnvironment(process.env, logger),
+            }));
+        }
+    } catch {
+        return null;
+    }
+    const out = stdout.replace(/\r\n/g, "\n");
+    const dbg = stderr.replace(/\r\n/g, "\n");
+    const user = out.match(/^user (\S+)$/m)?.[1];
+    const hostname = out.match(/^hostname (\S+)$/m)?.[1];
+    const port = out.match(/^port (\S+)$/m)?.[1];
+    if (!user || !hostname || !port) return null;
+    const configFiles = [...dbg.matchAll(/^debug\d+: Reading configuration data (.+)$/gm)].map((m) => m[1]!.trim());
+    const identityFiles = [...out.matchAll(/^identityfile (.+)$/gm)].map((m) => {
+        const path = m[1]!.trim();
+        return { path, exists: existsSync(nativePath(expandHomePath(path))) };
+    });
+    return { configFiles, user, hostname, port, identityFiles };
+}
+
+export type SshFailureKind = "auth" | "resolve" | "unreachable" | "hostkey" | "other";
+
+export interface AuthFailureDiagnosisInput {
+    role: "jump" | "target";
+    /** 人读落点（user@host 或 host，可带端口） */
+    label: string;
+    /** 是否显式给了用户名——没给时解析出的用户名值得单独提醒 */
+    userGiven: boolean;
+    /** 目标：--key / keyFile 传入的路径；跳板恒为空（--key 不传给跳板） */
+    keyFile?: string;
+    source: SshIdentitySource | null;
+    /** 失败类别（缺省 auth）：resolve=主机名/别名解析不出；unreachable=连不上 */
+    kind?: Extract<SshFailureKind, "auth" | "resolve" | "unreachable">;
+    /** 诊断探测带回的 ssh 原始报错行——原样直交 */
+    sshLines?: string[];
+}
+
+/**
+ * 连接失败诊断（纯函数）：把角色（跳板/目标）、类别、探测到的来源与出路拼成可操作文案。
+ * source 为 null（探测失败）时只保留不依赖来源的说明。
+ */
+export function formatAuthFailureDiagnosis(input: AuthFailureDiagnosisInput): string {
+    const lines: string[] = [];
+    const kind = input.kind ?? "auth";
+    const isJump = input.role === "jump";
+    const what = isJump ? "跳板" : "目标";
+    // 目标串可能为空（坏层文件/空 target）——留一对空反引号等于没说
+    const label = input.label.trim() || "（空目标——检查 --host 或层文件里的 target）";
+    if (kind === "auth") {
+        lines.push(isJump ? `[跳板认证失败] 跳板 \`${label}\` 拒绝了认证（Permission denied）。` : `[目标认证失败] \`${label}\` 拒绝了认证（Permission denied）。`);
+        if (isJump) {
+            lines.push("  --key 只用于目标主机，不会传给跳板——跳板的用户名与密钥取自 ssh 配置：");
+        } else {
+            lines.push("  exec 通道没有终端，口令/密码/私钥口令的提示无法应答（BatchMode）——带口令的私钥请先装入 ssh-agent：");
+        }
+    } else if (kind === "resolve") {
+        lines.push(`[${what}无法解析] ${what} \`${label}\` 解析不出地址。`);
+        lines.push(`  ${what}别名或主机名由**本运行环境**的 ssh 配置与 DNS 解析——沙箱、服务进程、远端会话的工作环境里可能没有该别名（本机命令行能连 ≠ 这里能连）：`);
+    } else {
+        lines.push(`[${what}不可达] 连不上${what} \`${label}\`。`);
+        lines.push("  核对下面的地址与端口是否符合预期；网络、防火墙、VPN、对方 sshd 是否在监听：");
+    }
+    const s = input.source;
+    if (s) {
+        lines.push(`    实际读取的配置文件：${s.configFiles.length ? s.configFiles.join("；") : "（无）"}`);
+        lines.push(`    解析为：user=${s.user}${input.userGiven ? "" : "（未显式指定）"} hostname=${s.hostname} port=${s.port}`);
+        if (kind === "auth") {
+            const present = s.identityFiles.filter((f) => f.exists);
+            const absent = s.identityFiles.filter((f) => !f.exists);
+            lines.push(`    在场的身份文件：${present.length ? present.map((f) => f.path).join("；") : "（无）"}`);
+            if (absent.length) lines.push(`    （另有 ${absent.length} 个身份文件不存在：${absent.slice(0, 3).map((f) => f.path).join("、")}${absent.length > 3 ? " 等" : ""}）`);
+            if (!present.length) {
+                lines.push("    ⚠ 没有任何在场的身份文件——这就是被拒的原因");
+            }
+            if (!input.userGiven && present.length) {
+                lines.push("    （未显式指定用户名——若上面的 user 不是期望的登录用户，就是被拒的原因之一）");
+            }
+        }
+    }
+    if (!isJump && input.keyFile) {
+        const ok = existsSync(nativePath(expandHomePath(input.keyFile)));
+        lines.push(`    --key：${input.keyFile}${ok ? "" : "（文件不存在！）"}`);
+    }
+    if (isJump && kind === "auth") {
+        lines.push("  出路（任选其一）：① 在 ssh config 里给跳板配 Host 条目并写 IdentityFile，-J 改用该别名；② 把密钥装入 ssh-agent；③ SDK 用结构化 jump:{ host, user, keyFile }");
+    } else if (isJump && kind === "resolve") {
+        lines.push("  出路：改用 user@host[:port] 字面量，或在运行环境的 ssh config 里补上该条目后重试");
+    }
+    if (input.sshLines?.length) {
+        lines.push("  [ssh 原始输出·直交]");
+        for (const l of input.sshLines) lines.push(`    ${l}`);
+    }
+    return "\n" + lines.join("\n");
+}
+
+/** ssh 报错里值得直交的行（其余 debug 噪声不带回） */
+const SSH_FAILURE_LINE_RE = /Permission denied|Could not resolve hostname|Name or service not known|Connection (timed out|refused|closed|reset)|No route to host|Network is unreachable|Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|kex_exchange_identification|banner exchange|Too many authentication failures|Operation timed out|not accessible: No such file|Load key|no such identity|Bad configuration option|command-line line \d+/;
+
+/** 该报错行点名的主机是不是 host（`user@host: …` / `hostname host:` / `host host port` / `by host` / `to host port`） */
+function sshLineNamesHost(line: string, host: string): boolean {
+    if (!host) return false;
+    return [`@${host}:`, `hostname ${host}:`, `hostname ${host} `, `host ${host} `, `host ${host}:`, `by ${host} `, `to ${host} port`, `to ${host}:`]
+        .some((needle) => line.includes(needle));
+}
+
+export interface SshFailureVerdict {
+    /** 失败发生在哪一段：jump=跳板（ProxyCommand 内层），target=目标段，none=没有可判读的失败行 */
+    stage: "jump" | "target" | "none";
+    kind: SshFailureKind | null;
+    /** ssh 原始报错行（去重、截断） */
+    lines: string[];
+}
+
+/** 带主机名的报错行形态：`user@host: …` / `Could not resolve hostname host` / `connect to host host port N` / `… by host port N` */
+const SSH_NAMED_LINE_RE = /@[^@\s]+: |hostname \S+|host \S+ port \d+|by \S+ port \d+/;
+
+/**
+ * ssh 诊断输出的归属判定（纯函数）：失败点归到跳板段或目标段。
+ * 归属看第一条**点名了主机**的报错行——`Permission denied, please try again.` 这类不带
+ * 主机的重试提示会排在真正的拒绝行前面（真机抓回：只看首行会把跳板被拒归给目标）。
+ * 跳板段先失败时不会有目标段的报错，所以第一条点名行即失败点。
+ */
+export function classifySshFailure(rawStderr: string, jumpHost: string | null): SshFailureVerdict {
+    const lines: string[] = [];
+    for (const raw of rawStderr.replace(/\r\n/g, "\n").split("\n")) {
+        const line = raw.replace(/^debug\d+:\s*/, "").trim();
+        if (!line || !SSH_FAILURE_LINE_RE.test(line) || lines.includes(line.slice(0, 200))) continue;
+        lines.push(line.slice(0, 200));
+        if (lines.length >= 8) break;
+    }
+    const first = lines[0];
+    if (!first) return { stage: "none", kind: null, lines };
+    const kind: SshFailureKind = /Permission denied|Too many authentication failures/.test(first) ? "auth"
+        : /Could not resolve hostname|Name or service not known/.test(first) ? "resolve"
+        : /Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/.test(first) ? "hostkey"
+        : /Connection (timed out|refused|closed|reset)|No route to host|Network is unreachable|kex_exchange_identification|banner exchange|Operation timed out/.test(first) ? "unreachable"
+        : "other";
+    const named = lines.find((l) => SSH_NAMED_LINE_RE.test(l));
+    const stage: SshFailureVerdict["stage"] = named && jumpHost && sshLineNamesHost(named, jumpHost) ? "jump" : "target";
+    return { stage, kind, lines };
+}
+
+/**
+ * 连接失败诊断探测（DSH 评估 2026-11-26 真机发现）：带跳板（ProxyCommand）时 ssh 把自身的
+ * stdout/stderr 指向 /dev/null——跳板解析失败、认证被拒、不可达一概表现为「255 + 零输出 +
+ * 秒退」，真实原因不可见（曾因此被误报成沙箱管道损坏）。失败之后主动用**同样的连接参数
+ * 与主机密钥策略**重放一次连接，日志开到详细、远端只执行 `true`，把 ssh 自己的报错带回。
+ * 副作用：多一次连接尝试（远端至多执行一条 `true`）。
+ */
+export async function probeSshConnectionFailure(
+    hop: SshHop, conn: SshConnParams | undefined, logger?: FilaxisLogger,
+): Promise<{ verdict: SshFailureVerdict; exitCode: number | null } | null> {
+    // 与真实连接同一套选项与主机密钥策略，只去掉日志级别压制（改由 -v 提供）
+    const base = autonomousSshOpts(conn);
+    const opts: string[] = [];
+    for (let i = 0; i < base.length; i += 2) {
+        if (String(base[i + 1]).startsWith("LogLevel=")) continue;
+        opts.push(base[i]!, base[i + 1]!);
+    }
+    const argv = ["-v", ...opts, ...sshArgsFor(hop), "true"];
+    let stderr = "";
+    let exitCode: number | null = null;
+    try {
+        if (sshFileStdioRequested()) {
+            const r = await spawnWithFileRedirect(argv, "", { timeoutMs: 12_000, logger });
+            stderr = r.stderr;
+            exitCode = r.exitCode;
+        } else {
+            const { execFile } = await import("node:child_process");
+            const probed = await new Promise<{ stderr: string; code: number | null }>((resolve, reject) => {
+                execFile("ssh", argv, {
+                    timeout: 12_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
+                    env: openSshEnvironment(process.env, logger),
+                }, (err, _stdout, errOut) => {
+                    // 拿不到 stderr（进程没起来/被探针超时杀掉）才算探测失败；非 0 退出是预期内的结果
+                    if (errOut == null) { reject(err ?? new Error("ssh 诊断探测无输出")); return; }
+                    const e = err as (NodeJS.ErrnoException & { killed?: boolean }) | null;
+                    if (e?.killed) { reject(new Error("ssh 诊断探测超时")); return; }
+                    // err.code：非 0 退出时是退出码（number）；本地启动失败时是字符串错误码
+                    resolve({ stderr: String(errOut), code: e ? (typeof e.code === "number" ? e.code : null) : 0 });
+                });
+            });
+            stderr = probed.stderr;
+            exitCode = probed.code;
+        }
+    } catch {
+        return null;
+    }
+    const jumpHost = conn?.jump ? parseJumpSpec(conn.jump).host : null;
+    return { verdict: classifySshFailure(stderr, jumpHost), exitCode };
 }
 
 /** 层的完整途经身份链（target + hops），供回环检测 */
