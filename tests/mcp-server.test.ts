@@ -153,7 +153,9 @@ describe("MCP Server（REQ-0003）", () => {
             await Promise.all([...stack.layers.keys()].map((name) => stack.removeLayer(name, { destroy: true })));
             rmSync(dir, { recursive: true, force: true });
         }
-    });
+        // 预算补齐：二十余次本地驱动调用，每次起子进程——Windows 上实测 ~5.6s 撞 bun 缺省 5s
+        //（v0.2.12 基线在本机即超时，与被测行为无关）
+    }, 45_000);
 
     test("transfer_file puts and gets bytes on the selected layer and report verification", async () => {
         const dir = mkdtempSync(join(tmpdir(), "fx-mcp-transfer-"));

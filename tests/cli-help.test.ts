@@ -80,7 +80,8 @@ test.each([
 });
 
 test("CLI treats --help after -- as command data", () => {
-    const result = Bun.spawnSync([process.execPath, "bin/filaxis.ts", "exec", "--", "printf '%s' --help"], { stderr: "pipe", windowsHide: true });
+    // --no-daemon：否则会探到机器上正在跑的真实 Daemon 并经它执行
+    const result = Bun.spawnSync([process.execPath, "bin/filaxis.ts", "exec", "--no-daemon", "--", "printf '%s' --help"], { stderr: "pipe", windowsHide: true });
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toBe("--help");
 });

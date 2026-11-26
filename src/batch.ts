@@ -17,15 +17,23 @@
  *   非预期退出码 = fail，但退出码/输出原样进报告
  */
 import type { RuntimeDriver } from "./driver.js";
+import { readFileSync } from "node:fs";
 import { editFileMulti, type EditMultiHunk } from "./file-edit.js";
 import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
 import { shellQuote } from "./ssh-helpers.js";
 
-/** exec 步骤（命令 + 预期退出码集合——非零预期显式声明） */
+/** exec 步骤（命令 + 预期退出码集合——非零预期显式声明）。
+ *  命令来源二选一：`command` 内联，或 `commandFile` 引用脚本文件（DSH 评估
+ *  2026-11-26 #6）——命令原样进文件，JSON 字符串里的引号/换行转义全部省掉，
+ *  且同一脚本可被多个步骤/批次复用。commandFile 在计划校验阶段读取并内联：
+ *  读不出或为空即整批拒绝（零副作用），不会跑到一半才发现。 */
 export interface BatchExecStep {
     id: string;
     kind: "exec";
-    command: string;
+    command?: string;
+    /** 脚本文件路径（与 command 互斥）。相对路径按当前进程工作目录解析——经 Daemon
+     *  执行时由调用方传入的工作目录解析（CLI 已接；MCP 直连请给绝对路径） */
+    commandFile?: string;
     timeoutMs?: number;
     /** 预期退出码集合（缺省 [0]；如健康检查预期 [0] 或显式 [3]） */
     expectExit?: number[];
@@ -160,11 +168,14 @@ export async function runBatch(
         if (!BATCH_STEP_KINDS.includes(step.kind)) {
             throw new Error(`批次计划非法：未知 kind '${step.kind}'（合法: ${BATCH_STEP_KINDS.join("、")}）`);
         }
-        const targetLayers = validateStep(step) ?? planLayers ?? [undefined];
+        // commandFile 在此读取并内联（零副作用阶段，且先于 validateStep——后者要求
+        // command 已在场）；不改写调用方传入的计划对象
+        const source = step.kind === "exec" ? { ...step, command: resolveExecCommand(step) } : step;
+        const targetLayers = validateStep(source) ?? planLayers ?? [undefined];
         if (step.kind === "get" && targetLayers.length > 1) {
             throw new Error(`批次计划非法：步骤 '${step.id}' 的 kind='get' 不支持多个目标层（并发下载会覆盖同一 local_path），请拆分为独立步骤`);
         }
-        const { after: dependencies, ...operation } = step;
+        const { after: dependencies, ...operation } = source;
         if (operation.kind === "exec" && operation.expectExit) operation.expectExit = [...operation.expectExit];
         if (operation.kind === "edit") operation.hunks = operation.hunks.map((hunk) => ({ ...hunk }));
         const steps = targetLayers.map((layer) => {
@@ -325,6 +336,105 @@ function nonEmptyString(value: unknown): value is string {
     return typeof value === "string" && value.trim().length > 0;
 }
 
+/** exec 步骤的命令来源（DSH 评估 2026-11-26 #6）：command 与 commandFile 二选一。
+ *  commandFile 就地读取并内联为 command——计划非法时零副作用。内容归一同
+ *  exec --script-file（剥 BOM、CRLF→LF：Windows 侧编辑器写出的脚本到 bash 里 \r 会
+ *  被当成命令名的一部分）。相对路径按当前进程工作目录解析。 */
+function resolveExecCommand(step: BatchExecStep): string {
+    // 显式类型注解：never 返回的辅助函数只有这样声明，其后的控制流收窄才生效
+    const invalid: (detail: string) => never = (detail): never => {
+        throw new Error(`批次计划非法：步骤 '${step.id}' ${detail}`);
+    };
+    const hasCommand = step.command !== undefined;
+    const hasFile = step.commandFile !== undefined;
+    if (hasCommand && hasFile) invalid("的 command 与 commandFile 互斥（只能给一个）");
+    if (hasFile) {
+        const file = step.commandFile;
+        if (typeof file !== "string" || !nonEmptyString(file)) invalid("的 commandFile 需为非空字符串路径");
+        let raw: string;
+        try {
+            raw = readFileSync(file, { encoding: "utf-8" });
+        } catch (error) {
+            return invalid(`的 commandFile 读取失败（${file}）：${(error as Error).message}`);
+        }
+        const command = (raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw).replace(/\r\n/g, "\n");
+        if (!command.trim()) invalid(`的 commandFile 内容为空（${file}）`);
+        return command;
+    }
+    if (!hasCommand) invalid("是 exec 步骤但缺 command（内联命令，或改用 commandFile 引用脚本文件）");
+    return step.command as string;
+}
+
+/** 层名是否含通配（`*` 任意字符序列、`?` 单个字符；DSH 评估 2026-11-26 #6） */
+export function hasLayerWildcard(name: string): boolean {
+    return /[*?]/.test(name);
+}
+
+function wildcardToRegExp(pattern: string): RegExp {
+    return new RegExp(`^${pattern.split(/([*?])/).map((part) => (part === "*" ? ".*" : part === "?" ? "." : part.replace(/[.+^${}()|[\]\\]/g, "\\$&"))).join("")}$`);
+}
+
+/**
+ * 按已知层名展开一个层目标（层名或含通配的模式）。精确等于已知层名的优先按字面
+ * 取（层名本身含 * ? 也不会被当模式）。无匹配返回空数组——由调用方决定报错口径。
+ */
+export function expandLayerPattern(target: string, known: readonly string[]): string[] {
+    if (known.includes(target)) return [target];
+    if (!hasLayerWildcard(target)) return [target];
+    const re = wildcardToRegExp(target);
+    return known.filter((name) => re.test(name));
+}
+
+/**
+ * 计划里的层通配展开（CLI 与 MCP 入口共用；内核的层解析函数只认具体名，所以通配
+ * 必须在入口按「已知层名全集」展开）。规则：
+ * - 顶层 layer 与每个步骤的 layer（单个名或数组）里的模式都展开；展开结果保持已知
+ *   层名的原有顺序；数组内去重。
+ * - **无匹配即整批拒绝**（零副作用）：把 "q-*" 原样当层名交下去，轻则报「层未保存」，
+ *   重则被当成默认层目标——静默换执行面。
+ * - 不含通配的计划原样返回（同一对象引用）。
+ */
+export function expandBatchLayerWildcards(plan: BatchPlan, known: readonly string[], knownLabel = "已存层"): BatchPlan {
+    const expandOne = (target: string | string[] | undefined, where: string): string | string[] | undefined => {
+        if (target === undefined) return undefined;
+        const expandName = (name: string): string[] => {
+            if (!nonEmptyString(name)) return [name]; // 形态校验交给 validateLayerTarget
+            const hit = expandLayerPattern(name, known);
+            if (hit.length === 0) {
+                throw new Error(
+                    `批次计划非法：${where} 的层通配 '${name}' 未匹配任何${knownLabel}` +
+                    `（现有：${known.slice(0, 12).join("、")}${known.length > 12 ? ` 等 ${known.length} 个` : known.length ? "" : "（无）"}）`,
+                );
+            }
+            return hit;
+        };
+        if (typeof target === "string") {
+            const hit = expandName(target);
+            return hit.length === 1 ? hit[0]! : hit;
+        }
+        const out: string[] = [];
+        for (const name of target) for (const h of expandName(name)) if (!out.includes(h)) out.push(h);
+        return out;
+    };
+        const sameAs = (original: string | string[] | undefined, hit: string | string[] | undefined): boolean => {
+            if (original === undefined || hit === undefined) return original === hit;
+            if (typeof original === "string" || typeof hit === "string") return original === hit;
+            return original.length === hit.length && original.every((name, i) => name === hit[i]);
+        };
+        let touched = false;
+        const layer = expandOne(plan.layer, "计划 layer");
+        if (!sameAs(plan.layer, layer)) touched = true;
+        const steps = plan.steps.map((step) => {
+            if (!step || typeof step !== "object" || step.layer === undefined) return step;
+            const hit = expandOne(step.layer, `步骤 '${step.id}' 的 layer`);
+            if (sameAs(step.layer, hit)) return step;
+            touched = true;
+            return { ...step, layer: hit } as typeof step;
+        });
+        if (!touched) return plan;
+        return { ...plan, ...(layer !== undefined ? { layer } : {}), steps };
+}
+
 function validateLayerTarget(value: unknown, label: string): string[] | undefined {
     if (value === undefined) return undefined;
     if (typeof value === "string") {
@@ -389,7 +499,10 @@ async function runStep(drv: RuntimeDriver, s: ResolvedBatchStep, previewBytes?: 
     const base = { id: s.id, kind: s.kind, startedAt };
     try {
         if (s.kind === "exec") {
-            const r = await drv.exec(s.command, { timeoutMs: s.timeoutMs, maxOutputBytes: previewBytes });
+            // command 在校验阶段已由 resolveExecCommand 保证在场（commandFile 已内联）
+            const command = s.command;
+            if (command === undefined) throw new Error(`步骤 '${s.id}' 缺少 command（内部错误：commandFile 未解析）`);
+            const r = await drv.exec(command, { timeoutMs: s.timeoutMs, maxOutputBytes: previewBytes });
             const expect = s.expectExit ?? [0];
             const ok = expect.includes(r.exitCode);
             return {

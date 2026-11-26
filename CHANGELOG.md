@@ -11,6 +11,15 @@
 
 ---
 
+## 未发布
+
+- **[DeepSeek]** SSH 的非交互子进程（命令执行、观察窗、转发、文件传输）启用 `BatchMode`：认证失败时当场报 `Permission denied`，不再无提示地挂到调用方超时。PTY 登录链保持可交互。连接被拒时错误信息附带实际读取的 SSH 配置文件，以及解析出的用户与身份文件；跳板被拒时说明 `--key` 只用于目标主机。
+- **[DeepSeek]** 一次性 PTY 命令（`filaxis exec --no-daemon --pty`）不再在输出结果后多等约 8 秒才退出。
+- **[DeepSeek]** `batch` 的 exec 步骤可用 `commandFile` 引用脚本文件，替代 `command`（MCP 字段名为 `command_file`）。层名支持 `*` 与 `?` 通配，按已存或已注册的层名展开，没有任何匹配时整批拒绝。CLI 新增 `--max-parallel` 与 `--no-stop-on-fail`，覆盖计划里的对应字段。
+- **[DeepSeek]** `filaxis forward list` 缺省只列仍在用的转发，`--all` 列出全部（MCP 为 `forward_list` 的 `include_closed`）。CLI JSON 与 MCP 的转发记录改用 snake_case 字段，`forwardId` 保留为兼容别名。
+- **[DeepSeek]** `filaxis exec --json` 输出单行结构化结果；文本模式的完成标记在正文排空后输出，`2>&1` 合流时位于末尾。
+- **[自挖]** 一次性模式（`--no-daemon`）按层文件里的 `driver` 加载已存层，不再把任何条目都当作 SSH 目标。
+
 ## 0.2.12
 
 - 新增可显式启动的本机 Daemon。符合条件的 CLI 和 MCP 调用可共享命名层、转发与观察窗。MCP 代理断线后重连，已发出但终态未知的调用会按 `outcome: "unknown"` 返回。

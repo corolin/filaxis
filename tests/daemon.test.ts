@@ -396,7 +396,8 @@ describe("DaemonServer & DaemonClient RPC", () => {
             await srv.stack.addLayer("fixture", driver);
             const removed = await runCliAsync(["forward", "remove", "fwd-id", "--layer", "fixture", "--json"], dir);
             expect(removed.exitCode).toBe(1);
-            expect(JSON.parse(removed.stdout)).toEqual({ forwardId: "fwd-id", status: "unknown", detail: "fixture unverified" });
+            // CLI --json 对外为 snake_case（forward_id 为主名；forwardId 保留为兼容别名）
+            expect(JSON.parse(removed.stdout)).toEqual({ forward_id: "fwd-id", forwardId: "fwd-id", status: "unknown", detail: "fixture unverified" });
         } finally {
             await srv.stop();
             rmSync(dir, { recursive: true, force: true });
@@ -634,13 +635,13 @@ describe("CLI daemon / forward / stream E2E", () => {
 
             const okL = await runCliAsync(["forward", "add", "--layer", "prod", "-L", "127.0.0.1:5432", "--json"], dir);
             expect(okL.exitCode).toBe(0);
-            const infoL = JSON.parse(okL.stdout) as { kind: string; bindPort: number; targetHost: string; targetPort: number };
-            expect(infoL).toMatchObject({ kind: "local", bindPort: 54321, targetHost: "127.0.0.1", targetPort: 5432 });
+            const infoL = JSON.parse(okL.stdout) as { kind: string; bind_port: number; target_host: string; target_port: number };
+            expect(infoL).toMatchObject({ forward_id: expect.any(String), kind: "local", bind_port: 54321, target_host: "127.0.0.1", target_port: 5432 });
 
             const okD = await runCliAsync(["forward", "add", "--layer", "prod", "-D", "--json"], dir);
             expect(okD.exitCode).toBe(0);
-            const infoD = JSON.parse(okD.stdout) as { kind: string; bindPort: number };
-            expect(infoD).toMatchObject({ kind: "dynamic", bindPort: 54321 });
+            const infoD = JSON.parse(okD.stdout) as { kind: string; bind_port: number };
+            expect(infoD).toMatchObject({ kind: "dynamic", bind_port: 54321 });
 
             const badD = await runCliAsync(["forward", "add", "--layer", "prod", "-D", "-1"], dir);
             expect(badD.exitCode).toBe(1);
@@ -1120,4 +1121,52 @@ describe("CLI daemon / forward / stream E2E", () => {
         expect(() => parseAddrToUrl("http://127.0.0.1")).toThrow(/非法 Daemon 监听地址/);
         expect(() => parseAddrToUrl("[::1]")).toThrow(/非法 Daemon 监听地址/);
     });
+});
+
+// ---------------------------------------------------------------------------
+// DSH + GLM-5.4 使用评估（2026-11-26）#5a/#5b：forward list
+// ---------------------------------------------------------------------------
+describe("CLI forward list（DSH 评估 2026-11-26 #5a/#5b）", () => {
+    test("默认只报在用的转发；--all 连已停止的一并列出；--json 为 snake_case 且带 forwardId 兼容别名", async () => {
+        const dir = makeTempDir("fx-daemon-forward-list-");
+        const srv = new DaemonServer({ daemonDir: dir });
+        try {
+            await srv.start();
+            const driver = new SshPtyDriver({ driver: "ssh", target: "fixture.invalid" });
+            const info = (forwardId: string, status: "active" | "stopped" | "exited" | "unknown") => ({
+                forwardId, kind: "local" as const, bindAddr: "127.0.0.1", bindPort: 43210, transportMode: "subprocess" as const, status, createdAt: 1,
+            });
+            // remove 之后条目以 stopped 留在表里（给 closeForward 做幂等判定）——列表查询不该再报它
+            driver.listForwards = () => [info("live", "active"), info("gone", "stopped"), info("dead", "exited"), info("unsure", "unknown")];
+            await srv.stack.addLayer("fixture", driver);
+
+            const plain = await runCliAsync(["forward", "list", "--layer", "fixture"], dir);
+            expect(plain.exitCode).toBe(0);
+            expect(plain.stdout).toContain("live |");
+            expect(plain.stdout).toContain("unsure |"); // 终止未确认：不能当已停隐藏
+            expect(plain.stdout).not.toContain("gone |"); // 修前：remove 过的照样列出，与「无活跃转发」文案自相矛盾
+            expect(plain.stdout).not.toContain("dead |");
+
+            const all = await runCliAsync(["forward", "list", "--layer", "fixture", "--all"], dir);
+            expect(all.exitCode).toBe(0);
+            for (const id of ["live |", "unsure |", "gone |", "dead |"]) expect(all.stdout).toContain(id);
+
+            const json = await runCliAsync(["forward", "list", "--layer", "fixture", "--json"], dir);
+            const parsed = JSON.parse(json.stdout) as Array<Record<string, unknown>>;
+            expect(parsed.map((f) => f.forward_id)).toEqual(["live", "unsure"]);
+            expect(parsed[0]).toMatchObject({
+                forward_id: "live", forwardId: "live", kind: "local", bind_addr: "127.0.0.1", bind_port: 43210,
+                transport_mode: "subprocess", status: "active", created_at: 1,
+            });
+            // 记录里除兼容别名外不再有驼峰键（与参数 forward_id、观察窗 window_id 同一命名风格）
+            expect(Object.keys(parsed[0]!).filter((k) => /[a-z][A-Z]/.test(k) && k !== "forwardId")).toEqual([]);
+
+            const allJson = await runCliAsync(["forward", "list", "--layer", "fixture", "--all", "--json"], dir);
+            const allParsed = JSON.parse(allJson.stdout) as Array<{ forward_id: string }>;
+            expect(allParsed.map((f) => f.forward_id)).toEqual(["live", "gone", "dead", "unsure"]);
+        } finally {
+            await srv.stop();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 60_000); // 本机实测 ~25s（起停 Daemon + 三次 CLI）
 });

@@ -21,6 +21,7 @@ import {
     DaemonServer, DaemonClient, probeDaemon, spawnDaemonBackground, parseAddrToUrl, urlRequestHost, urlRequestPort,
     defaultDaemonDir, readDaemonLock, readDaemonConnection, cleanupDaemonFiles, isPidAlive,
     normalizeForwardSpec, type CloseForwardResult, type OpenForwardSpec, type ForwardInfo, type CliTargetSpec,
+    forwardInfoToPublic, closeForwardResultToPublic, isForwardActive, expandBatchLayerWildcards,
 } from "../src/index.js";
 import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
@@ -73,8 +74,10 @@ function strArg(argv: string[], i: number): string {
 const batchValueOptions = new Set([
     "--host", "--user", "--port", "--key", "-J", "--jump", "--hop", "--enter",
     "--docker", "--docker-shell", "--docker-runtime", "--forward", "--host-key", "--known-hosts",
-    "--layer", "--request-file", "--daemon-dir",
+    "--layer", "--request-file", "--daemon-dir", "--max-parallel",
 ]);
+/** batch 模式下的无值开关（其余 `-` 开头的一律拒绝：batch 不接受位置参数） */
+const batchFlagOptions = new Set(["--stdin-json", "--no-daemon", "--no-stop-on-fail"]);
 
 function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "default"): {
     host?: string; user?: string; port?: number; key?: string;
@@ -83,6 +86,8 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
     forward: string[]; hostKey?: string; knownHosts?: string;
     layer?: string;
     timeout?: number; duration?: number; stream?: string; all?: boolean;
+    /** batch 开关（DSH 评估 2026-11-26 #6）：覆盖计划里的 maxParallel / stopOnFail */
+    maxParallel?: number; noStopOnFail?: boolean;
     writeMode?: "auto" | "inplace";
     transport?: "exec" | "sftp";
     stdinJson?: boolean; requestFile?: string; pty?: boolean; help?: boolean;
@@ -103,7 +108,7 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
         if (noMoreOpts) { o.positional.push(a); continue; }
         if (a === "--") { noMoreOpts = true; continue; } // 命令分隔符：终止选项解析
         if (a === "--help" || a === "-h") return { ...o, help: true };
-        if (mode === "batch" && a.startsWith("-") && a !== "--stdin-json" && a !== "--no-daemon") {
+        if (mode === "batch" && a.startsWith("-") && !batchFlagOptions.has(a)) {
             if (!batchValueOptions.has(a)) throw new Error(`batch 不支持 ${a}`);
             const value = argv[i + 1];
             if (!value || value.startsWith("-")) throw new Error(`batch 的 ${a} 需要参数值`);
@@ -135,6 +140,8 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
                 break;
             }
             case "--timeout": o.timeout = numArg(argv, i, { positive: true }); i++; break; // 正数（Hydrogen R9 #4：0/负数曾静默禁用或立即杀）
+            case "--max-parallel": o.maxParallel = numArg(argv, i, { positive: true }); i++; break;
+            case "--no-stop-on-fail": o.noStopOnFail = true; break;
             case "--duration": o.duration = numArg(argv, i, { positive: true }); i++; break;
             case "--stream": {
                 const stream = strArg(argv, i);
@@ -345,9 +352,15 @@ function handleLayerCmd(sub: string | undefined, rest: ReturnType<typeof parseOp
 
 const sshLogger = { ...noopLogger, warn: (message: string) => console.error(`[filaxis] ${message}`) };
 
-function savedLayerDriver(name: string, layers: Record<string, RuntimeDescriptor> = loadLayerStore()): SshPtyDriver {
+function savedLayerDriver(name: string, layers: Record<string, RuntimeDescriptor> = loadLayerStore()): RuntimeDriver {
     if (!Object.hasOwn(layers, name)) throw new Error(`层 '${name}' 未保存（filaxis layer list 查看；filaxis layer save ${name} --host ... 创建）`);
-    return new SshPtyDriver(layers[name]!, { logger: sshLogger });
+    const descriptor = layers[name]!;
+    // 按 descriptor 的 driver 分派，与 Daemon 路径的 resolveTarget 一致。已存层按约定由
+    // `layer save --host` 产生（SSH），但层文件可被手改：这里曾无条件包成 SshPtyDriver
+    //——非 SSH 条目（driver:"local"）会变成对空主机名的 ssh 连接（落到 localhost 的 sshd）
+    if (descriptor.driver === "ssh") return new SshPtyDriver(descriptor, { logger: sshLogger });
+    if (descriptor.driver === "local") return new LocalRuntimeDriver(descriptor.cwd ? { cwd: descriptor.cwd } : undefined);
+    throw new Error(`层 '${name}' 的 driver '${descriptor.driver}' 在一次性模式（--no-daemon）下不可用——去掉 --no-daemon 经 Daemon 执行`);
 }
 
 async function driverFor(opts: ReturnType<typeof parseOpts>, needPtyLink = false): Promise<RuntimeDriver> {
@@ -540,6 +553,39 @@ async function requireDaemon(opts: ReturnType<typeof parseOpts>): Promise<Daemon
     return client;
 }
 
+/**
+ * exec 结果输出（DSH 评估 2026-11-26 #5c）：完成标记原先紧跟 stdout 写入就发 stderr。
+ * stdout 对管道是异步写入——正文还在排队时标记已到，调用方 `2>&1` 合流后它就落在
+ * 正文中间。先等 stdout 排空再写标记（合流后标记恒在末尾）。--json 结构化输出，
+ * 调用方不必再从正文里认标记行。
+ * 只设 exitCode、不 process.exit（Gemini #8——曾跳过外层 finally 的 drv.destroy()）。
+ */
+async function printExecResult(r: { stdout: string; stderr: string; exitCode: number; effectiveUser?: string }, json: boolean): Promise<void> {
+    if (json) {
+        console.log(JSON.stringify({ exitCode: r.exitCode, effectiveUser: r.effectiveUser ?? null, stdout: r.stdout, stderr: r.stderr }));
+    } else {
+        process.stdout.write(r.stdout);
+        if (r.stderr) process.stderr.write(r.stderr);
+        await drainStdout();
+        console.error(`\n[exit=${r.exitCode} user=${r.effectiveUser ?? "?"}]`);
+    }
+    process.exitCode = r.exitCode;
+}
+
+/** 等 stdout 排空：没有待写数据直接返回；有则空写一次——回调排在其后，正文全部
+ *  落地才触发。空写在个别运行时不回调也不能挂住（2s 上限，且不拖住进程退出） */
+function drainStdout(): Promise<void> {
+    const pending = (process.stdout as { writableLength?: number }).writableLength;
+    if (pending === 0) return Promise.resolve();
+    return new Promise<void>((done) => {
+        let settled = false;
+        const finish = (): void => { if (!settled) { settled = true; done(); } };
+        const cap = setTimeout(finish, 2000);
+        cap.unref?.();
+        process.stdout.write("", () => { clearTimeout(cap); finish(); });
+    });
+}
+
 function printBatchReport(r: BatchReport): void {
     for (const s of r.steps) {
         const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})${s.layer === undefined ? "" : ` layer=${s.layer}`}`;
@@ -603,6 +649,16 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
     }
     if (o.layer && plan && typeof plan === "object" && !Array.isArray(plan) && plan.layer === undefined) {
         plan = { ...plan, layer: o.layer };
+    }
+    // 命令行开关覆盖计划字段（DSH 评估 2026-11-26 #6）：显式写在命令行上的意图优先。
+    // --no-stop-on-fail 把缺省的失败即停关掉——巡检要「一台挂了其余照看」；改配置→验证
+    // →重载这类链保持缺省（前一步失败不该继续）
+    if (plan && typeof plan === "object" && !Array.isArray(plan)) {
+        if (o.maxParallel !== undefined) plan = { ...plan, maxParallel: o.maxParallel };
+        if (o.noStopOnFail) plan = { ...plan, stopOnFail: false };
+        // 层通配（"q-*"）按已存层名展开——只在此入口做：内核的层解析只认具体名。
+        // 无匹配即拒绝（把 "q-*" 原样交下去会被当成一个不存在的层名）
+        plan = expandBatchLayerWildcards(plan, Object.keys(loadLayerStore()), "已存层");
     }
     if (daemon) {
         const savedLayers = Object.fromEntries(
@@ -811,13 +867,13 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
         const target = buildCliTargetSpec(o);
         const info = await client.rpc<ForwardInfo>("forward.add", { target, spec });
         if (info.status !== "active") {
-            if (o.json) console.log(JSON.stringify(info, null, 2));
+            if (o.json) console.log(JSON.stringify(forwardInfoToPublic(info), null, 2));
             else console.error(`forward add: id=${info.forwardId} status=${info.status}${info.lastError ? ` (${info.lastError})` : ""}`);
             process.exitCode = 1;
             return;
         }
         if (o.json) {
-            console.log(JSON.stringify(info, null, 2));
+            console.log(JSON.stringify(forwardInfoToPublic(info), null, 2));
         } else {
             const targetDesc = info.kind === "dynamic" ? "SOCKS5" : `${info.targetHost}:${info.targetPort}`;
             console.log(`forward added: id=${info.forwardId} layer=${info.layer ?? "?"} ${info.kind} ${info.bindAddr}:${info.bindPort} -> ${targetDesc} (${info.transportMode})`);
@@ -825,16 +881,25 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
         return;
     }
     if (sub === "list") {
-        const res = await client.rpc<{ forwards: ForwardInfo[] }>("forward.list", { ...(o.layer ? { layer: o.layer } : {}) });
+        // 默认只报仍在用的转发（DSH 评估 2026-11-26 #5a）：remove 之后条目以 stopped
+        // 留在表里做幂等判定——曾照样列出，与「无活跃转发」的空表文案自相矛盾。
+        // --all 连同已停止/已退出的一并列出（--json 同受 --all 控制）
+        const all = o.all === true;
+        const res = await client.rpc<{ forwards: ForwardInfo[] }>("forward.list", {
+            ...(o.layer ? { layer: o.layer } : {}),
+            includeClosed: all,
+        });
+        // 本地再滤一次：对上不认 includeClosed 的旧 daemon，行为不变
+        const shown = all ? res.forwards : res.forwards.filter(isForwardActive);
         if (o.json) {
-            console.log(JSON.stringify(res.forwards, null, 2));
+            console.log(JSON.stringify(shown.map(forwardInfoToPublic), null, 2));
             return;
         }
-        if (res.forwards.length === 0) {
-            console.log("（无活跃动态端口转发）");
+        if (shown.length === 0) {
+            console.log(all ? "（无动态端口转发）" : "（无活跃动态端口转发）");
             return;
         }
-        for (const f of res.forwards) {
+        for (const f of shown) {
             const dst = f.kind === "dynamic" ? "SOCKS5" : `${f.targetHost}:${f.targetPort}`;
             console.log(`  ${f.forwardId} | layer=${f.layer ?? "?"} | ${f.kind} ${f.bindAddr}:${f.bindPort} -> ${dst} | ${f.transportMode} | ${f.status}`);
         }
@@ -846,7 +911,7 @@ async function handleForwardCmd(sub: string | undefined, o: ReturnType<typeof pa
             ...(o.layer ? { layer: o.layer } : {}),
         });
         if (o.json) {
-            console.log(JSON.stringify(res, null, 2));
+            console.log(JSON.stringify(closeForwardResultToPublic(res), null, 2));
         } else {
             console.log(`forward remove: id=${res.forwardId} status=${res.status}${res.detail ? ` (${res.detail})` : ""}`);
         }
@@ -955,9 +1020,10 @@ const generalHelp = `filaxis CLI — 千里一线，执行有迹
 用法:
   filaxis mcp-config [--format json|toml]  # 输出 MCP 配置片段
   filaxis exec    [--host u@h [--port N] [--key F]] [-J jump] [--enter CMD]... [--docker CTR]
-                  [--timeout MS] [--pty] -- <command>
+                  [--timeout MS] [--pty] [--json] -- <command>
                   # --enter 支持 "ssh <目标>"（自动非交互重放）与 "<...> bash" 结尾形态；
                   # 交互式进入（su - 类）用 --pty（stderr 与 stdout 混流=终端物理行为）
+                  # --json 输出单行 {exitCode, effectiveUser, stdout, stderr}（脚本取值用，不必认标记行）
   filaxis cat     [--host ...] <path>
   ${transferUsage("put")}
   ${transferUsage("get")}
@@ -965,20 +1031,27 @@ const generalHelp = `filaxis CLI — 千里一线，执行有迹
                   <path> --stdin-json | --request-file <f>  #   免 Shell 通道（JSON {old,new,all}——多行/引号保真）
   filaxis observe [--host ...] [--stream stderr|stdout|both] [--duration MS] -- <command>
   filaxis probe   [--host ...]                                     # 两段式环境探测
-  filaxis batch   [--layer ...|--host ...] --request-file <plan>   # 批次组合（DAG 依赖+fail-fast+逐步骤证据）
+  filaxis batch   [--layer ...|--host ...] --request-file <plan>   # 批次组合（DAG 依赖+逐步骤证据）
                   --stdin-json                                 # 计划及每步可用 layer 选择已保存层
+                  [--max-parallel N] [--no-stop-on-fail]         # 覆盖计划里的 maxParallel / stopOnFail
+                  # 缺省失败即停：某步失败后未启动的步骤标 skipped（改配置→验证→重载这类链要这个）
+                  # 巡检要「一台挂了其余照看」→ --no-stop-on-fail
+                  # exec 步骤可写 "commandFile": 引用脚本文件（零转义、可复用）替代 "command"
+                  # layer 支持通配（"q-*" 按已存层名展开）
   filaxis layer   save <name> --host ... [-J/--hop/--enter/--docker/...]   # 层路径持久化
                   list | rm <name>                                 # 层清单/移除
   filaxis daemon  start [--addr host:port] [--foreground]          # 显式启停常驻 Daemon
                   status | stop [--force]                          # 查看状态/优雅停机
   filaxis forward add (--layer NAME|--host ...) (-L|-R|-D SPEC)    # 动态端口转发（需 Daemon）
-                  list [--layer NAME] | remove <forward_id>
+                  list [--layer NAME] [--all] | remove <forward_id>
+                  # list 默认只报仍在用的转发；--all 连已停止/已退出的一并列出
   filaxis stream  open [--layer NAME|--host ...] -- <command>      # 跨命令持续观察窗（需 Daemon）
                   peek <window_id> [--after SEQ|--before SEQ] | close <window_id> | list
   （全子命令 --layer <name> 用已存层一行直达；与 --host 互斥；检测到活跃 Daemon 时自动复用，--no-daemon 绕过）
 
 路径描述（需 --host；对齐内核三件套 connParams/sshHops/enterPipeline）:
-  -J, --jump <j>          跳板（-J：途径机不占层，ssh 自身代理）
+  -J, --jump <j>          跳板（-J：途径机不占层，ssh 自身代理）。跳板的用户名与密钥取自
+                          ssh 配置/ssh-agent——--key 只给目标主机；字面 IP 跳板需在 ssh config 配好
   --hop <user@host[:port]> 逐跳登录链（可重复=链序；每跳独立端口/用户，密钥共享 --key）
   --enter <cmd>           进入内层 shell（可重复=管线序，如 "docker exec -i web bash"）
   --docker <name>         糖 = --enter "docker exec -i <name> sh"（--docker-shell bash / --docker-runtime podman 可换）
@@ -992,14 +1065,18 @@ async function main() {
     const helpFlag = (value: string | undefined) => value === "--help" || value === "-h";
     const commandHelp = new Map<string, string>([
         ["mcp-config", "filaxis mcp-config [--format json|toml]"],
-        ["exec", "filaxis exec [--layer NAME | --host HOST] [--timeout MS] [--pty] -- <command>\nfilaxis exec [目标选项] --stdin-script | --script-file FILE"],
+        ["exec", "filaxis exec [--layer NAME | --host HOST] [--timeout MS] [--pty] [--json] -- <command>\nfilaxis exec [目标选项] --stdin-script | --script-file FILE\n--json 输出单行 {exitCode, effectiveUser, stdout, stderr}（脚本取值用，不必从正文里认 [exit=N user=…] 标记行）"],
         ["cat", "filaxis cat [--layer NAME | --host HOST] -- <path>"],
         ["put", transferUsage("put")],
         ["get", transferUsage("get")],
         ["edit", "filaxis edit [--layer NAME | --host HOST] <path> <old> <new> [--all] [--write-mode auto|inplace]\nfilaxis edit [目标选项] <path> --stdin-json | --request-file FILE"],
         ["observe", "filaxis observe [--layer NAME | --host HOST] [--stream stderr|stdout|both] [--duration MS] -- <command>"],
         ["probe", "filaxis probe [--layer NAME | --host HOST]"],
-        ["batch", "filaxis batch [--layer NAME | --host HOST] --request-file FILE | --stdin-json\n目标优先级：步骤 layer → 计划 layer → --layer 或 --host。命名层来自 filaxis layer save。"],
+        ["batch", "filaxis batch [--layer NAME|--layer 通配 | --host HOST] --request-file FILE | --stdin-json\n" +
+            "          [--max-parallel N] [--no-stop-on-fail]\n" +
+            "目标优先级：步骤 layer → 计划 layer → --layer 或 --host。命名层来自 filaxis layer save；名字可写通配（如 \"q-*\"），按已存层名展开。\n" +
+            "--max-parallel / --no-stop-on-fail 覆盖计划里的 maxParallel / stopOnFail。缺省失败即停（未启动步骤标 skipped）；巡检要「一台挂了其余照看」用 --no-stop-on-fail。\n" +
+            "exec 步骤可用 \"commandFile\" 引用脚本文件，替代 \"command\"（命令原样进文件，零转义、可复用）。"],
         ["layer", "filaxis layer save <name> --host HOST | list | rm <name>"],
         ["layer save", "filaxis layer save <name> --host HOST [--port N] [--key FILE] [-J JUMP] [--hop HOST] [--enter CMD] [--docker CTR] [--forward SPEC] [--host-key tofu|strict] [--known-hosts FILE]"],
         ["layer list", "filaxis layer list"],
@@ -1008,9 +1085,9 @@ async function main() {
         ["daemon start", "filaxis daemon start [--addr host:port] [--foreground] [--daemon-dir dir] [--json]"],
         ["daemon status", "filaxis daemon status [--daemon-dir dir] [--json]"],
         ["daemon stop", "filaxis daemon stop [--force] [--daemon-dir dir] [--json]"],
-        ["forward", "filaxis forward add (--layer NAME | --host HOST) (-L SPEC | -R SPEC | -D SPEC) [--id ID] [--json] | list [--layer NAME] [--json] | remove <forward_id> [--layer NAME] [--json]"],
+        ["forward", "filaxis forward add (--layer NAME | --host HOST) (-L SPEC | -R SPEC | -D SPEC) [--id ID] [--json] | list [--layer NAME] [--all] [--json] | remove <forward_id> [--layer NAME] [--json]"],
         ["forward add", "filaxis forward add (--layer NAME | --host HOST) (-L [[bind:]port:]host:port | -R [[bind:]port:]host:port | -D [[bind:]port]) [--id ID] [--json]"],
-        ["forward list", "filaxis forward list [--layer NAME] [--daemon-dir dir] [--json]"],
+        ["forward list", "filaxis forward list [--layer NAME] [--all] [--daemon-dir dir] [--json]\n默认只报仍在用的转发（已停止/已退出的条目用 --all 查看）。--json 字段为 snake_case（forward_id、bind_addr…），forwardId 保留为兼容别名。"],
         ["forward remove", "filaxis forward remove <forward_id> [--layer NAME] [--daemon-dir dir] [--json]"],
         ["stream", "filaxis stream open (--layer NAME | --host HOST) [--stream stdout|stderr|both] [--limit N] [--wait MS] [--json] -- <command> | peek <window_id> [--after SEQ|--before SEQ] [--limit N] [--wait MS] [--json] | close <window_id> | list"],
         ["stream open", "filaxis stream open [--layer NAME | --host HOST] [--stream stdout|stderr|both] [--limit N] [--wait MS] [--name NAME] [--json] -- <command>"],
@@ -1120,10 +1197,7 @@ async function main() {
                     timeoutMs: o.timeout ?? 120_000,
                     channel: o.pty ? "pty" : undefined,
                 });
-                process.stdout.write(r.stdout);
-                if (r.stderr) process.stderr.write(r.stderr);
-                console.error(`\n[exit=${r.exitCode} user=${r.effectiveUser ?? "?"}]`);
-                process.exitCode = r.exitCode; // 不 process.exit（Gemini #8——曾跳过外层 finally 的 drv.destroy()）
+                await printExecResult(r, o.json === true);
                 break;
             }
             case "cat": {
@@ -1265,10 +1339,7 @@ async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon
                 timeoutMs: o.timeout ?? 120_000,
                 pty: o.pty === true,
             });
-            process.stdout.write(r.stdout);
-            if (r.stderr) process.stderr.write(r.stderr);
-            console.error(`\n[exit=${r.exitCode} user=${r.effectiveUser ?? "?"}]`);
-            process.exitCode = r.exitCode;
+            await printExecResult(r, o.json === true);
             break;
         }
         case "cat": {

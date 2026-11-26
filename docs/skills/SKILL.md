@@ -18,7 +18,7 @@ description: |
 | 任务意图 | MCP 工具或参考 |
 |---|---|
 | 等一条会自行结束的命令并获取退出码 | `run_command` |
-| 批量巡检或按依赖跨层执行 | `run_batch`。涉及跳板或多机取证时读 [跨主机排查](./cross-host-diagnosis.md) |
+| 批量巡检或按依赖跨层执行 | `run_batch`（巡检传 `stop_on_fail: false`，否则一台失败其余被跳过）。涉及跳板或多机取证时读 [跨主机排查](./cross-host-diagnosis.md) |
 | 启动后台服务、等就绪或核实进程退出码 | `start_session` → `stop_session`。读 [长跑任务](./longrun-observe.md) |
 | 按游标实时看日志、看完关窗 | `observe_stream`（开窗即读+游标续读）→ `close_stream`。读 [持续观察窗](./stream-window.md) |
 | 读文件/列目录、编辑/建文本、建目录/移动/删除、传文件 | `read_path`、`edit_file`、`manage_path`、`transfer_file`。读 [文件操作](./file-sync.md) |
@@ -51,14 +51,21 @@ filaxis edit --layer <名> <path> --request-file edit.json
 # ⑤ 挂起类命令（nc/ping/tail -f）必带 --timeout——CLI 缺省 120s
 filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 '; sleep 1) | nc 127.0.0.1 6379"
+
+# ⑥ 批次（计划 JSON 免转义；巡检加 --no-stop-on-fail；层名可写通配，按已存层名展开）
+filaxis batch --layer "q-*" --no-stop-on-fail --request-file plan.json
+filaxis exec --layer <名> --json -- "<command>"     # 单行 JSON {exitCode, effectiveUser, stdout, stderr}
 ```
 
 **MCP 形态实战指引**（第十二季盲测 B 组教训）：
 - 多个 SSH 目标可用一次 `connect_layer` 调用，例如 `{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`；也可单台传 `host` 或传 `enter_cmd` 从既有层进入容器。字符串可用运行环境 SSH 配置里的别名。按输入顺序建连，单个目标失败后继续尝试。返回的 `layers` 只含建连成功或复用的实际层名，并已去重，非空时可直接传给 `run_batch.layer`。批量结果的 `active_layer` 是调用结束时的默认层。
 - **定位/巡检期用 `run_batch` 打包**——多个 `read` / `exec` 一次调用并行
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
+- **巡检要显式关掉失败即停**：`run_batch` 缺省任一步失败即停，尚未启动的步骤（含其它层的展开实例）标 `skipped`——一台失败，其余都不看。批量巡检、多机取证这类只读批次传 `stop_on_fail: false`（CLI：`filaxis batch … --no-stop-on-fail`）。第一遍只看各步状态行，再对失败的层单独钻取。改配置→验证→重载这类链保持缺省：前一步失败不应继续。
+- **少写转义**：`exec` 步骤可用 `command_file` 引用脚本文件，替代 `command`——命令原样进文件，JSON 里的引号和换行不必再转义，同一脚本可被多个步骤复用（二者互斥；读不出或内容为空则整批拒绝）。相对路径相对服务进程的工作目录，经 Daemon 执行时建议给绝对路径。
 - `run_batch` 的顶层 `layer` 和步骤 `layer` 均支持传单个层名或层名数组（也可同时传：顶层是批次默认值，步骤的 `layer` 仅覆盖本步；两处都省略时使用调用时的默认层）。传多个层名数组时，步骤按 `id@layer` 展开并在 `max_parallel` 并发池内并行执行，下游 `after` 需等被依赖步骤的所有展开实例均 ok 后才启动（`kind: "get"` 不支持多层数组，防并发覆盖同一 `local_path`）；单元素数组保留原 `id`。结果逐步标明命名层。
-- CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。
+- CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。计划文件里的字段是驼峰写法（`command` 或 `commandFile`、`maxParallel`、`stopOnFail`）；命令行开关 `--max-parallel N` 与 `--no-stop-on-fail` 覆盖计划里的对应字段。
+- 层名可写通配：`*` 匹配任意字符序列，`?` 匹配单个字符（如 `"q-*"`），按已注册或已保存的层名展开，免去逐个罗列。没有任何匹配时整批拒绝，不会改用默认层。
 - 层名数组只查已注册或保存的层。SDK 可用 `stack.addLayer("local", { driver: "local" })` 把本机加入命名层；CLI 和独立 MCP 服务的本机默认目标不会自动注册为 `local`。
 - `max_parallel` 是整个批次的并发上限。无依赖的步骤可以并行，包括同层的独立巡检。需要先改配置、再验证、最后重载时，用 `after` 引用前置步骤的 `id`。依赖可以跨层，前置步骤成功后才会启动后续步骤。
 - `after` 引用当前批次计划里声明的原始步骤 ID。同一环境可能有多个层名，扇出按层名各执行一次。多个步骤或批次可能同时修改同一资源时，由调用方按实际资源串行化，例如用「环境身份 + 配置路径」作为互斥键。
@@ -72,7 +79,7 @@ filaxis exec --layer <名> --timeout 8000 -- "(printf 'PING
 - 宿主拦截 SSH 匿名管道时，在建层前设 `FILAXIS_SSH_STDIO_MODE=inherit`。它支持直连、单跳 `-J` 和可非交互重放的进入步骤。逐跳 PTY、交互进入、持久转发和持续观察窗需要可用的匿名管道。若首轮已发出且终态未知，先核实远端状态再决定是否重发。
 - Windows 的 OpenSSH 子进程会继承现有配置，并由 Filaxis 补齐缺失的系统和账户变量，例如 `SystemRoot`、`windir`、`ProgramData` 和 `USERNAME`。成功补齐 `SystemRoot` 时，CLI 和 MCP 会在 stderr 告警一次，SDK 通过注入的 logger 记录。SSH 秒退且双流为空时，可检查启动器是否保留了系统环境。
 
-用 `filaxis daemon start` 启动本机守护进程后，CLI 与未指定 SSH 启动目标的 MCP 服务可共享层、转发和观察窗。用 `filaxis daemon status` 查看状态，`filaxis daemon stop` 停止，或给单次命令传 `--no-daemon`。持续观察用 `filaxis stream open/peek/close`，转发用 `filaxis forward add/list/remove`，或在 MCP `manage_layers` 中使用 `forward_add`、`forward_list`、`forward_remove`。按返回的窗口 ID 或转发 ID 查询和关闭。
+用 `filaxis daemon start` 启动本机守护进程后，CLI 与未指定 SSH 启动目标的 MCP 服务可共享层、转发和观察窗。用 `filaxis daemon status` 查看状态，`filaxis daemon stop` 停止，或给单次命令传 `--no-daemon`。持续观察用 `filaxis stream open/peek/close`，转发用 `filaxis forward add/list/remove`，或在 MCP `manage_layers` 中使用 `forward_add`、`forward_list`、`forward_remove`。按返回的窗口 ID 或转发 ID 查询和关闭。转发列表缺省只报仍在用的转发，已停止的条目用 `filaxis forward list --all` 或 `forward_list` 的 `include_closed: true` 查看；转发记录字段为 snake_case（`forward_id`、`bind_addr`、`bind_port`…）。
 
 SDK 的 `createAgentToolkit` 也可在宿主进程内复用连接和 PTY，并接受结构化参数。
 

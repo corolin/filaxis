@@ -108,25 +108,31 @@ describe("manage_layers dynamic forwarding & 12-tool surface", () => {
             const opened = await manage_layers({ ...spec, bind_port: 18121, forward_id: "injected" });
             await stack.addLayer("named", named, { activate: false });
             await manage_layers({ ...spec, layer: "named", bind_port: 18122, forward_id: "named" });
-            expect((await manage_layers({ action: "forward_list" })).forwards.map((f) => f.forwardId).sort())
+            // 结果记录为 snake_case（forward_id 主名；forwardId 仅兼容别名）——与参数命名一致
+            expect((await manage_layers({ action: "forward_list" })).forwards.map((f) => f.forward_id).sort())
                 .toEqual(["injected", "named"]);
 
             stack.setActive("named");
-            expect((await manage_layers({ action: "forward_list" })).forwards.map((f) => f.forwardId).sort())
+            expect((await manage_layers({ action: "forward_list" })).forwards.map((f) => f.forward_id).sort())
                 .toEqual(["injected", "named"]);
-            expect((await manage_layers({ action: "forward_list", layer: "named" })).forwards.map((f) => f.forwardId))
+            expect((await manage_layers({ action: "forward_list", layer: "named" })).forwards.map((f) => f.forward_id))
                 .toEqual(["named"]);
             await expect(manage_layers({ ...spec, bind_port: 18123, forward_id: "injected" }))
                 .rejects.toThrow(/已存在于注入驱动/);
-            await expect(manage_layers({ action: "forward_remove", forward_id: opened.forward.forwardId }))
+            await expect(manage_layers({ action: "forward_remove", forward_id: opened.forward.forward_id }))
                 .resolves.toMatchObject({ status: "stopped" });
-            expect(named.listForwards()).toMatchObject([{ forwardId: "named", status: "active" }]);
+            expect(named.listForwards()).toMatchObject([{ forwardId: "named", status: "active" }]); // SDK 类型保持驼峰
+            // forward_list 缺省只报仍在用的转发：刚 remove 的 "injected"（stopped 墓碑）不再出现；
+            // include_closed=true 才连墓碑一并返回
+            expect((await manage_layers({ action: "forward_list" })).forwards.map((f) => f.forward_id)).toEqual(["named"]);
+            expect((await manage_layers({ action: "forward_list", include_closed: true })).forwards.map((f) => f.forward_id).sort())
+                .toEqual(["injected", "named"]);
 
             await stack.addLayer("injected-alias", injected, { activate: false });
             await manage_layers({ ...spec, layer: "injected-alias", bind_port: 18121, forward_id: "unregistered" });
             await stack.removeLayer("injected-alias");
             const remaining = await manage_layers({ action: "forward_list" });
-            expect(remaining.forwards.map((f) => f.forwardId).sort()).toEqual(["named", "unregistered"]);
+            expect(remaining.forwards.map((f) => f.forward_id).sort()).toEqual(["named", "unregistered"]);
             await expect(manage_layers({ action: "forward_remove", forward_id: "unregistered" }))
                 .resolves.toMatchObject({ status: "stopped" });
         } finally {
@@ -215,17 +221,21 @@ describe("manage_layers dynamic forwarding & 12-tool surface", () => {
             expect(added.structuredContent).toMatchObject({
                 action: "forward_add",
                 forward: {
-                    forwardId: "mcp-r1",
+                    forward_id: "mcp-r1",
                     layer: "ssh-main",
                     kind: "remote",
-                    bindPort: 45123,
+                    bind_port: 45123,
                     status: "active",
                 },
             });
+            // 别名与主名同值（兼容期）；record 的其余字段也是 snake_case
+            const addedForward = (added.structuredContent as { forward: Record<string, unknown> }).forward;
+            expect(addedForward.forwardId).toBe("mcp-r1");
+            expect(Object.keys(addedForward).some((k) => /[a-z][A-Z]/.test(k) && k !== "forwardId")).toBe(false);
 
             const listed = await call(4, { action: "forward_list" });
             expect(listed.isError).toBe(false);
-            expect((listed.structuredContent as { forwards: Array<{ forwardId: string }> }).forwards.map((f) => f.forwardId))
+            expect((listed.structuredContent as { forwards: Array<{ forward_id: string }> }).forwards.map((f) => f.forward_id))
                 .toEqual(["mcp-r1"]);
 
             const removed = await call(5, { action: "forward_remove", forward_id: "mcp-r1" });
@@ -331,7 +341,7 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
                 params: { name: "manage_layers", arguments: { action: "forward_list" } },
             });
             const fwdListResp = await waitForResponse(p2.responses, 10);
-            expect((fwdListResp.result as { structuredContent: { forwards: Array<{ forwardId: string }> } }).structuredContent.forwards.map((f) => f.forwardId))
+            expect((fwdListResp.result as { structuredContent: { forwards: Array<{ forward_id: string }> } }).structuredContent.forwards.map((f) => f.forward_id))
                 .toEqual(["cli-fwd"]);
 
             p2.send({
