@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.12"
+  version: "0.2.13"
 description: |
   使用 Filaxis（@syrkos/filaxis）执行跨层命令、批量巡检、管理后台任务、观察日志或操作目标层文件。
   也用于排查 SSH 别名与跳板、解读 unknown 终态或写入保障。纯本机一次性命令和与 Filaxis 无关的任务可跳过。
@@ -79,7 +79,7 @@ filaxis exec --layer <名> --json -- "<command>"     # 单行 JSON {exitCode, ef
 - 宿主拦截 SSH 匿名管道时，在建层前设 `FILAXIS_SSH_STDIO_MODE=inherit`。它支持直连、单跳 `-J` 和可非交互重放的进入步骤。逐跳 PTY、交互进入、持久转发和持续观察窗需要可用的匿名管道。若首轮已发出且终态未知，先核实远端状态再决定是否重发。
 - Windows 的 OpenSSH 子进程会继承现有配置，并由 Filaxis 补齐缺失的系统和账户变量，例如 `SystemRoot`、`windir`、`ProgramData` 和 `USERNAME`。成功补齐 `SystemRoot` 时，CLI 和 MCP 会在 stderr 告警一次，SDK 通过注入的 logger 记录。SSH 秒退且双流为空时，可检查启动器是否保留了系统环境。
 
-用 `filaxis daemon start` 启动本机守护进程后，CLI 与未指定 SSH 启动目标的 MCP 服务可共享层、转发和观察窗。用 `filaxis daemon status` 查看状态，`filaxis daemon stop` 停止，或给单次命令传 `--no-daemon`。持续观察用 `filaxis stream open/peek/close`，转发用 `filaxis forward add/list/remove`，或在 MCP `manage_layers` 中使用 `forward_add`、`forward_list`、`forward_remove`。按返回的窗口 ID 或转发 ID 查询和关闭。转发列表缺省只报仍在用的转发，已停止的条目用 `filaxis forward list --all` 或 `forward_list` 的 `include_closed: true` 查看；转发记录字段为 snake_case（`forward_id`、`bind_addr`、`bind_port`…）。
+用 `filaxis daemon start` 启动本机守护进程后，CLI 与未显式指定 `--host` 或 `--layer` 的 MCP 服务可共享层、转发和观察窗。用 `filaxis daemon status` 查看状态，`filaxis daemon stop` 停止，或给单次命令传 `--no-daemon`。持续观察用 `filaxis stream open/peek/close`，转发用 `filaxis forward add/list/remove`，或在 MCP `manage_layers` 中使用 `forward_add`、`forward_list`、`forward_remove`。按返回的窗口 ID 或转发 ID 查询和关闭。转发列表缺省只报仍在用的转发，已停止的条目用 `filaxis forward list --all` 或 `forward_list` 的 `include_closed: true` 查看。转发记录字段为 snake_case（`forward_id`、`bind_addr`、`bind_port`…）。
 
 SDK 的 `createAgentToolkit` 也可在宿主进程内复用连接和 PTY，并接受结构化参数。
 

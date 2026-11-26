@@ -8,10 +8,11 @@
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import type { RuntimeDescriptor } from "./driver.js";
 
 export function layerStorePath(): string {
-    return process.env.FILAXIS_LAYERS ?? (homedir() + "//.filaxis/layers.json");
+    return process.env.FILAXIS_LAYERS ?? join(homedir(), ".filaxis", "layers.json");
 }
 
 /** 文件不存在视为空表；存在但读不出、或形态不对则抛错（坏档不静默当空） */

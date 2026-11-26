@@ -82,17 +82,19 @@ async function main(): Promise<void> {
     const stderr = (message: string) => console.error(`[mcp] ${message}`);
     const logger = { ...noopLogger, warn: stderr, error: stderr };
     const hasSshPathOpts = Boolean(o.port !== undefined || o.user || o.key || o.jump || o.hop.length || o.enter.length || o.docker);
+    let savedDescriptor: RuntimeDescriptor | undefined;
     // --layer 与 --host 族互斥（快照寻址 = 整个连接参数都在快照里）
     if (o.layer) {
         if (o.host || hasSshPathOpts) throw new Error("filaxis-mcp: --layer 与 --host 族互斥");
-        if (!Object.hasOwn(loadLayerStore(), o.layer)) {
+        savedDescriptor = loadLayerStore()[o.layer];
+        if (!savedDescriptor) {
             throw new Error(`filaxis-mcp: 层 '${o.layer}' 未保存（filaxis layer list 查看；filaxis layer save ${o.layer} --host ... 创建）`);
         }
     }
     if (!o.host && hasSshPathOpts) {
         throw new Error("SSH 路径参数需要 --host");
     }
-    const useDaemonAllowed = !o.noDaemon && process.env.FILAXIS_NO_DAEMON !== "1" && !o.host && !hasSshPathOpts;
+    const useDaemonAllowed = !o.noDaemon && process.env.FILAXIS_NO_DAEMON !== "1" && !o.layer && !o.host && !hasSshPathOpts;
     if (useDaemonAllowed) {
         const activeDaemon = await probeDaemon(o.daemonDir);
         if (activeDaemon) {
@@ -119,11 +121,11 @@ async function main(): Promise<void> {
         const desc: RuntimeDescriptor = { driver: "ssh", target: o.host, ...(Object.keys(config).length ? { config } : {}) };
         opts = { descriptor: desc };
     } else {
-        opts = {}; // local 缺省
+        opts = { descriptor: savedDescriptor };
     }
     // 已存层表注入：run_command 等工具按层名寻址、run_batch 的层通配都认 filaxis layer
     // save 保存的层（与 CLI 一致）。按需读取，进程存活期间新保存的层也认。
-    const tk = createAgentToolkit(stack, o.layer ? { descriptor: loadLayerStore()[o.layer]! } : { ...opts, savedLayers: loadLayerStore });
+    const tk = createAgentToolkit(stack, { ...opts, savedLayers: loadLayerStore });
     new McpServer({
         toolkit: tk,
         logger,

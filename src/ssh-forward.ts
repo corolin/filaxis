@@ -864,10 +864,16 @@ export class SshForwardManager {
                 socket.destroy();
                 return;
             }
+            const reportFailure = (message: string): void => {
+                if (entry.closing) return;
+                entry.info.lastError = message;
+                this.log.warn(`[filaxis] 转发 ${entry.info.forwardId} ${message}`);
+            };
             let child: ChildProcess;
             try {
                 child = this.deps.spawnBridge(bridgeArgv);
-            } catch {
+            } catch (error) {
+                reportFailure(`穿层桥接子进程启动失败: ${error instanceof Error ? error.message : String(error)}`);
                 socket.destroy();
                 return;
             }
@@ -885,7 +891,12 @@ export class SshForwardManager {
 
             socket.on("error", teardownConn);
             socket.once("close", teardownConn);
-            child.once("error", teardownConn);
+            let childError = false;
+            child.once("error", (error) => {
+                childError = true;
+                reportFailure(`穿层桥接子进程异常: ${error.message}`);
+                teardownConn();
+            });
             child.once("close", () => {
                 bridgeConns.delete(conn);
                 teardownConn();
@@ -908,15 +919,19 @@ export class SshForwardManager {
                 return `穿层桥接子进程未送出数据即退出 (code=${code ?? signal})${why ? `: ${why}` : ""}`;
             };
             child.once("close", (code, signal) => {
-                if (entry.closing || relayedBytes > 0) return;
+                if (entry.closing || childError || relayedBytes > 0) return;
+                if (teardownStarted && signal !== null && !stderrTail.trim()) return;
                 const failed = code !== 0 || signal !== null;
                 if (code === 0 && signal === null && !stderrTail.trim()) {
                     // 客户端连上不发数据就断开也会走到这里，不当作故障
                     this.log.debug(`[filaxis] 转发 ${entry.info.forwardId} ${bridgeDied(code, signal)}`);
                     return;
                 }
-                entry.info.lastError = bridgeDied(code, signal);
-                this.log[failed ? "warn" : "info"](`[filaxis] 转发 ${entry.info.forwardId} ${entry.info.lastError}`);
+                if (failed) reportFailure(bridgeDied(code, signal));
+                else {
+                    entry.info.lastError = bridgeDied(code, signal);
+                    this.log.info(`[filaxis] 转发 ${entry.info.forwardId} ${entry.info.lastError}`);
+                }
             });
 
             if (child.stdin) socket.pipe(child.stdin);

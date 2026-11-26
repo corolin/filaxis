@@ -621,6 +621,22 @@ describe("CLI batch：开关 / 层通配 / commandFile（DSH 评估 2026-11-26 #
         expect(r.err).toContain("未匹配任何已存层");
     }, 30_000);
 
+    test("CLI batch keeps plan validation errors after wildcard support", () => {
+        for (const [plan, message] of [
+            [{ layer: "*", steps: {} }, "steps"],
+            [{ ...snap, layer: 123 }, "需为非空字符串"],
+            [{ ...snap, layer: ["fx-a", "fx-a"] }, "含重复层名"],
+            [{ ...snap, layer: ["fx-*", "fx-*"] }, "含重复层名"],
+            [{ steps: [{ id: "read", kind: "read", path: "x", commandFile: "a.sh" }] }, "只支持 kind='exec'"],
+        ] as const) {
+            const r = cli([], plan);
+            expect(r.code).toBe(1);
+            expect(r.out).toBe("");
+            expect(r.err).toContain(message);
+            expect(r.err).toContain("批次计划非法");
+        }
+    }, 30_000);
+
     test("--no-stop-on-fail：失败后其余步骤照看（缺省失败即停时标 skipped）；--max-parallel 1 保序", () => {
         const plan = { steps: [{ id: "boom", kind: "exec", command: "exit 7" }, { id: "rest", kind: "exec", command: "printf SURVIVED" }] };
         const fastFail = cli(["--max-parallel", "1"], plan);
@@ -726,11 +742,13 @@ describe("CLI exec 输出（DSH 评估 2026-11-26 #5c）", () => {
         expect(r.exitCode).toBe(3);
     }, 30_000);
 
-    test.skipIf(!Bun.which("sh"))("文本模式经 2>&1 合流：完成标记恒在末尾，正文一行不少", () => {
+    const sh = process.env.FILAXIS_SHELL || Bun.which("sh");
+    test.skipIf(!sh)("文本模式经 2>&1 合流：完成标记恒在末尾，正文一行不少", () => {
         const n = 20000;
         // 经 sh 合流（与调用方写 `filaxis … 2>&1` 同形）。大输出下 stdout 是异步排队——
         // 标记若不等它排空就发 stderr，合流后就会插进正文中间
-        const r = Bun.spawnSync(["sh", "-c", `${JSON.stringify(process.execPath)} bin/filaxis.ts exec --no-daemon -- 'seq 1 ${n}' 2>&1`], {
+        const command = `i=1; while [ "$i" -le ${n} ]; do echo "$i"; i=$((i + 1)); done`;
+        const r = Bun.spawnSync([sh!, "-c", `${JSON.stringify(process.execPath)} bin/filaxis.ts exec --no-daemon -- '${command}' 2>&1`], {
             stdout: "pipe", stderr: "pipe", windowsHide: true,
         });
         const lines = r.stdout.toString().split(/\r?\n/);

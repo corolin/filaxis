@@ -634,6 +634,9 @@ describe("enterPipeline layer-penetrating dynamic forwarding (stdio-bridge)", ()
             expect(nested.command).toContain("socat");
         }
 
+        const quoted = renderEnterBridgeCommand([{ cmd: "ssh -tt -i '/tmp/key  -t name' vm-b" }], inner);
+        expect(quoted).toMatchObject({ kind: "ok", command: expect.stringContaining("'ssh' '-T' '-i' '/tmp/key  -t name' 'vm-b'") });
+
         const bad = renderEnterBridgeCommand([{ cmd: "su - app" }], inner);
         expect(bad.kind).toBe("unreachable");
     });
@@ -764,33 +767,44 @@ describe("enterPipeline layer-penetrating dynamic forwarding (stdio-bridge)", ()
     test("真机回归 2026-11-26：桥接子进程未送出数据即退出时，死因（stderr 尾部）挂到转发记录上，不再无声", async () => {
         // 真机两次踩中：内层连不上目标端口（ConnectionRefused）/ 桥命令在远端没跑起来，
         // stderr 里写得清清楚楚，但产品把它丢弃——外面只看到连接立刻断开、零报错。
+        let failToSpawn = false;
         const drv = new SshPtyDriver({
             driver: "ssh",
             target: "ops@host",
             config: { enterPipeline: [{ cmd: "docker exec -it web bash" }] },
         }, {
             _forwardDeps: {
-                spawnBridge: () => spawn(process.execPath, [
-                    "-e",
-                    "process.stderr.write('Traceback (most recent call last):\\nConnectionRefusedError: [Errno 111] Connection refused\\n');process.exit(2);",
-                ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true }),
+                spawnBridge: () => {
+                    if (failToSpawn) throw new Error("bridge unavailable");
+                    return spawn(process.execPath, [
+                        "-e",
+                        "process.stderr.write('Traceback (most recent call last):\\nConnectionRefusedError: [Errno 111] Connection refused\\n');process.exit(2);",
+                    ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+                },
             },
         });
         drv.exec = async () => ({ stdout: "node\n", stderr: "", exitCode: 0 });
         const info = await drv.openForward({ id: "ctr-dead", kind: "L", targetHost: "127.0.0.1", targetPort: 22 });
         expect(info.transportMode).toBe("stdio-bridge");
         // 连一下触发桥子进程；连接会被关闭
-        await new Promise<void>((resolve) => {
+        const connectAndWait = () => new Promise<void>((resolve) => {
             const c = net.createConnection({ host: "127.0.0.1", port: info.bindPort });
             c.on("error", () => undefined);
             c.once("close", () => resolve());
             c.once("connect", () => c.write("x"));
         });
-        await new Promise((r) => setTimeout(r, 300));
-        const listed = drv.listForwards().find((f) => f.forwardId === "ctr-dead");
-        expect(listed?.lastError).toContain("未送出数据即退出");
-        expect(listed?.lastError).toContain("ConnectionRefusedError");
-        await drv.destroy().catch(() => undefined);
+        try {
+            await connectAndWait();
+            await new Promise((r) => setTimeout(r, 300));
+            const listed = drv.listForwards().find((f) => f.forwardId === "ctr-dead");
+            expect(listed?.lastError).toContain("未送出数据即退出");
+            expect(listed?.lastError).toContain("ConnectionRefusedError");
+            failToSpawn = true;
+            await connectAndWait();
+            expect(drv.listForwards()[0]?.lastError).toContain("bridge unavailable");
+        } finally {
+            await drv.destroy();
+        }
     }, 15_000);
 
     test("keeps a disconnected bridge child addressable until its exit is verified", async () => {

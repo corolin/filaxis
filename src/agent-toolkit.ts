@@ -884,7 +884,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
     const loadingSaved = new Map<string, Promise<RuntimeDriver>>();
     const savedDescriptor = (name: string): RuntimeDescriptor | undefined => {
         if (!opts.savedLayers) return undefined;
-        const entry = opts.savedLayers()[name];
+        const store = opts.savedLayers();
+        const entry = Object.hasOwn(store, name) ? store[name] : undefined;
         return entry && typeof entry === "object" ? entry : undefined;
     };
     const loadSaved = (name: string): Promise<RuntimeDriver> => {
@@ -894,7 +895,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
             const descriptor = savedDescriptor(name);
             if (!descriptor) throw new Error(`层 '${name}' 未注册，也不在已存层表里`);
             try {
-                return (await stack.addLayer(name, descriptor, { activate: false })).handle.driver;
+                const driver = await stack.connect(descriptor);
+                return (await stack.addLayer(name, driver, { activate: false })).handle.driver;
             } catch (e) {
                 throw new Error(`已存层 '${name}' 加载失败: ${e instanceof Error ? e.message : String(e)}`);
             }
@@ -1008,6 +1010,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         if (label !== undefined && typeof label !== "string") throw new Error("label 需为字符串");
         assertOptionalLayerName(from);
         assertOptionalLayerName(name);
+        if (from !== undefined) await resolveDrv(from);
         const srcName = from ?? stack.activeLayer?.name;
         if (!srcName) throw new Error("无源层——先用 connect_layer 建立 SSH 层，或显式传 from");
         const h = await stack.layerInto(srcName, name ?? label ?? enterCmd.slice(0, 30), enterCmd, { label });
@@ -1551,6 +1554,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     const { name, ...extra } = rest;
                     if (Object.keys(extra).length) throw new Error("manage_layers(activate) 只接受 action 和 name");
                     if (typeof name !== "string" || !name.trim()) throw new Error("name 需为非空层名");
+                    await resolveDrv(name);
                     return { action: "activate" as const, active_layer: stack.setActive(name).name };
                 }
                 if (action === "remove") {
@@ -1585,6 +1589,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     };
                     const selectedLayer = layerName ?? stack.activeLayer?.name;
                     if (selectedLayer !== undefined) {
+                        await resolveDrv(selectedLayer);
                         if (spec.id && unregisteredDriver()?.listForwards?.().some((f) => f.forwardId === spec.id)) {
                             throw new Error(`转发 ID '${spec.id}' 已存在于注入驱动`);
                         }
@@ -1660,7 +1665,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     layer: layerName === undefined ? stack.activeLayer?.name : layerName,
                     stopOnFail: stop_on_fail,
                     maxParallel: max_parallel,
-                }, knownLayerNames(), "已注册层或已存层");
+                }, knownLayerNames, opts.savedLayers ? "已注册层或已存层" : "已注册层");
                 const r = await runBatch(resolveDrv, plan, output === "text" ? { previewBudgetBytes: 4096 } : {});
                 return {
                     status: r.status,

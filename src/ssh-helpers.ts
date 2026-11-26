@@ -150,8 +150,8 @@ function assertBareHost(target: string): void {
 }
 
 /** ssh 命令行参数（spawn 数组与 ssh -G 解析共用） */
-export function sshArgsFor(hop: SshHop): string[] {
-    return renderSshArgs(hop, process.platform === "win32");
+export function sshArgsFor(hop: SshHop, opts: { interactive?: boolean } = {}): string[] {
+    return renderSshArgs(hop, process.platform === "win32", false, opts.interactive === true);
 }
 
 function quoteWindowsProxyArg(value: string): string {
@@ -170,7 +170,7 @@ function knownHostsOption(file: string, windows: boolean): string {
     return `UserKnownHostsFile=${quoted}`;
 }
 
-function renderSshArgs(hop: SshHop, windowsProxy: boolean, remote = false): string[] {
+function renderSshArgs(hop: SshHop, windowsProxy: boolean, remote = false, interactive = remote): string[] {
     if (!isHopObj(hop) || !hop.conn) {
         assertBareHost(hopHost(hop));
         return [hopHost(hop)];
@@ -196,7 +196,8 @@ function renderSshArgs(hop: SshHop, windowsProxy: boolean, remote = false): stri
         const keyOpt = jumpKey ? `-i ${proxyQuote(jumpKey)} ` : "";
         const portOpt = js.port ? `-p ${js.port} ` : "";
         const target = proxyQuote(js.user ? `${js.user}@${js.host}` : js.host);
-        args.push("-o", `ProxyCommand=ssh ${hk}${keyOpt}${portOpt}-W %h:%p ${target}`);
+        const batchOpt = interactive ? "" : "-o BatchMode=yes ";
+        args.push("-o", `ProxyCommand=ssh ${batchOpt}${hk}${keyOpt}${portOpt}-W %h:%p ${target}`);
     }
     if (keyFile) args.push("-i", remote ? keyFile : expandHomePath(keyFile));
     if (port) args.push("-p", String(port));
@@ -645,56 +646,6 @@ export function classifySshFailure(rawStderr: string, jumpHost: string | null): 
     return { stage, kind, lines };
 }
 
-/**
- * 连接失败诊断探测（DSH 评估 2026-11-26 真机发现）：带跳板（ProxyCommand）时 ssh 把自身的
- * stdout/stderr 指向 /dev/null——跳板解析失败、认证被拒、不可达一概表现为「255 + 零输出 +
- * 秒退」，真实原因不可见（曾因此被误报成沙箱管道损坏）。失败之后主动用**同样的连接参数
- * 与主机密钥策略**重放一次连接，日志开到详细、远端只执行 `true`，把 ssh 自己的报错带回。
- * 副作用：多一次连接尝试（远端至多执行一条 `true`）。
- */
-export async function probeSshConnectionFailure(
-    hop: SshHop, conn: SshConnParams | undefined, logger?: FilaxisLogger,
-): Promise<{ verdict: SshFailureVerdict; exitCode: number | null } | null> {
-    // 与真实连接同一套选项与主机密钥策略，只去掉日志级别压制（改由 -v 提供）
-    const base = autonomousSshOpts(conn);
-    const opts: string[] = [];
-    for (let i = 0; i < base.length; i += 2) {
-        if (String(base[i + 1]).startsWith("LogLevel=")) continue;
-        opts.push(base[i]!, base[i + 1]!);
-    }
-    const argv = ["-v", ...opts, ...sshArgsFor(hop), "true"];
-    let stderr = "";
-    let exitCode: number | null = null;
-    try {
-        if (sshFileStdioRequested()) {
-            const r = await spawnWithFileRedirect(argv, "", { timeoutMs: 12_000, logger });
-            stderr = r.stderr;
-            exitCode = r.exitCode;
-        } else {
-            const { execFile } = await import("node:child_process");
-            const probed = await new Promise<{ stderr: string; code: number | null }>((resolve, reject) => {
-                execFile("ssh", argv, {
-                    timeout: 12_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
-                    env: openSshEnvironment(process.env, logger),
-                }, (err, _stdout, errOut) => {
-                    // 拿不到 stderr（进程没起来/被探针超时杀掉）才算探测失败；非 0 退出是预期内的结果
-                    if (errOut == null) { reject(err ?? new Error("ssh 诊断探测无输出")); return; }
-                    const e = err as (NodeJS.ErrnoException & { killed?: boolean }) | null;
-                    if (e?.killed) { reject(new Error("ssh 诊断探测超时")); return; }
-                    // err.code：非 0 退出时是退出码（number）；本地启动失败时是字符串错误码
-                    resolve({ stderr: String(errOut), code: e ? (typeof e.code === "number" ? e.code : null) : 0 });
-                });
-            });
-            stderr = probed.stderr;
-            exitCode = probed.code;
-        }
-    } catch {
-        return null;
-    }
-    const jumpHost = conn?.jump ? parseJumpSpec(conn.jump).host : null;
-    return { verdict: classifySshFailure(stderr, jumpHost), exitCode };
-}
-
 /** 层的完整途经身份链（target + hops），供回环检测 */
 export function layerPathIdentities(desc: RuntimeDescriptor): SshHop[] {
     const hops: SshHop[] = Array.isArray(desc.config?.sshHops) ? (desc.config.sshHops as SshHop[]) : [];
@@ -753,6 +704,10 @@ export function tokenizeArgv(line: string): string[] {
 
 export const shellQuote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
+function sshEnterTokens(command: string): string[] {
+    return tokenizeArgv(command).filter((arg) => arg !== "-t" && arg !== "-tt");
+}
+
 /** 环境变量名合法性（拼入远端命令前的红线——防 argv/引号注入） */
 export const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -792,16 +747,15 @@ export function renderExecChannel(
     /** 单层进入命令的非交互重放形态（docker：-it→-i + shell 追加 -s；ssh：剥 -t +
      *  远端命令位接 sh -s） */
     const replayTokens = (raw: string): string[] | { unreachable: true; reason: string; step: string } => {
-        // -it / -t → -i（非交互）；进入命令须以 shell 结尾（内层读 stdin）
-        const cleaned = raw.replace(/(^|\s)-(it|ti)\b/g, "$1-i").replace(/(^|\s)-t\b/g, "$1-i").trim();
         // ssh 形态（用户实测反馈）：`ssh remote-vm` 不以 shell 结尾，但远端命令位
         // 可直接接 sh -s（ssh host sh -s = stdin 管道链，零嵌套引用）——并非真不可
         // 直达。注意清洗语义与 docker 相反：ssh 的 -t 是「强制 PTY」须**剥掉**
         // （换成 -i 会变成 identity file 指认，完全跑偏）
-        if (/^ssh(\s|$)/.test(cleaned)) {
-            const stripped = cleaned.replace(/(^|\s)-+(tt|t)\b/g, "$1").replace(/\s+/g, " ").trim();
-            return [...tokenizeArgv(stripped), "sh", "-s"];
+        if (/^ssh(\s|$)/.test(raw.trim())) {
+            return [...sshEnterTokens(raw.trim()), "sh", "-s"];
         }
+        // -it / -t → -i（非交互）；进入命令须以 shell 结尾（内层读 stdin）
+        const cleaned = raw.replace(/(^|\s)-(it|ti)\b/g, "$1-i").replace(/(^|\s)-t\b/g, "$1-i").trim();
         const m = SHELL_TAIL_RE.exec(cleaned);
         if (!m) {
             return {
@@ -824,11 +778,11 @@ export function renderExecChannel(
     if (steps.length > 0) {
         const first = replayTokens(steps[0]!.cmd);
         if ("unreachable" in first) return { kind: "unreachable", reason: first.reason, step: first.step };
-        remoteArgs.push(...first);
+        remoteArgs.push(...first.map(quoteSshShellArg));
         for (const s of steps.slice(1)) {
             const t = replayTokens(s.cmd);
             if ("unreachable" in t) return { kind: "unreachable", reason: t.reason, step: t.step };
-            innerLayers.push(t.join(" "));
+            innerLayers.push(t.map(quoteSshShellArg).join(" "));
         }
     }
     // 终层远端 shell：POSIX sh 通吃（包装脚本纯 POSIX——报告 #3：FreeBSD/Alpine 无 bash
@@ -869,8 +823,7 @@ export function renderEnterBridgeCommand(steps: EnterStep[], innerCommand: strin
         const raw = steps[i]!.cmd;
         const trimmed = raw.trim();
         if (/^ssh(\s|$)/.test(trimmed)) {
-            const stripped = trimmed.replace(/(^|\s)-+(tt|t)\b/g, "$1").replace(/\s+/g, " ").trim();
-            const parsed = tokenizeArgv(stripped);
+            const parsed = sshEnterTokens(trimmed);
             if (!parsed.includes("-T")) parsed.splice(1, 0, "-T");
             // ssh 跳比 docker/bash 尾形态多一层 shell 解析：本机 spawn 的整串命令先被
             // 跳板 sh 消费一次，嵌套 ssh 再把多个参数按空格拼接（引号结构全丢）。若只

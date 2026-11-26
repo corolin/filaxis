@@ -53,19 +53,19 @@ describe("ssh-helpers", () => {
         expect(sshArgsFor({ host: "192.0.2.10", conn: { user: "root", port: 2222, jump: "jump", keyFile: "~/id_ed", forwards: [{ kind: "L", port: 8080, target: "localhost:80" }] } }))
             .toEqual([
                 // ProxyCommand 等价形态（跳板白名单+sh 引用+策略随主连接——Astra 十一轮 #1/#2）
-                "-o", `ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -W %h:%p ${proxyHost("jump")}`,
+                "-o", `ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -W %h:%p ${proxyHost("jump")}`,
                 "-i", expect.any(String), "-p", "2222", "-L", "8080:localhost:80", "root@192.0.2.10",
             ]);
         // 跳板串 [host]:port / host:port / user@[host]:port → 命令行 -p 展开（引用包裹）
         expect(sshArgsFor({ host: "t", conn: { jump: "[127.0.0.1]:2222" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("127.0.0.1")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("127.0.0.1")}`);
         expect(sshArgsFor({ host: "t", conn: { jump: "root@h:2222" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("root@h")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("root@h")}`);
         expect(sshArgsFor({ host: "t", conn: { jump: "u@[198.51.100.9]:2200" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("u@198.51.100.9")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("u@198.51.100.9")}`);
         // IPv6 字面量
         expect(sshArgsFor({ host: "t", conn: { jump: "[::1]:2200" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("::1")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("::1")}`);
     });
 
     // GPT Astra 十一轮 #1：jump 原文拼入经 shell 执行的 ProxyCommand = 命令注入入口。
@@ -111,7 +111,7 @@ describe("ssh-helpers", () => {
             hostKeyPolicy: "strict",
             knownHostsFile: "C:\\SSH data\\known_hosts",
         } });
-        expect(args[1]).toBe('ProxyCommand=ssh -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=\\"C:/SSH data/known_hosts\\"" -i "C:\\SSH data\\id_jump" -W %h:%p jump.example');
+        expect(args[1]).toBe('ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=\\"C:/SSH data/known_hosts\\"" -i "C:\\SSH data\\id_jump" -W %h:%p jump.example');
     });
 
     // GPT Astra 十一轮 #3：多跳逗号链显式拒绝（旧 -J 直传时跳板策略裸奔）——指引 sshInto
@@ -269,6 +269,11 @@ describe("ssh-helpers", () => {
         if (r2.kind === "ok") {
             expect(r2.remoteArgs).toEqual(["ssh", "remote-vm", "-p", "2222", "sh", "-s", "sh", "-s"]); // -tt 剥除
         }
+        const quoted = renderExecChannel([{ cmd: "ssh -t -i '/tmp/key  -t name' remote-vm" }], "x", { marker: "M", nonceWrapped: "( x )" });
+        expect(quoted).toMatchObject({
+            kind: "ok",
+            remoteArgs: ["ssh", "-i", "'/tmp/key  -t name'", "remote-vm", "sh", "-s", "sh", "-s"],
+        });
     });
 
     // 多层 enter（用户实测实锤）：旧形态全层塞 argv——第一层 sh -s 吞掉脚本、后续层
@@ -1624,6 +1629,9 @@ describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
         const root = h.rootSshSpawnArgs(["root@example.invalid"]);
         expect(root[0]).toBe("-tt");
         expect(root.includes("BatchMode=yes")).toBe(false);
+        const withJump = { host: "target", conn: { jump: "jump" } };
+        expect(h.sshArgsFor(withJump)[1]).toContain("BatchMode=yes");
+        expect(h.sshArgsFor(withJump, { interactive: true })[1]).not.toContain("BatchMode");
         const hopCmd = h.hopSshCommand({ host: "example.invalid", conn: { user: "root" } });
         expect(hopCmd.startsWith("ssh ")).toBe(true);
         expect(hopCmd).not.toContain("BatchMode");
@@ -1713,21 +1721,13 @@ describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
             "ssh: Could not resolve hostname target.example.invalid: No such host is known.\n", noopLogger);
         expect(plainUnresolved).toContain("[连接层失败]");
         expect(plainUnresolved).not.toContain("认证失败");
-        // 带跳板、且 stderr 判读不出原因：触发诊断探测（真跑一次 ssh）。example.invalid 必然
-        // 解析不出，探测会带回 ssh 原始报错并归段——结论随环境，但一定不是「认证失败」
-        const probed = await __testConnFailureDiagnosis("root@target.example.invalid", conn,
+        // 报告原始失败的位置，保留目标的错误行。
+        const unresolved = await __testConnFailureDiagnosis("root@target.example.invalid", conn,
             "ssh: Could not resolve hostname target.example.invalid: No such host is known.\n", noopLogger);
-        expect(probed).not.toContain("认证失败");
-        expect(/\[跳板无法解析\]|\[目标无法解析\]|\[跳板不可达\]|\[目标不可达\]|\[连接层失败\]/.test(probed)).toBe(true);
-        // 探测带回了 ssh 原始报错（探测自身失败时才会退回通用提示）
-        if (!probed.includes("[连接层失败]")) {
-            expect(probed).toContain("[ssh 原始输出·直交]");
-            expect(probed).toContain("Could not resolve hostname");
-        }
-        // 带跳板的静默失败（真机上 ssh 吞掉代理进程的 stderr）：同样进入探测
+        expect(unresolved).toContain("[目标无法解析]");
+        expect(unresolved).toContain("Could not resolve hostname target.example.invalid");
         const silent = await __testConnFailureDiagnosis("root@target.example.invalid", conn, "", noopLogger);
-        expect(silent).not.toContain("认证失败");
-        expect(silent.length).toBeGreaterThan(0);
+        expect(silent).toContain("失败位置无法确认");
         // 与连接层无关的输出：不附诊断
         expect(await __testConnFailureDiagnosis("h", undefined, "some other failure output", noopLogger)).toBe("");
     }, 60_000);

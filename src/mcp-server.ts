@@ -311,7 +311,8 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
                 `forwards=${result.forwards.length}`,
                 ...result.forwards.map((f) => {
                     const dst = f.kind === "dynamic" ? "SOCKS5" : `${singleLine(f.target_host ?? "")}:${f.target_port}`;
-                    return `${singleLine(f.forward_id)} | layer=${singleLine(f.layer ?? "?")} | ${f.kind} ${singleLine(f.bind_addr)}:${f.bind_port} -> ${dst} | ${f.status}`;
+                    const error = f.last_error ? ` | ${singleLine(f.last_error).slice(0, 240)}` : "";
+                    return `${singleLine(f.forward_id)} | layer=${singleLine(f.layer ?? "?")} | ${f.kind} ${singleLine(f.bind_addr)}:${f.bind_port} -> ${dst} | ${f.status}${error}`;
                 }),
             ].join("\n");
         }

@@ -5,10 +5,11 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import {
     createAgentToolkit,
@@ -616,6 +617,46 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             expect(existsSync(tokenFile)).toBe(false);
         } finally {
             if (child.exitCode === null) child.kill("SIGTERM");
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    test("filaxis-mcp --layer honors the saved target while a daemon is running", async () => {
+        const dir = makeTempDir("fx-mcp-bin-layer-");
+        const srv = new DaemonServer({ daemonDir: dir });
+        let child: ChildProcess | undefined;
+        try {
+            await srv.start();
+            const store = join(dir, "layers.json");
+            const records = Object.fromEntries(["first", "second"].map((name) => {
+                const cwd = join(dir, name);
+                mkdirSync(cwd);
+                writeFileSync(join(cwd, "marker.txt"), name);
+                return [name, { driver: "local", cwd }];
+            }));
+            writeFileSync(store, JSON.stringify(records));
+            const proc = spawn(process.execPath, ["bin/filaxis-mcp.ts", "--daemon-dir", dir, "--layer", "first"], {
+                stdio: ["pipe", "pipe", "pipe"],
+                env: { ...process.env, FILAXIS_LAYERS: store, FILAXIS_NO_DAEMON: "0" },
+                windowsHide: true,
+            });
+            child = proc;
+            const responses: Array<Record<string, unknown>> = [];
+            createInterface({ input: proc.stdout }).on("line", (line) => responses.push(JSON.parse(line)));
+            for (const [id, layer, marker] of [[1, undefined, "first"], [2, "second", "second"]] as const) {
+                proc.stdin.write(JSON.stringify({
+                    jsonrpc: "2.0", id, method: "tools/call",
+                    params: { name: "read_path", arguments: { path: "marker.txt", layer } },
+                }) + "\n");
+                expect((await waitForResponse(responses, id)).result).toMatchObject({
+                    content: [{ type: "text", text: expect.stringContaining(marker) }],
+                });
+            }
+            proc.stdin.end();
+            expect(await new Promise<number | null>((resolve) => proc.once("close", resolve))).toBe(0);
+        } finally {
+            if (child?.exitCode === null) child.kill("SIGTERM");
+            await srv.stop();
             rmSync(dir, { recursive: true, force: true });
         }
     }, 15_000);

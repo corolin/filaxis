@@ -11,18 +11,18 @@
 
 ---
 
-## 未发布
+## 0.2.13
 
-- **[DeepSeek]** SSH 的非交互子进程（命令执行、观察窗、转发、文件传输）启用 `BatchMode`：认证失败时当场报 `Permission denied`，不再无提示地挂到调用方超时。PTY 登录链保持可交互。连接被拒时错误信息附带实际读取的 SSH 配置文件，以及解析出的用户与身份文件；跳板被拒时说明 `--key` 只用于目标主机。
+- **[DeepSeek]** 非交互 SSH 及其跳板代理启用 `BatchMode`，PTY 登录链保持可交互。认证失败依据原始 SSH 输出和本地配置报告。缺少完成哨兵时保留未知终态，由调用方决定是否再次连接。
 - **[DeepSeek]** 一次性 PTY 命令（`filaxis exec --no-daemon --pty`）不再在输出结果后多等约 8 秒才退出。
 - **[DeepSeek]** `batch` 的 exec 步骤可用 `commandFile` 引用脚本文件，替代 `command`（MCP 字段名为 `command_file`）。层名支持 `*` 与 `?` 通配，按已存或已注册的层名展开，没有任何匹配时整批拒绝。CLI 新增 `--max-parallel` 与 `--no-stop-on-fail`，覆盖计划里的对应字段。
 - **[DeepSeek]** `filaxis forward list` 缺省只列仍在用的转发，`--all` 列出全部（MCP 为 `forward_list` 的 `include_closed`）。CLI JSON 与 MCP 的转发记录改用 snake_case 字段，`forwardId` 保留为兼容别名。
 - **[DeepSeek]** `filaxis exec --json` 输出单行结构化结果；文本模式的完成标记在正文排空后输出，`2>&1` 合流时位于末尾。
 - **[自挖]** 一次性模式（`--no-daemon`）按层文件里的 `driver` 加载已存层，不再把任何条目都当作 SSH 目标。
 - **[自挖]** 修复穿层转发（`-L` 经 enterPipeline 进入内层）在 `ssh <目标>` 形态的进入步骤上全部静默失效：转发建立成功，但任何连接立刻被关闭且无报错。原因是给嵌套 ssh 的命令少包一层引号，内层桥接命令在目标机上没有被执行。docker / bash 结尾形态不受影响。
-- **[自挖]** MCP 与 SDK 现在和 CLI 认同一份已存层表：`run_command` 等工具的 `layer` 参数与 `run_batch` 的层通配可以直接写 `filaxis layer save` 保存的层名，命中时尚未注册的层会自动加载（不抢默认层）。`filaxis-mcp --layer NAME` 不再报「暂不支持」，可直接绑定已存层；经 Daemon 的 MCP 同样生效。SDK：新增 `createAgentToolkit` 的 `savedLayers` 入参与 `loadLayerStore` 导出，工具集自身仍不读用户目录。
-- **[自挖]** 穿层转发的桥接子进程未送出数据就退出时，死因写入转发记录（`filaxis forward list` 与 `--json` 的 `last_error`）并记日志，不再丢弃。
-- **[自挖]** `batch` 计划里出现未知顶层字段（例如把 `layer` 写成 `layers`）时当场拒绝，不再静默忽略后落回默认层执行。
+- **[自挖]** 独立 MCP 和 Daemon 的 MCP 入口都支持按名加载 CLI 保存的层，`run_batch` 也可以按通配匹配。带 `--layer NAME` 启动的 MCP 服务以指定层为默认目标，直接运行。SDK 可用 `createAgentToolkit` 的 `savedLayers` 和导出的 `loadLayerStore` 接入同一份层表。
+- **[自挖]** 穿层执行保留 SSH 参数里的引号内容。桥接子进程启动失败或无输出即异常退出时，最近错误会显示在 CLI 和 MCP 的转发列表里。
+- **[自挖]** `batch` 会明确拒绝未知顶层字段、格式错误的层目标和重复目标。脚本文件参数仅适用于 exec 步骤。
 
 ## 0.2.12
 

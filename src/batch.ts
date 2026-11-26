@@ -404,19 +404,24 @@ export function expandLayerPattern(target: string, known: readonly string[]): st
  *   重则被当成默认层目标——静默换执行面。
  * - 不含通配的计划原样返回（同一对象引用）。
  */
-export function expandBatchLayerWildcards(plan: BatchPlan, known: readonly string[], knownLabel = "已存层"): BatchPlan {
+export function expandBatchLayerWildcards(
+    plan: BatchPlan,
+    known: readonly string[] | (() => readonly string[]),
+    knownLabel = "已存层",
+): BatchPlan {
+    if (!Array.isArray(plan.steps)) return plan;
+    let names: readonly string[] | undefined;
     const expandOne = (target: string | string[] | undefined, where: string): string | string[] | undefined => {
-        if (target === undefined) return undefined;
+        const targets = typeof target === "string" ? [target] : target;
+        if (!Array.isArray(targets) || ![...targets].every(nonEmptyString) || !targets.some(hasLayerWildcard)) return target;
+        validateLayerTarget(target, where);
+        const available = names ??= typeof known === "function" ? known() : known;
         const expandName = (name: string): string[] => {
-            if (!nonEmptyString(name)) return [name]; // 形态校验交给 validateLayerTarget
-            const hit = expandLayerPattern(name, known);
+            const hit = expandLayerPattern(name, available);
             if (hit.length === 0) {
-                // 一个层名都没有时点明「通配展开的范围」，否则 Agent 会以为层表坏了
-                const scope = known.length === 0
-                    ? `（当前没有任何${knownLabel}${knownLabel === "已注册层"
-                        ? "——这里的通配只按本会话 connect_layer 注册的层名展开，不读已存层表；要按已存层扇出请用 CLI 的 filaxis batch"
-                        : ""}）`
-                    : `（现有：${known.slice(0, 12).join("、")}${known.length > 12 ? ` 等 ${known.length} 个` : ""}）`;
+                const scope = available.length === 0
+                    ? `（当前没有任何${knownLabel}）`
+                    : `（现有：${available.slice(0, 12).join("、")}${available.length > 12 ? ` 等 ${available.length} 个` : ""}）`;
                 throw new Error(`批次计划非法：${where} 的层通配 '${name}' 未匹配任何${knownLabel}${scope}`);
             }
             return hit;
@@ -425,27 +430,19 @@ export function expandBatchLayerWildcards(plan: BatchPlan, known: readonly strin
             const hit = expandName(target);
             return hit.length === 1 ? hit[0]! : hit;
         }
-        const out: string[] = [];
-        for (const name of target) for (const h of expandName(name)) if (!out.includes(h)) out.push(h);
-        return out;
+        const out = [...new Set(targets.flatMap(expandName))];
+        return out.length === targets.length && out.every((name, i) => name === targets[i]) ? target : out;
     };
-        const sameAs = (original: string | string[] | undefined, hit: string | string[] | undefined): boolean => {
-            if (original === undefined || hit === undefined) return original === hit;
-            if (typeof original === "string" || typeof hit === "string") return original === hit;
-            return original.length === hit.length && original.every((name, i) => name === hit[i]);
-        };
-        let touched = false;
-        const layer = expandOne(plan.layer, "计划 layer");
-        if (!sameAs(plan.layer, layer)) touched = true;
-        const steps = plan.steps.map((step) => {
-            if (!step || typeof step !== "object" || step.layer === undefined) return step;
-            const hit = expandOne(step.layer, `步骤 '${step.id}' 的 layer`);
-            if (sameAs(step.layer, hit)) return step;
-            touched = true;
-            return { ...step, layer: hit } as typeof step;
-        });
-        if (!touched) return plan;
-        return { ...plan, ...(layer !== undefined ? { layer } : {}), steps };
+    const layer = expandOne(plan.layer, "计划 layer");
+    let touched = layer !== plan.layer;
+    const steps = plan.steps.map((step) => {
+        if (!step || typeof step !== "object" || step.layer === undefined) return step;
+        const hit = expandOne(step.layer, `步骤 '${step.id}' 的 layer`);
+        if (step.layer === hit) return step;
+        touched = true;
+        return { ...step, layer: hit };
+    });
+    return touched ? { ...plan, layer, steps } : plan;
 }
 
 function validateLayerTarget(value: unknown, label: string): string[] | undefined {
@@ -480,6 +477,9 @@ function validateStep(step: BatchStepWithDeps): string[] | undefined {
         throw new Error(`批次计划非法：步骤 '${step.id}' 的 ${field} ${expected}`);
     };
     const stepLayers = validateLayerTarget(step.layer, `步骤 '${step.id}' 的 layer`);
+    if (step.kind !== "exec" && "commandFile" in step && step.commandFile !== undefined) {
+        invalid("commandFile", "只支持 kind='exec'");
+    }
     if (step.after !== undefined && (!Array.isArray(step.after) || ![...step.after].every(nonEmptyString))) {
         invalid("after", "需为步骤 id 数组");
     }

@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.12"
+  version: "0.2.13"
 description: |
   Use Filaxis (@syrkos/filaxis) to run commands across layers, batch inspections, manage background jobs, follow logs, or operate on files.
   Also use it to diagnose SSH aliases and jump hosts or interpret unknown outcomes and write guarantees. Skip for simple local shell commands and tasks unrelated to Filaxis.
@@ -66,7 +66,7 @@ filaxis batch --layer "q-*" --no-stop-on-fail --request-file plan.json
 filaxis exec --layer <name> --json -- "<command>"     # single-line JSON {exitCode, effectiveUser, stdout, stderr}
 ```
 
-Run `filaxis daemon start` to share layers, forwards, and observation windows between the CLI and MCP launchers without an explicit SSH target. Use `filaxis daemon status` to inspect the daemon, `filaxis daemon stop` to stop it, or `--no-daemon` for an individual call. Manage continuous observation with `filaxis stream open/peek/close`. Manage forwarding with `filaxis forward add/list/remove` or the MCP `manage_layers` actions `forward_add`, `forward_list`, and `forward_remove`. Use the returned window or forward ID to inspect and close it. The forward list reports only forwards still in use; pass `filaxis forward list --all` or `forward_list` with `include_closed: true` to include stopped entries. Forward records use snake_case fields (`forward_id`, `bind_addr`, `bind_port`, …).
+Run `filaxis daemon start` to share layers, forwards, and observation windows between the CLI and MCP launchers started without `--host` or `--layer`. Use `filaxis daemon status` to inspect the daemon, `filaxis daemon stop` to stop it, or `--no-daemon` for an individual call. Manage continuous observation with `filaxis stream open/peek/close`. Manage forwarding with `filaxis forward add/list/remove` or the MCP `manage_layers` actions `forward_add`, `forward_list`, and `forward_remove`. Use the returned window or forward ID to inspect and close it. The forward list reports only forwards still in use. Pass `filaxis forward list --all` or `forward_list` with `include_closed: true` to include stopped entries. Forward records use snake_case fields (`forward_id`, `bind_addr`, `bind_port`, …).
 
 ---
 

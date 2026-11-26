@@ -31,7 +31,7 @@ import type {
 import {
     autonomousSshOpts, SSH_INPUT_WAIT_RE, enterStepsOf, hopLabel, rootSshSpawnArgs, cdTargetArg,
     sshArgsFor, renderExecChannel, shellQuote, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
-    describeSshIdentitySource, formatAuthFailureDiagnosis, parseJumpSpec, probeSshConnectionFailure,
+    classifySshFailure, describeSshIdentitySource, formatAuthFailureDiagnosis, parseJumpSpec,
 } from "./ssh-helpers.js";
 import { RemoteSessionManager } from "./remote-session-manager.js";
 import { SshForwardManager, type ForwardDeps, type OpenForwardSpec, type ForwardInfo, type CloseForwardResult } from "./ssh-forward.js";
@@ -626,7 +626,7 @@ export class SshPtyDriver implements RuntimeDriver {
             this.log.warn(`[SshPty] 内层 shell 已退出，层退化：${evidence}——连接仍在但已非本层环境`);
         };
 
-        this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop), connParams), this.log);
+        this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop, { interactive: true }), connParams), this.log);
         try { await this.link.handshake(`ssh ${hopLabel(rootHop)}`); }
         catch (error) { this.link.kill(); throw error; }
         for (const hop of hops) {
@@ -964,7 +964,7 @@ export class SshPtyDriver implements RuntimeDriver {
                     // **带跳板时不套这个指纹**（DSH 评估 2026-11-26 真机发现）：ProxyCommand
                     // 模式下 ssh 把自身 stderr 指向 /dev/null——跳板解析失败/认证被拒/
                     // 不可达一概是「255 + 零输出 + 秒退」，套上去就把真实原因换成一句
-                    //「疑似沙箱管道损坏、去设文件中转」（totally 答非所问）。交给下面的诊断探测
+                    //「疑似沙箱管道损坏、去设文件中转」。按收到的原始报错诊断。
                     if (!connParams?.jump && isBrokenStdioExit(code, evidence, errorOutput, Date.now() - spawnAt)) {
                         // 沙箱 stdio 管道损坏指纹（DeepSeek Harness 反馈）。**不自动重放**
                         //（Sol 78 P1-2）：首轮结果未知=远端可能已执行副作用——非幂等命令
@@ -980,17 +980,13 @@ export class SshPtyDriver implements RuntimeDriver {
                         });
                         return;
                     }
-                    finish(() => {
-                        const base = `命令未完成（无完成哨兵——通道中断/进程被信号终止，close code=${code}）${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500 字符:\n${evidence.slice(-500)}\nstderr 尾 300:\n${errorOutput.slice(-300)}`;
-                        // 诊断可能要探测 ssh 配置来源（ssh -v -G，不连网，约 100ms）——失败
-                        // 路径上多等这一下，换调用方一眼看出是跳板没密钥还是目标用户名不对。
-                        // 诊断自身出错不得吞掉原始错误（回落通用提示）
-                        void connFailureDiagnosis(rootHop, connParams, errorOutput, this.log).then((diag) => {
-                            reject(withUnknownOutcome(new Error(base + diag)));
-                        }, () => {
-                            reject(withUnknownOutcome(new Error(base + ALIAS_HINT)));
-                        });
-                    });
+                    const base = `命令未完成（无完成哨兵——通道中断/进程被信号终止，close code=${code}）${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500 字符:\n${evidence.slice(-500)}\nstderr 尾 300:\n${errorOutput.slice(-300)}`;
+                    const report = (diag: string) => finish(() => reject(withUnknownOutcome(new Error(base + diag))));
+                    if (code !== 255 || evidence.length > 0) {
+                        report("");
+                        return;
+                    }
+                    void connFailureDiagnosis(rootHop, connParams, errorOutput, this.log).then(report, () => report(ALIAS_HINT));
                     return;
                 }
                 // 哨兵在场：退出码以哨兵为准（code===null 的信号杀竞态也不伪 0）
@@ -1111,68 +1107,38 @@ function withSshLines(diag: string, lines: string[] | undefined): string {
 const jumpLabelOf = (js: { host: string; user?: string; port?: number }): string =>
     `${js.user ? `${js.user}@` : ""}${js.host}${js.port ? `:${js.port}` : ""}`;
 
-/** 连接层失败诊断（DSH 评估 2026-11-26 #1b）：通用提示对「跳板被拒」答非所问——
- *  --key 只给目标主机，跳板的凭据取自 ssh 配置。按角色（跳板/目标）与类别（认证/解析/
- *  不可达）给专属说明，并实测配置来源（ssh -v -G，不连网）。
- *  **带跳板的静默失败走诊断探测**（真机发现）：ProxyCommand 模式下 ssh 把自身 stderr
- *  指向 /dev/null——跳板解析失败/认证被拒/不可达一概是「255 + 零输出」，通用提示与
- *  沙箱管道指纹都在猜。失败后主动重放一次连接把真实原因带回。 */
+/** 根据原始 SSH 报错定位连接阶段。需要补充凭据来源时只读取本地 SSH 配置。 */
 async function connFailureDiagnosis(rootHop: SshHop, connParams: SshConnParams | undefined, errorOutput: string, logger: FilaxisLogger): Promise<string> {
-    const connFail = /Could not resolve hostname|Connection (timed out|refused|closed)|Permission denied|Host key verification failed|no route to host/i.test(errorOutput);
-    // ssh 没留下任何报错：只在带跳板时才需要（也才值得）诊断
-    const silent = errorOutput.trim() === "";
     const jump = connParams?.jump;
-    if (!connFail && !(silent && jump)) return "";
     try {
-        if (jump) {
-            const js = parseJumpSpec(jump);
-            const label = jumpLabelOf(js);
-            const jumpSource = () => describeSshIdentitySource(
-                { host: js.host, conn: { user: js.user, port: js.port, keyFile: js.keyFile, hostKeyPolicy: connParams?.hostKeyPolicy, knownHostsFile: connParams?.knownHostsFile } }, logger);
-            // 跳板进程的拒绝行写作 `<解析后的用户>@<跳板 host>: Permission denied`——按 host 锚定
-            if (errorOutput.includes(`${js.host}: Permission denied`)) {
-                return formatAuthFailureDiagnosis({ role: "jump", label, userGiven: js.user != null, source: await jumpSource() });
-            }
-            if (silent || !/Permission denied/i.test(errorOutput)) {
-                const probe = await probeSshConnectionFailure(rootHop, connParams, logger);
-                if (probe) {
-                    const { stage, kind, lines } = probe.verdict;
-                    if (stage === "jump") {
-                        if (kind === "auth" || kind === "resolve" || kind === "unreachable") {
-                            return formatAuthFailureDiagnosis({
-                                role: "jump", label, userGiven: js.user != null, kind,
-                                source: kind === "unreachable" ? null : await jumpSource(), sshLines: lines,
-                            });
-                        }
-                        return withSshLines("\n[跳板连接失败] ssh 在跳板段报错（见下）——核对跳板的连接参数与 ssh 配置。", lines);
-                    }
-                    if (stage === "target") {
-                        const target = typeof rootHop === "string" ? rootHop : rootHop.host;
-                        const targetLabel = `${target}${connParams?.port ? `:${connParams.port}` : ""}`;
-                        if (kind === "auth" || kind === "resolve" || kind === "unreachable") {
-                            return formatAuthFailureDiagnosis({
-                                role: "target", label: targetLabel, kind,
-                                userGiven: target.includes("@") || Boolean(connParams?.user),
-                                keyFile: kind === "auth" ? connParams?.keyFile : undefined,
-                                source: await describeSshIdentitySource(rootHop, logger), sshLines: lines,
-                            });
-                        }
-                        return withSshLines(`\n[目标连接失败] 跳板 \`${label}\` 已连通，ssh 在目标段报错（见下）。`, lines);
-                    }
-                    if (probe.exitCode === 0) {
-                        return "\n[连接诊断] 用同样的连接参数重放连接成功（远端只执行了 true）——此前的失败不是连接配置问题（瞬时网络/对端负载）。此前那次命令的远端执行结果仍未知，核实后再决定是否重发。";
-                    }
-                }
-            }
+        const js = jump ? parseJumpSpec(jump) : undefined;
+        const { stage, kind, lines } = classifySshFailure(errorOutput, js?.host ?? null);
+        if (stage === "none") {
+            return js && !errorOutput.trim()
+                ? "\n[SSH] 跳板连接未返回诊断输出，失败位置无法确认。"
+                : "";
         }
-        if (!/Permission denied/i.test(errorOutput)) return ALIAS_HINT;
+        if (js && stage === "jump") {
+            const label = jumpLabelOf(js);
+            if (kind !== "auth" && kind !== "resolve" && kind !== "unreachable") {
+                return withSshLines("\n[跳板连接失败] ssh 在跳板段报错。", lines);
+            }
+            const source = kind === "auth" ? await describeSshIdentitySource(
+                { host: js.host, conn: { user: js.user, port: js.port, keyFile: js.keyFile } }, logger) : null;
+            return formatAuthFailureDiagnosis({
+                role: "jump", label, userGiven: js.user != null, kind, source, sshLines: lines,
+            });
+        }
+        if (kind !== "auth" && (!js || kind !== "resolve")) return withSshLines(ALIAS_HINT, lines);
         const target = typeof rootHop === "string" ? rootHop : rootHop.host;
         return formatAuthFailureDiagnosis({
             role: "target",
             label: `${target}${connParams?.port ? `:${connParams.port}` : ""}`,
             userGiven: target.includes("@") || Boolean(connParams?.user),
-            keyFile: connParams?.keyFile,
-            source: await describeSshIdentitySource(rootHop, logger),
+            kind,
+            keyFile: kind === "auth" ? connParams?.keyFile : undefined,
+            source: kind === "auth" ? await describeSshIdentitySource(rootHop, logger) : null,
+            sshLines: lines,
         });
     } catch {
         return ALIAS_HINT;

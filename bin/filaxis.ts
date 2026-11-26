@@ -347,7 +347,13 @@ function savedLayerDriver(name: string, layers: Record<string, RuntimeDescriptor
     // `layer save --host` 产生（SSH），但层文件可被手改：这里曾无条件包成 SshPtyDriver
     //——非 SSH 条目（driver:"local"）会变成对空主机名的 ssh 连接（落到 localhost 的 sshd）
     if (descriptor.driver === "ssh") return new SshPtyDriver(descriptor, { logger: sshLogger });
-    if (descriptor.driver === "local") return new LocalRuntimeDriver(descriptor.cwd ? { cwd: descriptor.cwd } : undefined);
+    if (descriptor.driver === "local") {
+        const shell = descriptor.config?.shell;
+        return new LocalRuntimeDriver({
+            cwd: descriptor.cwd,
+            shell: typeof shell === "string" ? shell : undefined,
+        });
+    }
     throw new Error(`层 '${name}' 的 driver '${descriptor.driver}' 在一次性模式（--no-daemon）下不可用——去掉 --no-daemon 经 Daemon 执行`);
 }
 
@@ -552,26 +558,15 @@ async function printExecResult(r: { stdout: string; stderr: string; exitCode: nu
     if (json) {
         console.log(JSON.stringify({ exitCode: r.exitCode, effectiveUser: r.effectiveUser ?? null, stdout: r.stdout, stderr: r.stderr }));
     } else {
-        process.stdout.write(r.stdout);
+        if (r.stdout) {
+            await new Promise<void>((done, reject) => {
+                process.stdout.write(r.stdout, (error) => error ? reject(error) : done());
+            });
+        }
         if (r.stderr) process.stderr.write(r.stderr);
-        await drainStdout();
         console.error(`\n[exit=${r.exitCode} user=${r.effectiveUser ?? "?"}]`);
     }
     process.exitCode = r.exitCode;
-}
-
-/** 等 stdout 排空：没有待写数据直接返回；有则空写一次——回调排在其后，正文全部
- *  落地才触发。空写在个别运行时不回调也不能挂住（2s 上限，且不拖住进程退出） */
-function drainStdout(): Promise<void> {
-    const pending = (process.stdout as { writableLength?: number }).writableLength;
-    if (pending === 0) return Promise.resolve();
-    return new Promise<void>((done) => {
-        let settled = false;
-        const finish = (): void => { if (!settled) { settled = true; done(); } };
-        const cap = setTimeout(finish, 2000);
-        cap.unref?.();
-        process.stdout.write("", () => { clearTimeout(cap); finish(); });
-    });
 }
 
 function printBatchReport(r: BatchReport): void {
@@ -635,6 +630,7 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
     } catch (e) {
         throw new Error(`batch 计划 JSON 解析失败: ${(e as Error).message}`);
     }
+    let saved: Record<string, RuntimeDescriptor> | undefined;
     if (o.layer && plan && typeof plan === "object" && !Array.isArray(plan) && plan.layer === undefined) {
         plan = { ...plan, layer: o.layer };
     }
@@ -646,11 +642,11 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
         if (o.noStopOnFail) plan = { ...plan, stopOnFail: false };
         // 层通配（"q-*"）按已存层名展开——只在此入口做：内核的层解析只认具体名。
         // 无匹配即拒绝（把 "q-*" 原样交下去会被当成一个不存在的层名）
-        plan = expandBatchLayerWildcards(plan, Object.keys(loadLayerStore()), "已存层");
+        plan = expandBatchLayerWildcards(plan, () => Object.keys(saved ??= loadLayerStore()), "已存层");
     }
     if (daemon) {
         const savedLayers = Object.fromEntries(
-            Object.entries(loadLayerStore()).map(([name, descriptor]) => [name, resolveDaemonSshPaths(descriptor)]),
+            Object.entries(saved ??= loadLayerStore()).map(([name, descriptor]) => [name, resolveDaemonSshPaths(descriptor)]),
         );
         const target = !o.layer ? buildCliTargetSpec(o) : undefined;
         const resolvedPlan: BatchPlan = (plan && typeof plan === "object" && !Array.isArray(plan) && Array.isArray(plan.steps))
@@ -670,7 +666,6 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
         return;
     }
     const drivers = new Map<string | undefined, RuntimeDriver>();
-    let saved: Record<string, RuntimeDescriptor> | undefined;
     try {
         const r = await runBatch(async (name) => {
             const existing = drivers.get(name);

@@ -517,7 +517,7 @@ export class DaemonServer {
                 }
                 // commandFile（exec 步骤引用的脚本文件，DSH 评估 2026-11-26 #6）同款按调用方
                 // 工作目录解析——Daemon 进程自己的工作目录与 CLI 调用方无关
-                if (step && typeof step === "object" && step.kind === "exec" && typeof step.commandFile === "string") {
+                if (step && typeof step === "object" && step.kind === "exec" && typeof step.commandFile === "string" && step.commandFile.trim()) {
                     return { ...step, commandFile: this.resolveClientLocalPath(step.commandFile, clientCwd) };
                 }
                 return step;

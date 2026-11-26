@@ -265,8 +265,8 @@ describe("MCP Server（REQ-0003）", () => {
                 structuredContent: { status: "ok", steps: [{ layer: "first", stdout: "from first" }, { layer: "second", stdout: "from second" }] },
             });
             expect(calls).toEqual(["first:one", "second:two"]);
-            steps[1]!.layer = "missing";
-            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "run_batch", arguments: { layer: "first", steps } } });
+            const missingLayerSteps = [steps[0], { ...steps[1], layer: "missing" }];
+            f.write({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "run_batch", arguments: { layer: "first", steps: missingLayerSteps } } });
             expect((await waitId(f, 2)).result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("missing") }] });
             expect(calls).toHaveLength(2);
             const typo = { id: "typo", kind: "exec", command: "no", layre: "second" };
