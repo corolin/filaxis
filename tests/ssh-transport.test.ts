@@ -53,19 +53,19 @@ describe("ssh-helpers", () => {
         expect(sshArgsFor({ host: "192.0.2.10", conn: { user: "root", port: 2222, jump: "jump", keyFile: "~/id_ed", forwards: [{ kind: "L", port: 8080, target: "localhost:80" }] } }))
             .toEqual([
                 // ProxyCommand 等价形态（跳板白名单+sh 引用+策略随主连接——Astra 十一轮 #1/#2）
-                "-o", `ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -W %h:%p ${proxyHost("jump")}`,
+                "-o", `ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -W %h:%p ${proxyHost("jump")}`,
                 "-i", expect.any(String), "-p", "2222", "-L", "8080:localhost:80", "root@192.0.2.10",
             ]);
         // 跳板串 [host]:port / host:port / user@[host]:port → 命令行 -p 展开（引用包裹）
         expect(sshArgsFor({ host: "t", conn: { jump: "[127.0.0.1]:2222" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("127.0.0.1")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("127.0.0.1")}`);
         expect(sshArgsFor({ host: "t", conn: { jump: "root@h:2222" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("root@h")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2222 -W %h:%p ${proxyHost("root@h")}`);
         expect(sshArgsFor({ host: "t", conn: { jump: "u@[198.51.100.9]:2200" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("u@198.51.100.9")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("u@198.51.100.9")}`);
         // IPv6 字面量
         expect(sshArgsFor({ host: "t", conn: { jump: "[::1]:2200" } })[1])
-            .toBe(`ProxyCommand=ssh -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("::1")}`);
+            .toBe(`ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2200 -W %h:%p ${proxyHost("::1")}`);
     });
 
     // GPT Astra 十一轮 #1：jump 原文拼入经 shell 执行的 ProxyCommand = 命令注入入口。
@@ -111,7 +111,7 @@ describe("ssh-helpers", () => {
             hostKeyPolicy: "strict",
             knownHostsFile: "C:\\SSH data\\known_hosts",
         } });
-        expect(args[1]).toBe('ProxyCommand=ssh -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=\\"C:/SSH data/known_hosts\\"" -i "C:\\SSH data\\id_jump" -W %h:%p jump.example');
+        expect(args[1]).toBe('ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=\\"C:/SSH data/known_hosts\\"" -i "C:\\SSH data\\id_jump" -W %h:%p jump.example');
     });
 
     // GPT Astra 十一轮 #3：多跳逗号链显式拒绝（旧 -J 直传时跳板策略裸奔）——指引 sshInto
@@ -269,6 +269,11 @@ describe("ssh-helpers", () => {
         if (r2.kind === "ok") {
             expect(r2.remoteArgs).toEqual(["ssh", "remote-vm", "-p", "2222", "sh", "-s", "sh", "-s"]); // -tt 剥除
         }
+        const quoted = renderExecChannel([{ cmd: "ssh -t -i '/tmp/key  -t name' remote-vm" }], "x", { marker: "M", nonceWrapped: "( x )" });
+        expect(quoted).toMatchObject({
+            kind: "ok",
+            remoteArgs: ["ssh", "-i", "'/tmp/key  -t name'", "remote-vm", "sh", "-s", "sh", "-s"],
+        });
     });
 
     // 多层 enter（用户实测实锤）：旧形态全层塞 argv——第一层 sh -s 吞掉脚本、后续层
@@ -1604,4 +1609,228 @@ describe("Sol 90：PTY 自然退出快速感知", () => {
         expect(e?.message).toMatch(/断开|断链/);
         expect(Date.now() - t0).toBeLessThan(3_000); // 修前：ready 不翻 false——干等到 5s 超时
     }, 15_000);
+});
+
+// ---------------------------------------------------------------------------
+// DSH + GLM-5.4 使用评估（2026-11-26）：非交互 BatchMode / 认证诊断 / mux 哈希锚点
+// ---------------------------------------------------------------------------
+describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
+    /** [-o, 值, -o, 值…] → ["-o 值", …] */
+    const pairs = (opts: string[]) => opts.filter((_, i) => i % 2 === 0).map((k, j) => `${k} ${opts[j * 2 + 1]}`);
+
+    test("非交互子进程缺省 BatchMode=yes；PTY 登录链（root attach / hop 登录）不带", async () => {
+        const h = await import("../src/ssh-helpers.js");
+        // exec 通道 / 观察窗 / 转发 / 文件传输都从这一处取选项——无终端的 ssh 遇到口令提示
+        // 应答不了，让它当场失败而不是零输出挂到调用方超时
+        expect(pairs(h.autonomousSshOpts())).toContain("-o BatchMode=yes");
+        expect(pairs(h.autonomousSshOpts({ hostKeyPolicy: "strict", knownHostsFile: "~/.ssh/kh" }))).toContain("-o BatchMode=yes");
+        expect(pairs(h.autonomousSshOpts(undefined, { interactive: true }))).not.toContain("-o BatchMode=yes");
+        // PTY 登录链：-tt 强制终端，提示会回显进 PTY——保留交互（不加 BatchMode）
+        const root = h.rootSshSpawnArgs(["root@example.invalid"]);
+        expect(root[0]).toBe("-tt");
+        expect(root.includes("BatchMode=yes")).toBe(false);
+        const withJump = { host: "target", conn: { jump: "jump" } };
+        expect(h.sshArgsFor(withJump)[1]).toContain("BatchMode=yes");
+        expect(h.sshArgsFor(withJump, { interactive: true })[1]).not.toContain("BatchMode");
+        const hopCmd = h.hopSshCommand({ host: "example.invalid", conn: { user: "root" } });
+        expect(hopCmd.startsWith("ssh ")).toBe(true);
+        expect(hopCmd).not.toContain("BatchMode");
+    });
+
+    test("mux socket 目录名哈希锚点（参数间以 NUL 分隔——防拼接歧义）", async () => {
+        const { muxSocketPath } = await import("../src/ssh-helpers.js");
+        const os = await import("node:os");
+        const path = await import("node:path");
+        const fs = await import("node:fs");
+        const d = path.join(os.tmpdir(), "fx-mux-anchor");
+        try {
+            const tail = (args: string[]) => muxSocketPath(args, d).split(/[\\/]/).pop();
+            // v0.2.12 发布版的取值：分隔符当时是字符串字面量里的真 NUL 字节（补丁事故），
+            // 现为转义序列——运行时字符串不变，哈希逐项相同
+            expect(tail(["root@h", "-i", "k"])).toBe("cm-19f1562a3ad5d1a4");
+            expect(tail(["-p", "22", "u@h"])).toBe("cm-9d6035f41ff0fc39");
+            expect(tail(["a"])).toBe("cm-ca978112ca1bbdca");
+            expect(tail(["ab", "c"])).toBe("cm-6c032e631d39a14d");
+            expect(tail(["a", "bc"])).toBe("cm-40bb547d936bbd31"); // 与 ["ab","c"] 不同：NUL 分隔的意义
+        } finally {
+            fs.rmSync(d, { recursive: true, force: true });
+        }
+    });
+
+    test.skipIf(!Bun.which("ssh"))("describeSshIdentitySource：本地 ssh -v -G 解析（不连网）给出用户/主机/端口与身份文件在场情况", async () => {
+        const { describeSshIdentitySource } = await import("../src/ssh-helpers.js");
+        const src = await describeSshIdentitySource("localhost");
+        expect(src).not.toBeNull();
+        expect(src!.hostname).toBe("localhost");
+        expect(src!.port).toMatch(/^\d+$/);
+        expect(src!.user.length).toBeGreaterThan(0);
+        expect(src!.identityFiles.every((f) => typeof f.path === "string" && typeof f.exists === "boolean")).toBe(true);
+        expect(Array.isArray(src!.configFiles)).toBe(true);
+        // 探测自身失败返回 null（诊断不得掩盖原始错误）：非法主机名（前导 -）与 ssh 拒绝的参数
+        expect(await describeSshIdentitySource("-bad-host")).toBeNull();
+    }, 20_000);
+
+    test("formatAuthFailureDiagnosis：跳板角色点明 --key 不传给跳板并给三条出路；无在场身份文件时点破", async () => {
+        const { formatAuthFailureDiagnosis } = await import("../src/ssh-helpers.js");
+        const mk = (exists: boolean) => ({
+            configFiles: ["C:/Users/u/.ssh/config"], user: "root", hostname: "10.0.0.1", port: "22",
+            identityFiles: [{ path: "~/.ssh/id_ed25519", exists }, { path: "~/.ssh/id_rsa", exists: false }],
+        });
+        const jumpNoKey = formatAuthFailureDiagnosis({ role: "jump", label: "root@10.0.0.1", userGiven: true, source: mk(false) });
+        expect(jumpNoKey).toContain("[跳板认证失败]");
+        expect(jumpNoKey).toContain("跳板 `root@10.0.0.1`");
+        expect(jumpNoKey).toContain("--key 只用于目标主机，不会传给跳板");
+        expect(jumpNoKey).toContain("实际读取的配置文件：C:/Users/u/.ssh/config");
+        expect(jumpNoKey).toContain("解析为：user=root hostname=10.0.0.1 port=22");
+        expect(jumpNoKey).not.toContain("未显式指定"); // 给了用户名就不啰嗦
+        expect(jumpNoKey).toContain("没有任何在场的身份文件");
+        expect(jumpNoKey).toContain("①");
+        expect(jumpNoKey).toContain("②");
+        expect(jumpNoKey).toContain("③");
+        // 目标角色：在场的与缺席的分开列（缺席的折叠计数）；--key 文件不在场要点破
+        const target = formatAuthFailureDiagnosis({ role: "target", label: "root@10.0.0.1", userGiven: false, keyFile: "D:/keys/absent", source: mk(true) });
+        expect(target).toContain("[目标认证失败]");
+        expect(target).toContain("在场的身份文件：~/.ssh/id_ed25519");
+        expect(target).toContain("另有 1 个身份文件不存在：~/.ssh/id_rsa");
+        expect(target).not.toContain("没有任何在场的身份文件");
+        expect(target).toContain("未显式指定");
+        expect(target).toContain("--key：D:/keys/absent（文件不存在！）");
+        expect(target).not.toContain("出路"); // 出路三条是跳板专属
+        // 探测失败：只留不依赖来源的说明，不崩
+        const degraded = formatAuthFailureDiagnosis({ role: "jump", label: "j", userGiven: false, source: null });
+        expect(degraded).toContain("[跳板认证失败]");
+        expect(degraded).not.toContain("实际读取的配置文件");
+        expect(degraded).not.toContain("没有任何在场的身份文件"); // 来源未知时不下这个结论
+    });
+
+    test.skipIf(!Bun.which("ssh"))("connFailureDiagnosis：按被拒的角色分流；非认证类连接失败保持通用提示", async () => {
+        const { __testConnFailureDiagnosis } = await import("../src/ssh-pty-driver.js");
+        const { noopLogger } = await import("../src/logger.js");
+        const conn = { jump: "root@jump.example.invalid" } as never;
+        const jumpDenied = await __testConnFailureDiagnosis("root@target.example.invalid", conn,
+            "root@jump.example.invalid: Permission denied (publickey).\n\nConnection closed by UNKNOWN port 65535\n", noopLogger);
+        expect(jumpDenied).toContain("[跳板认证失败]");
+        expect(jumpDenied).toContain("跳板 `root@jump.example.invalid`");
+        // 目标被拒（跳板正常）：目标角色，不误判成跳板
+        const targetDenied = await __testConnFailureDiagnosis("root@target.example.invalid", conn,
+            "root@target.example.invalid: Permission denied (publickey,password).\n", noopLogger);
+        expect(targetDenied).toContain("[目标认证失败]");
+        expect(targetDenied).not.toContain("[跳板认证失败]");
+        // 不带跳板的解析失败：ssh 的报错可见，保持通用提示（不附认证类诊断）
+        const plainUnresolved = await __testConnFailureDiagnosis("root@target.example.invalid", undefined,
+            "ssh: Could not resolve hostname target.example.invalid: No such host is known.\n", noopLogger);
+        expect(plainUnresolved).toContain("[连接层失败]");
+        expect(plainUnresolved).not.toContain("认证失败");
+        // 报告原始失败的位置，保留目标的错误行。
+        const unresolved = await __testConnFailureDiagnosis("root@target.example.invalid", conn,
+            "ssh: Could not resolve hostname target.example.invalid: No such host is known.\n", noopLogger);
+        expect(unresolved).toContain("[目标无法解析]");
+        expect(unresolved).toContain("Could not resolve hostname target.example.invalid");
+        const silent = await __testConnFailureDiagnosis("root@target.example.invalid", conn, "", noopLogger);
+        expect(silent).toContain("失败位置无法确认");
+        // 与连接层无关的输出：不附诊断
+        expect(await __testConnFailureDiagnosis("h", undefined, "some other failure output", noopLogger)).toBe("");
+    }, 60_000);
+});
+
+// DSH 评估 2026-11-26 #4：exec --no-daemon --pty 稳定 8.1s——结果早已打印，进程却等握手
+// 竞速的 8s 定时器到期才退（CLI 不调 process.exit，靠事件循环排空退出）。
+describe("DSH 评估 2026-11-26 #4：一次性 PTY 进程不被握手定时器拖住", () => {
+    test.skipIf(!Bun.which("ssh"))("握手结束后进程随事件循环排空退出（不留 8s 竞速定时器）", async () => {
+        const os = await import("node:os");
+        const path = await import("node:path");
+        const fs = await import("node:fs");
+        const { pathToFileURL } = await import("node:url");
+        const d = fs.mkdtempSync(path.join(os.tmpdir(), "fx-oneshot-"));
+        const script = path.join(d, "oneshot.ts");
+        const modUrl = pathToFileURL(path.join(process.cwd(), "src", "ssh-pty-driver.ts")).href;
+        fs.writeFileSync(script, [
+            `const { __testPtyLink } = await import(${JSON.stringify(modUrl)});`,
+            "const link = new __testPtyLink();",
+            "try { await link.attach(['-V']); await link.handshake('oneshot'); } catch { /* ssh -V 即退：握手按预期失败 */ }",
+            "console.log('HANDSHAKE_DONE');",
+            "// 刻意不调 process.exit：与 CLI 一次性进程一致，靠事件循环排空退出",
+            "",
+        ].join("\n"));
+        try {
+            const t0 = Date.now();
+            const p = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "pipe", windowsHide: true });
+            const [out, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+            const elapsed = Date.now() - t0;
+            expect(out).toContain("HANDSHAKE_DONE");
+            expect(code).toBe(0);
+            // 修前：握手后进程被拖到 attach+8s 才退（真机 8360ms；修后 1187ms）
+            expect(elapsed).toBeLessThan(6_000);
+        } finally {
+            fs.rmSync(d, { recursive: true, force: true });
+        }
+    }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// DSH 评估 2026-11-26（真机发现）：带跳板时 ssh 把代理进程的 stderr 指向 /dev/null——
+// 跳板段的任何失败都是「255 + 零输出」。诊断探测带 -v 重放把报错带回后，按报错行
+// 判定失败发生在哪一段。
+// ---------------------------------------------------------------------------
+describe("DSH 评估 2026-11-26：ssh 报错行归属判定（classifySshFailure）", () => {
+    test("跳板被拒：不带主机的重试提示排在前面时，仍归到跳板段", async () => {
+        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        // 真机实录（vm-homelab，跳板 nosuchuser@127.0.0.1:3322）：首版只看第一条报错行——
+        // 「Permission denied, please try again.」不带主机名，被归给了目标
+        const v = classifySshFailure([
+            "OpenSSH_10.0p2 Debian-7+deb13u4, OpenSSL 3.5.9 29 Sep 2026",
+            "debug1: Offering public key: /root/.ssh/id_ed25519 ED25519 SHA256:…",
+            "Permission denied, please try again.",
+            "nosuchuser@127.0.0.1: Permission denied (publickey,password).",
+            "kex_exchange_identification: Connection closed by remote host",
+            "Connection closed by UNKNOWN port 65535",
+        ].join("\n"), "127.0.0.1");
+        expect(v.stage).toBe("jump");
+        expect(v.kind).toBe("auth");
+        expect(v.lines).toContain("nosuchuser@127.0.0.1: Permission denied (publickey,password).");
+        expect(v.lines[0]).toBe("Permission denied, please try again.");
+        expect(v.lines.some((l) => l.startsWith("debug1:"))).toBe(false); // debug 前缀已剥； Offering 之类的进度行不带回
+    });
+
+    test("跳板别名解析不出 / 跳板端口不通：归跳板段，类别分别为 resolve / unreachable", async () => {
+        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        const unresolved = classifySshFailure(
+            "debug1: Reading configuration data /root/.ssh/config\nssh: Could not resolve hostname no-such-alias-xyz: Name or service not known\nkex_exchange_identification: Connection closed by remote host\n",
+            "no-such-alias-xyz",
+        );
+        expect(unresolved.stage).toBe("jump");
+        expect(unresolved.kind).toBe("resolve");
+        expect(unresolved.lines).toEqual([
+            "ssh: Could not resolve hostname no-such-alias-xyz: Name or service not known",
+            "kex_exchange_identification: Connection closed by remote host",
+        ]);
+        const refused = classifySshFailure("ssh: connect to host 127.0.0.1 port 9: Connection refused\r\nConnection closed by UNKNOWN port 65535\r\n", "127.0.0.1");
+        expect(refused.stage).toBe("jump");
+        expect(refused.kind).toBe("unreachable");
+        expect(refused.lines).toHaveLength(2); // CRLF 归一后仍是两行
+    });
+
+    test("跳板已连通、目标被拒：归目标段；无跳板时一律目标段", async () => {
+        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        const targetDenied = classifySshFailure("nosuchuser@localhost: Permission denied (publickey,password).\n", "127.0.0.1");
+        expect(targetDenied.stage).toBe("target");
+        expect(targetDenied.kind).toBe("auth");
+        // 「Connection closed by remote host」不带具体主机——不点名跳板
+        const kex = classifySshFailure("kex_exchange_identification: Connection closed by remote host\n", "jump.example");
+        expect(kex.stage).toBe("target");
+        expect(kex.kind).toBe("unreachable");
+        expect(classifySshFailure("root@h: Permission denied (publickey).\n", null).stage).toBe("target");
+        // 跳板与目标同名：第一条点名行即失败点（跳板段先失败）
+        expect(classifySshFailure("u@same: Permission denied (publickey).\n", "same").stage).toBe("jump");
+    });
+
+    test("没有可判读的报错行：stage=none（连接探测成功时不附误导诊断）；最多带回 8 行", async () => {
+        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        const ok = classifySshFailure("debug1: Authentication succeeded (publickey).\ndebug1: channel 0: new session\n", "j");
+        expect(ok).toEqual({ stage: "none", kind: null, lines: [] });
+        const many = classifySshFailure(Array.from({ length: 20 }, (_, i) => `h${i}: Permission denied (publickey).`).join("\n"), "j");
+        expect(many.lines).toHaveLength(8);
+        const hostkey = classifySshFailure("root@h: Host key verification failed.\n", "j");
+        expect(hostkey.kind).toBe("hostkey");
+    });
 });

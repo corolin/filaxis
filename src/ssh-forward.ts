@@ -56,6 +56,73 @@ export interface CloseForwardResult {
     detail?: string;
 }
 
+/** 转发是否仍承载流量（DSH 评估 2026-11-26 #5a）。已停止/已退出的条目只是墓碑——
+ *  留在表里是给 closeForward 做幂等判定（already_closed）的，列表类查询默认不该再
+ *  把它们当作在用的转发报出来。status=unknown 是「终止未确认」，不能当已停隐藏。 */
+export function isForwardActive(info: Pick<ForwardInfo, "status">): boolean {
+    return info.status !== "stopped" && info.status !== "exited";
+}
+
+/**
+ * 对外转发记录（CLI --json 与 MCP 结果；DSH 评估 2026-11-26 #5b）：snake_case——
+ * 与工具参数（forward_id、bind_addr…）和流观察窗的 window_id 同一命名风格。
+ * SDK 类型 ForwardInfo 保持驼峰不动。
+ */
+export interface PublicForwardInfo {
+    forward_id: string;
+    /** 兼容别名（将移除）——请读 forward_id */
+    forwardId: string;
+    layer?: string;
+    kind: DynamicForwardKind;
+    bind_addr: string;
+    bind_port: number;
+    target_host?: string;
+    target_port?: number;
+    transport_mode: ForwardTransportMode;
+    status: ForwardStatus;
+    created_at: number;
+    pid?: number;
+    exit_code?: number | null;
+    last_error?: string;
+}
+
+export interface PublicCloseForwardResult {
+    forward_id: string;
+    /** 兼容别名（将移除）——请读 forward_id */
+    forwardId: string;
+    status: CloseForwardResult["status"];
+    detail?: string;
+}
+
+export function forwardInfoToPublic(info: ForwardInfo): PublicForwardInfo {
+    return {
+        forward_id: info.forwardId,
+        forwardId: info.forwardId,
+        ...(info.layer !== undefined ? { layer: info.layer } : {}),
+        kind: info.kind,
+        bind_addr: info.bindAddr,
+        bind_port: info.bindPort,
+        ...(info.targetHost !== undefined ? { target_host: info.targetHost } : {}),
+        ...(info.targetPort !== undefined ? { target_port: info.targetPort } : {}),
+        transport_mode: info.transportMode,
+        status: info.status,
+        created_at: info.createdAt,
+        ...(info.pid !== undefined ? { pid: info.pid } : {}),
+        ...(info.exitCode !== undefined ? { exit_code: info.exitCode } : {}),
+        ...(info.lastError !== undefined ? { last_error: info.lastError } : {}),
+    };
+}
+
+/** closeForward 结果的对外投影（同 forwardInfoToPublic） */
+export function closeForwardResultToPublic(res: CloseForwardResult): PublicCloseForwardResult {
+    return {
+        forward_id: res.forwardId,
+        forwardId: res.forwardId,
+        status: res.status,
+        ...(res.detail !== undefined ? { detail: res.detail } : {}),
+    };
+}
+
 export interface NormalizedForwardSpec {
     kind: DynamicForwardKind;
     flag: "-L" | "-R" | "-D";
@@ -797,10 +864,16 @@ export class SshForwardManager {
                 socket.destroy();
                 return;
             }
+            const reportFailure = (message: string): void => {
+                if (entry.closing) return;
+                entry.info.lastError = message;
+                this.log.warn(`[filaxis] 转发 ${entry.info.forwardId} ${message}`);
+            };
             let child: ChildProcess;
             try {
                 child = this.deps.spawnBridge(bridgeArgv);
-            } catch {
+            } catch (error) {
+                reportFailure(`穿层桥接子进程启动失败: ${error instanceof Error ? error.message : String(error)}`);
                 socket.destroy();
                 return;
             }
@@ -818,15 +891,48 @@ export class SshForwardManager {
 
             socket.on("error", teardownConn);
             socket.once("close", teardownConn);
-            child.once("error", teardownConn);
+            let childError = false;
+            child.once("error", (error) => {
+                childError = true;
+                reportFailure(`穿层桥接子进程异常: ${error.message}`);
+                teardownConn();
+            });
             child.once("close", () => {
                 bridgeConns.delete(conn);
                 teardownConn();
             });
             child.stdin?.on("error", teardownConn);
             child.stdout?.on("error", teardownConn);
-            child.stderr?.on("data", () => undefined);
+            // 桥接子进程的 stderr 不是数据面（不进隧道），但也不能丢：内层连不上
+            // 目标端口、桥工具启动失败等原因全写在这里。真机排查时连接只会「立刻
+            // 断开、零报错」，死因只能手工复现 spawn 才看得见。留尾部一段，子进程
+            // 没送出任何数据就退出时记日志并挂到转发记录上。
+            let relayedBytes = 0;
+            let stderrTail = "";
+            child.stdout?.on("data", (d: Buffer) => { relayedBytes += d.length; });
+            child.stderr?.on("data", (d: Buffer) => {
+                stderrTail = (stderrTail + d.toString("utf-8")).slice(-2048);
+            });
             child.stderr?.on("error", () => undefined);
+            const bridgeDied = (code: number | null, signal: NodeJS.Signals | null): string => {
+                const why = stderrTail.trim().split(/\r?\n/).filter(Boolean).slice(-4).join(" | ");
+                return `穿层桥接子进程未送出数据即退出 (code=${code ?? signal})${why ? `: ${why}` : ""}`;
+            };
+            child.once("close", (code, signal) => {
+                if (entry.closing || childError || relayedBytes > 0) return;
+                if (teardownStarted && signal !== null && !stderrTail.trim()) return;
+                const failed = code !== 0 || signal !== null;
+                if (code === 0 && signal === null && !stderrTail.trim()) {
+                    // 客户端连上不发数据就断开也会走到这里，不当作故障
+                    this.log.debug(`[filaxis] 转发 ${entry.info.forwardId} ${bridgeDied(code, signal)}`);
+                    return;
+                }
+                if (failed) reportFailure(bridgeDied(code, signal));
+                else {
+                    entry.info.lastError = bridgeDied(code, signal);
+                    this.log.info(`[filaxis] 转发 ${entry.info.forwardId} ${entry.info.lastError}`);
+                }
+            });
 
             if (child.stdin) socket.pipe(child.stdin);
             if (child.stdout) child.stdout.pipe(socket);

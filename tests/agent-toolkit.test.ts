@@ -1668,3 +1668,93 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         }
     }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// DSH + GLM-5.4 使用评估（2026-11-26）#6：run_batch 的 command_file 与层通配
+// ---------------------------------------------------------------------------
+describe("run_batch：command_file 与层通配（DSH 评估 2026-11-26 #6）", () => {
+    test("command_file 引用脚本文件替代 command：命令原样进文件，免 JSON 转义", async () => {
+        const fs = await import("node:fs");
+        const os = await import("node:os");
+        const path = await import("node:path");
+        const { TOOL_DEFS } = await import("../src/agent-toolkit.js");
+        const d = fs.mkdtempSync(path.join(os.tmpdir(), "fx-tk-cf-"));
+        try {
+            const tk = createAgentToolkit(new RuntimeStack(), {});
+            const f = path.join(d, "snap.sh");
+            fs.writeFileSync(f, "printf '%s\\n' \"it's\" 'a \"quoted\" word'\n");
+            const r = await tk.handlers.run_batch({ steps: [{ id: "cf", kind: "exec", command_file: f }] });
+            expect(r.status).toBe("ok");
+            expect(r.steps[0]!.stdout).toContain("it's");
+            expect(r.steps[0]!.stdout).toContain('a "quoted" word');
+            // 二者互斥；驼峰 commandFile 在 MCP 面不是合法字段（字段名统一 snake_case）
+            await expect(tk.handlers.run_batch({ steps: [{ id: "s", kind: "exec", command: "x", command_file: f }] })).rejects.toThrow(/互斥/);
+            await expect(tk.handlers.run_batch({ steps: [{ id: "s", kind: "exec", commandFile: f }] })).rejects.toThrow(/未知字段/);
+            // schema 把 command_file 暴露给调用方
+            const batchTool = TOOL_DEFS.find((t) => t.function.name === "run_batch")!;
+            const params = batchTool.function.parameters as { properties: { steps: { items: { properties: Record<string, unknown> } } } };
+            expect(params.properties.steps.items.properties).toHaveProperty("command_file");
+        } finally {
+            fs.rmSync(d, { recursive: true, force: true });
+        }
+    }, 30_000);
+
+    test("已存层：未注册的层名与层通配命中入口注入的层表时按需加载，且不抢默认层", async () => {
+        // 三路互通（用户 2026-11-26 定调：CLI / MCP / SDK 本来就该认同一份层）。
+        // 入口注入读取函数；工具集自身不读用户目录。
+        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const stack = new RuntimeStack();
+        await stack.addLayer("q-a", new LocalRuntimeDriver());
+        let reads = 0;
+        const store: Record<string, { driver: string }> = { "sv-1": { driver: "local" }, "sv-2": { driver: "local" } };
+        const tk = createAgentToolkit(stack, { savedLayers: () => { reads++; return store; } });
+        try {
+            // 通配：已存的那两个此刻才注册
+            const r = await tk.handlers.run_batch({ layer: "sv-?", steps: [{ id: "hi", kind: "exec", command: "printf hi" }] });
+            expect(r.status).toBe("ok");
+            expect(r.steps.map((s) => s.id).sort()).toEqual(["hi@sv-1", "hi@sv-2"]);
+            expect([...stack.layers.keys()].sort()).toEqual(["q-a", "sv-1", "sv-2"]);
+            // 被顺带加载的层不抢默认层
+            expect(stack.activeLayer?.name).not.toMatch(/^sv-/);
+
+            // 精确层名：单个工具也认已存层
+            const rc = await tk.handlers.run_command({ layer: "sv-1", command: "printf named" }) as { stdout: string };
+            expect(rc.stdout).toContain("named");
+
+            // 进程存活期间新保存的层也认（读取函数每次调用、不缓存）
+            store["sv-3"] = { driver: "local" };
+            const r3 = await tk.handlers.run_batch({ layer: "sv-3", steps: [{ id: "x", kind: "exec", command: "printf three" }] });
+            // 单层计划保留原步骤 id；层字段指向新加载的已存层
+            expect(r3.steps[0]!.id).toBe("x");
+            expect(r3.steps[0]!.layer).toBe("sv-3");
+
+            // 哪边都没有：点名说清；坏档：原样报出，不当空表
+            await expect(tk.handlers.run_batch({ layer: "ghost", steps: [{ id: "s", kind: "exec", command: "x" }] }))
+                .rejects.toThrow(/未注册，也不在已存层表里/);
+            const broken = createAgentToolkit(new RuntimeStack(), { savedLayers: () => { throw new Error("层快照必须是对象"); } });
+            await expect(broken.handlers.run_batch({ layer: "a-*", steps: [{ id: "s", kind: "exec", command: "x" }] }))
+                .rejects.toThrow(/层快照必须是对象/);
+            expect(reads).toBeGreaterThan(0);
+        } finally {
+            await Promise.all([...stack.layers.keys()].map((n) => stack.removeLayer(n, { destroy: true })));
+        }
+    }, 30_000);
+
+    test("layer 通配按已注册层名展开；无匹配则拒绝（不落到默认层）", async () => {
+        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const stack = new RuntimeStack();
+        await stack.addLayer("q-a", new LocalRuntimeDriver());
+        await stack.addLayer("q-b", new LocalRuntimeDriver());
+        await stack.addLayer("keep", new LocalRuntimeDriver());
+        const tk = createAgentToolkit(stack, {});
+        try {
+            const r = await tk.handlers.run_batch({ layer: "q-?", steps: [{ id: "hi", kind: "exec", command: "printf hi" }] });
+            expect(r.status).toBe("ok");
+            expect(r.steps.map((s) => s.id).sort()).toEqual(["hi@q-a", "hi@q-b"]);
+            await expect(tk.handlers.run_batch({ layer: "zz-*", steps: [{ id: "s", kind: "exec", command: "x" }] }))
+                .rejects.toThrow(/未匹配任何已注册层/);
+        } finally {
+            await Promise.all([...stack.layers.keys()].map((n) => stack.removeLayer(n, { destroy: true })));
+        }
+    }, 30_000);
+});

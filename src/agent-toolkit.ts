@@ -16,12 +16,12 @@ import type { LayerHandle, RuntimeStack } from "./runtime-stack.js";
 import { editFile } from "./file-edit.js";
 import { transferLayerFile, validateFileTransferFields, type FileTransferTransport, type LayerFileTransferResult } from "./layer-file-transfer.js";
 import type { TransferResult } from "./file-transfer.js";
-import { BATCH_STEP_KINDS, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
-import type { FileEntry, RuntimeDriver } from "./driver.js";
+import { BATCH_STEP_KINDS, expandBatchLayerWildcards, runBatch, type BatchLayerTarget, type BatchStepWithDeps } from "./batch.js";
+import type { FileEntry, RuntimeDescriptor, RuntimeDriver } from "./driver.js";
 import type { SessionOwnership as _SessionOwnership, StopResult } from "./session-ownership.js";
 import { SessionOwnership } from "./session-ownership.js";
 import { sshArgsFor } from "./ssh-helpers.js";
-import type { ForwardInfo, OpenForwardSpec } from "./ssh-forward.js";
+import { forwardInfoToPublic, isForwardActive, type ForwardInfo, type OpenForwardSpec, type PublicForwardInfo } from "./ssh-forward.js";
 
 export interface AgentToolDef {
     type: "function";
@@ -139,8 +139,10 @@ export type ManageLayersResult =
     | { action: "list"; text: string; layers: Array<{ name: string; driver: string; target?: string }> }
     | { action: "activate"; active_layer: string }
     | { action: "remove"; removed: string }
-    | { action: "forward_add"; forward: ForwardInfo }
-    | { action: "forward_list"; forwards: ForwardInfo[] }
+    // 转发记录对外为 snake_case 投影（forward_id、bind_addr…；forwardId 为兼容别名）——
+    // 与本工具的参数命名和 observe_stream 的 window_id 同一风格
+    | { action: "forward_add"; forward: PublicForwardInfo }
+    | { action: "forward_list"; forwards: PublicForwardInfo[] }
     | { action: "forward_remove"; forward_id: string; status: "stopped" | "already_closed" | "unknown"; detail?: string };
 
 export interface AgentToolHandlers {
@@ -184,7 +186,7 @@ export interface AgentToolHandlers {
         timeout_ms?: number;
         layer?: string;
     }): Promise<Extract<ManageLayersResult, { action: "forward_add" }>>;
-    manage_layers(args: { action: "forward_list"; layer?: string }): Promise<Extract<ManageLayersResult, { action: "forward_list" }>>;
+    manage_layers(args: { action: "forward_list"; layer?: string; include_closed?: boolean }): Promise<Extract<ManageLayersResult, { action: "forward_list" }>>;
     manage_layers(args: { action: "forward_remove"; forward_id: string; layer?: string }): Promise<Extract<ManageLayersResult, { action: "forward_remove" }>>;
     // ── 兼容 0.2.10 旧工具名直调（不进入 tools/list，仅 handlers/MCP call 适配器）──
     spawn_and_observe(args: { command: string; ready_marker?: string; error_pattern?: string; name?: string; layer?: string }): Promise<{
@@ -236,6 +238,10 @@ export interface AgentToolkitOptions {
     sessionResultTtlMs?: number;
     /** Interval for checking tracked sessions and expiring results. */
     sessionCheckIntervalMs?: number;
+    /** 已存层表（`filaxis layer save` 的产物）的读取函数，按需调用、不缓存——入口注入
+     *  （filaxis-mcp 与 Daemon 传 loadLayerStore）。工具集自身不读用户目录：未注入时
+     *  行为与从前一致。未注册的层名或层通配命中这里的条目时按需注册（不抢默认层）。 */
+    savedLayers?: () => Record<string, RuntimeDescriptor>;
 }
 
 const fileTransferProperties = {
@@ -427,7 +433,8 @@ export const TOOL_DEFS: AgentToolDef[] = [
             description:
                 "编排并执行多步骤文件或命令 DAG（exec/edit/read/put/get），支持按 layer 数组跨多层并行扇出。" +
                 "单步操作请使用专用工具（run_command、read_path、edit_file、transfer_file）；多步骤依赖、批量读取/修改或多层同发请使用本工具。" +
-                "无 after 依赖的步骤并行，顺序链靠 after 显式保序；默认任一步失败即停（未启动步骤标 skipped），**不做自动回滚**。",
+                "无 after 依赖的步骤并行，顺序链靠 after 显式保序；默认任一步失败即停（未启动步骤标 skipped），**不做自动回滚**。" +
+                "巡检/批量只读请传 stop_on_fail:false——缺省的失败即停会让其余步骤被跳过（一台失败，其余都不看）。",
             parameters: {
                 type: "object",
                 additionalProperties: false,
@@ -443,8 +450,12 @@ export const TOOL_DEFS: AgentToolDef[] = [
                                 ...fileTransferProperties,
                                 id: { type: "string", description: "步骤唯一 id（after 引用用）" },
                                 kind: { type: "string", enum: BATCH_STEP_KINDS },
-                                layer: batchLayerSchema("覆盖批次默认层。多个层名按 id@layer 展开，单元素数组保留原 id；kind=get 只接受单层"),
-                                command: { type: "string", description: "kind=exec：shell 命令" },
+                                layer: batchLayerSchema("覆盖批次默认层。多个层名按 id@layer 展开，单元素数组保留原 id；kind=get 只接受单层。可写通配（如 \"q-*\"），按本会话已注册的层名与已存层表（filaxis layer save 的产物）展开，命中未注册的已存层时自动加载"),
+                                command: { type: "string", description: "kind=exec：shell 命令（或改用 command_file 引用脚本文件）" },
+                                command_file: {
+                                    type: "string", minLength: 1,
+                                    description: "kind=exec：脚本文件路径，替代 command（二者互斥）。命令原样进文件——免 JSON 转义、同一脚本可复用；读不出或为空则整批拒绝。相对路径相对服务进程工作目录，经 Daemon 执行时建议给绝对路径",
+                                },
                                 expect_exit: { type: "array", items: { type: "number" }, description: "kind=exec：预期退出码集合（缺省 [0]）" },
                                 timeout_ms: { type: "number", description: "kind=exec：超时毫秒" },
                                 path: { type: "string", description: "kind=edit/read：文件路径" },
@@ -467,9 +478,9 @@ export const TOOL_DEFS: AgentToolDef[] = [
                             required: ["id", "kind"],
                         },
                     },
-                    stop_on_fail: { type: "boolean", description: "失败即停（缺省 true）" },
+                    stop_on_fail: { type: "boolean", description: "失败即停（缺省 true：某步失败后未启动的步骤标 skipped）。巡检/批量只读请传 false——一台失败其余照看" },
                     max_parallel: { type: "number", description: "并行度上限（缺省 3）" },
-                    layer: batchLayerSchema("批次默认目标层名或层名数组（缺省=默认层；传数组时未覆盖 layer 的步骤自动展开到各层并行执行）"),
+                    layer: batchLayerSchema("批次默认目标层名或层名数组（缺省=默认层；传数组时未覆盖 layer 的步骤自动展开到各层并行执行）。可写通配（如 \"q-*\"），按本会话已注册的层名与已存层表（filaxis layer save 的产物）展开，命中未注册的已存层时自动加载"),
                     output: { type: "string", enum: ["text", "full"], description: "MCP 输出模式。text 适合只读文本块的客户端，保留简短预览；full（默认）另在 structuredContent 保留完整输出" },
                 },
                 required: ["steps"],
@@ -741,7 +752,8 @@ export const TOOL_DEFS: AgentToolDef[] = [
                 "action='activate' 将指定 name 设为默认层（保留所有连接）；" +
                 "action='remove' 移出指定层（缺省保留连接在指纹缓存以便零成本重建，传 destroy=true 才真销毁连接）；" +
                 "action='forward_add' 在目标或默认 SSH 层动态开启 -L/-R/-D 端口转发（bind_port 不填或传 0 自动分配空闲端口）；" +
-                "action='forward_list' 查询动态端口转发列表；action='forward_remove' 关闭指定 forward_id。" +
+                "action='forward_list' 查询动态端口转发列表（缺省只报仍在用的转发，include_closed=true 连已停止/已退出的一并返回）；" +
+                "action='forward_remove' 关闭指定 forward_id。转发记录字段为 snake_case（forward_id、bind_addr、bind_port、target_host、target_port、transport_mode、status…；forwardId 仅为兼容别名）。" +
                 "新建 SSH 或进入内层环境请用 connect_layer。",
             parameters: {
                 type: "object",
@@ -761,6 +773,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                     target_port: { type: "integer", minimum: 1, maximum: 65535, description: "action=forward_add（local/remote 必填）：目标端口" },
                     forward_id: { type: "string", minLength: 1, description: "action=forward_add 可选自定义 ID；action=forward_remove 必填转发 ID" },
                     timeout_ms: { type: "integer", minimum: 1, maximum: 2147483647, description: "action=forward_add：建链超时毫秒数，缺省 15000" },
+                    include_closed: { type: "boolean", description: "action=forward_list：true 连已停止/已退出的转发一并返回（缺省 false=只报仍在用的）" },
                 },
                 oneOf: [
                     {
@@ -810,6 +823,7 @@ export const TOOL_DEFS: AgentToolDef[] = [
                         properties: {
                             action: { type: "string", const: "forward_list" },
                             layer: { ...layerNameSchema },
+                            include_closed: { type: "boolean" },
                         },
                         required: ["action"],
                     },
@@ -864,10 +878,45 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
     const readyTimeoutMs = opts.readyTimeoutMs ?? 15_000;
     /** 层寻址（第十季注册表）：显式层名 > 注册表默认层（最近 push）> 初始层——
      *  未用层族时与旧行为逐字节一致（零破坏），push 后六工具自动落新默认层 */
+    // 已存层：未注册的层名命中入口注入的层表时按需注册。同名并发只建一次（名字预留
+    // 会把第二次 addLayer 判成重名）；加载后与 connect_layer 注册的层无差别。
+    // activate:false——被顺带加载的层不抢默认层。
+    const loadingSaved = new Map<string, Promise<RuntimeDriver>>();
+    const savedDescriptor = (name: string): RuntimeDescriptor | undefined => {
+        if (!opts.savedLayers) return undefined;
+        const store = opts.savedLayers();
+        const entry = Object.hasOwn(store, name) ? store[name] : undefined;
+        return entry && typeof entry === "object" ? entry : undefined;
+    };
+    const loadSaved = (name: string): Promise<RuntimeDriver> => {
+        const inflight = loadingSaved.get(name);
+        if (inflight) return inflight;
+        const p = (async () => {
+            const descriptor = savedDescriptor(name);
+            if (!descriptor) throw new Error(`层 '${name}' 未注册，也不在已存层表里`);
+            try {
+                const driver = await stack.connect(descriptor);
+                return (await stack.addLayer(name, driver, { activate: false })).handle.driver;
+            } catch (e) {
+                throw new Error(`已存层 '${name}' 加载失败: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        })().finally(() => loadingSaved.delete(name));
+        loadingSaved.set(name, p);
+        return p;
+    };
+    /** 层名解析范围：已注册的在前，其后是已存层表里尚未注册的 */
+    const knownLayerNames = (): string[] => {
+        const names = [...stack.layers.keys()];
+        if (opts.savedLayers) {
+            for (const name of Object.keys(opts.savedLayers())) if (!names.includes(name)) names.push(name);
+        }
+        return names;
+    };
     const resolveDrv = async (layerName?: string): Promise<RuntimeDriver> => {
         if (layerName !== undefined) {
             if (typeof layerName !== "string" || !layerName.trim()) throw new Error("layer 需为非空层名");
-            return stack.layer(layerName).driver;
+            if (stack.layers.has(layerName)) return stack.layer(layerName).driver;
+            return loadSaved(layerName);
         }
         return stack.active ?? await layer();
     };
@@ -961,6 +1010,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         if (label !== undefined && typeof label !== "string") throw new Error("label 需为字符串");
         assertOptionalLayerName(from);
         assertOptionalLayerName(name);
+        if (from !== undefined) await resolveDrv(from);
         const srcName = from ?? stack.activeLayer?.name;
         if (!srcName) throw new Error("无源层——先用 connect_layer 建立 SSH 层，或显式传 from");
         const h = await stack.layerInto(srcName, name ?? label ?? enterCmd.slice(0, 30), enterCmd, { label });
@@ -1504,6 +1554,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     const { name, ...extra } = rest;
                     if (Object.keys(extra).length) throw new Error("manage_layers(activate) 只接受 action 和 name");
                     if (typeof name !== "string" || !name.trim()) throw new Error("name 需为非空层名");
+                    await resolveDrv(name);
                     return { action: "activate" as const, active_layer: stack.setActive(name).name };
                 }
                 if (action === "remove") {
@@ -1538,14 +1589,15 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     };
                     const selectedLayer = layerName ?? stack.activeLayer?.name;
                     if (selectedLayer !== undefined) {
+                        await resolveDrv(selectedLayer);
                         if (spec.id && unregisteredDriver()?.listForwards?.().some((f) => f.forwardId === spec.id)) {
                             throw new Error(`转发 ID '${spec.id}' 已存在于注入驱动`);
                         }
-                        return { action: "forward_add" as const, forward: await stack.openForward(spec, selectedLayer) };
+                        return { action: "forward_add" as const, forward: forwardInfoToPublic(await stack.openForward(spec, selectedLayer)) };
                     }
                     const drv = await layer();
                     if (stack.layers.get(INITIAL_LAYER_NAME)?.driver === drv) {
-                        return { action: "forward_add" as const, forward: await stack.openForward(spec, INITIAL_LAYER_NAME) };
+                        return { action: "forward_add" as const, forward: forwardInfoToPublic(await stack.openForward(spec, INITIAL_LAYER_NAME)) };
                     }
                     if (typeof drv.openForward !== "function") {
                         throw new Error(`层 '${drv.descriptor.driver}' 不支持动态端口转发`);
@@ -1553,16 +1605,20 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     if (spec.id && stack.listForwards().some((f) => f.forwardId === spec.id)) {
                         throw new Error(`转发 ID '${spec.id}' 已存在于已注册层`);
                     }
-                    return { action: "forward_add" as const, forward: await drv.openForward(spec) };
+                    return { action: "forward_add" as const, forward: forwardInfoToPublic(await drv.openForward(spec)) };
                 }
                 if (action === "forward_list") {
-                    const { layer: layerName, ...extra } = rest;
+                    const { layer: layerName, include_closed, ...extra } = rest;
                     const unknown = Object.keys(extra);
                     if (unknown.length) throw new Error(`manage_layers(forward_list) 未知参数：${unknown.join(", ")}`);
+                    if (include_closed !== undefined && typeof include_closed !== "boolean") throw new Error("include_closed 需为布尔值");
                     assertOptionalLayerName(layerName);
                     const registered = stack.listForwards(layerName);
                     const external = layerName === undefined ? unregisteredDriver()?.listForwards?.() ?? [] : [];
-                    return { action: "forward_list" as const, forwards: [...registered, ...external] };
+                    const all = [...registered, ...external];
+                    // 缺省只报仍在用的转发：已停止/已退出的条目是幂等判定的墓碑，不是在用的转发
+                    const shown = include_closed === true ? all : all.filter(isForwardActive);
+                    return { action: "forward_list" as const, forwards: shown.map(forwardInfoToPublic) };
                 }
                 if (action === "forward_remove") {
                     const { forward_id, layer: layerName, ...extra } = rest;
@@ -1592,15 +1648,16 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const extra = Object.keys(unknownArgs);
                 if (extra.length) throw new Error(`run_batch 未知参数：${extra.join(", ")}（支持 steps、layer、stop_on_fail、max_parallel、output）`);
                 if (output !== undefined && output !== "text" && output !== "full") throw new Error('output 需为 "text" 或 "full"');
-                const r = await runBatch(resolveDrv, {
+                const plan = expandBatchLayerWildcards({
                     steps: steps.map((raw, stepIdx): BatchStepWithDeps => {
                         if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`steps[${stepIdx}] 需为对象`);
                         // 仅转换字段名，实际类型由 runBatch 在执行前统一校验。
-                        const { id, kind, layer, after, command, path, hunks, expect_exit, timeout_ms, write_mode, local_path, remote_path, transport, ...unknownFields } = raw;
+                        const { id, kind, layer, after, command, command_file, path, hunks, expect_exit, timeout_ms, write_mode, local_path, remote_path, transport, ...unknownFields } = raw;
                         const extra = Object.keys(unknownFields);
                         if (extra.length) throw new Error(`steps[${stepIdx}] 含未知字段：${extra.join(", ")}（目标层字段为 layer）`);
                         return {
                             id, kind, layer, after, command, path, hunks, transport,
+                            commandFile: command_file,
                             expectExit: expect_exit, timeoutMs: timeout_ms, writeMode: write_mode,
                             localPath: local_path, remotePath: remote_path,
                         } as BatchStepWithDeps;
@@ -1608,7 +1665,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     layer: layerName === undefined ? stack.activeLayer?.name : layerName,
                     stopOnFail: stop_on_fail,
                     maxParallel: max_parallel,
-                }, output === "text" ? { previewBudgetBytes: 4096 } : {});
+                }, knownLayerNames, opts.savedLayers ? "已注册层或已存层" : "已注册层");
+                const r = await runBatch(resolveDrv, plan, output === "text" ? { previewBudgetBytes: 4096 } : {});
                 return {
                     status: r.status,
                     failed_step: r.failedStep,

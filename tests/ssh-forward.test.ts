@@ -628,12 +628,49 @@ describe("enterPipeline layer-penetrating dynamic forwarding (stdio-bridge)", ()
         ], buildInnerTcpBridgeCmd("socat", "127.0.0.1", 8080));
         expect(nested.kind).toBe("ok");
         if (nested.kind === "ok") {
-            expect(nested.command).toContain("'ssh' '-T' 'vm-b' 'sh' '-c'");
+            // ssh 跳的 `sh -c <内层>` 必须整体再包一层引号（嵌套 ssh 会把参数按空格
+            // 拼接，单层引号在跳板 sh 就被消费掉）
+            expect(nested.command).toContain("'ssh' '-T' 'vm-b' 'sh -c");
             expect(nested.command).toContain("socat");
         }
 
+        const quoted = renderEnterBridgeCommand([{ cmd: "ssh -tt -i '/tmp/key  -t name' vm-b" }], inner);
+        expect(quoted).toMatchObject({ kind: "ok", command: expect.stringContaining("'ssh' '-T' '-i' '/tmp/key  -t name' 'vm-b'") });
+
         const bad = renderEnterBridgeCommand([{ cmd: "su - app" }], inner);
         expect(bad.kind).toBe("unreachable");
+    });
+
+    test("DSH 真机回归 2026-11-26：ssh 跳的引号层级 = 跳数 + 内层（裸 exec 终结 shell 案）", () => {
+        // 真机病链：单层引号在跳板 sh 被消费 → 嵌套 ssh 空格拼接 → 目标收到
+        // `sh -c exec ...` → dash 的裸 exec 直接退出 shell → python 桥根本没跑，
+        // 转发 listener 活着但连接即断、零报错。钉住：每多一跳 ssh，内层多一层引号。
+        const inner = buildInnerTcpBridgeCmd("python3", "127.0.0.1", 22);
+
+        const oneHop = renderEnterBridgeCommand([{ cmd: "ssh root@10.0.0.12" }], inner);
+        expect(oneHop.kind).toBe("ok");
+        if (oneHop.kind === "ok") {
+            // 末段是单个引号包裹的 `sh -c <内层>`（引号作为字符保留在参数里）
+            expect(oneHop.command.startsWith("'ssh' '-T' 'root@10.0.0.12' ")).toBe(true);
+            expect(oneHop.command).toContain("'sh -c");
+            // 内层整体作为嵌套 ssh 的一个参数存在，不是裸拼的 'sh' '-c'
+            expect(oneHop.command).not.toContain("'sh' '-c'");
+            // 双重引号包裹：内层脚本与参数在两层转义后仍存活，且以目标参数收尾
+            expect(oneHop.command).toContain("exec python3 -u -c");
+            expect(oneHop.command).toContain("127.0.0.1");
+            expect(oneHop.command).toMatch(/22'\\'''$/);
+        }
+
+        const twoHops = renderEnterBridgeCommand([
+            { cmd: "ssh jump-a" },
+            { cmd: "ssh -t 10.0.0.12" },
+        ], inner);
+        expect(twoHops.kind).toBe("ok");
+        if (twoHops.kind === "ok") {
+            // 两跳：`sh -c ` 出现两次（每跳一层）
+            expect(twoHops.command.match(/sh -c /g)?.length).toBe(2);
+            expect(twoHops.command).toContain("'sh -c");
+        }
     });
 
     test("guards enterPipeline layers against -R/-D host leaks, missing tools, and interactive steps", async () => {
@@ -724,6 +761,49 @@ describe("enterPipeline layer-penetrating dynamic forwarding (stdio-bridge)", ()
             client?.destroy();
             await drv.destroy().catch(() => undefined);
             await new Promise<void>((r) => echoServer.close(() => r()));
+        }
+    }, 15_000);
+
+    test("真机回归 2026-11-26：桥接子进程未送出数据即退出时，死因（stderr 尾部）挂到转发记录上，不再无声", async () => {
+        // 真机两次踩中：内层连不上目标端口（ConnectionRefused）/ 桥命令在远端没跑起来，
+        // stderr 里写得清清楚楚，但产品把它丢弃——外面只看到连接立刻断开、零报错。
+        let failToSpawn = false;
+        const drv = new SshPtyDriver({
+            driver: "ssh",
+            target: "ops@host",
+            config: { enterPipeline: [{ cmd: "docker exec -it web bash" }] },
+        }, {
+            _forwardDeps: {
+                spawnBridge: () => {
+                    if (failToSpawn) throw new Error("bridge unavailable");
+                    return spawn(process.execPath, [
+                        "-e",
+                        "process.stderr.write('Traceback (most recent call last):\\nConnectionRefusedError: [Errno 111] Connection refused\\n');process.exit(2);",
+                    ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+                },
+            },
+        });
+        drv.exec = async () => ({ stdout: "node\n", stderr: "", exitCode: 0 });
+        const info = await drv.openForward({ id: "ctr-dead", kind: "L", targetHost: "127.0.0.1", targetPort: 22 });
+        expect(info.transportMode).toBe("stdio-bridge");
+        // 连一下触发桥子进程；连接会被关闭
+        const connectAndWait = () => new Promise<void>((resolve) => {
+            const c = net.createConnection({ host: "127.0.0.1", port: info.bindPort });
+            c.on("error", () => undefined);
+            c.once("close", () => resolve());
+            c.once("connect", () => c.write("x"));
+        });
+        try {
+            await connectAndWait();
+            await new Promise((r) => setTimeout(r, 300));
+            const listed = drv.listForwards().find((f) => f.forwardId === "ctr-dead");
+            expect(listed?.lastError).toContain("未送出数据即退出");
+            expect(listed?.lastError).toContain("ConnectionRefusedError");
+            failToSpawn = true;
+            await connectAndWait();
+            expect(drv.listForwards()[0]?.lastError).toContain("bridge unavailable");
+        } finally {
+            await drv.destroy();
         }
     }, 15_000);
 

@@ -20,10 +20,11 @@ import { editFile } from "./file-edit.js";
 import { transferLayerFile, type FileTransferTransport } from "./layer-file-transfer.js";
 import { discoverLayer } from "./layer-discovery.js";
 import { runBatch, type BatchPlan } from "./batch.js";
-import type { OpenForwardSpec, ForwardInfo } from "./ssh-forward.js";
+import { isForwardActive, type OpenForwardSpec, type ForwardInfo } from "./ssh-forward.js";
 import { createAgentToolkit, type AgentToolkit } from "./agent-toolkit.js";
 import { McpProtocolHandler } from "./mcp-server.js";
 import { noopLogger, type FilaxisLogger } from "./logger.js";
+import { loadLayerStore } from "./layer-store.js";
 import {
     acquireDaemonLock,
     assertLoopbackHost,
@@ -137,7 +138,7 @@ export class DaemonServer {
         this.log = opts.logger ?? noopLogger;
         this.stack = opts.stack ?? new RuntimeStack({ logger: this.log });
         this.windowRegistry = opts.windowRegistry ?? new StreamWindowRegistry({ logger: this.log });
-        this.toolkit = opts.toolkit ?? createAgentToolkit(this.stack, { windowRegistry: this.windowRegistry });
+        this.toolkit = opts.toolkit ?? createAgentToolkit(this.stack, { windowRegistry: this.windowRegistry, savedLayers: loadLayerStore });
         this.mcpHandler = new McpProtocolHandler({ toolkit: this.toolkit, serverVersion: this.version });
         this.sseKeepaliveMs = opts.sseKeepaliveMs ?? DEFAULT_SSE_KEEPALIVE_MS;
         this.writeFiles = opts.writeFiles !== false;
@@ -514,6 +515,11 @@ export class DaemonServer {
                     && typeof step.localPath === "string") {
                     return { ...step, localPath: this.resolveClientLocalPath(step.localPath, clientCwd) };
                 }
+                // commandFile（exec 步骤引用的脚本文件，DSH 评估 2026-11-26 #6）同款按调用方
+                // 工作目录解析——Daemon 进程自己的工作目录与 CLI 调用方无关
+                if (step && typeof step === "object" && step.kind === "exec" && typeof step.commandFile === "string" && step.commandFile.trim()) {
+                    return { ...step, commandFile: this.resolveClientLocalPath(step.commandFile, clientCwd) };
+                }
                 return step;
             }),
         };
@@ -833,7 +839,11 @@ export class DaemonServer {
 
             case "forward.list": {
                 const layer = typeof params.layer === "string" ? params.layer : undefined;
-                return { forwards: this.stack.listForwards(layer) };
+                // includeClosed（DSH 评估 2026-11-26 #5a）：缺省 true 保持协议兼容；调用方
+                // 显式传 false 时只报仍在用的转发（stopped/exited 是墓碑，见 isForwardActive）
+                const includeClosed = params.includeClosed !== false;
+                const forwards = this.stack.listForwards(layer);
+                return { forwards: includeClosed ? forwards : forwards.filter(isForwardActive) };
             }
 
             case "forward.remove": {

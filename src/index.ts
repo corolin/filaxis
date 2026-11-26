@@ -14,6 +14,7 @@ export * from "./local-driver.js";
 export * from "./events.js";
 export * from "./factory.js";
 export * from "./runtime-stack.js";
+export * from "./layer-store.js";
 export * from "./dialect.js";
 export * from "./ssh-helpers.js";
 export * from "./ssh-forward.js";
@@ -51,7 +52,7 @@ export { Vt100Screen } from "./vt100-screen.js";
 export type { Vt100ScreenOptions } from "./vt100-screen.js";
 export { editFile, editFileMulti, EditConflictError } from "./file-edit.js";
 export type { EditFileOptions, EditFileResult, EditFileMultiResult, EditMultiHunk } from "./file-edit.js";
-export { runBatch } from "./batch.js";
+export { runBatch, expandBatchLayerWildcards, expandLayerPattern, hasLayerWildcard } from "./batch.js";
 export type {
     BatchPlan, BatchLayerTarget, BatchStep, BatchStepWithDeps, BatchExecStep, BatchEditStep, BatchReadStep, BatchPutStep, BatchGetStep,
     BatchReport, BatchStepReport, BatchStepStatus,

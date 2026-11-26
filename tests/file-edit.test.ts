@@ -489,13 +489,13 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         // --layer 与 --host 互斥
         let err1 = "";
         try {
-            execSync('bun bin/filaxis.ts exec --layer nginx --host x -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
+            execSync('bun bin/filaxis.ts exec --no-daemon --layer nginx --host x -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
         } catch (e) { err1 = String((e as { stderr?: string }).stderr ?? e); }
         expect(err1).toContain("互斥");
         // 未保存层报错
         let err2 = "";
         try {
-            execSync('bun bin/filaxis.ts exec --layer ghost -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
+            execSync('bun bin/filaxis.ts exec --no-daemon --layer ghost -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
         } catch (e) { err2 = String((e as { stderr?: string }).stderr ?? e); }
         expect(err2).toContain("未保存");
         // rm 后清单空

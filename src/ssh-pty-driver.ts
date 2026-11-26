@@ -31,6 +31,7 @@ import type {
 import {
     autonomousSshOpts, SSH_INPUT_WAIT_RE, enterStepsOf, hopLabel, rootSshSpawnArgs, cdTargetArg,
     sshArgsFor, renderExecChannel, shellQuote, muxFlagsFor, assertNoLikelyTypoKeys, envPrefixOf, ENV_NAME_RE, type SshConnParams, type SshHop, ENTER_ALIAS_KEYS,
+    classifySshFailure, describeSshIdentitySource, formatAuthFailureDiagnosis, parseJumpSpec,
 } from "./ssh-helpers.js";
 import { RemoteSessionManager } from "./remote-session-manager.js";
 import { SshForwardManager, type ForwardDeps, type OpenForwardSpec, type ForwardInfo, type CloseForwardResult } from "./ssh-forward.js";
@@ -361,7 +362,13 @@ ${command}
             if (this.rawArrived) resolve();
             else this.firstOutWaiter = resolve;
         });
-        await Promise.race([firstOut, new Promise((r) => setTimeout(r, 8000))]);
+        // 竞速定时器必须清（DSH 评估 2026-11-26 #4）：首输出先到时 race 已 settle，但 8s
+        // 定时器仍挂在事件循环上。常驻进程无感；一次性 CLI（--no-daemon --pty）不调
+        // process.exit、靠事件循环排空退出——结果早已打印，进程却被拖到 attach+8s 才退
+        //（实测 8360ms，同一命令不带 --pty 为 694ms）
+        let quietTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([firstOut, new Promise<void>((r) => { quietTimer = setTimeout(r, 8000); })]);
+        clearTimeout(quietTimer);
         await new Promise((r) => setTimeout(r, 600));
     }
 
@@ -619,7 +626,7 @@ export class SshPtyDriver implements RuntimeDriver {
             this.log.warn(`[SshPty] 内层 shell 已退出，层退化：${evidence}——连接仍在但已非本层环境`);
         };
 
-        this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop), connParams), this.log);
+        this.link.attach(rootSshSpawnArgs(sshArgsFor(rootHop, { interactive: true }), connParams), this.log);
         try { await this.link.handshake(`ssh ${hopLabel(rootHop)}`); }
         catch (error) { this.link.kill(); throw error; }
         for (const hop of hops) {
@@ -861,8 +868,11 @@ export class SshPtyDriver implements RuntimeDriver {
             // 的握手成本从「每条命令」降到「每 10min 窗口首条」（ControlPersist=600）；
             // 与观察流同一 socket（exec/observe 同主机共享一条主连接）
             const destArgs = sshArgsFor(rootHop);
-            const sshOptions = autonomousSshOpts(connParams);
-            if (fileStdio) sshOptions.unshift("-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes");
+            const sshOptions = autonomousSshOpts(connParams); // 非交互子进程：已含 BatchMode=yes（认证失败当场报错，不挂在提示上）
+            // mux socket 名按 [...sshOptions, ...destArgs] 哈希——exec 与观察窗/转发都经
+            // autonomousSshOpts 取同一份选项，socket 名才一致、master 才能共享（勿在
+            // 个别调用点往 sshOptions 里单方面加选项）
+            if (fileStdio) sshOptions.unshift("-T", "-o", "ClearAllForwardings=yes");
             const argv = [...sshOptions, ...muxFlagsFor(destArgs, { sshOptions }), ...destArgs, "--", ...render.remoteArgs];
             // 显式 stdio 模式覆盖（DeepSeek Harness 反馈）：FILAXIS_SSH_STDIO_MODE=inherit
             // 直接走文件中转（管道句柄在受限沙箱里被拦截——ssh 秒退 255 零输出）
@@ -950,8 +960,12 @@ export class SshPtyDriver implements RuntimeDriver {
                 if (!completion) {
                     // 沙箱 stdio 管道损坏诊断（DeepSeek Harness 反馈）：秒退 255+
                     // 零输出=管道句柄被拦截的指纹——一次文件中转重试（cmd/sh 的 >
-                    // 是文件句柄非管道句柄，沙箱放行）；重试仍败才报错附双模式现场
-                    if (isBrokenStdioExit(code, evidence, errorOutput, Date.now() - spawnAt)) {
+                    // 是文件句柄非管道句柄，沙箱放行）；重试仍败才报错附双模式现场。
+                    // **带跳板时不套这个指纹**（DSH 评估 2026-11-26 真机发现）：ProxyCommand
+                    // 模式下 ssh 把自身 stderr 指向 /dev/null——跳板解析失败/认证被拒/
+                    // 不可达一概是「255 + 零输出 + 秒退」，套上去就把真实原因换成一句
+                    //「疑似沙箱管道损坏、去设文件中转」。按收到的原始报错诊断。
+                    if (!connParams?.jump && isBrokenStdioExit(code, evidence, errorOutput, Date.now() - spawnAt)) {
                         // 沙箱 stdio 管道损坏指纹（DeepSeek Harness 反馈）。**不自动重放**
                         //（Sol 78 P1-2）：首轮结果未知=远端可能已执行副作用——非幂等命令
                         // 重试违宪（tmux spawn 错误同款纪律「勿盲目重试非幂等命令」）。
@@ -966,20 +980,13 @@ export class SshPtyDriver implements RuntimeDriver {
                         });
                         return;
                     }
-                    finish(() => {
-                        // 连接层失败诊断（试用反馈 #29：-J/--host 传 ssh-config 别名在沙箱/
-                        // 远端环境「不认」——别名解析依赖**运行环境**的 ~/.ssh/config，本机
-                        // 有的别名沙箱里没有。报错直交 + 指引，缩短排障路径）
-                        const connFail = /Could not resolve hostname|Connection (timed out|refused|closed)|Permission denied|Host key verification failed|no route to host/i.test(errorOutput);
-                        const diag = connFail
-                            ? "\n[连接层失败] ssh 本身没建起链——若 --host/-J 传的是 ssh-config 别名，注意别名解析用的是**本运行环境**的 ~/.ssh/config（沙箱/远端会话可能没有该条目：改用 user@host[:port] 字面量或先补 config）"
-                            : "";
-                        const e = new Error(
-                            `命令未完成（无完成哨兵——通道中断/进程被信号终止，close code=${code}）${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500 字符:\n${evidence.slice(-500)}\nstderr 尾 300:\n${errorOutput.slice(-300)}${diag}`,
-                        ) as Error & { outcome: "unknown" };
-                        e.outcome = "unknown";
-                        reject(e);
-                    });
+                    const base = `命令未完成（无完成哨兵——通道中断/进程被信号终止，close code=${code}）${stdinErr ? `；stdin 管道错误: ${stdinErr.message}` : ""}。半截现场 stdout 尾 500 字符:\n${evidence.slice(-500)}\nstderr 尾 300:\n${errorOutput.slice(-300)}`;
+                    const report = (diag: string) => finish(() => reject(withUnknownOutcome(new Error(base + diag))));
+                    if (code !== 255 || evidence.length > 0) {
+                        report("");
+                        return;
+                    }
+                    void connFailureDiagnosis(rootHop, connParams, errorOutput, this.log).then(report, () => report(ALIAS_HINT));
                     return;
                 }
                 // 哨兵在场：退出码以哨兵为准（code===null 的信号杀竞态也不伪 0）
@@ -1083,6 +1090,61 @@ export class SshPtyDriver implements RuntimeDriver {
         return this.forwardManager ? this.forwardManager.listForwards() : [];
     }
 }
+
+const ALIAS_HINT =
+    "\n[连接层失败] ssh 本身没建起链——若 --host/-J 传的是 ssh-config 别名，注意别名解析用的是**本运行环境**的 ~/.ssh/config（沙箱/远端会话可能没有该条目：改用 user@host[:port] 字面量或先补 config）";
+
+function withUnknownOutcome(e: Error): Error & { outcome: "unknown" } {
+    return Object.assign(e, { outcome: "unknown" as const });
+}
+
+/** 带上 ssh 原始报错行（直交） */
+function withSshLines(diag: string, lines: string[] | undefined): string {
+    if (!lines?.length) return diag;
+    return diag + "\n  [ssh 原始输出·直交]\n" + lines.map((l) => `    ${l}`).join("\n");
+}
+
+const jumpLabelOf = (js: { host: string; user?: string; port?: number }): string =>
+    `${js.user ? `${js.user}@` : ""}${js.host}${js.port ? `:${js.port}` : ""}`;
+
+/** 根据原始 SSH 报错定位连接阶段。需要补充凭据来源时只读取本地 SSH 配置。 */
+async function connFailureDiagnosis(rootHop: SshHop, connParams: SshConnParams | undefined, errorOutput: string, logger: FilaxisLogger): Promise<string> {
+    const jump = connParams?.jump;
+    try {
+        const js = jump ? parseJumpSpec(jump) : undefined;
+        const { stage, kind, lines } = classifySshFailure(errorOutput, js?.host ?? null);
+        if (stage === "none") {
+            return js && !errorOutput.trim()
+                ? "\n[SSH] 跳板连接未返回诊断输出，失败位置无法确认。"
+                : "";
+        }
+        if (js && stage === "jump") {
+            const label = jumpLabelOf(js);
+            if (kind !== "auth" && kind !== "resolve" && kind !== "unreachable") {
+                return withSshLines("\n[跳板连接失败] ssh 在跳板段报错。", lines);
+            }
+            const source = kind === "auth" ? await describeSshIdentitySource(
+                { host: js.host, conn: { user: js.user, port: js.port, keyFile: js.keyFile } }, logger) : null;
+            return formatAuthFailureDiagnosis({
+                role: "jump", label, userGiven: js.user != null, kind, source, sshLines: lines,
+            });
+        }
+        if (kind !== "auth" && (!js || kind !== "resolve")) return withSshLines(ALIAS_HINT, lines);
+        const target = typeof rootHop === "string" ? rootHop : rootHop.host;
+        return formatAuthFailureDiagnosis({
+            role: "target",
+            label: `${target}${connParams?.port ? `:${connParams.port}` : ""}`,
+            userGiven: target.includes("@") || Boolean(connParams?.user),
+            kind,
+            keyFile: kind === "auth" ? connParams?.keyFile : undefined,
+            source: kind === "auth" ? await describeSshIdentitySource(rootHop, logger) : null,
+            sshLines: lines,
+        });
+    } catch {
+        return ALIAS_HINT;
+    }
+}
+export const __testConnFailureDiagnosis = connFailureDiagnosis; // 测试导出面
 
 /** shell 单引号安全引用 */
 function q(s: string): string {
