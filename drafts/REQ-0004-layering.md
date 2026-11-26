@@ -85,59 +85,78 @@ SDK 导出（`src/index.ts`）保持扁平：迁入 `operations/` 的模块改�
 interface Middle {
   readonly host: { kind: "in-process" | "daemon"; version: string; protocolVersion: number; pid?: number };
   readonly ops: MiddleOps;
-  /** 即弃实例与 SDK 实例用：销毁层、driver、观察窗、会话跟踪 */
-  dispose(): Promise<void>;
+  /** 销毁观察窗、会话跟踪与自建的观察窗注册表（同步） */
+  dispose(): void;
+  /** 宿主退出前的收尾：再销毁本实例拥有的 driver。远程形态是空操作（状态在 Daemon 进程里） */
+  shutdown(): Promise<void>;
 }
-createMiddle(opts?: { stack?: RuntimeStack; savedLayers?: () => Record<string, LayerDescriptor>; logger?: FilaxisLogger; … }): Middle
-connectRemoteMiddle(client: DaemonClient): Promise<Middle>   // 同形客户端；握手失败即抛 ProtocolMismatchError
+createMiddle(opts?: MiddleOptions): LocalMiddle            // 进程内实例
+connectRemoteMiddle(client: DaemonClient): Promise<Middle> // 同形客户端；握手失败即抛 ProtocolMismatchError
 ```
+
+`MiddleOptions`：`stack`、`descriptor`（初始层，缺省本机）、`driver`（外部持有生命周期的 driver）、`windowRegistry`、`readyTimeoutMs`、`sessionResultTtlMs`、`sessionCheckIntervalMs`、`savedLayers`、`logger`、`version`。
+
+进程内实例（`LocalMiddle`）另把状态句柄交给宿主：`stack`、`sessionOwner`、`resolveLayerRef`、`windowRegistry()`、`listStreamsSync()`（Daemon 同步汇总状态用）、`shutdown()`。
+
+`shutdown()` 必须销毁 driver：连接复用的主进程、PTY 链都是 driver 的子进程，一次性 CLI 进程退出前不销毁会滞留。
 
 ### 5.2 命名约定
 
-- **中层线协议（RPC 参数 / 结果）、CLI `--json` 输出：统一 camelCase**（即 TypeScript 类型原样）。
-- **snake_case 只属于 MCP 工具面**（`run_batch` / `exit_code` / `window_id` …），由工具面适配器投影。0.2.13 里 CLI 转发记录改成 snake_case 是在「两套命名并存」上打的补丁，0.3.0 收敛为上面的规则。
+- **中层线协议（RPC 参数 / 结果）、CLI `--json` 输出、Daemon `/status` 的结果：统一 camelCase**（即 TypeScript 类型原样）。
+- **snake_case 只属于 MCP 工具面**（`run_batch` / `exit_code` / `window_id` …），由工具面适配器（`agent-toolkit.ts`）投影。0.2.13 里 CLI 转发记录改成 snake_case 是在「两套命名并存」上打的补丁，0.3.0 收敛为上面的规则。MCP 的 12 个工具名与 schema 不变。
 - 批次计划（`BatchPlan`）字段沿用现状（`steps` / `layer` / `stopOnFail` / `maxParallel`；步骤 `command` / `commandFile` / `after` …）；MCP 面继续用 `command_file` / `stop_on_fail`，由工具面转换。
+- 参数语法（未知字段、枚举、范围的报错文案）属于界面层：工具面的校验文案带工具面的字段名，是 MCP 契约的一部分；中层只带不变量守卫。
 
-### 5.3 操作集（24 个）
+### 5.3 操作集（26 个）
 
 | 组 | 操作 | 语义要点 |
 |---|---|---|
-| 宿主 | `status` | 宿主信息：协议版本、包版本、层、转发、观察窗清单 |
-| | `features` | 内核能力探测（mux / sftp / persistent …） |
-| 层 | `connectLayer` | 三种形态：SSH 目标（可批量 `targets`）/ 进入内层（`enter`）/ 临时描述符；批量逐个报告、不整批中断 |
+| 能力 | `features` | 内核能力探测（mux / sftp / persistent …）。（宿主状态 `GET /status` 是 Daemon 端点，不是操作） |
+| 层 | `connectSsh` `connectSshBatch` `connectInto` | 登记 SSH 目标（单台 / 批量逐个报告、不整批并发）/ 从已有层进入内层 |
 | | `listLayers` `activateLayer` `removeLayer` | 命名层的查 / 设默认 / 移除（`destroy` 才销毁 driver） |
 | | `probeLayer` | 两段式环境探测（蒸馏值） |
 | 执行 | `runCommand` | 等完成拿退出码；`pty` 走终端通道；非零退出码是数据不是异常 |
-| | `runBatch` | 计划校验、层通配展开、`commandFile` 内联都在中层做完，再交内核 |
+| | `runBatch` | 计划校验、层通配展开、`commandFile` 内联都在中层做完，再交内核。参数另有 `defaultLayer`（未指定层的步骤落在哪一层）、`layers`（调用方带来的层描述符，命中时优先于中层自己的层表）、`cwd`（默认层是本机层时的命令工作目录）、`previewBudgetBytes` |
 | | `startSession` `stopSession` | 长跑会话；停止是请求、死亡须核实，`unknown` 不是成功也不是失败 |
 | | `observe` | 限时观察（起会话 → 等 `durationMs` → 读日志 → 停 → 必要时核实） |
 | 文件 | `readFile` `readPath` `writeFile` | 读文本 / 读文件或列目录 / 写入（`overwrite`、`createDirs`） |
-| | `editFile` `editFileMulti` | 受控编辑（CAS）；多 hunk 版 |
+| | `editFile` | 受控编辑（CAS）。多处替换走 `runBatch` 的 `edit` 步骤（`hunks`） |
 | | `managePath` | `mkdir` / `move` / `delete` |
 | | `transferFile` | `put` / `get`，`transport`、`writeMode`，校验等级如实报告 |
-| 观察窗 | `openStream` `peekStream` `closeStream` `listStreams` | 开窗、三种游标读（`afterSeq` / `beforeSeq` / 末尾）、关窗、清单 |
+| 观察窗 | `openStream` `peekStream` `closeStream` `listStreams` | 开窗、三种游标读（`afterSeq` / `beforeSeq` / 末尾，可按 `stream` 过滤）、关窗、清单 |
 | 转发 | `openForward` `listForwards` `closeForward` | `-L` / `-R` / `-D`；缺省只列在用；关闭三态 |
+
+`REMOTE_OP_NAMES`（`src/operations/protocol.ts`）是客户端与服务端共用的操作清单，带穷举检查：中层增删操作而忘了同步，typecheck 报错。
 
 ### 5.4 层引用 `LayerRef`
 
 ```ts
 type LayerRef =
-  | { layer: string }                               // 命名层：已注册，或在已存层表里（按需加载，不抢默认层）
-  | { descriptor: LayerDescriptor; name?: string }  // 临时目标（CLI --host 族、connect_layer 的参数）；给 name 则登记为命名层
-  | undefined;                                      // 默认层
+  | string                                            // 命名层（简写）
+  | { layer: string }                                 // 命名层：已注册，或在已存层表里（按需加载，不抢默认层）
+  | { descriptor: RuntimeDescriptor; name?: string }  // 带描述符，见下
+  | undefined;                                        // 中层的默认层
 ```
 
-中层唯一负责把 `LayerRef` 解析成 driver（今天工具集的 `resolveDrv` 与 Daemon 的 `resolveTarget` 合并为此）。同名并发只建一次；配置与既有命名层不一致且该层有活跃转发 / 观察窗时拒绝覆盖（沿用 Daemon 现状）。
+中层唯一负责把 `LayerRef` 解析成 driver（原工具集的 `resolveDrv` 与 Daemon 的 `resolveTarget` 合并为此）。
+
+- **`undefined` = 中层当前的默认层**，与 MCP 的「不传 layer」同义。CLI 的「命令行没写目标」不是 `undefined`——界面层把它显式翻译成 `{ descriptor: { driver: "local" } }`。 Daemon 里若有人把一个 SSH 层登记成默认层（甚至就叫 `local`），无目标的 CLI 命令不会被它吸走。
+- 带描述符、给 `name`：按命名层登记。与既有登记的连接指纹一致则复用；不一致则替换（该层有活跃转发或观察窗时拒绝静默覆盖）。
+- 带描述符、不给 `name`：按连接指纹登记为一个临时命名层（名字带指纹短哈希，同指纹复用），不抢默认层。纯本机描述符（local、无 `cwd`、无 `config`）不登记进层栈。
+- 同名并发只建一次；并发请求带着不同描述符时拒绝合并。
 
 ### 5.5 与调用方机器相关的规则
 
 | 事项 | 规则 |
 |---|---|
 | 本机文件路径（传输的 `localPath`、`commandFile`） | 界面层解析成绝对路径后再调用 |
-| **本机层**上的相对路径（`filaxis exec cat x.txt` 这种落在 local 层的路径） | 界面层解析成绝对路径（它知道目标是不是本机层）。经 Daemon 时工作目录与 Daemon 进程无关 |
-| 本机层的命令工作目录 | 显式参数 `cwd`（绝对路径） |
-| SSH 密钥 / known_hosts 路径 | 界面层展开 `~` 与相对路径后再调用 |
+| **本机层**上的相对路径（`filaxis cat x.txt` 这种落在 local 层的路径） | 界面层解析成绝对路径。基准是**层自己的工作目录**，没有则取调用方的（经 Daemon 时它的工作目录与调用方无关） |
+| 本机层的命令工作目录 | 显式参数 `cwd`（只在没指定 `--layer` / `--host` 时传；已存层用它自己的） |
+| SSH 密钥 / known_hosts 路径 | 界面层展开相对路径后再调用 |
+| 调用方眼里的层表 | 批次经 `layers` 参数随请求带给中层：重新保存过的层立刻生效；CLI 用 `FILAXIS_LAYERS` 指向别处时以调用方为准 |
 | 大输出 | `exec --out` / `batch --out-dir` 落盘是界面层的事，中层不感知 |
+
+线协议里没有 `clientCwd` / `target.cwd` 这类「调用方工作目录」参数。
 
 ---
 
@@ -148,41 +167,46 @@ type LayerRef =
 ```
 POST /rpc   { "protocol": 3, "op": "runCommand", "params": { … } }
         → 200 { "ok": true,  "protocol": 3, "result": … }
-        → 200 { "ok": false, "error": { "message", "name?", "code?", "outcome?", … } }   // 操作失败/结果未知：沿用 HTTP 200 + 错误体
-        → 400 / 413                                                                  // 仅请求体本身有问题
-GET /status  含 protocolVersion、version、pid
+        → 200 { "ok": false, "error": "<message>", "name?", "code?", "outcome", "sessionId", "logBase", "exitCode", "forwardId" … }
+        → 400 / 413        // 仅请求体本身有问题
+GET /status  含 protocolVersion、version、pid、layers、forwards、streams
 ```
 
 - 操作名 = 中层操作名（camelCase）；不再有 `exec` / `forward.add` / `stream.peek` 这套独立命名。
-- 传输仍是本机回环 HTTP + Bearer token + SSE（MCP 端点），**0.3.0 不换传输**。
-- 错误体保留 `outcome` / `code` / `sessionId` / `logBase` / `forwardId` 等字段（执行语义宪法不变：结果未知不伪造终态、不自动重放）。
+- `/rpc` 是薄转发：取操作 → 调用 → 回结果，不认识任何具体操作。操作失败一律 HTTP 200 + 错误体（与「传输失败」区分开），错误体保留 `outcome` 等字段（执行语义宪法不变：结果未知不伪造终态、不自动重放）。
+- 传输仍是本机回环 HTTP + Bearer token + SSE（MCP 端点），**0.3.0 不换传输**。MCP 端点与 `/rpc` 调用同一个中层。
 
 ### 6.2 版本握手
 
 - `PROTOCOL_VERSION`（`src/operations/protocol.ts`）是线协议版本，与包版本分离；不兼容的线协议变更才递增。
-- **客户端**：连上先取 `/status`，`protocolVersion` 不等于自己的（或缺失——那是 0.2.x 的 Daemon）即抛 `ProtocolMismatchError`，报双方版本、Daemon pid 与处置办法（`filaxis daemon stop` 后重启）。**绝不向错配的 Daemon 发操作。**
-- **服务端**：信封 `protocol` 不等于自己的即拒绝（错误码 `E_PROTOCOL_MISMATCH`），不执行。
-- 0.2.x 客户端 × 0.3 Daemon：旧客户端不带 `protocol` 字段 → 被拒并看到上面的错误（而不是被旧逻辑静默执行）。
+- **客户端**：连上先取 `/status`，`protocolVersion` 不等于自己的（或缺失——那是 0.2.x 的 Daemon）即抛 `ProtocolMismatchError`（`code: E_PROTOCOL_MISMATCH`），报双方版本、Daemon pid 与处置办法（`filaxis daemon stop` 后重启）。**绝不向错配的 Daemon 发操作**，也不退回另一条执行路径。
+- **服务端**：信封 `protocol` 不等于自己的即拒绝（`code: E_PROTOCOL_MISMATCH`），不执行。
+- 0.2.x 客户端 × 0.3 Daemon：旧客户端不带 `protocol` 字段 → 被拒并看到上面的错误。
 
-### 6.3 Daemon 启动策略
+### 6.3 宿主策略
 
-| 入口 | 缺省 | 退出方式 |
+| 入口 | 缺省 | 另一种形态 |
 |---|---|---|
-| `filaxis-mcp` | **经 Daemon**：没有在跑就自动启动（复用 `filaxis daemon start` 的同一条拉起路径） | `--no-daemon` / `FILAXIS_NO_DAEMON=1` → 进程内即弃中层（状态只属于这个 MCP 服务进程） |
-| CLI | 有 Daemon 在跑就用，没有就走进程内即弃中层；**不隐式启动**（脚本里的一次性命令不该留下后台进程） | `filaxis daemon start` / `stop` 显式管理 |
-| SDK | 进程内 | `connectRemoteMiddle` 连 Daemon |
+| `filaxis-mcp` | **经 Daemon**：没有在跑就自动启动（复用 `filaxis daemon start` 的同一条拉起路径；两个客户端同时首启时只有一个拉起成功） | `--no-daemon` / `FILAXIS_NO_DAEMON=1`，或带了绑定参数（`--host` 族 / `--enter` / `--docker` / `--layer`）→ 进程内即弃中层。绑定参数描述的是「这个会话的默认层」，共享的 Daemon 没法替某一个客户端设默认层 |
+| CLI | 有 Daemon 在跑就用，没有就走进程内即弃中层；**不隐式启动**（脚本里的一次性命令不该留下后台进程） | `--no-daemon` 强制进程内；`filaxis daemon start` / `stop` 显式管理 |
+| SDK | 进程内（`createMiddle`） | `connectRemoteMiddle` 连 Daemon，方法签名不变 |
 
-CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没了）：没有 Daemon 时明确报错，与现状一致。
+CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没了）：没有 Daemon 时明确报错。
 
 ---
 
-## 7. 分层门禁（`scripts/check-boundaries.ts` 新增断言）
+## 7. 分层门禁（`bun run check:boundaries` 的第四道断言）
 
-按 §4 的归属把文件标成 core / middle / interface，逐条 import 断言：
+断言本体是纯函数模块 `scripts/layering-gate.ts`（输入「文件路径 → 源码」，输出违规清单）；门禁脚本用真文件调它，测试用合成例子逐类验证。
 
-1. core 文件 import middle 或 interface 模块 → 违规。
-2. middle 文件 import interface 模块 → 违规。
-3. interface 文件与 `bin/` 从 core 模块做**值导入** → 违规（`import type` 放行）。
+| 规则 | 断言 |
+|---|---|
+| R1 | 内核只依赖内核与各层共用的日志器——不依赖中层或界面层，**连类型也不取**（依赖方向不许倒过来） |
+| R2 | 中层可依赖内核，不得依赖界面层 |
+| R3 | 界面层从内核只能取类型（`import type`） |
+| R3b | 界面层与中层不得经 SDK 总出口（`src/index.ts`）取符号——总出口再导出了整个内核，从它取符号等于绕过逐模块判断 |
+
+归属：`src/operations/**` 是中层；`src/agent-toolkit.ts`、`mcp-server.ts`、`mcp-proxy.ts`、`daemon-server.ts`、`daemon-client.ts`、`daemon-files.ts` 与 `bin/**` 是界面层；`src/logger.ts` 各层共用；其余 `src/**` 是内核。测试与示例不在门禁范围内。
 
 原有三条（零上游业务概念 / 零裸 `Bun.*` / 零第三方运行时依赖）不变。
 
@@ -190,39 +214,43 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 
 ## 8. 有意变更清单（0.3.0）
 
-1. Daemon 线协议：操作名改为中层操作名，信封带 `protocol`；旧客户端与新 Daemon 互相显式拒绝。
-2. `filaxis-mcp` 缺省经 Daemon 并自动启动（推翻 0.2.x「MCP 绝不隐式启动 Daemon」的设计与用例）。
-3. CLI `--json` 输出统一 camelCase（转发记录从 0.2.13 的 snake_case 改回；观察窗同理）。
-4. Daemon 线协议移除 `clientCwd` / `target.cwd`；本机层的相对路径由 CLI 解析。**效果**：一次性模式与经 Daemon 的行为一致（相对的本地文件路径、相对的密钥路径在两种模式下不再有差别）。
-5. SDK：`createAgentToolkit` 的 handler 不再含操作逻辑（薄适配），`AgentToolkitOptions` 增加 `middle`（传入已建好的中层；原 `stack` 形态保留，内部代建中层）；新增导出 `createMiddle` `connectRemoteMiddle` `Middle` `MiddleOps` `PROTOCOL_VERSION`。
-6. `src/runtime-stack.ts`、`layer-store.ts`、`session-ownership.ts` 迁入 `src/operations/`（SDK 导出路径不变）。
+1. **Daemon 线协议**：操作名改为中层操作名，信封带 `protocol`；`clientCwd` / `target.cwd` 取消。0.2.x 客户端与 0.3.0 Daemon 互相显式拒绝。
+2. **裸 RPC 不带层 = 中层当前默认层**（与 MCP 一致）。CLI 的「没写目标 = 本机」在界面层翻译，对外行为不变。
+3. **`filaxis-mcp` 缺省经 Daemon 并自动启动**；绑定参数与 `--no-daemon` 走进程内。推翻 0.2.x「MCP 绝不隐式启动 Daemon」。
+4. **CLI `--json` 统一 camelCase**：转发记录从 0.2.13 的 snake_case 改回，观察窗、Daemon 状态同理。snake_case 只属于 MCP 工具面；MCP 的 12 个工具名与 schema 不变。
+5. **一次性模式与经 Daemon 的行为一致**：相对的本机文件路径、相对的密钥路径在两种模式下不再有差别（原 0.2.x 有 8 处差异）。
+6. **提示文案统一**：「层不存在」「不认识的 driver」由中层报错并带补救办法，经 Daemon 与一次性模式不再是两句。
+7. **SDK**：`createAgentToolkit(stack, opts)` 签名不变（内部代建中层；`opts.middle` 可传入已建好的），handler 不再含操作逻辑；新增导出 `createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`；`src/runtime-stack.ts`、`layer-store.ts`、`session-ownership.ts` 迁入 `src/operations/`，符号名不变。
+8. **`bun run check:boundaries` 多一道断言**（§7）。
 
-**非目标**：跨语言 IPC（Host Protocol PRD 后续）；内核文件物理搬迁；更换传输层；改动执行语义宪法（完成哨兵 / abort≠已取消 / 零自动重放 / PTY 状态机）。
+**非目标**：跨语言 IPC（Host Protocol PRD / ROADMAP §3）；内核文件物理搬迁；更换传输层；改动执行语义宪法（完成哨兵 / abort≠已取消 / 零自动重放 / PTY 状态机）；补齐 SDK 公开面里尚未成为独立操作的能力（`ready()`、`verifySession()`、读落盘日志、事件订阅——ROADMAP §6.1 P2）。
 
 ---
 
-## 9. 迁移步骤（每步独立提交，既有测试保持通过）
+## 9. 迁移步骤（as executed）
 
-| 步 | 内容 | 完成标志 |
+| 步 | 内容 | 提交 |
 |---|---|---|
-| **M0** | 版本握手：`PROTOCOL_VERSION`、`/status` 带 `protocolVersion`、新客户端遇旧 Daemon 明确拒绝 | 新 CLI 对 0.2.13 Daemon 报错不执行；单测 |
-| **M1** | 中层成型：建 `src/operations/`，迁入三个模块；`createMiddle` 与操作集从 `agent-toolkit.ts` 的 handler 里提出来；工具集变成「工具定义 + 投影 + 薄转发」；`createAgentToolkit(stack, opts)` 签名不变 | 工具集 / MCP 测试零改动通过；typecheck |
-| **M2** | Daemon RPC 改为中层的薄转发：`DaemonServer` 装配一个 `Middle`，`/rpc` 变成操作表；信封带 `protocol` 并拒绝错配；`connectRemoteMiddle` 同形客户端 | daemon / mcp-proxy 测试改用同形客户端后通过 |
-| **M3** | CLI 全面改走 `Middle`（远程或即弃）：删掉 `savedLayerDriver` / `driverFor` 等自己拼驱动的代码；路径解析收口到界面层；CLI JSON 统一 camelCase | CLI 冒烟测试通过；§1.1 列的 8 处差异消失 |
-| **M4** | `filaxis-mcp` 缺省经 Daemon（自动启动），`--no-daemon` 进程内 | 「绝不隐式启动」用例改写为新设计 |
-| **M5** | 门禁：§7 三条断言 | `bun run check:boundaries` 能拦下故意制造的三类违规（测试钉住） |
-| **M6** | 同构用例集：同一组操作用例在 即弃进程内 / SDK 长驻 / Daemon 远程 三种宿主下跑 | AC-03 |
-| **M7** | 文档（SKILL、包说明书 AGENTS.md、CHANGELOG 0.3.0）、全量回归、真机三环境复验 | AC-06 |
+| **M0** | 版本握手：`PROTOCOL_VERSION`、`/status` 带 `protocolVersion`、新客户端遇旧 Daemon 明确拒绝 | `bb9853e` |
+| **M1a** | `runtime-stack` / `layer-store` / `session-ownership` 迁入 `src/operations/`（纯机械） | `6735f0b` |
+| **M1b** | 中层成型：`createMiddle` 与操作集从工具集 handler 里提出来；工具集变成「校验 → 调中层 → 投影」的薄适配器，行为不变 | `6c4a634` |
+| **M2+M3** | Daemon RPC 改为薄转发、信封带 `protocol`、同形客户端；CLI 全面改走中层。**两步合并**：Daemon 的 RPC 一旦换成操作名，CLI 必须同步切换，否则两者之间的端到端用例会断；中间留一个旧方法名的过渡垫片是马上要删的一次性代码 | `c1a2319` |
+| **M4** | `filaxis-mcp` 缺省经 Daemon、自动启动；绑定参数与 `--no-daemon` 走进程内 | `317a0e8` |
+| **M5** | 分层门禁的四条断言 + 清掉界面层最后三处内核值依赖 | `76d0b10` |
+| **M6** | 同构用例集：30 条声明式用例 × 三种宿主 | 见提交记录 |
+| **M7** | 文档、全量回归、真机三环境复验 | 见提交记录 |
+
+重写过程中被既有用例与同构用例抓回的回归（均已修）：批次已存层改由 Daemon 自己读层表；「没写目标」落到中层默认层；带工作目录的本机层相对路径基准取错；开在未登记本机层上的观察窗被算到同名命名层头上；多行 import 的类型说明符被判成值导入。
 
 ---
 
 ## 10. 验收标准清单 (Acceptance Criteria / AC Matrix)
 
-- [ ] **AC-01 一份操作实现**：Daemon 的 `/rpc` 处理只有「取操作 → 调用 → 回结果」，不含校验、目标解析、路径解析或结果整形；操作逻辑只存在于 `src/operations/`。
-- [ ] **AC-02 界面层零内核值依赖**：`bin/` 与适配器模块对 core 模块没有任何值导入（门禁断言 + 测试）。
-- [ ] **AC-03 同构**：同一组操作用例（至少覆盖 `runCommand`、`runBatch`（含层通配与 `commandFile`）、`readFile`、`transferFile`、`startSession`/`stopSession`、`openStream`/`peekStream`/`closeStream`、`connectLayer`/`listLayers`/`removeLayer`）在 即弃进程内、SDK 长驻、Daemon 远程 三种宿主下结果一致。
-- [ ] **AC-04 版本握手**：新客户端 × 旧 Daemon（`protocolVersion` 缺失）→ 拒绝并报双方版本与 pid，不发出任何操作；旧客户端 × 新 Daemon（信封无 `protocol`）→ 被拒不执行；版本一致 → 正常。
-- [ ] **AC-05 MCP 宿主策略**：`filaxis-mcp` 无 Daemon 时自动启动并经其执行；`--no-daemon` 不启动且功能可用；两种模式下 `run_batch` 层通配、按名寻址已存层、转发、观察窗行为一致。
-- [ ] **AC-06 零回归**：除 §8 有意变更对应的用例外，既有测试全部通过；Windows 与 Linux（真机集成打开）两平台全量 0 失败；homelab / 腾讯云集群 / 多跳管线三组真实环境复验通过。
-- [ ] **AC-07 分层门禁**：三类违规各有一条测试证明会被 `check:boundaries` 拦下；现有代码零违规。
-- [ ] **AC-08 文档**：REQ-0004 状态更新；SKILL 与包说明书按新宿主策略与 JSON 约定修订；CHANGELOG 列出 §8 全部有意变更。
+- [x] **AC-01 一份操作实现**：`/rpc` 只有「取操作 → 调用 → 回结果」；操作逻辑只存在于 `src/operations/`。
+- [x] **AC-02 界面层零内核值依赖**：门禁断言 + 测试；现有 `src/` 与 `bin/` 零违规。
+- [x] **AC-03 同构**：`tests/isomorphism-corpus.ts` 30 条用例覆盖 `runCommand`、`runBatch`（层通配、`commandFile`、失败即停语义、调用方层表）、`readFile` / `writeFile` / `editFile` / `readPath` / `managePath`、`transferFile`、`startSession` / `stopSession`、`observe`、`openStream` / `peekStream` / `closeStream` / `listStreams`、`listLayers` / `activateLayer` / `removeLayer`、`probeLayer`、`features`、转发的不支持拒绝；在即弃进程内、SDK 长驻、Daemon 远程三种宿主下结果一致。
+- [x] **AC-04 版本握手**：客户端侧（旧 Daemon 不上报 → 拒绝并报 pid 与处置办法；版本一致放行）有单测；服务端拒绝错配信封；CLI 遇错配不退回一次性模式。
+- [x] **AC-05 MCP 宿主策略**：缺省自动启动并经其执行、另一客户端接得上同一 Daemon、MCP 退出后 Daemon 仍在；`--no-daemon` 不启动且功能可用；`--layer` 绑定时走进程内。
+- [ ] **AC-06 零回归**：除 §8 有意变更对应的用例外全部通过；Windows 与 Linux（真机集成打开）全量；三组真实环境复验。结果见最终汇报。
+- [x] **AC-07 分层门禁**：四类违规各有测试证明会被拦下；现有代码零违规。
+- [x] **AC-08 文档**：本文档、SKILL 中英文版、包说明书 AGENTS.md、CHANGELOG 已按新宿主策略与命名约定修订。

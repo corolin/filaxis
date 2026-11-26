@@ -11,6 +11,22 @@
 
 ---
 
+## 未发布（0.3.0-dev）
+
+> 架构级调整，含不兼容变更。设计见 [REQ-0004](./drafts/REQ-0004-layering.md)，长期方向见 [ROADMAP](./ROADMAP.md)。
+
+- **[用户]** 三层架构落地：**interface**（cli、mcp、给大模型用的工具面）/ **middle**（有状态的操作层，唯一实现）/ **core**（无状态执行内核）。中层由 `createMiddle()` 在进程内建立，或由 `connectRemoteMiddle(client)` 经 Daemon 使用，两者是同一个接口 `Middle`、方法签名一致。CLI、MCP、SDK 走的是同一组操作（26 个），不再各写一遍。
+- **[自挖]** **不兼容**：Daemon 线协议改为 `{protocol, op, params}`，操作名即中层操作名（原来的 `exec` / `cat` / `forward.add` / `stream.peek` 等方法名与 `clientCwd` / `target.cwd` 参数取消——与调用方机器相关的路径由调用方解析成绝对路径）。0.2.x 的客户端与 0.3.0 的 Daemon 互相显式拒绝，不会把请求交给对方执行。
+- **[自挖]** 客户端与 Daemon 增加线协议版本握手：`/status` 上报 `protocolVersion`，不一致（含旧 Daemon 不上报）即拒绝并列出双方版本、Daemon pid 与处置办法。升级之后旧 Daemon 还在跑时，新 CLI / 新 MCP 的请求不再被旧代码静默执行。
+- **[用户]** **不兼容**：`filaxis-mcp` 缺省经 Daemon 执行，没有在跑就自动启动（层、连接、转发、观察窗在两个 MCP 客户端之间、CLI 与 MCP 之间共享）；带 `--host` / `--enter` / `--docker` / `--layer` 这类绑定参数时在本进程内服务，`--no-daemon` 可强制走进程内。0.2.x 的「MCP 绝不隐式启动 Daemon」是有意推翻的。
+- **[自挖]** **不兼容**：CLI `--json` 输出与中层记录同形，统一 camelCase（`forwardId`、`bindAddr`、`windowId`…）。0.2.13 把转发记录改成 snake_case 是在「两套命名并存」上打的补丁；现在 snake_case 只属于 MCP 工具面，MCP 的 12 个工具名与 schema 不变。
+- **[自挖]** **不兼容**：裸 RPC 不带层 = 中层当前默认层（与 MCP 一致）；CLI 的「命令行没写目标」在界面层显式翻译成本机层——Daemon 里若有人把一个 SSH 层登记成默认层（甚至就叫 `local`），无目标的 CLI 命令不会被它吸走。「层不存在」「不认识的 driver」经 Daemon 与一次性模式不再是两句不同的提示，由中层统一报错并带补救办法。
+- **[自挖]** CLI 每个子命令只剩一份实现：原来「经 Daemon」与「一次性模式」两条路径有 8 处行为差异（本机文件路径、相对的密钥路径只在经 Daemon 时解析等），现在一致。本机层上的相对路径以层自己的工作目录为基准，没有则取调用方的；批次把调用方眼里的层表随请求带给中层，重新保存过的层立刻生效，不必等 Daemon 重启。
+- **[自挖]** SDK 新增导出：`createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及各操作的结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`。`createAgentToolkit(stack, opts)` 签名不变（内部代建中层，也可用 `opts.middle` 传入已建好的）。`src/runtime-stack.ts`、`layer-store.ts`、`session-ownership.ts` 迁入 `src/operations/`，原有导出名不变。
+- **[自挖]** `bun run check:boundaries` 新增第四道断言——三层依赖方向：内核只依赖内核；中层可依赖内核但不得依赖界面层；界面层从内核只能取类型，且不得经 SDK 总出口取符号。
+- **[自挖]** 本机层的工作目录不存在时，命令不再报成 `ENOENT … uv_spawn 'bash'`（看着像没装 bash，其实与 bash 无关），而是直接说明「本机层的工作目录不存在」并点名目录。已存层的工作目录被删或填错时最常见。
+- **[自挖]** 同构用例集：30 条与语言无关的声明式用例（`tests/isomorphism-corpus.ts`），在即弃进程内、SDK 长驻、Daemon 远程三种宿主上同参同果。1.x 的 Rust 内核将来拿同一份语料对照。
+
 ## 0.2.13
 
 - **[DeepSeek]** 非交互 SSH 及其跳板代理启用 `BatchMode`，PTY 登录链保持可交互。认证失败依据原始 SSH 输出和本地配置报告。缺少完成哨兵时保留未知终态，由调用方决定是否再次连接。
