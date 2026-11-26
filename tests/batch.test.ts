@@ -742,6 +742,71 @@ describe("CLI exec 输出（DSH 评估 2026-11-26 #5c）", () => {
         expect(r.exitCode).toBe(3);
     }, 30_000);
 
+    test("--out：完整输出落盘并与内容逐字节一致，终端只打头几行和路径；stderr 另存", async () => {
+        const { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const d = mkdtempSync(join(tmpdir(), "fx-out-"));
+        try {
+            const out = join(d, "nested", "o.txt").replace(/\\/g, "/");
+            const r = Bun.spawnSync(
+                [process.execPath, "bin/filaxis.ts", "exec", "--no-daemon", "--out", out, "--", "seq 1 100; printf 'e' >&2; exit 0"],
+                { stdout: "pipe", stderr: "pipe", windowsHide: true },
+            );
+            expect(r.exitCode).toBe(0);
+            const shown = r.stdout.toString();
+            // 终端只有头 15 行 + 一行交代；文件里是全部 100 行
+            expect(shown.split("\n").filter((l) => /^\d+$/.test(l))).toHaveLength(15);
+            expect(shown).toContain("共 100 行");
+            expect(shown).toContain("o.txt");
+            const file = readFileSync(out, "utf-8");
+            expect(file.split("\n").filter(Boolean)).toHaveLength(100);
+            expect(readFileSync(`${out}.stderr`, "utf-8")).toBe("e");
+            expect(r.stderr.toString()).toContain("[exit=0");
+            expect(r.stderr.toString()).toContain("已核对");
+
+            // --json：给路径与字节数，不再把正文塞进响应
+            const jr = Bun.spawnSync(
+                [process.execPath, "bin/filaxis.ts", "exec", "--no-daemon", "--json", "--out", join(d, "j.txt").replace(/\\/g, "/"), "--", "seq 1 3"],
+                { stdout: "pipe", stderr: "pipe", windowsHide: true },
+            );
+            const parsed = JSON.parse(jr.stdout.toString()) as { out: { stdout_bytes: number; stdout_lines: number }; stdout?: string };
+            expect(parsed.out.stdout_lines).toBe(3);
+            expect(parsed.out.stdout_bytes).toBe(6);
+            expect(parsed.stdout).toBeUndefined();
+            expect(jr.exitCode).toBe(0);
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
+    }, 30_000);
+
+    test("batch --out-dir：每个 exec 步骤各落 stdout/stderr 文件，终端只打头几行", async () => {
+        const { mkdtempSync, readFileSync, readdirSync, rmSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const d = mkdtempSync(join(tmpdir(), "fx-outdir-"));
+        try {
+            const plan = { steps: [
+                { id: "big", kind: "exec", command: "seq 1 40; printf 'E\\n' >&2" },
+                { id: "small", kind: "exec", command: "echo one" },
+            ] };
+            const r = Bun.spawnSync(
+                [process.execPath, "bin/filaxis.ts", "batch", "--no-daemon", "--out-dir", d.replace(/\\/g, "/"), "--stdin-json"],
+                { stdin: Buffer.from(JSON.stringify(plan)), stdout: "pipe", stderr: "pipe", windowsHide: true },
+            );
+            expect(r.exitCode).toBe(0);
+            const files = readdirSync(d).sort();
+            expect(files).toEqual(["big.stderr", "big.stdout", "small.stdout"]);
+            expect(readFileSync(join(d, "big.stdout"), "utf-8").split("\n").filter(Boolean)).toHaveLength(40);
+            expect(readFileSync(join(d, "big.stderr"), "utf-8")).toBe("E\n");
+            expect(readFileSync(join(d, "small.stdout"), "utf-8")).toBe("one\n");
+            const shown = r.stdout.toString();
+            expect(shown.split("\n").filter((l) => /^\d+$/.test(l))).toHaveLength(15); // big 只显示头 15 行
+            expect(shown).toContain("one"); // 没截断的小输出照常显示
+            expect(shown).toContain("完整输出 3 个文件");
+        } finally {
+            rmSync(d, { recursive: true, force: true });
+        }
+    }, 30_000);
+
     const sh = process.env.FILAXIS_SHELL || Bun.which("sh");
     test.skipIf(!sh)("文本模式经 2>&1 合流：完成标记恒在末尾，正文一行不少", () => {
         const n = 20000;

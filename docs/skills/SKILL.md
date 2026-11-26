@@ -63,6 +63,7 @@ filaxis exec --layer <名> --json -- "<command>"     # 单行 JSON {exitCode, ef
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
 - **巡检要显式关掉失败即停**：`run_batch` 缺省任一步失败即停，尚未启动的步骤（含其它层的展开实例）标 `skipped`——一台失败，其余都不看。批量巡检、多机取证这类只读批次传 `stop_on_fail: false`（CLI：`filaxis batch … --no-stop-on-fail`）。第一遍只看各步状态行，再对失败的层单独钻取。改配置→验证→重载这类链保持缺省：前一步失败不应继续。
 - **少写转义**：`exec` 步骤可用 `command_file` 引用脚本文件，替代 `command`——命令原样进文件，JSON 里的引号和换行不必再转义，同一脚本可被多个步骤复用（二者互斥；读不出或内容为空则整批拒绝）。相对路径相对服务进程的工作目录，经 Daemon 执行时建议给绝对路径。
+- **大输出落盘（CLI）**：`filaxis exec --out <文件>`、`filaxis batch --out-dir <目录>`——完整输出落到调用方本机（写后读回逐字节核对），终端只打头 15 行和文件路径；`batch` 的每个 exec 步骤各一个文件（层扇出后形如 `step@layer.stdout`，stderr 另存 `.stderr`）。输出多大都由规划决定用不用；不加则全量打到终端。没有 harness 输出外置的消费方走这一条。
 - `run_batch` 的顶层 `layer` 和步骤 `layer` 均支持传单个层名或层名数组（也可同时传：顶层是批次默认值，步骤的 `layer` 仅覆盖本步；两处都省略时使用调用时的默认层）。传多个层名数组时，步骤按 `id@layer` 展开并在 `max_parallel` 并发池内并行执行，下游 `after` 需等被依赖步骤的所有展开实例均 ok 后才启动（`kind: "get"` 不支持多层数组，防并发覆盖同一 `local_path`）；单元素数组保留原 `id`。结果逐步标明命名层。
 - CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。计划文件里的字段是驼峰写法（`command` 或 `commandFile`、`maxParallel`、`stopOnFail`）；命令行开关 `--max-parallel N` 与 `--no-stop-on-fail` 覆盖计划里的对应字段。
 - 层名可写通配：`*` 匹配任意字符序列，`?` 匹配单个字符（如 `"q-*"`），按已注册或已保存的层名展开（MCP、SDK 与 CLI 认同一份已存层表：`filaxis layer save` 保存的层不必先 `connect_layer`，按名寻址或被通配命中时自动加载；`filaxis-mcp --layer NAME` 可直接绑定已存层），免去逐个罗列。没有任何匹配时整批拒绝，不会改用默认层。

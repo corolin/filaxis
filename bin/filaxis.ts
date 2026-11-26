@@ -74,7 +74,7 @@ function strArg(argv: string[], i: number): string {
 const batchValueOptions = new Set([
     "--host", "--user", "--port", "--key", "-J", "--jump", "--hop", "--enter",
     "--docker", "--docker-shell", "--docker-runtime", "--forward", "--host-key", "--known-hosts",
-    "--layer", "--request-file", "--daemon-dir", "--max-parallel",
+    "--layer", "--request-file", "--daemon-dir", "--max-parallel", "--out-dir",
 ]);
 /** batch 模式下的无值开关（其余 `-` 开头的一律拒绝：batch 不接受位置参数） */
 const batchFlagOptions = new Set(["--stdin-json", "--no-daemon", "--no-stop-on-fail"]);
@@ -88,6 +88,8 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
     timeout?: number; duration?: number; stream?: string; all?: boolean;
     /** batch 开关（DSH 评估 2026-11-26 #6）：覆盖计划里的 maxParallel / stopOnFail */
     maxParallel?: number; noStopOnFail?: boolean;
+    /** 完整输出落盘（exec --out <文件>；batch --out-dir <目录>）：终端只打头几行和路径 */
+    out?: string; outDir?: string;
     writeMode?: "auto" | "inplace";
     transport?: "exec" | "sftp";
     stdinJson?: boolean; requestFile?: string; pty?: boolean; help?: boolean;
@@ -142,6 +144,8 @@ function parseOpts(argv: string[], mode: "default" | "strict" | "batch" = "defau
             case "--timeout": o.timeout = numArg(argv, i, { positive: true }); i++; break; // 正数（Hydrogen R9 #4：0/负数曾静默禁用或立即杀）
             case "--max-parallel": o.maxParallel = numArg(argv, i, { positive: true }); i++; break;
             case "--no-stop-on-fail": o.noStopOnFail = true; break;
+            case "--out": o.out = strArg(argv, i); i++; break;
+            case "--out-dir": o.outDir = strArg(argv, i); i++; break;
             case "--duration": o.duration = numArg(argv, i, { positive: true }); i++; break;
             case "--stream": {
                 const stream = strArg(argv, i);
@@ -554,7 +558,82 @@ async function requireDaemon(opts: ReturnType<typeof parseOpts>): Promise<Daemon
  * 调用方不必再从正文里认标记行。
  * 只设 exitCode、不 process.exit（Gemini #8——曾跳过外层 finally 的 drv.destroy()）。
  */
-async function printExecResult(r: { stdout: string; stderr: string; exitCode: number; effectiveUser?: string }, json: boolean): Promise<void> {
+/** `--out` / `--out-dir` 终端预览保留的行数 */
+const SPILL_HEAD_LINES = 15;
+
+interface SpilledOutput { path: string; bytes: number; lines: number; head: string; truncated: boolean }
+
+/**
+ * 把一段完整输出无损落到调用方本机：写临时文件 → 读回逐字节核对 → 原子改名。核对不上
+ * 就抛错，绝不报「已落盘」。返回终端预览用的头几行。
+ */
+function spillOutput(content: string, file: string): SpilledOutput {
+    const target = resolvePath(file);
+    mkdirSync(dirname(target), { recursive: true });
+    const data = Buffer.from(content, "utf-8");
+    const temporary = `${target}.tmp-${randomUUID()}`;
+    writeFileSync(temporary, data, { flag: "wx", mode: 0o600 });
+    try {
+        if (!readFileSync(temporary).equals(data)) throw new Error(`落盘后读回与内容不一致: ${target}`);
+    } catch (e) {
+        try { unlinkSync(temporary); } catch { /* 保留原错误 */ }
+        throw e;
+    }
+    renameSync(temporary, target);
+    const rows = content.length === 0 ? [] : content.split("\n");
+    if (rows.length > 0 && rows[rows.length - 1] === "") rows.pop(); // 末尾换行不算一行
+    const headRows = rows.slice(0, SPILL_HEAD_LINES);
+    return {
+        path: target,
+        bytes: data.length,
+        lines: rows.length,
+        head: headRows.join("\n") + (headRows.length > 0 ? "\n" : ""),
+        truncated: rows.length > SPILL_HEAD_LINES,
+    };
+}
+
+/** 预览尾部的一行交代：总行数、字节数、完整输出在哪 */
+function spillNote(sp: SpilledOutput, what: string): string {
+    return `… ${what} 共 ${sp.lines} 行 ${sp.bytes} 字节${sp.truncated ? `，终端只显示前 ${SPILL_HEAD_LINES} 行` : ""}；完整输出: ${sp.path}`;
+}
+
+/** 把步骤 id 变成安全的文件名（层扇出后形如 `step@layer`） */
+function stepOutputName(stepId: string, used: Set<string>): string {
+    const base = stepId.replace(/[^A-Za-z0-9._@-]/g, "_") || "step";
+    let name = base;
+    for (let n = 2; used.has(name); n++) name = `${base}~${n}`;
+    used.add(name);
+    return name;
+}
+
+async function printExecResult(
+    r: { stdout: string; stderr: string; exitCode: number; effectiveUser?: string },
+    json: boolean,
+    out?: string,
+): Promise<void> {
+    if (out !== undefined) {
+        // --out：完整输出落盘并核对，终端只打头几行和路径。stderr 另存 `<文件>.stderr`。
+        const stdoutFile = spillOutput(r.stdout, out);
+        const stderrFile = r.stderr ? spillOutput(r.stderr, `${out}.stderr`) : undefined;
+        if (json) {
+            console.log(JSON.stringify({
+                exitCode: r.exitCode, effectiveUser: r.effectiveUser ?? null,
+                out: { stdout: stdoutFile.path, stdout_bytes: stdoutFile.bytes, stdout_lines: stdoutFile.lines,
+                    ...(stderrFile ? { stderr: stderrFile.path, stderr_bytes: stderrFile.bytes } : {}) },
+            }));
+        } else {
+            process.stdout.write(stdoutFile.head);
+            if (stdoutFile.truncated) console.log(spillNote(stdoutFile, "stdout"));
+            if (stderrFile) {
+                process.stderr.write(stderrFile.head);
+                if (stderrFile.truncated) console.error(spillNote(stderrFile, "stderr"));
+            }
+            console.error(`\n[exit=${r.exitCode} user=${r.effectiveUser ?? "?"}]`);
+            console.error(`[out] stdout → ${stdoutFile.path}（${stdoutFile.bytes} 字节，已核对）${stderrFile ? `；stderr → ${stderrFile.path}` : ""}`);
+        }
+        process.exitCode = r.exitCode;
+        return;
+    }
     if (json) {
         console.log(JSON.stringify({ exitCode: r.exitCode, effectiveUser: r.effectiveUser ?? null, stdout: r.stdout, stderr: r.stderr }));
     } else {
@@ -569,7 +648,12 @@ async function printExecResult(r: { stdout: string; stderr: string; exitCode: nu
     process.exitCode = r.exitCode;
 }
 
-function printBatchReport(r: BatchReport): void {
+function printBatchReport(r: BatchReport, outDir?: string): void {
+    // --out-dir：每个 exec 步骤的 stdout / stderr 各落一个文件（文件名 = 步骤 id），终端只打头几行和路径
+    const dir = outDir === undefined ? undefined : resolvePath(outDir);
+    if (dir) mkdirSync(dir, { recursive: true });
+    const usedNames = new Set<string>();
+    const spillCount = { n: 0 };
     for (const s of r.steps) {
         const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})${s.layer === undefined ? "" : ` layer=${s.layer}`}`;
         if (s.status === "skipped") {
@@ -578,8 +662,22 @@ function printBatchReport(r: BatchReport): void {
         }
         if (s.kind === "exec") {
             console.log(`${head} exit=${s.exitCode}${s.effectiveUser ? ` user=${s.effectiveUser}` : ""}${s.error ? ` ✗ ${s.error}` : ""}`);
-            if (s.stdout) process.stdout.write(s.stdout.endsWith("\n") ? s.stdout : s.stdout + "\n");
-            if (s.stderr) process.stderr.write(s.stderr.endsWith("\n") ? s.stderr : s.stderr + "\n");
+            if (dir && (s.stdout || s.stderr)) {
+                const name = stepOutputName(s.id, usedNames);
+                if (s.stdout) {
+                    const sp = spillOutput(s.stdout, join(dir, `${name}.stdout`)); spillCount.n++;
+                    process.stdout.write(sp.head);
+                    console.log(sp.truncated ? spillNote(sp, "stdout") : `[out] ${sp.path}（${sp.bytes} 字节，已核对）`);
+                }
+                if (s.stderr) {
+                    const sp = spillOutput(s.stderr, join(dir, `${name}.stderr`)); spillCount.n++;
+                    process.stderr.write(sp.head);
+                    console.error(sp.truncated ? spillNote(sp, "stderr") : `[out] ${sp.path}（${sp.bytes} 字节，已核对）`);
+                }
+            } else {
+                if (s.stdout) process.stdout.write(s.stdout.endsWith("\n") ? s.stdout : s.stdout + "\n");
+                if (s.stderr) process.stderr.write(s.stderr.endsWith("\n") ? s.stderr : s.stderr + "\n");
+            }
         } else if (s.kind === "edit" && s.edits) {
             console.log(`${head} ${s.edits.path} 替换 ${s.edits.occurrences} 处，${s.edits.bytesBefore}B → ${s.edits.bytesAfter}B${s.edits.mutex === "degraded" ? "（无锁降级）" : ""}`);
         } else if (s.transfer) {
@@ -590,7 +688,7 @@ function printBatchReport(r: BatchReport): void {
         }
         if (s.error && s.kind !== "exec") console.error(`  ✗ ${s.error}`);
     }
-    console.log(`batch ${r.status}${r.failedStep ? `（失败于 ${r.failedStep}）` : ""}`);
+    console.log(`batch ${r.status}${r.failedStep ? `（失败于 ${r.failedStep}）` : ""}${dir ? `（完整输出 ${spillCount.n} 个文件 → ${dir}）` : ""}`);
     process.exitCode = r.status === "ok" ? 0 : 1;
 }
 
@@ -662,7 +760,7 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
             }
             : plan;
         const r = await daemon.rpc<BatchReport>("batch", { target, plan: resolvedPlan, savedLayers, clientCwd: process.cwd() });
-        printBatchReport(r);
+        printBatchReport(r, o.outDir);
         return;
     }
     const drivers = new Map<string | undefined, RuntimeDriver>();
@@ -674,7 +772,7 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, daemon: DaemonClient
             drivers.set(name, driver);
             return driver;
         }, plan);
-        printBatchReport(r);
+        printBatchReport(r, o.outDir);
     } finally {
         await Promise.all([...drivers.values()].map(destroyDriver));
     }
@@ -1026,6 +1124,7 @@ const generalHelp = `filaxis CLI — 千里一线，执行有迹
                   # 巡检要「一台挂了其余照看」→ --no-stop-on-fail
                   # exec 步骤可写 "commandFile": 引用脚本文件（零转义、可复用）替代 "command"
                   # layer 支持通配（"q-*" 按已存层名展开）
+                  [--out-dir DIR]                            # 完整输出落盘（每步一个文件），终端只打头几行和路径
   filaxis layer   save <name> --host ... [-J/--hop/--enter/--docker/...]   # 层路径持久化
                   list | rm <name>                                 # 层清单/移除
   filaxis daemon  start [--addr host:port] [--foreground]          # 显式启停常驻 Daemon
@@ -1053,7 +1152,7 @@ async function main() {
     const helpFlag = (value: string | undefined) => value === "--help" || value === "-h";
     const commandHelp = new Map<string, string>([
         ["mcp-config", "filaxis mcp-config [--format json|toml]"],
-        ["exec", "filaxis exec [--layer NAME | --host HOST] [--timeout MS] [--pty] [--json] -- <command>\nfilaxis exec [目标选项] --stdin-script | --script-file FILE\n--json 输出单行 {exitCode, effectiveUser, stdout, stderr}（脚本取值用，不必从正文里认 [exit=N user=…] 标记行）"],
+        ["exec", "filaxis exec [--layer NAME | --host HOST] [--timeout MS] [--pty] [--json] [--out FILE] -- <command>\nfilaxis exec [目标选项] --stdin-script | --script-file FILE\n--json 输出单行 {exitCode, effectiveUser, stdout, stderr}（脚本取值用，不必从正文里认 [exit=N user=…] 标记行）\n--out FILE：stdout 完整落到 FILE（stderr 另存 FILE.stderr），写后读回逐字节核对；终端只显示头 15 行和文件路径。配 --json 时输出 {exitCode, effectiveUser, out:{stdout, stdout_bytes, …}}。"],
         ["cat", "filaxis cat [--layer NAME | --host HOST] -- <path>"],
         ["put", transferUsage("put")],
         ["get", transferUsage("get")],
@@ -1061,10 +1160,11 @@ async function main() {
         ["observe", "filaxis observe [--layer NAME | --host HOST] [--stream stderr|stdout|both] [--duration MS] -- <command>"],
         ["probe", "filaxis probe [--layer NAME | --host HOST]"],
         ["batch", "filaxis batch [--layer NAME|--layer 通配 | --host HOST] --request-file FILE | --stdin-json\n" +
-            "          [--max-parallel N] [--no-stop-on-fail]\n" +
+            "          [--max-parallel N] [--no-stop-on-fail] [--out-dir DIR]\n" +
             "目标优先级：步骤 layer → 计划 layer → --layer 或 --host。命名层来自 filaxis layer save；名字可写通配（如 \"q-*\"），按已存层名展开。\n" +
             "--max-parallel / --no-stop-on-fail 覆盖计划里的 maxParallel / stopOnFail。缺省失败即停（未启动步骤标 skipped）；巡检要「一台挂了其余照看」用 --no-stop-on-fail。\n" +
-            "exec 步骤可用 \"commandFile\" 引用脚本文件，替代 \"command\"（命令原样进文件，零转义、可复用）。"],
+            "exec 步骤可用 \"commandFile\" 引用脚本文件，替代 \"command\"（命令原样进文件，零转义、可复用）。\n" +
+            "--out-dir DIR：每个 exec 步骤的 stdout / stderr 完整落到 DIR 下（文件名=步骤 id，层扇出后形如 step@layer），写后读回逐字节核对；终端只显示头 15 行和文件路径。不加则全量打到终端。"],
         ["layer", "filaxis layer save <name> --host HOST | list | rm <name>"],
         ["layer save", "filaxis layer save <name> --host HOST [--port N] [--key FILE] [-J JUMP] [--hop HOST] [--enter CMD] [--docker CTR] [--forward SPEC] [--host-key tofu|strict] [--known-hosts FILE]"],
         ["layer list", "filaxis layer list"],
@@ -1185,7 +1285,7 @@ async function main() {
                     timeoutMs: o.timeout ?? 120_000,
                     channel: o.pty ? "pty" : undefined,
                 });
-                await printExecResult(r, o.json === true);
+                await printExecResult(r, o.json === true, o.out);
                 break;
             }
             case "cat": {
@@ -1327,7 +1427,7 @@ async function runViaDaemon(cmd: string, o: ReturnType<typeof parseOpts>, daemon
                 timeoutMs: o.timeout ?? 120_000,
                 pty: o.pty === true,
             });
-            await printExecResult(r, o.json === true);
+            await printExecResult(r, o.json === true, o.out);
             break;
         }
         case "cat": {

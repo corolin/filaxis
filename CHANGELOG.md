@@ -18,6 +18,7 @@
 - **[DeepSeek]** `batch` 的 exec 步骤可用 `commandFile` 引用脚本文件，替代 `command`（MCP 字段名为 `command_file`）。层名支持 `*` 与 `?` 通配，按已存或已注册的层名展开，没有任何匹配时整批拒绝。CLI 新增 `--max-parallel` 与 `--no-stop-on-fail`，覆盖计划里的对应字段。
 - **[DeepSeek]** `filaxis forward list` 缺省只列仍在用的转发，`--all` 列出全部（MCP 为 `forward_list` 的 `include_closed`）。CLI JSON 与 MCP 的转发记录改用 snake_case 字段，`forwardId` 保留为兼容别名。
 - **[DeepSeek]** `filaxis exec --json` 输出单行结构化结果；文本模式的完成标记在正文排空后输出，`2>&1` 合流时位于末尾。
+- **[DeepSeek]** CLI 新增大输出落盘：`filaxis exec --out <文件>`、`filaxis batch --out-dir <目录>`。完整输出落到调用方本机并读回逐字节核对，终端只显示头 15 行和文件路径（配 `--json` 时输出文件路径与字节数）。不加这两个参数时行为不变。
 - **[自挖]** 一次性模式（`--no-daemon`）按层文件里的 `driver` 加载已存层，不再把任何条目都当作 SSH 目标。
 - **[自挖]** 修复穿层转发（`-L` 经 enterPipeline 进入内层）在 `ssh <目标>` 形态的进入步骤上全部静默失效：转发建立成功，但任何连接立刻被关闭且无报错。原因是给嵌套 ssh 的命令少包一层引号，内层桥接命令在目标机上没有被执行。docker / bash 结尾形态不受影响。
 - **[自挖]** 独立 MCP 和 Daemon 的 MCP 入口都支持按名加载 CLI 保存的层，`run_batch` 也可以按通配匹配。带 `--layer NAME` 启动的 MCP 服务以指定层为默认目标，直接运行。SDK 可用 `createAgentToolkit` 的 `savedLayers` 和导出的 `loadLayerStore` 接入同一份层表。
