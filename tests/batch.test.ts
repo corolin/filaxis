@@ -220,6 +220,19 @@ test("空 steps → 显式拒绝（内核级守卫，不再只靠 CLI）", async
     await expect(runBatch(drv, {} as never)).rejects.toThrow(/steps 需非空/);
 });
 
+// DSH 真机巡检踩中（2026-11-26）：`layers` 与 `layer` 一字之差被静默忽略，计划落回
+// 默认层在调用方本机执行——「想扫集群、结果扫了自己」。拼错的顶层字段必须当场拒绝。
+test("未知顶层字段 → 显式拒绝（layers≠layer 案）", async () => {
+    const drv = new LocalRuntimeDriver();
+    await expect(runBatch(drv, { layers: "q-*", steps: [{ id: "x", kind: "exec", command: "hostname" }] } as never))
+        .rejects.toThrow(/未知顶层字段 'layers'/);
+    await expect(runBatch(drv, { steps: [{ id: "x", kind: "exec", command: "true" }], layerr: 1 } as never))
+        .rejects.toThrow(/未知顶层字段 'layerr'/);
+    // 合法四字段不受影响
+    const r = await runBatch(drv, { steps: [{ id: "ok", kind: "exec", command: "true" }], layer: undefined, stopOnFail: false, maxParallel: 1 });
+    expect(r.steps[0]!.status).toBe("ok");
+});
+
 describe("runBatch layer 数组扇出", () => {
     function makeMockResolver(
         execImpl: (layer: string, command: string) => Promise<{ stdout: string; stderr: string; exitCode: number }>,

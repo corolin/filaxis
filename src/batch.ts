@@ -152,6 +152,16 @@ export async function runBatch(
     options: { previewBudgetBytes?: number } = {},
 ): Promise<BatchReport> {
     // ── 计划校验（零副作用阶段）──
+    // 未知顶层键拒绝（DSH 真机巡检踩中：`layers` 与 `layer` 一字之差被静默忽略，
+    // 计划落回默认层在调用方本机执行——「想扫集群、结果扫了自己」的副作用事故。
+    // 拼错的字段名必须当场报错，不能当不存在。）
+    if (plan && typeof plan === "object" && !Array.isArray(plan)) {
+        const known = new Set(["steps", "layer", "stopOnFail", "maxParallel"]);
+        const unknown = Object.keys(plan).filter((k) => !known.has(k));
+        if (unknown.length > 0) {
+            throw new Error(`批次计划非法：未知顶层字段 '${unknown.join("、")}'（合法: ${[...known].join("、")}——注意层字段名是 layer，可传数组扇出）`);
+        }
+    }
     if (!Array.isArray(plan?.steps) || plan.steps.length === 0) {
         // 空计划拒绝（冷路径摸排批 4：SDK 直调曾静默 ok——CLI 有守卫而内核没有，
         // 绕过 CLI 的消费方拿到「成功执行了零个步骤」的假成功）

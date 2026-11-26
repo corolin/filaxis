@@ -868,24 +868,29 @@ export function renderEnterBridgeCommand(steps: EnterStep[], innerCommand: strin
     for (let i = steps.length - 1; i >= 0; i--) {
         const raw = steps[i]!.cmd;
         const trimmed = raw.trim();
-        let tokens: string[];
         if (/^ssh(\s|$)/.test(trimmed)) {
             const stripped = trimmed.replace(/(^|\s)-+(tt|t)\b/g, "$1").replace(/\s+/g, " ").trim();
             const parsed = tokenizeArgv(stripped);
             if (!parsed.includes("-T")) parsed.splice(1, 0, "-T");
-            tokens = [...parsed, "sh", "-c", current];
-        } else {
-            const cleaned = trimmed.replace(/(^|\s)-(it|ti)\b/g, "$1-i").replace(/(^|\s)-t\b/g, "$1-i").trim();
-            const m = SHELL_TAIL_RE.exec(cleaned);
-            if (!m) {
-                return {
-                    kind: "unreachable",
-                    reason: "进入命令无法非交互透传 stdio 桥接（既非「… bash/sh」结尾、也非「ssh <目标>」形态）",
-                    step: raw,
-                };
-            }
-            tokens = [...tokenizeArgv(cleaned), "-c", current];
+            // ssh 跳比 docker/bash 尾形态多一层 shell 解析：本机 spawn 的整串命令先被
+            // 跳板 sh 消费一次，嵌套 ssh 再把多个参数按空格拼接（引号结构全丢）。若只
+            // 按单层引号渲染，目标侧拿到的已是 `sh -c exec ...`——dash 的裸 exec（无参
+            // 数）会按 POSIX 语义直接终结 shell，后面的命令全部不执行（真机实锤：穿层
+            // 转发 listener 活着、连接即断、零报错）。所以把 `sh -c <内层>` 整体再包一
+            // 层引号作为嵌套 ssh 的单个命令参数；每多一跳 ssh 就多一层，逐跳累积。
+            current = [...parsed.map(shellQuote), shellQuote(`sh -c ${shellQuote(current)}`)].join(" ");
+            continue;
         }
+        const cleaned = trimmed.replace(/(^|\s)-(it|ti)\b/g, "$1-i").replace(/(^|\s)-t\b/g, "$1-i").trim();
+        const m = SHELL_TAIL_RE.exec(cleaned);
+        if (!m) {
+            return {
+                kind: "unreachable",
+                reason: "进入命令无法非交互透传 stdio 桥接（既非「… bash/sh」结尾、也非「ssh <目标>」形态）",
+                step: raw,
+            };
+        }
+        const tokens = [...tokenizeArgv(cleaned), "-c", current];
         current = tokens.map(shellQuote).join(" ");
     }
     return { kind: "ok", command: current };

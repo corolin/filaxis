@@ -628,12 +628,46 @@ describe("enterPipeline layer-penetrating dynamic forwarding (stdio-bridge)", ()
         ], buildInnerTcpBridgeCmd("socat", "127.0.0.1", 8080));
         expect(nested.kind).toBe("ok");
         if (nested.kind === "ok") {
-            expect(nested.command).toContain("'ssh' '-T' 'vm-b' 'sh' '-c'");
+            // ssh 跳的 `sh -c <内层>` 必须整体再包一层引号（嵌套 ssh 会把参数按空格
+            // 拼接，单层引号在跳板 sh 就被消费掉）
+            expect(nested.command).toContain("'ssh' '-T' 'vm-b' 'sh -c");
             expect(nested.command).toContain("socat");
         }
 
         const bad = renderEnterBridgeCommand([{ cmd: "su - app" }], inner);
         expect(bad.kind).toBe("unreachable");
+    });
+
+    test("DSH 真机回归 2026-11-26：ssh 跳的引号层级 = 跳数 + 内层（裸 exec 终结 shell 案）", () => {
+        // 真机病链：单层引号在跳板 sh 被消费 → 嵌套 ssh 空格拼接 → 目标收到
+        // `sh -c exec ...` → dash 的裸 exec 直接退出 shell → python 桥根本没跑，
+        // 转发 listener 活着但连接即断、零报错。钉住：每多一跳 ssh，内层多一层引号。
+        const inner = buildInnerTcpBridgeCmd("python3", "127.0.0.1", 22);
+
+        const oneHop = renderEnterBridgeCommand([{ cmd: "ssh root@10.0.0.12" }], inner);
+        expect(oneHop.kind).toBe("ok");
+        if (oneHop.kind === "ok") {
+            // 末段是单个引号包裹的 `sh -c <内层>`（引号作为字符保留在参数里）
+            expect(oneHop.command.startsWith("'ssh' '-T' 'root@10.0.0.12' ")).toBe(true);
+            expect(oneHop.command).toContain("'sh -c");
+            // 内层整体作为嵌套 ssh 的一个参数存在，不是裸拼的 'sh' '-c'
+            expect(oneHop.command).not.toContain("'sh' '-c'");
+            // 双重引号包裹：内层脚本与参数在两层转义后仍存活，且以目标参数收尾
+            expect(oneHop.command).toContain("exec python3 -u -c");
+            expect(oneHop.command).toContain("127.0.0.1");
+            expect(oneHop.command).toMatch(/22'\\'''$/);
+        }
+
+        const twoHops = renderEnterBridgeCommand([
+            { cmd: "ssh jump-a" },
+            { cmd: "ssh -t 10.0.0.12" },
+        ], inner);
+        expect(twoHops.kind).toBe("ok");
+        if (twoHops.kind === "ok") {
+            // 两跳：`sh -c ` 出现两次（每跳一层）
+            expect(twoHops.command.match(/sh -c /g)?.length).toBe(2);
+            expect(twoHops.command).toContain("'sh -c");
+        }
     });
 
     test("guards enterPipeline layers against -R/-D host leaks, missing tools, and interactive steps", async () => {
