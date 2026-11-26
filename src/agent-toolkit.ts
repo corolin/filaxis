@@ -336,6 +336,17 @@ function assertOptionalLayerName(layer: unknown): asserts layer is string | unde
     }
 }
 
+/**
+ * 工具参数里的布尔开关：未传即不传，传了必须是布尔。校验与取值同在一处——工具参数是
+ * Record<string, unknown>，若「先 if 校验、再把原值传给操作」，校验靠的是控制流收窄，
+ * 非严格模式下不成立，unknown 会一路流进操作的类型化参数（打包的类型声明一步因此报错）。
+ */
+function boolOrUndefined(value: unknown, label: string): boolean | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== "boolean") throw new Error(`${label} 需为布尔值`);
+    return value;
+}
+
 function layerPathArgs(args: { path: string; layer?: string }) {
     const { path, layer, ...extra } = args;
     if (Object.keys(extra).length) throw new Error("只接受 path 和 layer");
@@ -1089,10 +1100,10 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     assertValidPath(path);
                     assertOptionalLayerName(layerName);
                     if (typeof content !== "string") throw new Error("edit_file 的 content 需为字符串");
-                    if (overwrite !== undefined && typeof overwrite !== "boolean") throw new Error("edit_file 的 overwrite 需为布尔值");
-                    if (createDirs !== undefined && typeof createDirs !== "boolean") throw new Error("edit_file 的 create_dirs 需为布尔值");
                     const r = await ops.writeFile({
-                        layer: layerName, path, content, overwrite, createDirs,
+                        layer: layerName, path, content,
+                        overwrite: boolOrUndefined(overwrite, "edit_file 的 overwrite"),
+                        createDirs: boolOrUndefined(createDirs, "edit_file 的 create_dirs"),
                     });
                     return { mode: "write" as const, path: r.path, created: r.created, bytes_after: r.bytesAfter };
                 }
@@ -1126,8 +1137,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     const { parents, ...extra } = rest;
                     const unknown = Object.keys(extra);
                     if (unknown.length) throw new Error(`manage_path(mkdir) 未知参数：${unknown.join(", ")}`);
-                    if (parents !== undefined && typeof parents !== "boolean") throw new Error("parents 需为布尔值");
-                    return await ops.managePath({ layer: layerName, action: "mkdir", path, parents });
+                    return await ops.managePath({ layer: layerName, action: "mkdir", path, parents: boolOrUndefined(parents, "parents") });
                 }
                 if (action === "move") {
                     const { destination, ...extra } = rest;
@@ -1139,8 +1149,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const { recursive, ...extra } = rest;
                 const unknown = Object.keys(extra);
                 if (unknown.length) throw new Error(`manage_path(delete) 未知参数：${unknown.join(", ")}`);
-                if (recursive !== undefined && typeof recursive !== "boolean") throw new Error("recursive 需为布尔值");
-                return await ops.managePath({ layer: layerName, action: "delete", path, recursive });
+                return await ops.managePath({ layer: layerName, action: "delete", path, recursive: boolOrUndefined(recursive, "recursive") });
             }) as AgentToolHandlers["manage_path"],
             transfer_file: (async (args: Record<string, unknown>) => {
                 const { direction, ...rest } = args;
@@ -1272,9 +1281,9 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     const { layer: layerName, include_closed, ...extra } = rest;
                     const unknown = Object.keys(extra);
                     if (unknown.length) throw new Error(`manage_layers(forward_list) 未知参数：${unknown.join(", ")}`);
-                    if (include_closed !== undefined && typeof include_closed !== "boolean") throw new Error("include_closed 需为布尔值");
+                    if (include_closed !== undefined) boolOrUndefined(include_closed, "include_closed"); // 先于层名校验，报错次序不变
                     assertOptionalLayerName(layerName);
-                    const r = await ops.listForwards({ layer: layerName, includeClosed: include_closed });
+                    const r = await ops.listForwards({ layer: layerName, includeClosed: boolOrUndefined(include_closed, "include_closed") });
                     return { action: "forward_list" as const, forwards: r.forwards.map(forwardInfoToPublic) };
                 }
                 if (action === "forward_remove") {
