@@ -411,10 +411,13 @@ export function expandBatchLayerWildcards(plan: BatchPlan, known: readonly strin
             if (!nonEmptyString(name)) return [name]; // 形态校验交给 validateLayerTarget
             const hit = expandLayerPattern(name, known);
             if (hit.length === 0) {
-                throw new Error(
-                    `批次计划非法：${where} 的层通配 '${name}' 未匹配任何${knownLabel}` +
-                    `（现有：${known.slice(0, 12).join("、")}${known.length > 12 ? ` 等 ${known.length} 个` : known.length ? "" : "（无）"}）`,
-                );
+                // 一个层名都没有时点明「通配展开的范围」，否则 Agent 会以为层表坏了
+                const scope = known.length === 0
+                    ? `（当前没有任何${knownLabel}${knownLabel === "已注册层"
+                        ? "——这里的通配只按本会话 connect_layer 注册的层名展开，不读已存层表；要按已存层扇出请用 CLI 的 filaxis batch"
+                        : ""}）`
+                    : `（现有：${known.slice(0, 12).join("、")}${known.length > 12 ? ` 等 ${known.length} 个` : ""}）`;
+                throw new Error(`批次计划非法：${where} 的层通配 '${name}' 未匹配任何${knownLabel}${scope}`);
             }
             return hit;
         };
