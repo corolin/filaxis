@@ -13,7 +13,7 @@
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import { createWriteStream, realpath as realpathCallback } from "node:fs";
+import { createWriteStream, realpath as realpathCallback, statSync } from "node:fs";
 import { promisify } from "node:util";
 import { ExecCapture, parseCompletionMarker } from "./exec-capture.js";
 
@@ -141,6 +141,12 @@ export class LocalRuntimeDriver implements RuntimeDriver {
         const logPath = path.join(this.execDir, `${taskId}.log`);
         const statusPath = path.join(this.execDir, `${taskId}.status.json`);
         const auditLabel = options?.auditLabel;
+        const cwd = options?.cwd || this.defaultCwd || process.cwd();
+        // 工作目录不存在时 spawn 报的是「ENOENT … uv_spawn '<shell>'」——看着像没装 shell，
+        // 其实与 shell 无关（已存层的工作目录被删或填错时最常见）。先查目录，把原因说直
+        if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
+            throw new Error(`本机层的工作目录不存在（或不是目录）: ${cwd}`);
+        }
 
         // FEAT-03 marker：子 shell 包裹业务命令，$? 变量锁 + nonce 防撞——
         // 用户命令内写 exit 42 也不丢退出码与 effectiveUser
@@ -157,7 +163,6 @@ export class LocalRuntimeDriver implements RuntimeDriver {
             const stderr = new ExecCapture(options?.maxOutputBytes);
 
             const env = { ...process.env, ...options?.env };
-            const cwd = options?.cwd || this.defaultCwd || process.cwd();
 
             // 不使用 shell: true——Node 会再包一层 sh -c，stdin 读取类命令（wc、无参 cat）挂死。
             // 命令经 stdin 喂 `shell -s`（自排查·八轮顺藤：-c 走 argv 受 Windows 32767

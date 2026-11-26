@@ -200,3 +200,29 @@ describe("local exec 审计与错误语义对齐（审查收口批）", () => {
         await expect(drv.exec(cmd, { timeoutMs: 15_000 })).rejects.toMatchObject({ outcome: "unknown" });
     }, 25_000);
 });
+
+// ---------------------------------------------------------------------------
+// REQ-0004 M6 同构用例集踩出：本机层的工作目录不存在时，spawn 报的是
+// 「ENOENT … uv_spawn 'bash'」——看着像没装 bash，其实与 bash 无关。把原因说直。
+// ---------------------------------------------------------------------------
+describe("本机层工作目录不存在时的报错", () => {
+    test("exec 直接拒绝并点名目录，不再报成找不到 shell；命令零副作用", async () => {
+        const base = mkdtempSync(join(tmpdir(), "fx-local-nocwd-"));
+        const missing = join(base, "gone");
+        try {
+            const drv = new LocalRuntimeDriver({ cwd: missing, execDir: join(base, "exec") });
+            let caught: unknown;
+            try { await drv.exec("echo side-effect"); } catch (e) { caught = e; }
+            expect(caught).toBeInstanceOf(Error);
+            expect((caught as Error).message).toContain("工作目录不存在");
+            expect((caught as Error).message).toContain(missing);
+            expect((caught as Error).message).not.toContain("uv_spawn");
+            // per-exec cwd 覆盖同样先查
+            const plain = new LocalRuntimeDriver({ execDir: join(base, "exec") });
+            await expect(plain.exec("echo x", { cwd: missing })).rejects.toThrow(/工作目录不存在/);
+        } finally {
+            rmSync(base, { recursive: true, force: true });
+        }
+        // 预算 30s：本机驱动构造时探测 shell（扫 PATH）在负载高的机器上要几秒
+    }, 30_000);
+});
