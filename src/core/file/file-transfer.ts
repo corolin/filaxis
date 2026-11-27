@@ -16,7 +16,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
-import { basename, dirname, join } from "node:path";
 import type { RemoteDialect } from "../base/dialect.js";
 import { renderInplaceWrite, renderPreserveMode } from "./file-placement.js";
 import { sshFileStdioRequested, spawnWithFileRedirect } from "../ssh/ssh-file-stdio.js";
@@ -684,22 +683,24 @@ export async function sftpPutFile(
     }
 }
 
-/** 本地下载临时名（Sol 63 P2-5）：basename+后缀超 255B 截前段+短 hash（NAME_MAX 安全） */
-/** 本地临时名（字节口径 NAME_MAX 安全）：suffix 由调用方给（fx-dl/filaxis-get
- *  两条下载路径共用——Sol 73 #5：getFile 内联旧版仍按码元计，252B 中文名
- *  追后缀 ENAMETOOLONG） */
+/** 本地下载临时名（字节口径 NAME_MAX 安全）：suffix 由调用方给（fx-dl/filaxis-get/sftp-get
+ *  三条下载路径共用——Sol 73 #5：getFile 内联旧版仍按码元计，252B 中文名
+ *  追后缀 ENAMETOOLONG）。目录部分按原样截取：path.join 会把路径里的 `link/..` 词法折叠，
+ *  临时文件落到另一个目录——目标目录明明存在也报 ENOENT（0.2.13 即如此） */
 function localTmpFor(localPath: string, suffix: string): string {
-    const name = basename(localPath);
+    const slash = Math.max(localPath.lastIndexOf("/"), localPath.lastIndexOf("\\"));
+    const dir = slash >= 0 ? localPath.slice(0, slash + 1) : "";
+    const name = slash >= 0 ? localPath.slice(slash + 1) : localPath;
     const suffixBytes = Buffer.byteLength(suffix, "utf-8");
     // 字节口径（Sol 72 #5 同 withSuffix）：多字节长名按 UTF-8 字节预算截断
     if (Buffer.byteLength(name, "utf-8") + suffixBytes <= 255) {
-        return join(dirname(localPath), name + suffix);
+        return dir + name + suffix;
     }
     const keep = Math.max(1, 255 - suffixBytes - 9);
     let cut = name.slice(0, keep);
     while (Buffer.byteLength(cut, "utf-8") > keep && cut.length > 0) cut = cut.slice(0, -1);
     if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
-    return join(dirname(localPath), cut + "~" + randomBytes(4).toString("hex") + suffix);
+    return dir + cut + "~" + randomBytes(4).toString("hex") + suffix;
 }
 
 /** sftp 快路径 get（batch `get`；校验同 put）。

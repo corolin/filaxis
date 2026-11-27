@@ -75,11 +75,13 @@ describe("调用方机器上的路径：符号链接后面的 .. 按内核语义
             expect(put.err).toBe("");
             expect(readFileSync(join(root, "dest", "uploaded.txt"), "utf-8")).toBe("kernel-payload\n");
 
-            // get：本机侧落点
-            const get = run(["get", "--no-daemon", join(root, "payload.txt"), "link/../downloaded.txt"], work);
+            // get：本机侧落点。目标目录 link/../newdir = <root>/newdir（存在）；词法折叠后的
+            // <root>/work/newdir 不存在——下载内核若把临时文件拼到那边，目标目录在也报 ENOENT
+            mkdirSync(join(root, "newdir"));
+            const get = run(["get", "--no-daemon", join(root, "payload.txt"), "link/../newdir/downloaded.txt"], work);
             expect(get.err).toBe("");
-            expect(existsSync(join(root, "downloaded.txt"))).toBe(true);
-            expect(existsSync(join(work, "downloaded.txt"))).toBe(false);
+            expect(readFileSync(join(root, "newdir", "downloaded.txt"), "utf-8")).toBe("kernel-payload\n");
+            expect(existsSync(join(work, "newdir"))).toBe(false);
 
             // batch：exec 步骤的 commandFile（经 --out-dir 落盘后读回，看跑的是哪份脚本）
             const plan = join(root, "plan.json");
