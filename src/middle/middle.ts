@@ -839,18 +839,21 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         },
 
         // 观察窗
-        async openStream({ layer, command, stream, name, limit = 20, waitMs = 0 }) {
+        async openStream({ layer, command, stream, name, limit = 20, waitMs = 0, cwd }) {
             assertOpen();
             if (typeof command !== "string" || !command.trim()) throw new Error("command 需为非空字符串");
             const drv = await resolveLayerRef(layer);
             if (observationDisposed) throw new Error("观察窗已关闭");
-            if (typeof drv.openStreamWindow !== "function") {
-                throw new Error(`层 '${layerLabel(layer)}' (${drv.descriptor.driver}) 不支持持续观察窗`);
+            // 工作目录只对本机层有意义，且不登记进层栈（与 runBatch 同一规则）：经 Daemon 时它的
+            // 工作目录与调用方无关，所以要由调用方传进来
+            const target = cwd && drv.descriptor?.driver === "local" ? instantiateDriver({ driver: "local", cwd })! : drv;
+            if (typeof target.openStreamWindow !== "function") {
+                throw new Error(`层 '${layerLabel(layer)}' (${target.descriptor.driver}) 不支持持续观察窗`);
             }
             const registry = windows();
             const id = crypto.randomUUID();
             const owner = [...stack.layers.values()].find((h) => h.driver === drv);
-            const win = await drv.openStreamWindow(registry, { name: id, command, stream, retainSequence: false });
+            const win = await target.openStreamWindow(registry, { name: id, command, stream, retainSequence: false });
             streamMeta.set(id, {
                 displayName: name,
                 layer: owner?.name ?? (drv.descriptor?.driver === "local" ? "local" : undefined),

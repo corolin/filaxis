@@ -1056,6 +1056,8 @@ async function handleStreamCmd(sub: string | undefined, o: ReturnType<typeof par
             ...(o.name ? { name: o.name } : {}),
             ...(o.limit !== undefined ? { limit: o.limit } : {}),
             ...(o.wait !== undefined ? { waitMs: o.wait } : {}),
+            // 没写目标 = 本机层：命令落在调用方的工作目录（经 Daemon 时它的工作目录与本进程无关）
+            cwd: defaultCwd(o),
         });
         if (o.json) console.log(JSON.stringify(res, null, 2));
         else printStreamResult(res);

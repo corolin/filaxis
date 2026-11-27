@@ -235,6 +235,16 @@ export const ISO_CASES: IsoCase[] = [
             { op: "closeStream", params: { windowId: "$ref:w.windowId" } },
         ],
     },
+    {
+        // 与 runCommand 的 cwd 同一契约：没写目标时本机层的工作目录由调用方指定（经 Daemon 时
+        // Daemon 的工作目录与调用方无关）。期望值另有 tests/open-stream-cwd.test.ts 断言
+        name: "openStream：没写目标就是本机，命令工作目录由调用方指定",
+        files: { "d/stream-marker.txt": "stream-cwd\n" },
+        steps: [
+            { op: "openStream", params: { command: "cat stream-marker.txt; sleep 20", cwd: "$tmp/d", waitMs: 2500 }, save: "w" },
+            { op: "closeStream", params: { windowId: "$ref:w.windowId" } },
+        ],
+    },
 
     // ── 层 ──
     {

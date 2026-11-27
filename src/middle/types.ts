@@ -194,7 +194,8 @@ export interface MiddleOps {
     }): Promise<LayerFileTransferResult>;
 
     // ── 观察窗 ──
-    openStream(args: { layer?: LayerRef; command: string; stream?: StreamFilter; name?: string; limit?: number; waitMs?: number }): Promise<StreamResult>;
+    /** `cwd`：本机层的命令工作目录——经 Daemon 时它的工作目录与调用方无关，要由调用方传进来 */
+    openStream(args: { layer?: LayerRef; command: string; stream?: StreamFilter; name?: string; limit?: number; waitMs?: number; cwd?: string }): Promise<StreamResult>;
     peekStream(args: {
         windowId: string; afterSeq?: number; beforeSeq?: number; windowMs?: number;
         limit?: number; waitMs?: number; stream?: StreamFilter;
