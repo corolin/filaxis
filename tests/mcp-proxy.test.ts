@@ -1037,7 +1037,10 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             if (req.method === "GET" && (req.url === "/status" || req.url === "/health")) {
                 if (req.url === "/status") onStatus(req.socket);
                 res.writeHead(200, { "Content-Type": "application/json" });
-                timers.push(setInterval(() => { if (!res.destroyed) res.write(" "); }, 100));
+                // 连接一关就停：Linux 上的 bun 1.3.12 不给这个应答对象置 destroyed
+                const trickle = setInterval(() => { if (!res.destroyed) res.write(" "); }, 100);
+                timers.push(trickle);
+                req.socket.on("close", () => clearInterval(trickle));
                 return;
             }
             res.writeHead(404).end();

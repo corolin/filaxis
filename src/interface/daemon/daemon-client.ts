@@ -151,6 +151,10 @@ export class DaemonClient {
                 headers["Content-Length"] = String(payload.byteLength);
             }
 
+            // 这条请求「已经判定失败」的原因：期限到了，或被外部中止。判定之后连接上再发生的事
+            // （应答对象的 end / aborted / error）一律按它算。Linux 上的 bun 1.3.12 在请求被销毁后
+            // 先给应答对象发 end（带着收到的半个应答体）——不拦的话半截应答会被当成完整应答
+            let failure: Error | undefined;
             const req = http.request({
                 protocol: this.baseUrl.protocol,
                 hostname: urlRequestHost(this.baseUrl),
@@ -163,24 +167,37 @@ export class DaemonClient {
                 const chunks: Buffer[] = [];
                 res.on("data", (d: Buffer) => chunks.push(d));
                 res.on("end", () => {
+                    if (failure) { onTransportError(failure); return; }
+                    // 连接在应答结束前关闭：没有完整的应答，不能当作结果
+                    if (res.complete === false) {
+                        onTransportError(new Error(`Daemon 应答不完整（连接在应答结束前关闭）: ${method} ${reqPath}`));
+                        return;
+                    }
                     const raw = Buffer.concat(chunks).toString("utf-8");
                     let json: unknown;
                     try { json = JSON.parse(raw); } catch { /* non-json */ }
                     settle(() => resolve({ statusCode: res.statusCode ?? 0, raw, json }));
                 });
+                res.on("aborted", () => {
+                    onTransportError(failure ?? new Error(`Daemon 应答中断: ${method} ${reqPath}`));
+                });
                 res.on("error", onTransportError);
             });
+            const fail = (err: Error): void => {
+                failure ??= err;
+                req.destroy(err);
+            };
 
-            // 缺省是空闲超时：长操作靠它做到「只杀哑不杀慢」。握手这类必须有限的请求另加硬性期限
+            // 缺省是空闲超时：长操作靠它做到「只杀哑不杀慢」。控制面与握手请求用硬性期限
             let deadline: ReturnType<typeof setTimeout> | undefined;
             if (timeoutMs !== undefined && timeoutMs > 0) {
                 const expire = (): void => {
-                    req.destroy(new Error(`Daemon 请求超时 (${timeoutMs}ms): ${method} ${reqPath}`));
+                    fail(new Error(`Daemon 请求超时 (${timeoutMs}ms): ${method} ${reqPath}`));
                 };
                 if (control.absoluteTimeout) deadline = setTimeout(expire, timeoutMs);
                 else req.setTimeout(timeoutMs, expire);
             }
-            const onAbort = (): void => { req.destroy(abortReason(control.signal!)); };
+            const onAbort = (): void => { fail(abortReason(control.signal!)); };
             control.signal?.addEventListener("abort", onAbort, { once: true });
             req.on("error", onTransportError);
             if (payload) req.write(payload);
@@ -192,7 +209,9 @@ export class DaemonClient {
                 fn();
             }
             function onTransportError(err: Error): void {
-                settle(() => reject(method === "POST" ? tagTransportUnknown(err) : err));
+                // 已判定失败的原因优先：随后连接上的 ECONNRESET 之类只是它的后果
+                const cause = failure ?? err;
+                settle(() => reject(method === "POST" ? tagTransportUnknown(cause) : cause));
             }
         });
     }
