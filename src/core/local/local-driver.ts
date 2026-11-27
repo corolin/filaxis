@@ -92,8 +92,35 @@ export class LocalRuntimeDriver implements RuntimeDriver {
         // No-op for local
     }
 
+    /** 在途的 exec 各持一个中止器：外部 signal 转发进来，destroy() 一并触发 */
+    private readonly runningExecs = new Set<AbortController>();
+
     async destroy() {
-        // 会话引擎句柄保留 TTL 自回收；此处无强制清理面（processMgr 属后续批次）
+        // 销毁 = 收掉这个 driver 起的、还在跑的东西（与 ssh 层「销毁即断链」同一语义）：在途 exec
+        // 中止、后台会话停机并核实。此前是空实现——Daemon 停机后进程要陪在途命令/会话跑完才退
+        // （长跑会话 = 旧进程活几小时），CLI 那头只等 5 秒就报「停机核实超时、终态未知」。
+        const reason = new Error("本机层已销毁");
+        for (const own of this.runningExecs) own.abort(reason);
+        this.runningExecs.clear();
+        const running = this.sessions.list().filter((s) => s.running);
+        await Promise.all(running.map((s) => this.sessions.stop(s.sessionId).catch(() => undefined)));
+    }
+
+    async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
+        const own = new AbortController();
+        const outer = options?.signal;
+        const forward = (): void => { own.abort(outer!.reason); };
+        if (outer) {
+            if (outer.aborted) forward();
+            else outer.addEventListener("abort", forward, { once: true });
+        }
+        this.runningExecs.add(own);
+        try {
+            return await this.execOnce(command, { ...options, signal: own.signal });
+        } finally {
+            this.runningExecs.delete(own);
+            outer?.removeEventListener("abort", forward);
+        }
     }
 
     openStreamWindow(registry: StreamWindowRegistry, opts: ObservationWindowOptions) {
@@ -132,7 +159,7 @@ export class LocalRuntimeDriver implements RuntimeDriver {
         return this.sessions.list();
     }
 
-    async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
+    private async execOnce(command: string, options?: ExecOptions): Promise<ExecResult> {
         if (options?.channel === "pty") {
             throw new Error('local Transport 不支持 channel:"pty"（PTY 交互语义属远端 Transport；本地 exec 通道天然分离且恒可用）');
         }

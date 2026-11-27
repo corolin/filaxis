@@ -894,6 +894,12 @@ async function handleDaemonCmd(sub: string | undefined, o: ReturnType<typeof par
             await srv.waitForStop();
             process.removeListener("SIGINT", onSignal);
             process.removeListener("SIGTERM", onSignal);
+            // 停机收尾在 waitForStop 之前已全部等完（服务、观察窗、工具面、中层与各驱动）。此刻还可能
+            // 挂着句柄的，只剩被中止的本机命令留下的孤儿子进程握着的管道——它们不属于 Daemon 了。
+            // 明确退出，不等事件循环排空：曾因此陪一条 20 秒的命令又活 19 秒，`daemon stop` 等不到
+            // 就报「停机核实超时、终态未知」。这里没有待跑的 finally，与「命令路径只设 exitCode」不冲突。
+            // 等 stdout 排空再退，启动横幅与收尾输出不丢。
+            process.stdout.write("", () => process.exit(0));
             return;
         }
         const cliEntryPath = fileURLToPath(import.meta.url);
