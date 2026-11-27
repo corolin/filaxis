@@ -109,6 +109,10 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one(toolFace, 'import("../../core/file/batch.js").catch((e) => console.error(e));')).toHaveLength(1);
         expect(one(toolFace, 'const x = import("../../core/file/batch.js").default;')).toHaveLength(1);
         expect(one(toolFace, 'void import("../../core/file/batch.js");')).toHaveLength(1);
+        // 成员被取出来稍后再调用、typeof 出现在值的位置、当实参传入——运行时都会加载模块
+        expect(one(toolFace, 'const then = import("../../core/file/batch.js").then;')).toHaveLength(1);
+        expect(one(toolFace, 'const kind = typeof import("../../core/file/batch.js");')).toHaveLength(1);
+        expect(one(toolFace, 'load(import("../../core/file/batch.js").runBatch);')).toHaveLength(1);
         expect(one(toolFace, 'import { BATCH_STEP_KINDS } from "../../core/file/batch.js";')).toHaveLength(1);
         // 混合写法里取了一个值也算
         expect(one(toolFace, 'import { BATCH_STEP_KINDS, type BatchPlan } from "../../core/file/batch.js";')).toHaveLength(1);
@@ -125,6 +129,10 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one(toolFace, 'type D = import("../../core/base/driver.js").RuntimeDriver;')).toEqual([]);
         expect(one(toolFace, 'let d: import("../../core/base/driver.js").RuntimeDriver;')).toEqual([]);
         expect(one(toolFace, 'type D = typeof import("../../core/base/driver.js").RuntimeDriver;')).toEqual([]);
+        expect(one(toolFace, 'let t: typeof import("../../core/base/driver.js");')).toEqual([]);
+        expect(one(toolFace, 'export type Loader = typeof import("../../core/base/driver.js");')).toEqual([]);
+        expect(one(toolFace, 'type Registry = Record<string, typeof import("../../core/base/driver.js")>;')).toEqual([]);
+        expect(one(toolFace, 'function f(p: typeof import("../../core/base/driver.js")) {}')).toEqual([]);
         expect(one("src/interface/mcp/mcp-server.ts", 'export type { StreamResult } from "../../middle/types.js";')).toEqual([]);
     });
 

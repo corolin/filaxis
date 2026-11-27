@@ -74,6 +74,20 @@ function namedSpecifiersAreAllTypes(clause: string): boolean {
     return specifiers.length > 0 && specifiers.every((specifier) => /^type\s/.test(specifier));
 }
 
+/**
+ * `import("x")` 之前是否处在类型位置：类型别名（`type X = …`）、冒号后的类型标注、`as` 之后，
+ * 或类型实参/联合/交叉里（同一句里得已经有类型标注或别名头——实参列表里的逗号不算）。
+ * 其余一律算值位置。
+ */
+function inTypePosition(before: string): boolean {
+    // `typeof import("x")` 的位置由 typeof 之前的上下文决定
+    const b = before.replace(/\s+$/, "").replace(/typeof$/, "").replace(/\s+$/, "");
+    if (/:$/.test(b) || /\bas$/.test(b)) return true;
+    if (/^\s*(?:export\s+)?type\s+[\w$]+\s*(?:<[^<>()]*>)?\s*=\s*$/.test(b)) return true;
+    if (/[<,|&]$/.test(b)) return /:/.test(b) || /^\s*(?:export\s+)?type\s+[\w$]+\s*(?:<[^<>()]*>)?\s*=/.test(b);
+    return false;
+}
+
 export function importsOf(text: string): ImportEdge[] {
     const out: ImportEdge[] = [];
     const lines = text.split(/\r?\n/);
@@ -147,7 +161,8 @@ export function importsOf(text: string): ImportEdge[] {
             return;
         }
         // 动态 import 与 require：类型位置的 import("x")（typeof import("x")、import("x").T）只取类型。
-        // 点号后面是方法调用（import("x").then(…)）或 default 的是取值——存疑时按取值算
+        // `typeof import("x")` 与 `import("x").T` 出现在值的位置同样是加载模块——只有确实处在类型
+        // 位置才算只取类型，其余一律按取值算（存疑时宁可误报）
         const dynamic = /\bimport\(\s*(["'])([^"']+)\1\s*\)/g;
         for (const m of trimmed.matchAll(dynamic)) {
             const after = trimmed.slice(m.index! + m[0].length);
@@ -155,7 +170,8 @@ export function importsOf(text: string): ImportEdge[] {
             const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(after);
             const valueMember = member !== null
                 && (member[1] === "default" || /^\s*(?:<[^<>()]*>)?\s*\(/.test(after.slice(member[0].length)));
-            const typePosition = !valueMember && (member !== null || /typeof\s*$/.test(before));
+            const typeQuery = member !== null || /typeof\s*$/.test(before);
+            const typePosition = !valueMember && typeQuery && inTypePosition(before);
             out.push({ spec: m[2]!, typeOnly: typePosition, line: index + 1 });
         }
         for (const m of trimmed.matchAll(/\brequire\(\s*(["'])([^"']+)\1\s*\)/g)) {
