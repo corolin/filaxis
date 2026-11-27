@@ -66,20 +66,26 @@ export class DaemonClient {
 
     async health(timeoutMs = 1500): Promise<boolean> {
         try {
-            const res = await this.rawRequest("GET", "/health", undefined, timeoutMs, false);
+            const res = await this.rawRequest("GET", "/health", undefined, timeoutMs, false, { absoluteTimeout: true });
             return res.statusCode === 200 && Boolean((res.json as { ok?: unknown } | undefined)?.ok === true);
         } catch {
             return false;
         }
     }
 
-    /** `control`：握手类请求可要求硬性期限、可被外部中止（见 RequestControl） */
+    /**
+     * `/status`：控制面请求，一律按硬性期限（到点即断，不看连接是否空闲）。probeDaemon、启动器的
+     * 握手、`daemon status` / `stop` 都走它——对端只滴数据不应答时，按「空闲多久」算就永远不触发，
+     * CLI 的每条命令都会被拖住。操作类 RPC（rpc）不变，仍是空闲超时：长操作靠它做到只杀哑不杀慢。
+     * `control.signal`：握手请求可被外部中止（见 RequestControl）。
+     */
     async status(timeoutMs = 3000, control: RequestControl = {}): Promise<DaemonStatusInfo> {
-        return this.unwrap<DaemonStatusInfo>(await this.rawRequest("GET", "/status", undefined, timeoutMs, true, control));
+        return this.unwrap<DaemonStatusInfo>(await this.rawRequest("GET", "/status", undefined, timeoutMs, true, { ...control, absoluteTimeout: true }));
     }
 
+    /** 控制面请求，同样按硬性期限 */
     async shutdown(timeoutMs = 5000): Promise<{ ok: true }> {
-        const response = await this.rawRequest("POST", "/shutdown", {}, timeoutMs, true);
+        const response = await this.rawRequest("POST", "/shutdown", {}, timeoutMs, true, { absoluteTimeout: true });
         return this.unwrap<{ ok: true }>(response);
     }
 

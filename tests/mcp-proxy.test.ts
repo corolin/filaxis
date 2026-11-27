@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
-import { ProtocolMismatchError } from "../src/interface/daemon/daemon-client.js";
+import { assertDaemonProtocol, ProtocolMismatchError } from "../src/interface/daemon/daemon-client.js";
 import { PROTOCOL_VERSION } from "../src/middle/protocol.js";
 import {
     createAgentToolkit,
@@ -1030,12 +1030,12 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         }
     }, 10_000);
 
-    /** 一个 /status 永不完整应答的假 Daemon：每隔 100ms 滴一个空格，让「空闲超时」永远不触发 */
+    /** 一个 /status、/health 永不完整应答的假 Daemon：每隔 100ms 滴一个空格，让「空闲超时」永远不触发 */
     function trickleStatusDaemon(onStatus: (socket: http.IncomingMessage["socket"]) => void) {
         const timers: NodeJS.Timeout[] = [];
         const server = http.createServer((req, res) => {
-            if (req.method === "GET" && req.url === "/status") {
-                onStatus(req.socket);
+            if (req.method === "GET" && (req.url === "/status" || req.url === "/health")) {
+                if (req.url === "/status") onStatus(req.socket);
                 res.writeHead(200, { "Content-Type": "application/json" });
                 timers.push(setInterval(() => { if (!res.destroyed) res.write(" "); }, 100));
                 return;
@@ -1044,6 +1044,34 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         });
         return { server, stop: () => { for (const t of timers) clearInterval(t); } };
     }
+
+    test("探测与握手类的 /status、/health 请求按硬性期限结束——对端只滴数据也不拖住启动器与 CLI", async () => {
+        // probeDaemon（CLI 的每条命令、MCP 启动器、daemon status / stop 都先过它）、启动器的握手、
+        // health 探测：这些请求本来就必须有限。它们的超时此前是「空闲多久」，对端每隔一会儿滴
+        // 一个字节就永不触发——真机上 filaxis daemon status 对着这样的对端挂了 7 分钟
+        const dir = makeTempDir("fx-probe-trickle-");
+        const fake = trickleStatusDaemon(() => undefined);
+        const hung = <T,>() => new Promise<T>((resolve) => setTimeout(() => resolve("hung" as T), 2_500));
+        try {
+            await new Promise<void>((resolve) => fake.server.listen(0, "127.0.0.1", resolve));
+            const port = (fake.server.address() as { port: number }).port;
+            const addr = `http://127.0.0.1:${port}`;
+            writeFileSync(join(dir, "daemon.addr"), addr);
+            writeFileSync(join(dir, "daemon.token"), "probe-trickle-token");
+
+            const t0 = Date.now();
+            expect(await Promise.race([probeDaemon(dir, 500), hung()])).toBeNull();
+            const client = new DaemonClient({ addr, token: "probe-trickle-token" });
+            expect(await Promise.race([client.health(500), hung()])).toBe(false);
+            await expect(Promise.race([assertDaemonProtocol(client, 500), hung()])).rejects.toThrow(/超时/);
+            expect(Date.now() - t0).toBeLessThan(2_500 + 500); // 三次都按各自的期限结束，没有一次等到「hung」
+        } finally {
+            fake.stop();
+            fake.server.closeAllConnections();
+            await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 10_000);
 
     test("握手在途时 stdin 关闭：在途的 /status 请求随即中止——对端一直滴数据也拖不住", async () => {
         // 代理收尾后不再开 SSE（上一笔），但握手请求本身还在等；而它的 1.5 秒是空闲超时，
