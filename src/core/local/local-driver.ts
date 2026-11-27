@@ -11,9 +11,9 @@
  * - exec 审计留痕保留（status/log 落盘 tempDir——「执行有迹」）
  * - shell 可配（缺省 bash；Windows 需 Git Bash/WSL——平台差异显式声明）
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
-import { createWriteStream, realpath as realpathCallback, statSync } from "node:fs";
+import { createWriteStream, readdirSync, readFileSync, realpath as realpathCallback, statSync } from "node:fs";
 import { promisify } from "node:util";
 import { ExecCapture, parseCompletionMarker } from "../base/exec-capture.js";
 
@@ -208,6 +208,8 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                 cwd,
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
+                // 不 detached：命令与宿主同处前台进程组，终端的 Ctrl-C 连命令一起送（SDK 宿主、进程内
+                // filaxis-mcp、一次性 CLI 都靠这个）。代价是中止时不能按组号杀——见 reapCommandTree
             });
             // stdin 管道错误必须监听（GPT Astra 九轮 P1）：shell 提前退出（流式解析
             // 撞语法错即死）时继续写管道抛 write EOF——无 error 监听器则 uncaught
@@ -252,7 +254,7 @@ export class LocalRuntimeDriver implements RuntimeDriver {
             let settled = false;
             let finished = false;
             const logStream = auditLabel === undefined ? createWriteStream(logPath) : undefined;
-            // error 监听 + 终结守卫（Hydrogen R5 #1）：超时/abort 设计=进程后台续跑，
+            // error 监听 + 终结守卫（Hydrogen R5 #1）：超时=进程后台续跑，abort=整棵进程树收割，
             // 其后任意输出再进 logStream.write=ERR_STREAM_WRITE_AFTER_END 崩宿主
             // （无 error 监听时同步抛）。写日志尽力而为——失败吞掉，data 侧判 finished
             const resumeOutput = () => { p.stdout.resume(); p.stderr.resume(); };
@@ -302,11 +304,11 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                 settled = true;
                 finished = true; // 审计终态封口（close 不得覆写 aborted）
                 detachLifecycle();
-                try { p.kill("SIGTERM"); } catch { /* 已退出 */ }
+                try { reapCommandTree(p, this.shell); } catch { /* 已退出 */ }
                 logStream?.end();
                 resumeOutput();
                 void writeStatus("aborted", { error: "Aborted by AbortSignal", exitCode: null });
-                const abortErr = new Error("Command aborted by AbortSignal（本地进程已 SIGTERM，终态未核实——outcome=unknown）") as Error & { name: "AbortError"; outcome: "unknown" };
+                const abortErr = new Error("Command aborted by AbortSignal（已向整棵进程树发 SIGTERM，终态未核实——outcome=unknown）") as Error & { name: "AbortError"; outcome: "unknown" };
                 abortErr.name = "AbortError";
                 abortErr.outcome = "unknown";
                 reject(abortErr);
@@ -417,6 +419,124 @@ async function resolvePosixRealpath(inputPath: string): Promise<string> {
         current = next;
     }
     return current;
+}
+
+/** 冻结后清点子孙的轮数：每轮捞到的新面孔都被停住，它们的子进程下一轮还挂在它们下面 */
+const REAP_ROUNDS = 3;
+
+/**
+ * 收割一条被中止的命令的整棵进程树——不是只杀外层 shell。命令在子 shell 里跑，子 shell 及其
+ * 子孙各是一个进程；只杀外层，其余的照跑到结束（两平台实测）。
+ *
+ * 命令与宿主同组（没有 detached，终端的 Ctrl-C 才连命令一起送），所以不能按组号杀，按父子表清点。
+ * 先冻结再清点：成员被 SIGSTOP 后不再分叉，外层也不会先死——外层一死子孙就被过继给 init，
+ * 父子链断了就再也找不回来。清点到不再有新面孔为止，然后逐个 SIGTERM、放开 SIGCONT。
+ * Windows：见 reapCommandTreeWindows。取不到父子表（没有 /proc 也没有 ps）时退回只杀外层。
+ */
+function reapCommandTree(p: ChildProcess, shell: string): void {
+    const pid = p.pid;
+    if (!pid) return;
+    if (process.platform === "win32") {
+        reapCommandTreeWindows(pid, shell);
+        return;
+    }
+    const frozen: number[] = [];
+    const stop = (target: number): void => {
+        try { process.kill(target, "SIGSTOP"); frozen.push(target); } catch { /* 已退出 */ }
+    };
+    stop(pid);
+    for (let round = 0; round < REAP_ROUNDS; round++) {
+        const table = processParentTable();
+        if (!table) break;
+        const found = descendants(table, pid).filter((q) => !frozen.includes(q));
+        if (found.length === 0) break;
+        for (const q of found) stop(q);
+    }
+    for (const q of frozen) { try { process.kill(q, "SIGTERM"); } catch { /* 已退出 */ } }
+    for (const q of frozen) { try { process.kill(q, "SIGCONT"); } catch { /* 已退出 */ } }
+}
+
+/**
+ * Windows 上收割整棵树。taskkill /T 沿 Windows 的父子链走，但 Git Bash（MSYS）每执行一个外部程序
+ * 都是「fork 出中间进程、再 exec」，exec 出来的进程挂在随即退出的中间进程下——在 Windows 的父子表里
+ * 是孤儿，taskkill 找不到；它若是脚本（`bash -c 'sleep 3; echo …'`），会接着把后面的命令跑完
+ * （真机复现）。MSYS 自己的进程表（ps -e，带 WINPID 列）认得完整的一族：先按它清点，再对清点到的
+ * 每个进程连同各自的 Windows 子树一起 taskkill。清点必须在杀之前——杀了之后父子关系就散了。
+ * 不是 Git Bash（ps 没有 WINPID 列）或表里找不到根时，退回只对根做 taskkill /T。
+ */
+function reapCommandTreeWindows(rootWinpid: number, shell: string): void {
+    const args = ["/T", "/F"];
+    for (const winpid of msysFamilyWinpids(shell, rootWinpid) ?? [rootWinpid]) args.push("/PID", String(winpid));
+    // fire-and-forget 的 spawn 必须挂 error 监听：taskkill 取不到时异步 error 会崩宿主进程
+    spawn("taskkill", args, { stdio: "ignore", windowsHide: true }).on("error", () => undefined);
+}
+
+/** 根（WINPID = rootWinpid）及其在 MSYS 进程表里的全部子孙的 Windows PID；不是 MSYS 的 ps 或找不到根时返回 null */
+function msysFamilyWinpids(shell: string, rootWinpid: number): number[] | null {
+    const ps = spawnSync(shell, ["-c", "ps -e"], { encoding: "utf-8", windowsHide: true });
+    if (ps.error || ps.status !== 0 || !ps.stdout.includes("WINPID")) return null;
+    // PID PPID PGID WINPID TTY UID STIME COMMAND：只取前四列数字（STIME 含空格，后面的不再解析）
+    const rows: Array<{ pid: number; ppid: number; winpid: number }> = [];
+    for (const line of ps.stdout.split("\n")) {
+        const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s/.exec(line);
+        if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), winpid: Number(m[4]) });
+    }
+    const root = rows.find((r) => r.winpid === rootWinpid);
+    if (!root) return null;
+    const out = [rootWinpid];
+    let frontier = [root.pid];
+    while (frontier.length > 0) {
+        const next: number[] = [];
+        for (const r of rows) {
+            if (frontier.includes(r.ppid) && r.pid !== root.pid) {
+                out.push(r.winpid);
+                next.push(r.pid);
+            }
+        }
+        frontier = next;
+    }
+    return out;
+}
+
+/** pid → 父 pid。Linux 读 /proc，其余 POSIX 用 ps；取不到返回 null */
+function processParentTable(): Map<number, number> | null {
+    const table = new Map<number, number>();
+    if (process.platform === "linux") {
+        let names: string[];
+        try { names = readdirSync("/proc"); } catch { return null; }
+        for (const name of names) {
+            if (!/^[0-9]+$/.test(name)) continue;
+            try {
+                // 形如 `pid (comm) state ppid …`：comm 可含空格与括号，从最后一个 ')' 之后取
+                const stat = readFileSync(`/proc/${name}/stat`, "utf-8");
+                table.set(Number(name), Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]));
+            } catch { /* 进程已退出或无权读 */ }
+        }
+        return table;
+    }
+    const ps = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf-8", windowsHide: true });
+    if (ps.error || ps.status !== 0) return null;
+    for (const line of ps.stdout.split("\n")) {
+        const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+        if (m) table.set(Number(m[1]), Number(m[2]));
+    }
+    return table;
+}
+
+function descendants(table: Map<number, number>, root: number): number[] {
+    const out: number[] = [];
+    let frontier = [root];
+    while (frontier.length > 0) {
+        const next: number[] = [];
+        for (const [child, parent] of table) {
+            if (frontier.includes(parent) && child !== root) {
+                out.push(child);
+                next.push(child);
+            }
+        }
+        frontier = next;
+    }
+    return out;
 }
 
 async function resolveRealpath(inputPath: string): Promise<string> {

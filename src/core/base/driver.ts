@@ -59,7 +59,12 @@ export interface ExecOptions {
     cwd?: string;
     /** 执行通道（缺省 "exec"） */
     channel?: ExecChannel;
-    /** AbortSignal 硬中断子进程：abort 时子进程立即 SIGTERM，Promise 以 AbortError reject */
+    /**
+     * 中断信号。abort 时 Promise 立即以 AbortError reject。
+     * 本机层：向命令的整棵进程树发 SIGTERM（Windows 为 taskkill /T）——命令在子 shell 里跑，
+     * 只杀外层 shell 的话其余的照跑；终态未核实，错误带 outcome: "unknown"。
+     * SSH 层：只终止本地 ssh 进程，远端进程树是否停下未核实（实测会跑完），outcome 同为 "unknown"。
+     */
     signal?: AbortSignal;
     /** Limit bytes retained per output stream. The pipe is drained and completion still requires the sentinel. */
     maxOutputBytes?: number;

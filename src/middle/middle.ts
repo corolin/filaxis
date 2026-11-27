@@ -513,7 +513,7 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         },
 
         // 执行
-        async runCommand({ layer, command, timeoutMs, pty, cwd }) {
+        async runCommand({ layer, command, timeoutMs, pty, cwd, signal }) {
             assertOpen();
             if (typeof command !== "string" || !command.trim()) throw new Error("command 需为非空字符串");
             const drv = await resolveLayerRef(layer);
@@ -523,9 +523,10 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
                 timeoutMs,
                 channel: pty ? "pty" : undefined,
                 ...(cwd && drv.descriptor?.driver === "local" ? { cwd } : {}),
+                ...(signal ? { signal } : {}),
             });
         },
-        async runBatch({ plan, layer, previewBudgetBytes, defaultLayer, layers, cwd }) {
+        async runBatch({ plan, layer, previewBudgetBytes, defaultLayer, layers, cwd, signal }) {
             assertOpen();
             const known = (): string[] => {
                 const names = [...stack.layers.keys()];
@@ -562,6 +563,7 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
                 return await runBatch(resolver, expanded, {
                     ...(previewBudgetBytes !== undefined ? { previewBudgetBytes } : {}),
                     ...(cwd !== undefined ? { commandCwd: cwd } : {}),
+                    ...(signal ? { signal } : {}),
                 });
             } finally {
                 if (scoped) await scoped.destroy().catch(() => undefined);
@@ -658,10 +660,14 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
                 note: stillRunningNote ?? "未取得可核实的终态。重连后，用完整会话 ID 和原目标层再次调用 stop_session，或上报结果未知。",
             };
         },
-        async observe({ layer, command, stream, durationMs = 8000, cwd }: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number; cwd?: string }): Promise<ObserveResult> {
+        async observe({ layer, command, stream, durationMs = 8000, cwd, signal }: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number; cwd?: string; signal?: AbortSignal }): Promise<ObserveResult> {
             const drv = await resolveLayerRef(layer);
             const session = await drv.execSession(command, cwd && drv.descriptor?.driver === "local" ? { name: "observe", cwd } : { name: "observe" });
-            await new Promise((r) => setTimeout(r, durationMs));
+            // 观察期内调用方断开（signal）：不再等到时长结束，直接进入读日志与停机
+            await Promise.race([
+                new Promise((r) => setTimeout(r, durationMs)),
+                signal ? new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })) : new Promise<void>(() => undefined),
+            ]);
             const streams: StreamName[] = stream === "stderr" ? ["stderr"] : stream === "stdout" ? ["stdout"] : ["stdout", "stderr"];
             const lines: ObserveResult["lines"] = [];
             try {

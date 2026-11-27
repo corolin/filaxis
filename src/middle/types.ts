@@ -159,7 +159,8 @@ export interface MiddleOps {
 
     // ── 执行 ──
     /** 等完成拿退出码。非零退出码是数据不是异常；pty 走终端通道 */
-    runCommand(args: { layer?: LayerRef; command: string; timeoutMs?: number; pty?: boolean; cwd?: string }): Promise<ExecResult>;
+    /** `signal`：调用方断开时由界面层触发——在途的命令中止（结果未知） */
+    runCommand(args: { layer?: LayerRef; command: string; timeoutMs?: number; pty?: boolean; cwd?: string; signal?: AbortSignal }): Promise<ExecResult>;
     /** 计划校验、层通配展开、commandFile 内联都在这里做完，再交内核 */
     runBatch(args: {
         plan: BatchPlan;
@@ -170,14 +171,16 @@ export interface MiddleOps {
         /** 调用方已知的层描述符（已存层表的当前内容，路径已按调用方解析）：命中时优先于中层自己的层表 */
         layers?: Record<string, RuntimeDescriptor>;
         /** 命令工作目录：exec 步骤落在「没有自己工作目录的本机层」上时（含具名的），由该步所选的驱动
-         *  在此目录执行——不另建驱动。带 defaultLayer 时另建不登记的本机驱动承载它（文件步骤也相对它） */
+         * 在此目录执行——不另建驱动。带 defaultLayer 时另建不登记的本机驱动承载它（文件步骤也相对它） */
         cwd?: string;
+        /** 调用方断开时中止 exec 步骤（这一步所选的驱动收到 signal） */
+        signal?: AbortSignal;
     }): Promise<BatchReport>;
     startSession(args: { layer?: LayerRef; command: string; name?: string; cwd?: string; readyMarker?: string; errorPattern?: string }): Promise<SessionHandle>;
     /** 停止是请求、死亡须核实；unknown 不是成功也不是失败 */
     stopSession(args: { sessionId: string; layer?: string }): Promise<SessionStopResult>;
     /** 限时观察：起会话 → 等 durationMs → 读日志 → 停 → 必要时核实 */
-    observe(args: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number; cwd?: string }): Promise<ObserveResult>;
+    observe(args: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number; cwd?: string; signal?: AbortSignal }): Promise<ObserveResult>;
 
     // ── 文件 ──
     readFile(args: { layer?: LayerRef; path: string }): Promise<{ content: string }>;

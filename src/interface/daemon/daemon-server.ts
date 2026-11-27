@@ -312,40 +312,18 @@ export class DaemonServer {
         }
 
         if (req.method === "POST" && reqPath === "/rpc") {
-            let payload: { protocol?: unknown; op?: unknown; params?: unknown };
+            let held: { payload: RpcEnvelope; release: () => void };
             try {
-                payload = await readJsonBody(req);
+                held = await readJsonBodyHeld(req);
             } catch (err) {
                 this.sendJsonBodyError(res, err);
                 return;
             }
-            // 线协议握手（REQ-0004 §6.2）：信封不带或带着别的协议版本（0.2.x 的客户端不带这个
-            // 字段）一律拒绝、不执行——旧客户端的请求若交给新代码或反过来，行为都不可预期
-            if (payload.protocol !== PROTOCOL_VERSION) {
-                const theirs = payload.protocol === undefined ? "（缺失）" : String(payload.protocol);
-                this.sendJson(res, 200, {
-                    ok: false,
-                    error: `Daemon 线协议版本不一致，已拒绝执行：请求 protocol=${theirs}，Daemon protocol=${PROTOCOL_VERSION}（pid=${process.pid}）。请把客户端与 Daemon 升级到同一版本后重试`,
-                    code: "E_PROTOCOL_MISMATCH",
-                });
-                return;
-            }
-            const op = typeof payload.op === "string" ? payload.op : "";
-            // 参数是对象或数组都原样交给操作（connectSshBatch 的参数就是一个数组——此前数组被换成
-            // 空对象，经 Daemon 调它必报「not iterable」）；缺失或标量按空参数
-            const raw = payload.params;
-            const params: Record<string, unknown> | unknown[] = Array.isArray(raw)
-                ? raw
-                : (raw && typeof raw === "object" ? raw as Record<string, unknown> : {});
-            if (!op) {
-                this.sendJson(res, 400, { ok: false, error: "RPC 请求缺少 op 字段" });
-                return;
-            }
             try {
-                const result = await this.dispatchOp(op, params);
-                this.sendJson(res, 200, { ok: true, protocol: PROTOCOL_VERSION, result });
-            } catch (err) {
-                this.sendJson(res, 200, serializeRpcError(err));
+                await this.handleRpc(held.payload, req, res);
+            } finally {
+                // 应答已发（或对方已走）：放开请求流，这条连接才能被复用
+                held.release();
             }
             return;
         }
@@ -354,14 +332,62 @@ export class DaemonServer {
     }
 
     /**
-     * 薄转发：取操作 → 调用 → 回结果。这里不认识任何具体操作——参数校验、目标解析、
-     * 路径解析与结果整形都在中层（src/middle/）或界面层。
+     * 一帧已读出的 RPC：协议握手 → 派发 → 回结果。调用方在应答之前断开，就中止它在途的操作。
      */
-    private dispatchOp(op: string, params: Record<string, unknown> | unknown[]): Promise<unknown> {
+    private async handleRpc(payload: RpcEnvelope, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+        // 线协议握手（REQ-0004 §6.2）：信封不带或带着别的协议版本（0.2.x 的客户端不带这个
+        // 字段）一律拒绝、不执行——旧客户端的请求若交给新代码或反过来，行为都不可预期
+        if (payload.protocol !== PROTOCOL_VERSION) {
+            const theirs = payload.protocol === undefined ? "（缺失）" : String(payload.protocol);
+            this.sendJson(res, 200, {
+                ok: false,
+                error: `Daemon 线协议版本不一致，已拒绝执行：请求 protocol=${theirs}，Daemon protocol=${PROTOCOL_VERSION}（pid=${process.pid}）。请把客户端与 Daemon 升级到同一版本后重试`,
+                code: "E_PROTOCOL_MISMATCH",
+            });
+            return;
+        }
+        const op = typeof payload.op === "string" ? payload.op : "";
+        // 参数是对象或数组都原样交给操作（connectSshBatch 的参数就是一个数组——此前数组被换成
+        // 空对象，经 Daemon 调它必报「not iterable」）；缺失或标量按空参数
+        const raw = payload.params;
+        const params: Record<string, unknown> | unknown[] = Array.isArray(raw)
+            ? raw
+            : (raw && typeof raw === "object" ? raw as Record<string, unknown> : {});
+        if (!op) {
+            this.sendJson(res, 400, { ok: false, error: "RPC 请求缺少 op 字段" });
+            return;
+        }
+        try {
+            // 调用方在应答之前断开（Ctrl-C、进程被杀、网络断）→ 中止它在途的操作：命令不再陪着一个已经没人等的调用跑完。
+            // 应答发完之后连接自然关闭不触发（监听在应答后摘掉）。此前经 Daemon 的命令活过被中断的 CLI，一次性模式下却随 CLI 一起停
+            const abort = new AbortController();
+            const socket = req.socket;
+            const onGone = (): void => abort.abort(new Error("调用方已断开"));
+            socket.on("close", onGone);
+            try {
+                const result = await this.dispatchOp(op, params, abort.signal);
+                this.sendJson(res, 200, { ok: true, protocol: PROTOCOL_VERSION, result });
+            } finally {
+                socket.removeListener("close", onGone);
+            }
+        } catch (err) {
+            this.sendJson(res, 200, serializeRpcError(err));
+        }
+        return;
+    }
+
+    /**
+     * 薄转发：取操作 → 调用 → 回结果。这里不认识任何具体操作——参数校验、目标解析、
+     * 路径解析与结果整形都在中层（src/middle/）或界面层。只有带在途执行的操作收 signal。
+     */
+    private dispatchOp(op: string, params: Record<string, unknown> | unknown[], signal: AbortSignal): Promise<unknown> {
         if (!isRemoteOp(op)) {
             return Promise.reject(new Error(`未知 Daemon 操作: ${op}（可用：${REMOTE_OP_NAMES.join("、")}）`));
         }
         const fn = (this.middle.ops as unknown as Record<string, (p: Record<string, unknown> | unknown[]) => Promise<unknown>>)[op]!;
+        if (!Array.isArray(params) && (op === "runCommand" || op === "runBatch" || op === "observe")) {
+            return fn.call(this.middle.ops, { ...params, signal });
+        }
         return fn.call(this.middle.ops, params);
     }
 
@@ -521,7 +547,11 @@ async function readRawJsonBody(req: http.IncomingMessage): Promise<unknown> {
         }
         chunks.push(buf);
     }
-    if (total > MAX_RPC_BODY_BYTES) {
+    return parseJsonBody(chunks, total > MAX_RPC_BODY_BYTES);
+}
+
+function parseJsonBody(chunks: Buffer[], tooBig: boolean): unknown {
+    if (tooBig) {
         throw new HttpStatusError(413, `请求体超过限制 (${MAX_RPC_BODY_BYTES} 字节)`);
     }
     const raw = Buffer.concat(chunks).toString("utf-8").trim();
@@ -533,10 +563,77 @@ async function readRawJsonBody(req: http.IncomingMessage): Promise<unknown> {
     }
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<{ protocol?: unknown; op?: unknown; params?: unknown }> {
-    const parsed = await readRawJsonBody(req);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+/**
+ * 读请求体，但不让请求流完结：按 Content-Length 收够字节就暂停，`end` 留到 release() 再发。
+ *
+ * 请求流一完结，bun 1.3.12 就不再把连接的关闭送到这个 socket 上——调用方在应答前断开，
+ * close 事件不来（读完再挂监听、轮询状态位、往回写都察觉不到）。暂停着才收得到。
+ * Node 与 Windows 上的 bun 1.4.4 实测读完也收得到，不必分运行时：三处这个写法都收得到。
+ * 没有 Content-Length（分块编码、无体）退回读完。
+ */
+async function readRawJsonBodyHeld(req: http.IncomingMessage): Promise<{ value: unknown; release: () => void }> {
+    const declared = Number(req.headers["content-length"]);
+    if (!Number.isInteger(declared) || declared < 0) {
+        return { value: await readRawJsonBody(req), release: () => undefined };
+    }
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        let tooBig = false;
+        let settled = false;
+        const cleanup = (): void => {
+            req.removeListener("data", onData);
+            req.removeListener("end", onEnd);
+            req.removeListener("error", onError);
+        };
+        const finish = (settle: () => void): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            settle();
+        };
+        const settle = (): void => {
+            try {
+                resolve({ value: parseJsonBody(chunks, tooBig), release });
+            } catch (err) {
+                reject(err);
+            }
+        };
+        const onError = (err: Error): void => finish(() => reject(err));
+        // 比声明的短（或超出限制后不再暂停）：按实收的字节结算
+        const onEnd = (): void => finish(settle);
+        const onData = (chunk: Buffer): void => {
+            total += chunk.byteLength;
+            if (tooBig) return; // keep draining so the client receives HTTP 413
+            if (total > MAX_RPC_BODY_BYTES) {
+                tooBig = true;
+                chunks.length = 0;
+                return;
+            }
+            chunks.push(chunk);
+            if (total >= declared) {
+                req.pause();
+                finish(settle);
+            }
+        };
+        const release = (): void => {
+            cleanup();
+            req.resume();
+        };
+        req.on("data", onData);
+        req.on("end", onEnd);
+        req.on("error", onError);
+    });
+}
+
+/** RPC 信封：一个 JSON 对象。请求流保持未完结（见 readRawJsonBodyHeld），信封不合格时先放开再报 */
+async function readJsonBodyHeld(req: http.IncomingMessage): Promise<{ payload: RpcEnvelope; release: () => void }> {
+    const { value, release } = await readRawJsonBodyHeld(req);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        release();
         throw new HttpStatusError(400, "RPC 请求体必须是 JSON 对象");
     }
-    return parsed as { protocol?: unknown; op?: unknown; params?: unknown };
+    return { payload: value as RpcEnvelope, release };
 }
+
+type RpcEnvelope = { protocol?: unknown; op?: unknown; params?: unknown };
