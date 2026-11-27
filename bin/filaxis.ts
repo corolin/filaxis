@@ -402,12 +402,14 @@ function callerLayerDescriptors(): Record<string, RuntimeDescriptor> {
  * 本机层上相对路径的基准目录（REQ-0004 §5.5）：层自己的工作目录，没有则取调用方的。
  * 经 Daemon 时它的工作目录与本进程无关，所以由界面层解析成绝对路径再交给中层；
  * 一次性模式下驱动本来也按这个目录解析，结果相同。非本机层返回 undefined（路径原样）。
+ * 已存本机层的基准取自 localLayerWorkingDir——与交给中层的描述符里的 cwd 是同一个值，
+ * 文件与命令不会各算各的（曾各算一次：cat 读调用方目录、exec 经 Daemon 读 Daemon 目录）。
  */
 function layerPathBase(opts: ReturnType<typeof parseOpts>): string | undefined {
     if (opts.host) return undefined;
     if (!opts.layer) return process.cwd();
     const saved = loadLayerStore()[opts.layer];
-    return saved !== undefined && saved.driver === "local" ? (saved.cwd ?? process.cwd()) : undefined;
+    return saved !== undefined && saved.driver === "local" ? localLayerWorkingDir(saved) : undefined;
 }
 
 /** 本机层的命令工作目录 = 调用方的工作目录（只在没指定 --layer / --host 时；已存层用它自己的） */
@@ -578,17 +580,24 @@ function resolveCallerSshPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor
     };
 }
 
+/** 已存本机层的工作目录：层自己的 cwd（相对的按调用方工作目录锚定），没有则取调用方的 */
+function localLayerWorkingDir(descriptor: RuntimeDescriptor): string {
+    const cwd = descriptor.cwd;
+    return typeof cwd === "string" && cwd ? callerPath(cwd) : process.cwd();
+}
+
 /**
  * 已存层描述符里相对于调用方工作目录的东西，在界面层锚定后再交给中层（经 Daemon 时它的工作
- * 目录与调用方无关）。SSH 层是密钥 / known_hosts；本机层是它自己的 `cwd`——`cwd: "project"`
- * 这种相对值不锚定的话，经 Daemon 时会变成相对于 Daemon 的目录：同一个层上 `exec` 读 Daemon
- * 目录下的文件、`cat` 读调用方目录下的文件（cat 的路径基准本来就按调用方解析）。
+ * 目录与调用方无关）。SSH 层是密钥 / known_hosts；本机层是它的 `cwd`，而且一律显式带上：
+ * - `cwd: "project"` 这种相对值不锚定，经 Daemon 时会变成相对于 Daemon 的目录；
+ * - 不写 cwd 时不带上，中层只能用 Daemon 自己的进程目录。
+ * 两种情况下 `cat` 的路径基准（layerPathBase）都是按调用方解析的——于是同一个层上 exec 读
+ * Daemon 目录下的文件、cat 读调用方目录下的文件，两条命令都退出 0。
  */
 function resolveCallerLayerPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor {
     const anchored = resolveCallerSshPaths(descriptor);
     if (anchored?.driver !== "local") return anchored;
-    const cwd = anchored.cwd;
-    return typeof cwd === "string" && cwd && !isAbsolute(cwd) ? { ...anchored, cwd: callerPath(cwd) } : anchored;
+    return { ...anchored, cwd: localLayerWorkingDir(anchored) };
 }
 
 async function tryDaemon(opts: ReturnType<typeof parseOpts>): Promise<DaemonClient | null> {
