@@ -6,10 +6,62 @@
 - **[Sol]** — GPT-6.1 Sol：其余大多数轮次的具体缺陷审查（九轮起接棒，Astra 额度不足）
 - **[全量审计]** — 外部全量审计报告（H/M 系列）
 - **[DeepSeek]** / **[Gemini]** — 其他外部审查与真机盲测
+- **[GPT]** — 外部 GPT 审查（用户转来的变更审查报告）
 - **[自挖]** — 本仓维护者主动自查
 - **[用户]** — 用户实测反馈
 
 ---
+
+## 0.3.0
+
+> 架构级调整，含不兼容变更。设计见 [REQ-0004](./drafts/REQ-0004-layering.md)。
+
+- **[用户]** 三层架构落地：**interface**（cli、mcp、给大模型用的工具面）/ **middle**（有状态的操作层，唯一实现）/ **core**（无状态执行内核）。中层由 `createMiddle()` 在进程内建立，或由 `connectRemoteMiddle(client)` 经 Daemon 使用，两者是同一个接口 `Middle`、方法签名一致。CLI、MCP、SDK 走的是同一组操作（26 个），不再各写一遍。
+- **[自挖]** **不兼容**：Daemon 线协议改为 `{protocol, op, params}`，操作名即中层操作名（原来的 `exec` / `cat` / `forward.add` / `stream.peek` 等方法名与 `clientCwd` / `target.cwd` 参数取消——与调用方机器相关的路径由调用方解析成绝对路径）。0.2.x 的客户端与 0.3.0 的 Daemon 互相显式拒绝，不会把请求交给对方执行。
+- **[自挖]** 客户端与 Daemon 增加线协议版本握手：`/status` 上报 `protocolVersion`，不一致（含旧 Daemon 不上报）即拒绝并列出双方版本、Daemon pid 与处置办法。升级之后旧 Daemon 还在跑时，新 CLI / 新 MCP 的请求不再被旧代码静默执行。
+- **[用户]** **不兼容**：`filaxis-mcp` 缺省经 Daemon 执行，没有在跑就自动启动（层、连接、转发、观察窗在两个 MCP 客户端之间、CLI 与 MCP 之间共享）；带 `--host` / `--enter` / `--docker` / `--layer` 这类绑定参数时在本进程内服务，`--no-daemon` 可强制走进程内。0.2.x 的「MCP 绝不隐式启动 Daemon」是有意推翻的。
+- **[自挖]** **不兼容**：CLI `--json` 输出与中层记录同形，统一 camelCase（`forwardId`、`bindAddr`、`windowId`…）。0.2.13 把转发记录改成 snake_case 是在「两套命名并存」上打的补丁；现在 snake_case 只属于 MCP 工具面，MCP 的 12 个工具名与 schema 不变。
+- **[自挖]** **不兼容**：裸 RPC 不带层 = 中层当前默认层（与 MCP 一致）；CLI 的「命令行没写目标」在界面层显式翻译成本机层——Daemon 里若有人把一个 SSH 层登记成默认层（甚至就叫 `local`），无目标的 CLI 命令不会被它吸走。「层不存在」「不认识的 driver」经 Daemon 与一次性模式不再是两句不同的提示，由中层统一报错并带补救办法。
+- **[自挖]** CLI 每个子命令只剩一份实现：原来「经 Daemon」与「一次性模式」两条路径有 8 处行为差异（本机文件路径、相对的密钥路径只在经 Daemon 时解析等），现在一致。本机层上的相对路径以层自己的工作目录为基准，没有则取调用方的；批次把调用方眼里的层表随请求带给中层，重新保存过的层立刻生效，不必等 Daemon 重启。
+- **[自挖]** SDK 新增导出：`createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及各操作的结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`。`createAgentToolkit(stack, opts)` 签名不变（内部代建中层，也可用 `opts.middle` 传入已建好的）。从包外导入的路径只有总出口 `@syrkos/filaxis`，不受下面的目录调整影响；原有导出名不变。
+- **[用户]** `src/` 按层划分目录，目录就是分层：`src/core/`（内核，内部按关注点分 `base` / `ssh` / `local` / `stream` / `tmux` / `file` / `probe`）、`src/middle/`（中层）、`src/interface/`（界面层：`mcp/` 与 `daemon/`）、`src/shared/`（各层共用），根下只留总出口 `src/index.ts`。`runtime-stack`、`layer-store`、`session-ownership` 归入 `src/middle/`。
+- **[自挖]** `bun run check:boundaries` 新增第四道断言——三层依赖方向，按目录判层：内核只依赖内核；中层可依赖内核但不得依赖界面层；界面层从内核只能取类型；任何一层都不得经 SDK 总出口取符号；`src/` 下没归进任何一层目录的源文件直接拦下。
+- **[自挖]** 进程内形态的 `filaxis-mcp`（带绑定参数或 `--no-daemon`）在客户端断开后即退出。此前只销毁观察窗注册表，绑定 SSH 层时 PTY 子进程撑住事件循环，客户端退出后这个进程连同它的 ssh 一直留着，每个客户端会话泄漏一个（0.2.13 即如此）。经 Daemon 的缺省形态没有这个问题。
+- **[自挖]** 本机层的工作目录不存在时，命令不再报成 `ENOENT … uv_spawn 'bash'`（看着像没装 bash，其实与 bash 无关），而是直接说明「本机层的工作目录不存在」并点名目录。已存层的工作目录被删或填错时最常见。
+- **[用户]** SKILL（中英文）新增「升级要点：0.2.13 → 0.3.0」，逐项列出旧新行为与要做什么：MCP 工具面不变；`filaxis-mcp` 缺省经 Daemon 并自动启动；版本握手（升级后先 `filaxis daemon stop`）；CLI `--json` 统一 camelCase；一次性模式与经 Daemon 行为一致；新增大输出落盘；MCP 代理滞留修复。
+- **[自挖]** `bun run build` 恢复为零错误退出。打包的最后一步（tsc 生成类型声明）此前不用项目配置、参数单独写，与日常的 `bun run typecheck` 是两套判断：0.3.0 重构工具集时留下 5 个类型错误（校验前的值直接传给了类型化参数），日常检查靠严格模式的控制流收窄放行，打包则以退出码 2 失败（0.2.13 没有这个问题）。现在这一步用 `tsconfig.build.json`（继承项目配置，只改输出），工具集里对应的五处取值改为显式校验，并由测试真的跑一遍。
+- **[自挖]** 经 Daemon 的 `filaxis-mcp` 在客户端于握手完成前关闭 stdin 时不再滞留。此前代理只中止「已激活」的 SSE 会话，而会话要等握手响应才登记：`filaxis-mcp < /dev/null`、`echo … | filaxis-mcp` 这类探测式调用，或宿主启动失败即退出时，握手请求没人撤，响应迟到后代理已关闭、队列不转发，Node 进程陪着一条空闲的 SSE 连接永不退出（发布包的 bin 由 Node 运行；自 0.2.12 引入 Daemon 与 MCP 代理起即如此，当时要有 Daemon 在跑才走这条路径）。现在会话在发出握手请求时就登记，stdin 关闭即撤下在途请求；排队的请求不代为执行。
+- **[GPT]** 落在本机层上的路径（`filaxis cat` / `edit`，以及传输落在本机层的那一侧）不再被词法折叠：符号链接后面的 `..` 按内核语义解析，与 shell 看到的一致。此前 `link/../marker.txt` 会被折叠成另一个文件，且不报错（0.2.13 两种模式都是内核语义；0.3.0 开发中引入，发布前修掉）。`--request-file`、`--script-file` 由 CLI 按相对路径直接读取，本来就是内核语义。
+- **[GPT]** `filaxis stream open` 没写目标时，命令落在调用方的工作目录。经 Daemon 时此前落在 Daemon 自己的目录（0.2.13 是调用方的）：`openStream` 操作补上 `cwd` 参数，与 `exec`、`observe`、`batch` 同一规则。
+- **[GPT]** `filaxis-mcp` 断线重连前也过线协议握手。此前只在首次连接前校验，Daemon 中途被换成另一个版本（升级/回滚后重启）时排队的请求会原样交给它。现在版本不一致即拒绝接入：排队中还没发出的请求报错（`outcome: "not_sent"`），代理以退出码 1 结束。
+- **[GPT]** 多个 `filaxis-mcp` 客户端同时冷启动时都接得上 Daemon。此前只有拉起成功的那个能用，其余报「Daemon 进程提前退出」退出（构建产物实测四个里只成一个）。
+- **[GPT]** 经 Daemon 的 `connectSshBatch` 恢复可用。Daemon 解包 RPC 参数时把数组换成了空对象，而它的参数恰是一个数组；现在对象与数组都原样交给操作。
+- **[GPT]** CI 的 Node 作业恢复：`node scripts/check-boundaries.ts` 靠类型剥离直接运行，相对导入须写真实扩展名（此前写作 `.js`，Node 下 `ERR_MODULE_NOT_FOUND`）。
+- **[GPT]** 分层门禁不再放行 `import("x").then(…)`、`.catch(…)`、`.default` 这类动态取值写法（此前点号后一律当成类型成员访问）。
+- **[GPT]** 调用方机器上的其余路径（`put` / `get` 的本机侧文件、批次 exec 步骤的 `commandFile`、`exec --out`、`batch --out-dir`、SSH 密钥文件）同样只补前缀、不折叠，与 shell 看到的是同一个文件。此前被词法折叠，会上传另一份文件、执行另一份脚本，且都退出 0（0.2.13 的一次性模式是内核语义；0.3.0 开发中引入，发布前修掉）。
+- **[GPT]** `filaxis-mcp` 的线协议握手没答上来（`/status` 报错、连不上、超时）时不再开连接，稍后再试；握手在途时客户端断开，迟到的握手结果不再触发连接。
+- **[GPT]** `openStream({ cwd })` 不再另建驱动：工作目录作为观察窗选项交给所选驱动处理，SDK 注入的驱动与带 shell 配置的驱动不再被绕过。
+- **[GPT]** 分层门禁再补两类取值写法：把成员取出来稍后调用（`const then = import("x").then`）与值位置的 `typeof import("x")`；是否只取类型改按所处位置判定。
+- **[GPT]** 已存本机层的相对 `cwd` 按调用方目录锚定。此前经 Daemon 时以 Daemon 的目录为基准，而 `cat` 的路径基准按调用方解析——同一个层上 `exec` 与 `cat` 读到不同文件，都退出 0（0.2.13 经 Daemon 时两条命令都读 Daemon 目录下的文件，不一致在两种模式之间）。经 Daemon 的其它调用方（MCP、远程 SDK）没有「调用方目录」的概念，带相对 `cwd` 的已存层仍以 Daemon 的工作目录为基准，建议写绝对路径。
+- **[GPT]** 下载的本地临时文件名不再折叠路径：`get` 到 `link/../dir/x` 这类路径时，临时文件此前被拼到词法折叠后的目录，目标目录明明存在也报 `ENOENT`（0.2.13 即如此）。普通下载与 SFTP 下载共用这个函数，都已修。
+- **[GPT]** `filaxis-mcp` 的线协议握手请求有硬性期限（1.5 秒到点即断，不看连接是否空闲），并随代理收尾一起中止。此前是空闲超时，对端持续滴数据就永不触发；stdin 关闭后进程会被在途的握手请求拖住。同类的一并修掉：控制面请求（`/status`、`/health`、`/shutdown`——`probeDaemon`、启动器的握手、`daemon status` / `daemon stop`）一律按硬性期限；此前对着只滴数据不应答的对端，CLI 的命令与 `filaxis-mcp` 的启动都会被无限期拖住（真机上 `daemon status` 挂了 7 分钟）。操作类 RPC 不变，仍是空闲超时。配套：请求因期限或中止被销毁后，这条连接上其后的「结束」不再算作应答——Linux 上的 bun 此前会把半截应答当成一次 HTTP 200。
+- **[GPT]** 分层门禁：表达式里的冒号（对象字面量的属性、三元表达式的分支）不再被当成类型标注，`const entry = { kind: typeof import("…") }` 这类动态取值会被拦下。
+- **[GPT]** 已存本机层不写 `cwd` 时也以调用方目录为基准（上一批「相对 cwd 锚定」的补全）：不写 `cwd` 的层经 Daemon 时命令此前落在 Daemon 自己的进程目录，而 `cat` 的路径基准按调用方解析——同一个层上两条命令读到不同文件。现在已存本机层的描述符一律显式带上绝对 `cwd`（层自己的，没有则调用方的），文件与命令的基准取自同一个值。经 Daemon 的其它调用方（MCP、远程 SDK）的边界同上。
+- **[GPT]** 修复上一批「下载的临时文件名不再折叠路径」引入的回归：POSIX 上反斜杠是普通的文件名字符，下载到含反斜杠的长文件名（如 242 字节）曾报 `ENAMETOOLONG`。分隔符改按平台认（Windows 两种都算，其余只认 `/`）。
+- **[GPT]** 分层门禁：参数默认值表达式里的动态导入（`function f(p = cond ? a : typeof import("…"))`）不再被当成类型；参数表改为逐段判定（标注冒号、默认值的 `=`、参数表是否闭合），回调类型 `cb: (e: X) => typeof import(…)` 这类真类型不再被误拦。
+- **[自挖]** 同构用例集：32 条与语言无关的声明式用例（`tests/isomorphism-corpus.ts`），在即弃进程内、SDK 长驻、Daemon 远程三种宿主上同参同果。1.x 的 Rust 内核将来拿同一份语料对照。
+- **[自挖]** 经 Daemon 的 `filaxis-mcp` 以客户端的工作目录为基准，与进程内形态同参同果。此前相对路径与命令的工作目录都以 Daemon 自己的目录为基准：Daemon 在 A 目录启动、MCP 客户端在 B 目录运行时，同一个 `read_path { path: "marker.txt" }` 进程内读到 B 的文件、经 Daemon 读到 A 的，两边都报成功（`edit_file`、`transfer_file` 的 `local_path`、`run_command` 的工作目录同理）。代理在 SSE 握手时带上自己的工作目录，Daemon 按会话记住；已存本机层用自己的 `cwd`，SSH 层的路径原样。
+- **[自挖]** `~` 展开与 tmux 窗格锁不再折叠调用方给的路径：`~/link/../key` 按 shell 与内核的语义解析（`..` 相对符号链接实际指向的位置），此前被词法折叠成 `~/key`，指向另一个文件；窗格锁文件此前可能落到折叠后的目录，那边不存在就报 `ENOENT`。
+- **[自挖]** 有命令或后台会话在途时 `filaxis daemon stop` 也停得下。此前 Daemon 早已停止服务，但进程要陪在途命令跑完才退：CLI 等 5 秒报「停机核实超时…终态未知」、退出码 1；后台会话动辄几分钟到几小时，旧进程就活那么久，照提示加 `--force` 会把会话进程强杀成没人认领的孤儿。本机驱动销毁时收掉自己起的东西：在途命令中止、后台会话停机并核实（与 SSH 层「销毁即断链」对齐）。
+- **[自挖]** bun 运行时下 Daemon 停机不再等在途请求。有 `/rpc` 请求在处理中时 `DaemonServer.stop()` 在 bun 下（Linux 实测 1.3.12）一直挂着，要等那条命令跑完才返回；Node 下不受影响。停机时连接逐个销毁，`close` 回调加 500ms 兜底。
+- **[自挖]** 分层门禁（`bun run check:boundaries`）不再误拦真类型：类成员的标注（`class C { p: typeof import(…) }`）与带泛型的返回类型标注此前被当成动态取值拦下。补 58 条对抗语料：27 种取值写法全部拦下、31 种类型写法全部放行。
+- **[自挖]** 多个 `filaxis daemon start` 同时冷启动时，输家报「Filaxis Daemon 已在运行 (pid=…, addr=…)」，不再报「Daemon 进程提前退出 (code=1)」。此前真机 5 个并发，最终只有一个 Daemon（结果正确），其余 4 个像是 Daemon 崩了，照着排查会白费工夫。
+- **[自挖]** Daemon 的 `/rpc` 在应答前检测到调用方断开时，会向在途的 `runCommand`、`runBatch`、`observe` 传递中止信号。目标命令的终态以所选通道能核实的结果为准。
+- **[GPT]** 断线错误保留 `reason: "disconnect"`、`channel` 和可核实的执行状态。Daemon 的无效 RPC 应答保留 `outcome: "unknown"`。MCP 只接受完整的 SSE 事件，单条 POST 传输失败只影响对应请求，迟到的重复结果会丢弃。SSH PTY 在输出排空后再判定完成哨兵。
+- **[GPT]** 远程 SDK 的 `AbortSignal` 作用于在途请求。信号已经中止时，尚未发出的命令与批次步骤会跳过。显式停止本机会话并确认其结束后返回 `stopped`，会话自然结束时仍可报告命令的退出码。
+- **[GPT]** Windows 本机命令取消时识别 Git Bash 启动器与实际 Bash 的 PID，已有的进程树清理可覆盖嵌套 Bash。
+- **[自挖]** 本机 `exec` 中止时尝试停止能识别到的本机进程。POSIX 按父子关系识别进程并发出 `SIGTERM`，Windows 尽量结合 Git Bash 的进程表执行 `taskkill /T`。忽略信号的进程和 Windows 启动的 WSL 内部进程可能继续运行。SSH exec 通道请求终止本地 SSH 进程，PTY 通道发送 Ctrl-C。命令终态未经核实时，错误携带 `outcome: "unknown"`。
+- **[自挖]** 上一条的运行时前提：bun 1.3.12（Linux 实测）在请求体读完后不再把连接的关闭送到 socket 上，Node 与 Windows 上的 bun 1.4.4 实测不受影响。Daemon 读 `/rpc` 请求体改为「读够 `Content-Length` 就暂停、应答后再放开」，请求流保持未完结才收得到断开；没有 `Content-Length` 的请求退回读完。
 
 ## 0.2.13
 
@@ -18,6 +70,7 @@
 - **[DeepSeek]** `batch` 的 exec 步骤可用 `commandFile` 引用脚本文件，替代 `command`（MCP 字段名为 `command_file`）。层名支持 `*` 与 `?` 通配，按已存或已注册的层名展开，没有任何匹配时整批拒绝。CLI 新增 `--max-parallel` 与 `--no-stop-on-fail`，覆盖计划里的对应字段。
 - **[DeepSeek]** `filaxis forward list` 缺省只列仍在用的转发，`--all` 列出全部（MCP 为 `forward_list` 的 `include_closed`）。CLI JSON 与 MCP 的转发记录改用 snake_case 字段，`forwardId` 保留为兼容别名。
 - **[DeepSeek]** `filaxis exec --json` 输出单行结构化结果；文本模式的完成标记在正文排空后输出，`2>&1` 合流时位于末尾。
+- **[DeepSeek]** CLI 新增大输出落盘：`filaxis exec --out <文件>`、`filaxis batch --out-dir <目录>`。完整输出落到调用方本机并读回逐字节核对，终端只显示头 15 行和文件路径（配 `--json` 时输出文件路径与字节数）。不加这两个参数时行为不变。
 - **[自挖]** 一次性模式（`--no-daemon`）按层文件里的 `driver` 加载已存层，不再把任何条目都当作 SSH 目标。
 - **[自挖]** 修复穿层转发（`-L` 经 enterPipeline 进入内层）在 `ssh <目标>` 形态的进入步骤上全部静默失效：转发建立成功，但任何连接立刻被关闭且无报错。原因是给嵌套 ssh 的命令少包一层引号，内层桥接命令在目标机上没有被执行。docker / bash 结尾形态不受影响。
 - **[自挖]** 独立 MCP 和 Daemon 的 MCP 入口都支持按名加载 CLI 保存的层，`run_batch` 也可以按通配匹配。带 `--layer NAME` 启动的 MCP 服务以指定层为默认目标，直接运行。SDK 可用 `createAgentToolkit` 的 `savedLayers` 和导出的 `loadLayerStore` 接入同一份层表。

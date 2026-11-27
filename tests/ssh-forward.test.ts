@@ -14,11 +14,11 @@ import {
     parseSubprocessRemotePort,
     buildInnerTcpBridgeCmd,
     type ForwardInfo,
-} from "../src/ssh-forward.js";
-import { renderEnterBridgeCommand, sshArgsFor } from "../src/ssh-helpers.js";
-import { SshPtyDriver } from "../src/ssh-pty-driver.js";
-import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
+} from "../src/core/ssh/ssh-forward.js";
+import { renderEnterBridgeCommand, sshArgsFor } from "../src/core/ssh/ssh-helpers.js";
+import { SshPtyDriver } from "../src/core/ssh/ssh-pty-driver.js";
+import { LocalRuntimeDriver } from "../src/core/local/local-driver.js";
+import { RuntimeStack } from "../src/middle/runtime-stack.js";
 
 class MockChild extends EventEmitter {
     stdout = new PassThrough();

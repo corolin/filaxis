@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.13"
+  version: "0.3.0"
 description: |
   使用 Filaxis（@syrkos/filaxis）执行跨层命令、批量巡检、管理后台任务、观察日志或操作目标层文件。
   也用于排查 SSH 别名与跳板、解读 unknown 终态或写入保障。纯本机一次性命令和与 Filaxis 无关的任务可跳过。
@@ -63,6 +63,7 @@ filaxis exec --layer <名> --json -- "<command>"     # 单行 JSON {exitCode, ef
   执行（B 组逐个调 18 步 vs CLI 组打包 11 步——这是 MCP 形态省步数的最大杠杆）；
 - **巡检要显式关掉失败即停**：`run_batch` 缺省任一步失败即停，尚未启动的步骤（含其它层的展开实例）标 `skipped`——一台失败，其余都不看。批量巡检、多机取证这类只读批次传 `stop_on_fail: false`（CLI：`filaxis batch … --no-stop-on-fail`）。第一遍只看各步状态行，再对失败的层单独钻取。改配置→验证→重载这类链保持缺省：前一步失败不应继续。
 - **少写转义**：`exec` 步骤可用 `command_file` 引用脚本文件，替代 `command`——命令原样进文件，JSON 里的引号和换行不必再转义，同一脚本可被多个步骤复用（二者互斥；读不出或内容为空则整批拒绝）。相对路径相对服务进程的工作目录，经 Daemon 执行时建议给绝对路径。
+- **大输出落盘（CLI）**：`filaxis exec --out <文件>`、`filaxis batch --out-dir <目录>`——完整输出落到调用方本机（写后读回逐字节核对），终端只打头 15 行和文件路径；`batch` 的每个 exec 步骤各一个文件（层扇出后形如 `step@layer.stdout`，stderr 另存 `.stderr`）。输出多大都由规划决定用不用；不加则全量打到终端。没有 harness 输出外置的消费方走这一条。
 - `run_batch` 的顶层 `layer` 和步骤 `layer` 均支持传单个层名或层名数组（也可同时传：顶层是批次默认值，步骤的 `layer` 仅覆盖本步；两处都省略时使用调用时的默认层）。传多个层名数组时，步骤按 `id@layer` 展开并在 `max_parallel` 并发池内并行执行，下游 `after` 需等被依赖步骤的所有展开实例均 ok 后才启动（`kind: "get"` 不支持多层数组，防并发覆盖同一 `local_path`）；单元素数组保留原 `id`。结果逐步标明命名层。
 - CLI 的 `filaxis batch --request-file plan.json` 同样支持这两个字段，并从 `filaxis layer save` 保存的层中解析名称。优先级依次为步骤 `layer`、计划 `layer`、命令行的 `--layer` 或 `--host`，全省略时使用本机。计划文件里的字段是驼峰写法（`command` 或 `commandFile`、`maxParallel`、`stopOnFail`）；命令行开关 `--max-parallel N` 与 `--no-stop-on-fail` 覆盖计划里的对应字段。
 - 层名可写通配：`*` 匹配任意字符序列，`?` 匹配单个字符（如 `"q-*"`），按已注册或已保存的层名展开（MCP、SDK 与 CLI 认同一份已存层表：`filaxis layer save` 保存的层不必先 `connect_layer`，按名寻址或被通配命中时自动加载；`filaxis-mcp --layer NAME` 可直接绑定已存层），免去逐个罗列。没有任何匹配时整批拒绝，不会改用默认层。
@@ -79,9 +80,9 @@ filaxis exec --layer <名> --json -- "<command>"     # 单行 JSON {exitCode, ef
 - 宿主拦截 SSH 匿名管道时，在建层前设 `FILAXIS_SSH_STDIO_MODE=inherit`。它支持直连、单跳 `-J` 和可非交互重放的进入步骤。逐跳 PTY、交互进入、持久转发和持续观察窗需要可用的匿名管道。若首轮已发出且终态未知，先核实远端状态再决定是否重发。
 - Windows 的 OpenSSH 子进程会继承现有配置，并由 Filaxis 补齐缺失的系统和账户变量，例如 `SystemRoot`、`windir`、`ProgramData` 和 `USERNAME`。成功补齐 `SystemRoot` 时，CLI 和 MCP 会在 stderr 告警一次，SDK 通过注入的 logger 记录。SSH 秒退且双流为空时，可检查启动器是否保留了系统环境。
 
-用 `filaxis daemon start` 启动本机守护进程后，CLI 与未显式指定 `--host` 或 `--layer` 的 MCP 服务可共享层、转发和观察窗。用 `filaxis daemon status` 查看状态，`filaxis daemon stop` 停止，或给单次命令传 `--no-daemon`。持续观察用 `filaxis stream open/peek/close`，转发用 `filaxis forward add/list/remove`，或在 MCP `manage_layers` 中使用 `forward_add`、`forward_list`、`forward_remove`。按返回的窗口 ID 或转发 ID 查询和关闭。转发列表缺省只报仍在用的转发，已停止的条目用 `filaxis forward list --all` 或 `forward_list` 的 `include_closed: true` 查看。转发记录字段为 snake_case（`forward_id`、`bind_addr`、`bind_port`…）。
+本机守护进程（Daemon）让 CLI 与 MCP 共享同一份现场——层、连接、转发、观察窗。`filaxis-mcp` 缺省经 Daemon 执行，没有在跑就自动启动；带了 `--host` / `--enter` / `--docker` / `--layer` 这类绑定参数时在本进程内服务（共享的 Daemon 没法替某一个客户端设默认层），`--no-daemon` 可强制走进程内。CLI 有 Daemon 在跑就用它，没有就在本进程内执行、不会自己启动；要跨命令共享现场先 `filaxis daemon start`，用 `filaxis daemon status` 查看状态，`filaxis daemon stop` 停止。客户端与 Daemon 的线协议版本不一致时直接拒绝执行并提示重启 Daemon（升级之后旧 Daemon 还在跑的情形）。持续观察用 `filaxis stream open/peek/close`，转发用 `filaxis forward add/list/remove`，或在 MCP `manage_layers` 中使用 `forward_add`、`forward_list`、`forward_remove`。按返回的窗口 ID 或转发 ID 查询和关闭。转发列表缺省只报仍在用的转发，已停止的条目用 `filaxis forward list --all` 或 `forward_list` 的 `include_closed: true` 查看。CLI 的 `--json` 输出与中层记录同形（camelCase：`forwardId`、`bindAddr`、`windowId`…）；snake_case 字段名（`forward_id`、`window_id`…）只出现在 MCP 工具面。
 
-SDK 的 `createAgentToolkit` 也可在宿主进程内复用连接和 PTY，并接受结构化参数。
+SDK 的 `createAgentToolkit` 也可在宿主进程内复用连接和 PTY，并接受结构化参数。CLI、MCP 与 SDK 走的是同一组中层操作：`createMiddle()` 建进程内实例，`connectRemoteMiddle(client)` 经 Daemon，两者方法签名一致。
 
 ### SDK 最小配方（Bun / Node 编码接入）
 
@@ -131,6 +132,21 @@ await stack.removeLayer("prod", { destroy: true });
 ```
 
 
+## 升级要点：0.2.13 → 0.3.0
+
+MCP 工具面没变：12 个工具名、参数 schema、snake_case 字段都照旧，已有的调用方式不用改。CLI 没有删除或改名任何子命令与参数。变的是下面几处，脚本或习惯依赖旧行为的要跟着改：
+
+| 变化 | 0.2.13 | 0.3.0 | 要做什么 |
+|---|---|---|---|
+| `filaxis-mcp` 的宿主 | 有 Daemon 在跑才经它，绝不自己启动 | 缺省经 Daemon，没有就自动启动；绑定参数或 `--no-daemon` 走进程内 | 层、连接、转发、观察窗在所有 MCP 客户端与 CLI 之间共享，客户端断开后现场仍留在 Daemon 里；要即弃就加 `--no-daemon` |
+| 版本握手 | 无 | 0.2.x 与 0.3.0 的客户端、Daemon 互相拒绝（`E_PROTOCOL_MISMATCH`），不把请求交给旧代码执行 | 升级后先 `filaxis daemon stop`（新旧 CLI 都能停对方版本的 Daemon），再重新发起命令 |
+| CLI `--json` 字段名 | 转发记录是 snake_case（`forward_id`，`forwardId` 留作别名） | 统一 camelCase（`forwardId`、`bindAddr`、`windowId`…），观察窗与 `daemon status` 同理 | 解析 CLI JSON 的脚本改字段名；MCP 面仍是 snake_case |
+| 一次性模式与经 Daemon | 两种模式有 8 处行为差异（相对的本机路径、相对的密钥路径等） | 一致；「层不存在」这类报错文案统一 | 一般不用改；依赖旧差异的脚本，结果可能不同 |
+| 大输出落盘 | 无 | 新增 `filaxis exec --out <文件>`、`filaxis batch --out-dir <目录>` | 按需使用；不加参数行为不变 |
+| MCP 代理进程滞留 | 客户端在握手完成前断开时，代理进程不退出（0.2.12 起） | 已修 | 无需处理 |
+
+没写目标的命令仍在本机执行。SDK 的 `createAgentToolkit(stack, opts)` 签名不变，包的导入路径不变，另新增 `createMiddle` / `connectRemoteMiddle` 导出。
+
 ## 核心契约速查（违者=生产事故）
 
 | 契约 | 一句话 |
@@ -138,6 +154,7 @@ await stack.removeLayer("prod", { destroy: true });
 | **终态三态** | `exited`（有真实退出码）/ `stopped`（死亡已核实）/ `unknown`（核实不可达——**既非成功也非失败**）；unknown 后用 `verifySession(id)` 实测（running/exited/unknown） |
 | **退出码是数据** | exec 非零退出码不抛异常；只有「无法执行」（超时/断链/abort）才 reject |
 | **完成哨兵是唯一凭证** | 无哨兵（断链/远端 kill）= reject + `outcome:"unknown"`——绝不伪造退出码，绝不自动重放非幂等命令 |
+| **断线原因** | `reason: "disconnect"` 表示已检测到 `channel` 指定的通道断开。命令终态仍以 `outcome` 为准 |
 | **永不结束的命令不进 exec** | exec 是「等完成」语义——`tail -f`/`top` 必超时；换 observe / 会话+watcher |
 | **受控编辑** | CAS 全称 Compare-and-Swap（比较后写回）。写前比较文件修改时间、大小和内容指纹，发现冲突就拒绝写回。分别查看 `mutex` 与 `writeMode`。传输校验等级见 `verification` |
 | **PTY 通道 stderr 混流** | 终端物理语义不是 bug；exec 通道才分离 |

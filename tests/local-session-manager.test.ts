@@ -5,8 +5,8 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { LocalSessionManager } from "../src/local-session-manager.js";
-import type { SessionEvent } from "../src/session-types.js";
+import { LocalSessionManager } from "../src/core/local/local-session-manager.js";
+import type { SessionEvent } from "../src/core/base/session-types.js";
 
 /** 轮询等待谓词为真（事件异步到达） */
 async function waitFor(pred: () => boolean, timeoutMs = 20_000): Promise<void> { // Windows Defender 对新 shell 路径首启扫描可 >5s
@@ -36,7 +36,8 @@ test.skipIf(process.platform !== "linux")("local stop reaps a redirected backgro
     try {
         expect(alive()).toBe(true);
         expect(m.verify(h.sessionId).status).toBe("running");
-        expect((await m.stop(h.sessionId)).status).toBe("exited");
+        expect(await m.stop(h.sessionId)).toEqual({ status: "stopped" });
+        expect(await m.stop(h.sessionId)).toEqual({ status: "stopped" });
         expect(alive()).toBe(false);
     } finally { if (alive()) process.kill(pid, "SIGKILL"); }
 }, 20_000);

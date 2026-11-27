@@ -14,9 +14,11 @@ import {
     cleanupDaemonFiles,
     DaemonClient,
     DaemonServer,
+    connectRemoteMiddle,
     daemonPaths,
     generateDaemonToken,
     LocalRuntimeDriver,
+    PROTOCOL_VERSION,
     parseAddrToUrl,
     probeDaemon,
     readDaemonConnection,
@@ -141,12 +143,17 @@ describe("DaemonServer & DaemonClient RPC", () => {
         const requests: unknown[] = [];
         const stub = http.createServer(async (req, res) => {
             let result: Record<string, unknown> = {};
+            if (req.method === "GET" && req.url === "/status") {
+                // 合规的 Daemon 会上报线协议版本（REQ-0004 §6.2）；不上报的会被客户端拒绝
+                const { PROTOCOL_VERSION } = await import("../src/middle/protocol.js");
+                result = { pid: 1, protocolVersion: PROTOCOL_VERSION, version: "stub", layers: [], forwards: [], streams: [] };
+            }
             if (req.method === "POST") {
                 const chunks: Buffer[] = [];
                 for await (const chunk of req) chunks.push(chunk);
                 const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
                 requests.push(request);
-                result = request.method === "batch"
+                result = request.op === "runBatch"
                     ? { status: "ok", steps: [] }
                     : { stdout: "", stderr: "", exitCode: 0 };
             }
@@ -174,11 +181,11 @@ describe("DaemonServer & DaemonClient RPC", () => {
                 sshHops: [{ host: "inner.invalid", conn: { keyFile: "inner-key" } }],
             };
             expect(requests).toMatchObject([
-                { method: "exec", params: { target: { descriptor: { config: { connParams: {
+                { op: "runCommand", params: { layer: { descriptor: { config: { connParams: {
                     keyFile: join(cwd, "key"), knownHostsFile: join(cwd, "hosts"),
                 } } } } } },
-                { method: "exec", params: { target: { layer: "fixture", descriptor: { config: savedConfig } } } },
-                { method: "batch", params: { savedLayers: { fixture: { config: savedConfig } } } },
+                { op: "runCommand", params: { layer: { name: "fixture", descriptor: { config: savedConfig } } } },
+                { op: "runBatch", params: { layers: { fixture: { config: savedConfig } } } },
             ]);
         } finally {
             await new Promise<void>((resolve) => stub.close(() => resolve()));
@@ -191,7 +198,7 @@ describe("DaemonServer & DaemonClient RPC", () => {
         try {
             const addr = await srv.start();
             const client = new DaemonClient({ addr, token: srv.token });
-            const rejection = client.rpc("cat", { path: "x".repeat(17 * 1024 * 1024) }, 5_000);
+            const rejection = client.rpc("readFile", { path: "x".repeat(17 * 1024 * 1024) }, 5_000);
             await expect(rejection).rejects.toMatchObject({ statusCode: 413, message: expect.stringContaining("请求体超过限制") });
             await expect(rejection).rejects.not.toHaveProperty("outcome");
             expect(await client.health()).toBe(true);
@@ -276,6 +283,34 @@ describe("DaemonServer & DaemonClient RPC", () => {
         }
     });
 
+    test("an invalid RPC result leaves the execution outcome unknown", async () => {
+        const responses = new Map([
+            ["Bearer invalid-json", "invalid JSON"],
+            ["Bearer missing-result", '{"ok":true}'],
+            ["Bearer missing-error", '{"ok":false}'],
+        ]);
+        const stub = http.createServer((req, res) => {
+            req.resume();
+            req.on("end", () => {
+                res.end(responses.get(req.headers.authorization ?? ""));
+            });
+        });
+        try {
+            await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
+            const addr = `127.0.0.1:${(stub.address() as { port: number }).port}`;
+            for (const token of ["invalid-json", "missing-result", "missing-error"]) {
+                const client = new DaemonClient({ addr, token });
+                const error = await client.rpc("runCommand", { command: "fixture" }).catch((error: unknown) => error);
+                expect(error).toBeInstanceOf(Error);
+                expect(error).toHaveProperty("outcome", "unknown");
+                expect(error).not.toHaveProperty("reason");
+            }
+        } finally {
+            stub.closeAllConnections();
+            await new Promise<void>((resolve) => stub.close(() => resolve()));
+        }
+    });
+
     test("executes exec/cat/edit and cross-call stream open/peek/list/close", async () => {
         const dir = makeTempDir("fx-daemon-rpc-");
         const work = makeTempDir("fx-daemon-work-");
@@ -287,10 +322,10 @@ describe("DaemonServer & DaemonClient RPC", () => {
             const targetFile = join(work, "sample.txt");
             writeFileSync(targetFile, "hello old world\n", "utf-8");
 
-            const catRes = await client.rpc<{ content: string }>("cat", { path: "sample.txt", target: { cwd: work } });
+            const catRes = await client.rpc<{ content: string }>("readFile", { path: targetFile });
             expect(catRes.content).toBe("hello old world\n");
 
-            const editRes = await client.rpc<{ occurrences: number }>("edit", {
+            const editRes = await client.rpc<{ occurrences: number }>("editFile", {
                 path: targetFile,
                 old: "old",
                 new: "new",
@@ -298,42 +333,42 @@ describe("DaemonServer & DaemonClient RPC", () => {
             expect(editRes.occurrences).toBe(1);
             expect(readFileSync(targetFile, "utf-8")).toBe("hello new world\n");
 
-            const execRes = await client.rpc<{ stdout: string; exitCode: number }>("exec", {
+            const execRes = await client.rpc<{ stdout: string; exitCode: number }>("runCommand", {
                 command: "printf 'daemon-exec-ok'",
             });
             expect(execRes.exitCode).toBe(0);
             expect(execRes.stdout).toBe("daemon-exec-ok");
 
             const opened = await client.rpc<{
-                window_id: string;
+                windowId: string;
                 frames: Array<{ seq: number; text: string }>;
-                last_delivered_seq?: number;
-            }>("stream.open", {
+                lastDeliveredSeq?: number;
+            }>("openStream", {
                 command: "printf 'line1\\n'; sleep 0.2; printf 'line2\\n'",
                 waitMs: 2000,
                 limit: 20,
             });
-            expect(opened.window_id).toBeTruthy();
+            expect(opened.windowId).toBeTruthy();
 
-            const listRes = await client.rpc<{ streams: Array<{ window_id: string }> }>("stream.list");
-            expect(listRes.streams.some((s) => s.window_id === opened.window_id)).toBe(true);
+            const listRes = await client.rpc<{ streams: Array<{ windowId: string }> }>("listStreams");
+            expect(listRes.streams.some((s) => s.windowId === opened.windowId)).toBe(true);
 
-            let cursor = opened.last_delivered_seq ?? 0;
+            let cursor = opened.lastDeliveredSeq ?? 0;
             const collected = opened.frames.map((f) => f.text);
             const deadline = Date.now() + 4000;
             while (collected.length < 2 && Date.now() < deadline) {
                 const peek = await client.rpc<{
                     frames: Array<{ seq: number; text: string }>;
-                    last_delivered_seq?: number;
-                }>("stream.peek", { windowId: opened.window_id, afterSeq: cursor, waitMs: 500 });
+                    lastDeliveredSeq?: number;
+                }>("peekStream", { windowId: opened.windowId, afterSeq: cursor, waitMs: 500 });
                 for (const f of peek.frames) collected.push(f.text);
-                cursor = peek.last_delivered_seq ?? cursor;
+                cursor = peek.lastDeliveredSeq ?? cursor;
             }
             expect(collected).toEqual(["line1", "line2"]);
 
-            const closed = await client.rpc<{ closed: boolean }>("stream.close", { windowId: opened.window_id });
+            const closed = await client.rpc<{ closed: boolean }>("closeStream", { windowId: opened.windowId });
             expect(closed.closed).toBe(true);
-            await expect(client.rpc("stream.peek", { windowId: opened.window_id })).rejects.toThrow(/不存在或已关闭/);
+            await expect(client.rpc("peekStream", { windowId: opened.windowId })).rejects.toThrow(/不存在或已关闭/);
         } finally {
             await srv.stop();
             rmSync(dir, { recursive: true, force: true });
@@ -353,13 +388,13 @@ describe("DaemonServer & DaemonClient RPC", () => {
             win.push("out-1", "stdout");
             win.push("err-2", "stderr");
             win.push("out-3", "stdout");
-            const peek = (cursors: Record<string, number> = {}) => client.rpc("stream.peek", {
+            const peek = (cursors: Record<string, number> = {}) => client.rpc("peekStream", {
                 windowId: win.name, limit: 1, stream: "stderr", ...cursors,
             }, 8_000);
             const frames = [{ seq: 2, text: "err-2", stream: "stderr" }];
             await expect(peek()).resolves.toMatchObject({ frames });
             await expect(peek({ beforeSeq: 4 })).resolves.toMatchObject({ frames });
-            await expect(peek({ afterSeq: 0 })).resolves.toMatchObject({ frames, last_delivered_seq: 2 });
+            await expect(peek({ afterSeq: 0 })).resolves.toMatchObject({ frames, lastDeliveredSeq: 2 });
             let readStarted!: () => void;
             const firstRead = new Promise<void>((resolve) => { readStarted = resolve; });
             const peekSince = win.peekSince.bind(win);
@@ -372,7 +407,7 @@ describe("DaemonServer & DaemonClient RPC", () => {
             await Promise.race([firstRead, waiting]);
             win.push("err-4", "stderr");
             await expect(waiting).resolves.toMatchObject({
-                frames: [{ seq: 4, text: "err-4", stream: "stderr" }], last_delivered_seq: 4,
+                frames: [{ seq: 4, text: "err-4", stream: "stderr" }], lastDeliveredSeq: 4,
             });
 
             observer.kill("SIGTERM");
@@ -396,8 +431,8 @@ describe("DaemonServer & DaemonClient RPC", () => {
             await srv.stack.addLayer("fixture", driver);
             const removed = await runCliAsync(["forward", "remove", "fwd-id", "--layer", "fixture", "--json"], dir);
             expect(removed.exitCode).toBe(1);
-            // CLI --json 对外为 snake_case（forward_id 为主名；forwardId 保留为兼容别名）
-            expect(JSON.parse(removed.stdout)).toEqual({ forward_id: "fwd-id", forwardId: "fwd-id", status: "unknown", detail: "fixture unverified" });
+            // CLI --json 与中层记录同形（camelCase，REQ-0004 §5.2）
+            expect(JSON.parse(removed.stdout)).toEqual({ forwardId: "fwd-id", status: "unknown", detail: "fixture unverified" });
         } finally {
             await srv.stop();
             rmSync(dir, { recursive: true, force: true });
@@ -424,28 +459,28 @@ describe("DaemonServer & DaemonClient RPC", () => {
             await srv.stack.addLayer("prod", sshDriver);
 
             const client = new DaemonClient({ addr, token: srv.token });
-            const added = await client.rpc<{ forwardId: string; bindPort: number; layer: string }>("forward.add", {
-                target: { layer: "prod" },
+            const added = await client.rpc<{ forwardId: string; bindPort: number; layer: string }>("openForward", {
+                layer: "prod",
                 spec: { id: "db-fwd", kind: "L", bindPort: 18080, targetHost: "127.0.0.1", targetPort: 5432 },
             });
             expect(added.forwardId).toBe("db-fwd");
             expect(added.layer).toBe("prod");
             expect(added.bindPort).toBe(18080);
 
-            const list = await client.rpc<{ forwards: Array<{ forwardId: string }> }>("forward.list", { layer: "prod" });
+            const list = await client.rpc<{ forwards: Array<{ forwardId: string }> }>("listForwards", { layer: "prod" });
             expect(list.forwards.map((f) => f.forwardId)).toEqual(["db-fwd"]);
 
-            const removed = await client.rpc<{ status: string }>("forward.remove", { forwardId: "db-fwd", layer: "prod" });
+            const removed = await client.rpc<{ status: string }>("closeForward", { forwardId: "db-fwd", layer: "prod" });
             expect(removed.status).toBe("stopped");
             expect(childRef.signals).toContain("SIGTERM");
 
-            await client.rpc("forward.add", {
-                target: { layer: "prod" },
+            await client.rpc("openForward", {
+                layer: "prod",
                 spec: { id: "detached", kind: "L", bindPort: 18080, targetHost: "127.0.0.1", targetPort: 5432 },
             });
-            await client.rpc("layer.remove", { name: "prod" });
+            await client.rpc("removeLayer", { layer: "prod" });
             expect(srv.stack.layers.has("prod")).toBe(false);
-            const detached = await client.rpc<{ forwards: Array<{ forwardId: string; layer?: string }> }>("forward.list");
+            const detached = await client.rpc<{ forwards: Array<{ forwardId: string; layer?: string }> }>("listForwards");
             expect(detached.forwards.map((f) => f.forwardId)).toEqual(["detached"]);
             expect(detached.forwards[0]).not.toHaveProperty("layer");
             expect(childRef.signals).toEqual([]);
@@ -537,18 +572,18 @@ describe("CLI daemon / forward / stream E2E", () => {
             const openRes = runCli(["stream", "open", "--wait", "2000", "--json", "--", "printf 's1\\ns2\\n'"], dir);
             expect(openRes.exitCode).toBe(0);
             const openJson = JSON.parse(openRes.stdout.toString()) as {
-                window_id: string;
+                windowId: string;
                 frames: Array<{ seq: number; text: string }>;
-                last_delivered_seq?: number;
+                lastDeliveredSeq?: number;
             };
-            expect(openJson.window_id).toBeTruthy();
+            expect(openJson.windowId).toBeTruthy();
 
-            const peekRes = runCli(["stream", "peek", openJson.window_id, "--after", "0", "--wait", "2000", "--json"], dir);
+            const peekRes = runCli(["stream", "peek", openJson.windowId, "--after", "0", "--wait", "2000", "--json"], dir);
             expect(peekRes.exitCode).toBe(0);
             const peekJson = JSON.parse(peekRes.stdout.toString()) as { frames: Array<{ text: string }> };
             expect(peekJson.frames.map((f) => f.text)).toEqual(["s1", "s2"]);
 
-            const closeRes = runCli(["stream", "close", openJson.window_id, "--json"], dir);
+            const closeRes = runCli(["stream", "close", openJson.windowId, "--json"], dir);
             expect(closeRes.exitCode).toBe(0);
 
             const stopRes = runCli(["daemon", "stop", "--json"], dir);
@@ -584,28 +619,29 @@ describe("CLI daemon / forward / stream E2E", () => {
 
             // Concurrent first requests to local layer must not collide in RuntimeStack.addLayer
             const [e1, e2] = await Promise.all([
-                client.rpc<{ stdout: string; exitCode: number }>("exec", { command: "printf 'c1'" }),
-                client.rpc<{ stdout: string; exitCode: number }>("exec", { command: "printf 'c2'" }),
+                client.rpc<{ stdout: string; exitCode: number }>("runCommand", { command: "printf 'c1'" }),
+                client.rpc<{ stdout: string; exitCode: number }>("runCommand", { command: "printf 'c2'" }),
             ]);
             expect(e1.stdout).toBe("c1");
             expect(e2.stdout).toBe("c2");
 
-            // batch honors client target.cwd for relative paths
-            const batchRes = await client.rpc<{ status: string; steps: Array<{ stdout?: string }> }>("batch", {
-                target: { descriptor: { driver: "local" }, cwd: work },
+            // batch honors the caller working directory for the local default layer
+            const batchRes = await client.rpc<{ status: string; steps: Array<{ stdout?: string }> }>("runBatch", {
+                defaultLayer: { descriptor: { driver: "local" } },
+                cwd: work,
                 plan: { steps: [{ id: "r1", kind: "read", path: "cwd-marker.txt" }] },
             });
             expect(batchRes.status).toBe("ok");
             expect(batchRes.steps[0]?.stdout).toBe("hello-cwd");
 
             // stream.open honors client target.cwd
-            const stRes = await client.rpc<{ window_id: string; frames: Array<{ text: string }> }>("stream.open", {
-                target: { descriptor: { driver: "local" }, cwd: work },
+            const stRes = await client.rpc<{ windowId: string; frames: Array<{ text: string }> }>("openStream", {
+                layer: { descriptor: { driver: "local", cwd: work } },
                 command: "cat cwd-marker.txt",
                 waitMs: 2000,
             });
             expect(stRes.frames.map((f) => f.text)).toContain("hello-cwd");
-            await client.rpc("stream.close", { windowId: stRes.window_id });
+            await client.rpc("closeStream", { windowId: stRes.windowId });
         } finally {
             await srv.stop();
             rmSync(dir, { recursive: true, force: true });
@@ -635,13 +671,13 @@ describe("CLI daemon / forward / stream E2E", () => {
 
             const okL = await runCliAsync(["forward", "add", "--layer", "prod", "-L", "127.0.0.1:5432", "--json"], dir);
             expect(okL.exitCode).toBe(0);
-            const infoL = JSON.parse(okL.stdout) as { kind: string; bind_port: number; target_host: string; target_port: number };
-            expect(infoL).toMatchObject({ forward_id: expect.any(String), kind: "local", bind_port: 54321, target_host: "127.0.0.1", target_port: 5432 });
+            const infoL = JSON.parse(okL.stdout) as { kind: string; bindPort: number; targetHost: string; targetPort: number };
+            expect(infoL).toMatchObject({ forwardId: expect.any(String), kind: "local", bindPort: 54321, targetHost: "127.0.0.1", targetPort: 5432 });
 
             const okD = await runCliAsync(["forward", "add", "--layer", "prod", "-D", "--json"], dir);
             expect(okD.exitCode).toBe(0);
-            const infoD = JSON.parse(okD.stdout) as { kind: string; bind_port: number };
-            expect(infoD).toMatchObject({ kind: "dynamic", bind_port: 54321 });
+            const infoD = JSON.parse(okD.stdout) as { kind: string; bindPort: number };
+            expect(infoD).toMatchObject({ kind: "dynamic", bindPort: 54321 });
 
             const badD = await runCliAsync(["forward", "add", "--layer", "prod", "-D", "-1"], dir);
             expect(badD.exitCode).toBe(1);
@@ -731,22 +767,22 @@ describe("CLI daemon / forward / stream E2E", () => {
             const client = new DaemonClient({ addr, token: srv.token });
 
             // 1) Initial named layer points to dirA
-            const c1 = await client.rpc<{ content: string }>("cat", {
-                target: { layer: "app", descriptor: { driver: "local", cwd: dirA } },
+            const c1 = await client.rpc<{ content: string }>("readFile", {
+                layer: { name: "app", descriptor: { driver: "local", cwd: dirA } },
                 path: "marker.txt",
             });
             expect(c1.content).toBe("from-A");
 
             // 2) Updated descriptor points to dirB -> Daemon replaces stale layer handle
-            const c2 = await client.rpc<{ content: string }>("cat", {
-                target: { layer: "app", descriptor: { driver: "local", cwd: dirB } },
+            const c2 = await client.rpc<{ content: string }>("readFile", {
+                layer: { name: "app", descriptor: { driver: "local", cwd: dirB } },
                 path: "marker.txt",
             });
             expect(c2.content).toBe("from-B");
 
-            // 3) batch savedLayers also honors updated descriptor for an already-cached layer
-            const b1 = await client.rpc<{ status: string; steps: Array<{ stdout?: string }> }>("batch", {
-                savedLayers: { app: { driver: "local", cwd: dirA } },
+            // 3) layer descriptors carried by the caller also win for an already-registered layer
+            const b1 = await client.rpc<{ status: string; steps: Array<{ stdout?: string }> }>("runBatch", {
+                layers: { app: { driver: "local", cwd: dirA } },
                 plan: { steps: [{ id: "r", kind: "read", layer: "app", path: "marker.txt" }] },
             });
             expect(b1.status).toBe("ok");
@@ -766,14 +802,14 @@ describe("CLI daemon / forward / stream E2E", () => {
                 },
             });
             await srv.stack.addLayer("tun-layer", sshOld);
-            const opening = client.rpc<{ forwardId: string }>("forward.add", {
-                target: { layer: "tun-layer" },
+            const opening = client.rpc<{ forwardId: string }>("openForward", {
+                layer: "tun-layer",
                 spec: { kind: "L", bindPort: 18111, targetHost: "db", targetPort: 5432 },
             });
             void opening.catch(() => undefined);
             const child = await started;
-            const replaceLayer = () => client.rpc("cat", {
-                target: { layer: "tun-layer", descriptor: { driver: "local", cwd: dirA } },
+            const replaceLayer = () => client.rpc("readFile", {
+                layer: { name: "tun-layer", descriptor: { driver: "local", cwd: dirA } },
                 path: "marker.txt",
             });
             try {
@@ -784,7 +820,7 @@ describe("CLI daemon / forward / stream E2E", () => {
             const { forwardId } = await opening;
             await expect(replaceLayer()).rejects.toThrow(/拒绝静默覆盖/);
 
-            await expect(client.rpc("forward.remove", { forwardId })).resolves.toMatchObject({ status: "stopped" });
+            await expect(client.rpc("closeForward", { forwardId })).resolves.toMatchObject({ status: "stopped" });
             await expect(replaceLayer()).resolves.toEqual({ content: "from-A" });
         } finally {
             await srv.stop();
@@ -809,7 +845,7 @@ describe("CLI daemon / forward / stream E2E", () => {
             const client = new DaemonClient({ addr: srv.addr, token: srv.token });
             expect(await client.health()).toBe(true);
             expect((await client.status()).version).toBe("ipv6");
-            const r = await client.rpc<{ stdout: string; exitCode: number }>("exec", { command: "printf 'v6-ok'" });
+            const r = await client.rpc<{ stdout: string; exitCode: number }>("runCommand", { command: "printf 'v6-ok'" });
             expect(r.exitCode).toBe(0);
             expect(r.stdout).toBe("v6-ok");
         } finally {
@@ -843,14 +879,14 @@ describe("CLI daemon / forward / stream E2E", () => {
             const addr = await srv.start();
             const client = new DaemonClient({ addr, token: srv.token });
 
-            const p1 = client.rpc<{ content: string }>("cat", {
-                target: { layer: "race-app", descriptor: { driver: "local", cwd: dirA } },
+            const p1 = client.rpc<{ content: string }>("readFile", {
+                layer: { name: "race-app", descriptor: { driver: "local", cwd: dirA } },
                 path: "marker.txt",
             });
             await firstEntered;
 
-            const p2 = client.rpc<{ content: string }>("cat", {
-                target: { layer: "race-app", descriptor: { driver: "local", cwd: dirB } },
+            const p2 = client.rpc<{ content: string }>("readFile", {
+                layer: { name: "race-app", descriptor: { driver: "local", cwd: dirB } },
                 path: "marker.txt",
             });
             await expect(p2).rejects.toThrow(/并发注册|拒绝合并/);
@@ -879,8 +915,8 @@ describe("CLI daemon / forward / stream E2E", () => {
             const client = new DaemonClient({ addr, token: srv.token });
 
             // 1) Even when activeLayer starts undefined, explicit ephemeral CLI target does not hijack it
-            const eph1 = await client.rpc<{ content: string }>("cat", {
-                target: { descriptor: { driver: "local", cwd: dirB } },
+            const eph1 = await client.rpc<{ content: string }>("readFile", {
+                layer: { descriptor: { driver: "local", cwd: dirB } },
                 path: "who.txt",
             });
             expect(eph1.content).toBe("CLI_EXPLICIT_B");
@@ -891,8 +927,8 @@ describe("CLI daemon / forward / stream E2E", () => {
             expect(srv.stack.activeLayer?.name).toBe("mcp-default");
 
             // 3) Explicit CLI named and ephemeral calls must NOT switch activeLayer away from "mcp-default"
-            const cliNamed = await client.rpc<{ content: string }>("cat", {
-                target: { layer: "cli-other", descriptor: { driver: "local", cwd: dirB } },
+            const cliNamed = await client.rpc<{ content: string }>("readFile", {
+                layer: { name: "cli-other", descriptor: { driver: "local", cwd: dirB } },
                 path: "who.txt",
             });
             expect(cliNamed.content).toBe("CLI_EXPLICIT_B");
@@ -958,39 +994,45 @@ describe("CLI daemon / forward / stream E2E", () => {
             await srv.stack.addLayer("local", fakeSsh as never);
 
             const client = new DaemonClient({ addr, token: srv.token });
-            // Implicit local (no target, or descriptor.driver === "local" without target.layer) executes locally, NOT on SSH "local"
-            const r1 = await client.rpc<{ stdout: string; exitCode: number }>("exec", { command: "printf 'REAL_LOCAL_1'" });
+            // "The local machine" (a plain local descriptor) executes locally, NOT on SSH "local".
+            // A raw RPC with no layer means the middle's default layer (REQ-0004 §5.4); the CLI
+            // translates "no target given" into this explicit local ref before calling.
+            const r1 = await client.rpc<{ stdout: string; exitCode: number }>("runCommand", {
+                layer: { descriptor: { driver: "local" } }, command: "printf 'REAL_LOCAL_1'",
+            });
             expect(r1.exitCode).toBe(0);
             expect(r1.stdout).toBe("REAL_LOCAL_1");
 
-            const r2 = await client.rpc<{ stdout: string; exitCode: number }>("exec", {
-                target: { descriptor: { driver: "local" } },
+            const r2 = await client.rpc<{ stdout: string; exitCode: number }>("runCommand", {
+                layer: { descriptor: { driver: "local" } },
                 command: "printf 'REAL_LOCAL_2'",
             });
             expect(r2.exitCode).toBe(0);
             expect(r2.stdout).toBe("REAL_LOCAL_2");
 
             // Explicit target: { layer: "local" } intentionally targets the registered layer named "local"
-            const r3 = await client.rpc<{ stdout: string; exitCode: number }>("exec", {
-                target: { layer: "local" },
+            const r3 = await client.rpc<{ stdout: string; exitCode: number }>("runCommand", {
+                layer: "local",
                 command: "printf 'IGNORED'",
             });
             expect(r3.stdout).toBe("FROM_SSH_NAMED_LOCAL");
-            await expect(client.rpc("forward.add", {
+            await expect(client.rpc("openForward", {
+                layer: { descriptor: { driver: "local" } },
                 spec: { kind: "D", bindPort: 0 },
             })).rejects.toMatchObject({ message: "层 'local' (local) 不支持动态端口转发" });
 
-            const stream = await client.rpc<{ window_id: string }>("stream.open", {
+            const stream = await client.rpc<{ windowId: string }>("openStream", {
+                layer: { descriptor: { driver: "local" } },
                 command: "printf 'implicit-local-log\\n'",
                 waitMs: 2_000,
             });
             try {
-                await expect(client.rpc("exec", {
-                    target: { layer: "local", descriptor: { driver: "local" } },
+                await expect(client.rpc("runCommand", {
+                    layer: { name: "local", descriptor: { driver: "local" } },
                     command: "printf 'NEW_NAMED_LOCAL'",
                 })).resolves.toMatchObject({ stdout: "NEW_NAMED_LOCAL", exitCode: 0 });
             } finally {
-                await client.rpc("stream.close", { windowId: stream.window_id });
+                await client.rpc("closeStream", { windowId: stream.windowId });
             }
         } finally {
             await srv.stop();
@@ -1000,15 +1042,22 @@ describe("CLI daemon / forward / stream E2E", () => {
 
     test("[P2] RPC mid-flight socket drop preserves error and tags outcome='unknown'", async () => {
         const dir = makeTempDir("fx-daemon-rpc-drop-");
+        let dropConnection = true;
         const stub = http.createServer((req, res) => {
             if (req.method === "GET" && req.url === "/status") {
+                if (!dropConnection) {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.write("{");
+                    return;
+                }
+                // 上报线协议版本（REQ-0004 §6.2）：CLI 过了握手才会发 RPC，这条用例测的才是 RPC 中途断连
                 res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ ok: true, result: {} }));
+                res.end(JSON.stringify({ ok: true, result: { pid: 1, version: "stub", protocolVersion: PROTOCOL_VERSION, layers: [], forwards: [], streams: [] } }));
                 return;
             }
             req.on("data", () => undefined);
             req.on("end", () => {
-                req.socket.destroy();
+                if (dropConnection) req.socket.destroy();
             });
         });
         await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", () => resolve()));
@@ -1017,12 +1066,12 @@ describe("CLI daemon / forward / stream E2E", () => {
             const client = new DaemonClient({ addr: `127.0.0.1:${port}`, token: "tok" });
             let caught: (Error & { outcome?: unknown; code?: unknown }) | undefined;
             try {
-                await client.rpc("exec", { command: "echo may-have-ran" });
+                await client.rpc("runCommand", { command: "echo may-have-ran" });
             } catch (e) {
                 caught = e as Error & { outcome?: unknown; code?: unknown };
             }
             expect(caught).toBeInstanceOf(Error);
-            expect(caught?.outcome).toBe("unknown");
+            expect(caught).toMatchObject({ outcome: "unknown", reason: "disconnect", channel: "daemon_rpc" });
 
             const paths = daemonPaths(dir);
             writePrivateFileAtomic(paths.addrFile, `127.0.0.1:${port}`);
@@ -1040,41 +1089,88 @@ describe("CLI daemon / forward / stream E2E", () => {
             expect(exitCode).toBe(1);
             expect(stdout).toBe("");
             expect(stderr).toContain("outcome=unknown");
+            expect(stderr).toContain("reason=disconnect channel=daemon_rpc");
+
+            dropConnection = false;
+            const timedOut = client.status(200);
+            await expect(timedOut).rejects.toThrow("Daemon 请求超时");
+            await expect(timedOut).rejects.not.toHaveProperty("reason");
         } finally {
+            stub.closeAllConnections();
             await new Promise<void>((resolve) => stub.close(() => resolve()));
             rmSync(dir, { recursive: true, force: true });
         }
     }, 10_000);
+
+    test("remote SDK AbortSignal cancels the RPC and leaves the issued command outcome unknown", async () => {
+        const srv = new DaemonServer({ writeFiles: false });
+        const driver = new LocalRuntimeDriver();
+        let calls = 0;
+        let markStarted!: () => void;
+        let markAborted!: () => void;
+        const started = new Promise<void>((resolve) => { markStarted = resolve; });
+        const aborted = new Promise<void>((resolve) => { markAborted = resolve; });
+        driver.exec = async (_command, options) => {
+            calls++;
+            await new Promise<void>((resolve) => {
+                options!.signal!.addEventListener("abort", resolve as () => void, { once: true });
+                markStarted();
+            });
+            markAborted();
+            throw new Error("command interrupted");
+        };
+        try {
+            const addr = await srv.start();
+            await srv.stack.addLayer("fixture", driver);
+            const middle = await connectRemoteMiddle(new DaemonClient({ addr, token: srv.token }));
+            const preAborted = middle.ops.runCommand({ layer: "fixture", command: "echo fixture", signal: AbortSignal.abort() });
+            await expect(preAborted).rejects.toMatchObject({ name: "AbortError" });
+            await expect(preAborted).rejects.not.toHaveProperty("outcome");
+            expect(calls).toBe(0);
+
+            const abort = new AbortController();
+            const result = middle.ops.runCommand({ layer: "fixture", command: "echo fixture", signal: abort.signal });
+            const rejection = result.catch((error: unknown) => error);
+            await started;
+            abort.abort("caller disconnected");
+            expect(await rejection).toMatchObject({ name: "AbortError", outcome: "unknown" });
+            await aborted;
+            expect(calls).toBe(1);
+        } finally {
+            await srv.stop();
+        }
+    }, 30_000);
 
     test("preserves confirmed RPC errors without marking their outcome unknown", async () => {
         const srv = new DaemonServer({ writeFiles: false });
         try {
             const addr = await srv.start();
             const client = new DaemonClient({ addr, token: srv.token });
-            const rejection = client.rpc("cat", {});
-            await expect(rejection).rejects.toThrow("cat 缺少 path 参数");
+            const rejection = client.rpc("readFile", {});
+            await expect(rejection).rejects.toThrow("path 需为非空路径");
             await expect(rejection).rejects.not.toHaveProperty("outcome");
 
             const unauthorized = new DaemonClient({ addr, token: "wrong-token" });
-            const rejectedAuth = unauthorized.rpc("exec", {});
+            const rejectedAuth = unauthorized.rpc("runCommand", {});
             await expect(rejectedAuth).rejects.toThrow("HTTP 401");
             await expect(rejectedAuth).rejects.not.toHaveProperty("outcome");
 
             const driver = new LocalRuntimeDriver();
             const failure = Object.assign(new Error("fixture command interrupted"), {
-                name: "AbortError", code: "ABORT_ERR", outcome: "unknown", partialOutput: "fixture output",
+                code: "E_PTY_CLOSED", outcome: "unknown", reason: "disconnect", channel: "ssh_pty", partialOutput: "fixture output",
             });
             driver.exec = async () => { throw failure; };
             await srv.stack.addLayer("fixture", driver);
-            await expect(client.rpc("exec", {
-                target: { layer: "fixture" }, command: "fixture",
+            await expect(client.rpc("runCommand", {
+                layer: "fixture", command: "fixture",
             })).rejects.toMatchObject({
                 name: failure.name, code: failure.code, outcome: failure.outcome, partialOutput: failure.partialOutput,
+                reason: failure.reason, channel: failure.channel,
             });
 
             driver.exec = async () => { throw { toString: () => "internal error details" }; };
-            await expect(client.rpc("exec", {
-                target: { layer: "fixture" }, command: "fixture",
+            await expect(client.rpc("runCommand", {
+                layer: "fixture", command: "fixture",
             })).rejects.toMatchObject({ message: "Daemon RPC 执行失败" });
         } finally {
             await srv.stop();
@@ -1094,16 +1190,16 @@ describe("CLI daemon / forward / stream E2E", () => {
             const addr = await srv.start();
             const client = new DaemonClient({ addr, token: srv.token });
             const target = { descriptor: { driver: "local", cwd: first } };
-            const read = (targetSpec: Record<string, unknown>) => client.rpc<{ content: string }>(
-                "cat", { target: targetSpec, path: "marker.txt" },
+            const read = (ref: unknown) => client.rpc<{ content: string }>(
+                "readFile", { layer: ref, path: "marker.txt" },
             );
             expect((await read(target)).content).toBe("first");
             const [layer] = (await client.status()).layers;
             if (!layer) throw new Error("Expected the descriptor to register a layer");
             const { name } = layer;
-            expect((await read({ layer: name, descriptor: { driver: "local", cwd: second } })).content).toBe("second");
+            expect((await read({ name, descriptor: { driver: "local", cwd: second } })).content).toBe("second");
             expect((await read(target)).content).toBe("first");
-            expect((await read({ layer: name })).content).toBe("second");
+            expect((await read(name)).content).toBe("second");
         } finally {
             await srv.stop();
             rmSync(dir, { recursive: true, force: true });
@@ -1127,7 +1223,7 @@ describe("CLI daemon / forward / stream E2E", () => {
 // DSH + GLM-5.4 使用评估（2026-11-26）#5a/#5b：forward list
 // ---------------------------------------------------------------------------
 describe("CLI forward list（DSH 评估 2026-11-26 #5a/#5b）", () => {
-    test("默认只报在用的转发；--all 连已停止的一并列出；--json 为 snake_case 且带 forwardId 兼容别名", async () => {
+    test("默认只报在用的转发；--all 连已停止的一并列出；--json 与中层记录同形（camelCase）", async () => {
         const dir = makeTempDir("fx-daemon-forward-list-");
         const srv = new DaemonServer({ daemonDir: dir });
         try {
@@ -1153,20 +1249,69 @@ describe("CLI forward list（DSH 评估 2026-11-26 #5a/#5b）", () => {
 
             const json = await runCliAsync(["forward", "list", "--layer", "fixture", "--json"], dir);
             const parsed = JSON.parse(json.stdout) as Array<Record<string, unknown>>;
-            expect(parsed.map((f) => f.forward_id)).toEqual(["live", "unsure"]);
+            expect(parsed.map((f) => f.forwardId)).toEqual(["live", "unsure"]);
             expect(parsed[0]).toMatchObject({
-                forward_id: "live", forwardId: "live", kind: "local", bind_addr: "127.0.0.1", bind_port: 43210,
-                transport_mode: "subprocess", status: "active", created_at: 1,
+                forwardId: "live", kind: "local", bindAddr: "127.0.0.1", bindPort: 43210,
+                transportMode: "subprocess", status: "active", createdAt: 1,
             });
-            // 记录里除兼容别名外不再有驼峰键（与参数 forward_id、观察窗 window_id 同一命名风格）
-            expect(Object.keys(parsed[0]!).filter((k) => /[a-z][A-Z]/.test(k) && k !== "forwardId")).toEqual([]);
+            // CLI --json 与中层记录同形：camelCase（snake_case 只属于 MCP 工具面，REQ-0004 §5.2）
+            expect(Object.keys(parsed[0]!).filter((k) => /_[a-z]/.test(k))).toEqual([]);
 
             const allJson = await runCliAsync(["forward", "list", "--layer", "fixture", "--all", "--json"], dir);
-            const allParsed = JSON.parse(allJson.stdout) as Array<{ forward_id: string }>;
-            expect(allParsed.map((f) => f.forward_id)).toEqual(["live", "gone", "dead", "unsure"]);
+            const allParsed = JSON.parse(allJson.stdout) as Array<{ forwardId: string }>;
+            expect(allParsed.map((f) => f.forwardId)).toEqual(["live", "gone", "dead", "unsure"]);
         } finally {
             await srv.stop();
             rmSync(dir, { recursive: true, force: true });
         }
     }, 60_000); // 本机实测 ~25s（起停 Daemon + 三次 CLI）
+});
+
+// ---------------------------------------------------------------------------
+// REQ-0004 §6.2 版本握手（M0）：升级后旧 Daemon 仍在运行时，新客户端必须明确拒绝，
+// 不能把请求交给旧代码执行，也不能悄悄退回另一条执行路径。
+// ---------------------------------------------------------------------------
+describe("REQ-0004 M0：Daemon 线协议版本握手", () => {
+    test("status 上报协议版本，与 PROTOCOL_VERSION 一致", async () => {
+        const { DaemonServer } = await import("../src/interface/daemon/daemon-server.js");
+        const { PROTOCOL_VERSION } = await import("../src/middle/protocol.js");
+        const dir = mkdtempSync(join(tmpdir(), "fx-proto-"));
+        const srv = new DaemonServer({ daemonDir: dir, version: "0.3.0-test" });
+        try {
+            await srv.start();
+            const status = srv.status();
+            expect(status.protocolVersion).toBe(PROTOCOL_VERSION);
+            expect(status.version).toBe("0.3.0-test");
+        } finally {
+            await srv.stop();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("旧 Daemon（不上报协议版本）或不同协议版本 → ProtocolMismatchError，带 pid 与处置办法", async () => {
+        const { DaemonClient, assertDaemonProtocol, ProtocolMismatchError } = await import("../src/interface/daemon/daemon-client.js");
+        const { PROTOCOL_VERSION } = await import("../src/middle/protocol.js");
+        type Status = Record<string, unknown> & { protocolVersion?: number };
+        const fake = (status: Status) => ({ status: async () => status }) as unknown as DaemonClient;
+
+        // 0.2.x 的 Daemon：status 里没有 protocolVersion
+        let caught: unknown;
+        try { await assertDaemonProtocol(fake({ pid: 4242, version: "0.2.13" })); } catch (e) { caught = e; }
+        expect(caught).toBeInstanceOf(ProtocolMismatchError);
+        const err = caught as InstanceType<typeof ProtocolMismatchError>;
+        expect(err.code).toBe("E_PROTOCOL_MISMATCH");
+        expect(err.daemonPid).toBe(4242);
+        expect(err.daemonVersion).toBe("0.2.13");
+        expect(err.message).toContain("protocol=" + PROTOCOL_VERSION);
+        expect(err.message).toContain("0.2.x");
+        expect(err.message).toContain("filaxis daemon stop");
+
+        // 不同协议版本
+        await expect(assertDaemonProtocol(fake({ pid: 1, version: "9.9.9", protocolVersion: PROTOCOL_VERSION + 1 })))
+            .rejects.toThrow(ProtocolMismatchError);
+
+        // 一致 → 放行并返回 status
+        const ok = await assertDaemonProtocol(fake({ pid: 7, version: "0.3.0", protocolVersion: PROTOCOL_VERSION }));
+        expect(ok.pid).toBe(7);
+    });
 });

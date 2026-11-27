@@ -4,10 +4,10 @@
  */
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
-import { McpServer } from "../src/mcp-server.js";
-import { createAgentToolkit, TOOL_DEFS } from "../src/agent-toolkit.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
-import { LocalRuntimeDriver } from "../src/local-driver.js";
+import { McpServer } from "../src/interface/mcp/mcp-server.js";
+import { createAgentToolkit, TOOL_DEFS } from "../src/interface/mcp/agent-toolkit.js";
+import { RuntimeStack } from "../src/middle/runtime-stack.js";
+import { LocalRuntimeDriver } from "../src/core/local/local-driver.js";
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -129,11 +129,11 @@ describe("MCP Server（REQ-0003）", () => {
             expect(existsSync(join(previous, "created"))).toBe(false);
 
             previousDriver.fs.rm = async () => {
-                throw Object.assign(new Error("connection lost"), { outcome: "unknown" });
+                throw Object.assign(new Error("connection lost"), { outcome: "unknown", reason: "disconnect", channel: "ssh_pty" });
             };
             expect(await call(11, "manage_path", { action: "delete", path: ".hidden" })).toMatchObject({
-                isError: true, content: [{ text: "outcome=unknown\nconnection lost" }],
-                structuredContent: { outcome: "unknown" },
+                isError: true, content: [{ text: "outcome=unknown\nreason=disconnect\nchannel=ssh_pty\nconnection lost" }],
+                structuredContent: { outcome: "unknown", reason: "disconnect", channel: "ssh_pty" },
             });
             const entries = Array.from({ length: 60 }, (_, i) => ({ name: `entry-${i}-${"雪".repeat(80)}-end`, isDirectory: false }));
             previousDriver.fs.readdir = async () => entries;
@@ -659,7 +659,7 @@ describe("MCP Server（REQ-0003）", () => {
             tailSession: async () => [],
             stopSession: async () => ({ status: "exited", exitCode: null }),
             verifySession: async () => ({ status: "exited", exitCode: null }),
-        } as unknown as import("../src/driver.js").RuntimeDriver;
+        } as unknown as import("../src/core/base/driver.js").RuntimeDriver;
         const fixture = mcpFixture(stack, createAgentToolkit(stack, { driver, readyTimeoutMs: 5 }));
         try {
             fixture.write({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
@@ -682,7 +682,7 @@ test("manage_layers(remove) returns all unresolved session handles via MCP", asy
         descriptor: { driver: "tmux" },
         exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
         destroy: async () => { throw Object.assign(new Error("cleanup unknown"), { outcome: "unknown", sessions }); },
-    } as unknown as import("../src/driver.js").RuntimeDriver;
+    } as unknown as import("../src/core/base/driver.js").RuntimeDriver;
     await stack.addLayer("owned", driver);
     const fixture = mcpFixture(stack);
     try {
@@ -738,7 +738,7 @@ test("MCP error text surfaces outcome=unknown and state handles for run_command,
             mkdir: async () => {},
             stat: async () => ({ mtimeMs: 100, size: 6, isDirectory: false }),
         },
-    } as unknown as import("../src/driver.js").RuntimeDriver;
+    } as unknown as import("../src/core/base/driver.js").RuntimeDriver;
 
     await stack.addLayer("mock", drv);
     const f = mcpFixture(stack);
@@ -1120,7 +1120,7 @@ describe("MCP layer array fan-out", () => {
                     destroy: async () => undefined,
                     exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
                 }),
-            } as unknown as import("../src/driver.js").RuntimeDriver);
+            } as unknown as import("../src/core/base/driver.js").RuntimeDriver);
             const ll = await call(14, "list_layers");
             expect(ll.structuredContent).not.toHaveProperty("action");
             expect(ll.content[0]!.text).toContain("alt");

@@ -8,9 +8,45 @@
 
 [简体中文](https://github.com/corolin/filaxis/blob/main/README.md) · English
 
+**A headless multi-screen ops workbench for AI agents.**\
 **Connect · Execute · Observe · Reattach**
 
-Filaxis is a TypeScript runtime for remote execution by AI agents and automation. It supports local execution, multi-hop SSH, persistent sessions, and streaming observation on Windows and Linux. The CLI (`filaxis`), SDK (`RuntimeStack` and `createAgentToolkit`), and MCP server (`filaxis-mcp`) share the same execution semantics. CI runs the full Bun suite and loopback SSH integration tests on Ubuntu. The Node LTS job checks types and runtime boundaries and runs the compiled CLI.
+Filaxis is a zero-dependency TypeScript runtime for remote execution by AI agents and automation (by Syrkos). It runs on Bun and Node LTS across Windows and Linux. Its **CLI (`filaxis`), MCP server (`filaxis-mcp`), and SDK (`createMiddle`, `RuntimeStack`, `createAgentToolkit`)** share the same middle-layer operations. MCP uses the local Daemon by default, the CLI can reuse a running Daemon, and SDK callers can join the shared workspace with `connectRemoteMiddle`.
+
+## Why give AI agents their own "screens"?
+
+> Human ops engineers work with multiple terminal windows, multiple monitors, and a persistent workspace.
+>
+> Why does an ordinary AI agent have to re-describe how to reach a target (`ssh -> ssh -> docker exec ...`) on every single command?
+>
+> **Why not give the agent a set of switchable "screens"?**
+
+Filaxis is not trying to reinvent SSH. Instead, it turns the multi-window terminal workbench that human engineers take for granted into addressable, persistent, on-demand execution contexts for AI agents (where a "screen" is not a physical monitor, but a live runtime context the agent can switch into and inspect at will):
+
+- **Human ops engineer**: Engineer + monitors + N persistent SSH windows — named tabs, `Alt + Tab` to switch context, and `tail -f` running on a side screen to glance at when needed.
+- **Ordinary AI agent**: Stateless `ssh -> ssh -> ...` from scratch on every tool call, nested shell-quoting traps across hops, and `tail -f` commands that either hang the tool call or flood the context window.
+- **Filaxis**: Named layers (virtual terminal tabs), rolling stream windows (virtual side screens), and a local Daemon (persistent workbench) — connect once, then switch layers and peek at streams across turns and clients.
+
+| Human Ops Workbench | Filaxis (MCP / CLI / SDK) |
+|---|---|
+| Open an SSH client (single host, `-J` jump, or batch) | `connect_layer` / `filaxis layer save` / `stack.addLayer` |
+| Enter a container or inner host from a server | `connect_layer(enter_cmd)` / `--enter` / `stack.layerInto` |
+| Name a terminal tab | Named Layer |
+| See which terminal windows are open | `manage_layers(list)` / `filaxis layer list` |
+| `Alt + Tab` between windows | Target by `layer` or switch default via `manage_layers(activate)` |
+| Keep the workbench open between commands | **Local Daemon** (persists layers, connections, forwards, and stream windows across CLI & MCP clients) |
+| Leave `tail -f` running on a side monitor | **Observation Window** (`observe_stream` / `filaxis stream open`) |
+| Scroll back through recent terminal output | **Local rolling buffer + cursor-based `peek`** (consult existing log files for full history) |
+| Watch and act across many terminals in parallel | Concurrent stream windows + `run_batch` / `filaxis batch` (with `"web-*"` wildcard fan-out) |
+| Open a local tunnel into an inner environment | Dynamic port forwarding (`manage_layers(forward_add)` / `filaxis forward add`) |
+| Close a window when finished | `manage_layers(remove)` / `close_stream` |
+
+This design directly resolves two fundamental tensions in agentic operations:
+
+1. **Humans don't close their entire terminal workbench and reconnect every window after typing a single command.** The local **Daemon** maintains the workspace lifecycle — starting in `0.3.0`, `filaxis-mcp` connects to (or auto-starts) the local Daemon by default so multiple MCP clients and the CLI share the same live layers, SSH connections, port forwards, and observation windows.
+2. **Keeping a screen open doesn't mean staring at it nonstop; keeping an observation window running doesn't mean burning tokens nonstop.** Unlike humans, an agent isn't bound by physical monitor space or visual attention. It can keep dozens of stream windows open simultaneously while output buffers locally, reading incremental frames by cursor only when needed.
+
+## Quick start (SDK)
 
 ```ts
 import { RuntimeStack } from "@syrkos/filaxis";
@@ -37,19 +73,22 @@ if (stop.status === "unknown") {
 }
 ```
 
+See [docs/skills/SKILL.en.md](./docs/skills/SKILL.en.md) for complete recipes covering named layers, container entry (`layerInto`), CAS file edits, multi-layer `runBatch`, and `createAgentToolkit`.
+
 ## Capabilities
 
 | Capability | What Filaxis provides |
 |---|---|
-| Runtime layers | Built-in local, SSH, and tmux drivers. Register custom drivers with `registerDriver()` or connect to environments such as Docker, Kubernetes, and Teleport through `launchCmd`. |
-| Command execution | The default non-interactive channel keeps stdout and stderr separate and applies the layer's working directory, environment variables, and replayable entry steps. The PTY channel inherits interactive shell state. |
-| Long-running sessions | `execSession` returns immediately. Output is recorded in separate `.out` and `.err` files and is available through a recent-output buffer, line watchers, and readiness checks. |
-| Streaming observation | A separate SSH channel streams live output. It can share the SSH master connection through ControlMaster where available. |
-| Persistent sessions | The tmux backend can reattach across processes by `terminalId` and restore the working directory. |
-| File transfer and editing | `putFile` and `getFile` report the verification level, using size and SHA-256 when available. `editFile` uses compare-and-swap (CAS) to check the file version before writing, and reports the lock protection and write mode. |
-| Environment discovery | Discover installed tools and GPU capabilities, select suitable layers with `matchLayers({ needs })`, and flag saved results when fingerprints drift. |
-| Connection management | Reuse connections by topology fingerprint. Filaxis reconnects with backoff and tracks degraded layers. |
-| SSH host verification | Trust on first use by default, with explicit strict mode and a configurable `known_hosts` file. The SDK accepts private-key paths. |
+| Runtime layers | Built-in `local`, `ssh`, and `tmux` drivers. Register custom drivers with `registerDriver()` or derive inner layers (Docker, Kubernetes, bastion hops) through entry pipelines (`layerInto` / `--enter`). |
+| Shared workspace & middle layer | Three-layer architecture (`interface / middle / core`): CLI, MCP, and SDK (`createMiddle` / `connectRemoteMiddle`) share the same 26 stateful operations, persisting layers, connections, forwards, and stream windows via the local Daemon with wire-protocol version handshakes. |
+| Command execution | The default non-interactive channel keeps stdout and stderr separate and replays the layer's working directory, environment variables, and entry pipeline. The PTY channel inherits interactive shell state. |
+| Cross-layer batching | `runBatch` / `run_batch` / `filaxis batch` fan out across layer arrays and `*` / `?` wildcards with `after` dependency ordering, `stopOnFail: false` fleet inspections, and CLI batch output files (`--out-dir`). |
+| Long-running sessions | `execSession` returns immediately. Output is recorded in separate `.out` and `.err` files with a hot recent-output window, backtrack-aware `ready()` checks (`evictedCount`), and line watchers. Stop reports `exited / stopped / unknown`, and `verifySession` checks session state. |
+| Streaming & observation windows | Dedicated SSH channels stream live output (reusing `ControlMaster` where available) into local rolling windows with monotonic frame numbers, non-destructive multi-consumer cursors, and automatic stream reaping on close. |
+| Persistent sessions & port forwards | The `tmux` backend reattaches across processes by `terminalId` and restores working directories. Dynamic SSH `-L`, `-R`, and SOCKS forwards work across replayable inner layers. |
+| File transfer and editing | `putFile` and `getFile` (plus optional `sftp` fast path) report verification levels using size and SHA-256 across GNU/BSD/BusyBox dialects. `editFile` uses compare-and-swap (CAS) to verify file versions before writing and reports lock protection and write mode. |
+| Discovery & connection governance | Probe installed tools and GPU capabilities, select layers via `matchLayers({ needs })`, flag stale fingerprints, reuse connections by topology fingerprint, and reconnect with backoff. |
+| SSH host verification | Trust on first use (`tofu`) by default, with explicit `strict` mode and configurable `known_hosts`. Private keys are passed by path only and never exposed in logs or rendered output. |
 
 ## Installation and system requirements
 
@@ -59,7 +98,7 @@ bun add @syrkos/filaxis
 npm install @syrkos/filaxis
 ```
 
-- The SDK runs on Bun 1.x and Node LTS with zero runtime npm dependencies.
+- Runs on Bun 1.x and Node LTS with **zero runtime npm dependencies** (CI runs the full Bun test suite and loopback SSH integration tests on Ubuntu, plus Node LTS typechecking, architecture boundary gates, build, and compiled CLI smoke tests).
 - SSH requires `ssh`. OpenSSH 7.3 or later supports the `-J` jump-host option. Persistent terminals require `tmux`, and the optional fast transfer path requires `sftp`.
 - `await stack.features()` checks tools where Filaxis runs. If the agent runs in a container, this reports the container's tools. Check target-side capabilities through the target layer.
 
@@ -85,6 +124,8 @@ Or launch it directly with `npx` in your MCP client configuration:
   }
 }
 ```
+
+Starting in `0.3.0`, `filaxis-mcp` runs through the local Daemon by default (auto-starting it if none is running), so multiple MCP clients and the CLI share layers, SSH connections, port forwards, and observation windows. Target-binding flags (`--host`, `--enter`, `--docker`, `--layer`) or `--no-daemon` run an isolated in-process server instead. After upgrading Filaxis, stop any older running Daemon first with `filaxis daemon stop` so the protocol handshake does not reject mismatched versions (see [0.3.0 upgrade notes](./docs/skills/SKILL.en.md)).
 
 Exposed MCP tools (12 tools):
 

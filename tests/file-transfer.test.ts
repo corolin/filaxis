@@ -7,10 +7,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { transferLayerFile } from "../src/layer-file-transfer.js";
-import { putFile, putContent, getFile, sftpPutFile, sftpGetFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/file-transfer.js";
-import { probeDialect, NULL_DIALECT, type RemoteDialect } from "../src/dialect.js";
+import { LocalRuntimeDriver } from "../src/core/local/local-driver.js";
+import { transferLayerFile } from "../src/core/file/layer-file-transfer.js";
+import { putFile, putContent, getFile, sftpPutFile, sftpGetFile, TransferVerificationError, type TransferExec, type SftpSpawnImpl } from "../src/core/file/file-transfer.js";
+import { probeDialect, NULL_DIALECT, type RemoteDialect } from "../src/core/base/dialect.js";
 
 const GNU: RemoteDialect = {
     family: "gnu",
@@ -405,8 +405,8 @@ describe("putFile（真实 shell 回归）", () => {
     });
 
     test.skipIf(process.platform !== "linux")("编辑和上传保留文件名末尾的换行", async () => {
-        const { editFile } = await import("../src/file-edit.js");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { editFile } = await import("../src/core/file/file-edit.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const driver = new LocalRuntimeDriver();
         const neighbor = fwd(join(dirR, "newline-name"));
         const target = neighbor + "\n";
@@ -677,8 +677,8 @@ describe("putFile（真实 shell 回归）", () => {
     }, 20_000);
 
     test.skipIf(!hasSh)("Sol 90 P1-2 editFile 命令形状：真身解析先于核验（同锚 __fx_tgt）", async () => {
-        const { editFile } = await import("../src/file-edit.js");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { editFile } = await import("../src/core/file/file-edit.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const drv = new LocalRuntimeDriver();
         const target = fwd(join(dirR, "p2-real.bin"));
         writeFileSync(join(dirR, "p2-real.bin"), "V=1\n");
@@ -709,7 +709,7 @@ describe("putFile（真实 shell 回归）", () => {
 // 审计 M5：SFTP batch 按行分割——路径含换行=命令注入面；前导 -=选项歧义。
 describe("SFTP 路径防线（审计 M5）", () => {
     test("换行路径拒绝（注入面）+ 前导 - 拒绝（选项歧义）", async () => {
-        const { sftpPutFile } = await import("../src/file-transfer.js");
+        const { sftpPutFile } = await import("../src/core/file/file-transfer.js");
         const opts = { connArgs: ["h"], spawnImpl: (async () => ({ exitCode: 0, stderr: "" })) as never };
         await expect(sftpPutFile({} as never, GNU, "a\nrm /x", "/r/p", opts)).rejects.toThrow(/含换行/);
         await expect(sftpPutFile({} as never, GNU, "/tmp/ok", "/r/p\nrename a b", opts)).rejects.toThrow(/含换行/);
@@ -721,7 +721,7 @@ describe("SFTP 路径防线（审计 M5）", () => {
 // 审计 M6：网络瞬断（exec reject）不得被判定「原语不支持」并永久缓存 NULL_DIALECT。
 describe("方言探测通道崩溃（审计 M6）", () => {
     test("第二条命令 reject → probeDialect 上抛 + 缓存为空（瞬断不固化降级）", async () => {
-        const { probeDialect, DialectCache } = await import("../src/dialect.js");
+        const { probeDialect, DialectCache } = await import("../src/core/base/dialect.js");
         let n = 0;
         const flaky = async (cmd: string) => {
             n++;

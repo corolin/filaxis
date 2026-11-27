@@ -2,24 +2,31 @@
 /**
  * bin/filaxis-mcp.ts — 牵丝 MCP Server 启动器（REQ-0003 FEAT-01）
  *
- * stdio JSON-RPC 2.0（MCP 协议子集）。层绑定经启动参数（与 filaxis exec
- * 的 --host 族同语义）：缺省 local；--host user@host 走 ssh 层。
+ * stdio JSON-RPC 2.0（MCP 协议子集）。宿主策略（REQ-0004 §6.3）：
+ * - 缺省经 Daemon：层、连接、转发、观察窗、会话全机共享——两个 MCP 客户端之间、CLI 与
+ *   MCP 之间看到的是同一份现场。没有 Daemon 在跑就启动一个。
+ * - 带绑定参数（--host 族 / --enter / --docker / --layer）或 --no-daemon 时在本进程内建
+ *   一个即弃的中层：绑定参数描述的是「这个会话的默认层」，常驻 Daemon 是全机共享的，
+ *   没法替某一个客户端设默认层。
  *
  * 接入示例（Claude Code / Gemini CLI / 任意 MCP 客户端）：
- *   filaxis-mcp                                    # local 层
- *   filaxis-mcp --host root@192.0.2.10 --port 2222  # ssh 层
+ *   filaxis-mcp                                    # 经 Daemon（共享现场）
+ *   filaxis-mcp --host root@192.0.2.10 --port 2222  # 本进程内，ssh 层为默认层
  *   filaxis-mcp --enter "ssh remote-vm" --host user@bastion  # 多跳
- *   filaxis-mcp --layer web-01                                 # 已存层（filaxis layer save）
- *   # 不论用哪种方式绑定，run_command 的 layer 参数与 run_batch 的层通配都认已存层
+ *   filaxis-mcp --layer web-01                     # 本进程内，已存层为默认层
+ *   # 不论怎么启动，工具的 layer 参数与 run_batch 的层通配都认已存层表
  */
-import { McpServer } from "../src/mcp-server.js";
-import { McpStdioProxy } from "../src/mcp-proxy.js";
-import { probeDaemon } from "../src/daemon-client.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
-import { createAgentToolkit } from "../src/agent-toolkit.js";
-import type { RuntimeDescriptor } from "../src/driver.js";
-import { noopLogger } from "../src/logger.js";
-import { loadLayerStore } from "../src/layer-store.js";
+import { McpServer } from "../src/interface/mcp/mcp-server.js";
+import { McpStdioProxy } from "../src/interface/mcp/mcp-proxy.js";
+import { probeDaemon, spawnDaemonBackground, waitForDaemon, assertDaemonProtocol } from "../src/interface/daemon/daemon-client.js";
+import { isPidAlive, readDaemonLock } from "../src/interface/daemon/daemon-files.js";
+import { createAgentToolkit } from "../src/interface/mcp/agent-toolkit.js";
+import { createMiddle } from "../src/middle/middle.js";
+import { loadLayerStore } from "../src/middle/layer-store.js";
+import type { RuntimeDescriptor } from "../src/core/base/driver.js";
+import type { FilaxisLogger } from "../src/shared/logger.js";
+import { dirname, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // argv 解析（零依赖手写——与 bin/filaxis.ts 同哲学；子集：--host/--port/--user/
 // --key/-J/--enter/--hop/--layer/--docker/--no-daemon/--daemon-dir）
@@ -71,16 +78,21 @@ for (let i = 0; i < argv.length; i++) {
             o.daemonDir = v;
             break;
         }
-        default: console.error(`filaxis-mcp: 未知参数 ${a}（支持 --host/--port/--user/--key/-J/--hop/--enter/--docker/--no-daemon/--daemon-dir）`);
+        default: console.error(`filaxis-mcp: 未知参数 ${a}（支持 --host/--port/--user/--key/-J/--hop/--enter/--layer/--docker/--no-daemon/--daemon-dir）`);
         process.exit(2);
     }
 }
 
+/** 同目录下的 CLI 入口（bun 直跑是 bin/filaxis.ts，发布包是 dist/bin/filaxis.js）——启动 Daemon 用 */
+function cliEntryPath(): string {
+    const self = fileURLToPath(import.meta.url);
+    return join(dirname(self), `filaxis${extname(self)}`);
+}
+
 async function main(): Promise<void> {
-    // 层装配（与 CLI driverFor 同语义的子集）
     // Keep diagnostics separate from MCP JSON-RPC stdout.
     const stderr = (message: string) => console.error(`[mcp] ${message}`);
-    const logger = { ...noopLogger, warn: stderr, error: stderr };
+    const logger: FilaxisLogger = { debug() { /* MCP 的 stdout 是协议通道，不输出调试日志 */ }, info() { /* 同上 */ }, warn: stderr, error: stderr };
     const hasSshPathOpts = Boolean(o.port !== undefined || o.user || o.key || o.jump || o.hop.length || o.enter.length || o.docker);
     let savedDescriptor: RuntimeDescriptor | undefined;
     // --layer 与 --host 族互斥（快照寻址 = 整个连接参数都在快照里）
@@ -94,16 +106,43 @@ async function main(): Promise<void> {
     if (!o.host && hasSshPathOpts) {
         throw new Error("SSH 路径参数需要 --host");
     }
-    const useDaemonAllowed = !o.noDaemon && process.env.FILAXIS_NO_DAEMON !== "1" && !o.layer && !o.host && !hasSshPathOpts;
-    if (useDaemonAllowed) {
-        const activeDaemon = await probeDaemon(o.daemonDir);
-        if (activeDaemon) {
-            new McpStdioProxy({ daemonDir: o.daemonDir, logger }).start();
-            return;
+
+    const bound = Boolean(o.layer || o.host || hasSshPathOpts);
+    if (!o.noDaemon && process.env.FILAXIS_NO_DAEMON !== "1" && !bound) {
+        // 缺省经 Daemon；没有在跑就启动一个。多个 MCP 客户端同时首启时只有一个拉起成功，
+        // 其余的子进程因锁被占而退出、只上报退出码——那就接入赢家拉起的那个。
+        let client = await probeDaemon(o.daemonDir);
+        if (!client) {
+            try {
+                await spawnDaemonBackground({ cliEntryPath: cliEntryPath(), daemonDir: o.daemonDir });
+            } catch (e) {
+                // 锁被别的活进程持有 = 它正在启动（或已在运行）：等它就绪后接入。不是这种情况
+                // （子进程自己崩了、锁是死的）就如实报原来的错。
+                const lock = readDaemonLock(o.daemonDir);
+                client = lock && isPidAlive(lock.pid) ? await waitForDaemon(o.daemonDir) : null;
+                if (!client) throw e;
+            }
+            client ??= await probeDaemon(o.daemonDir);
+            if (!client) throw new Error("filaxis-mcp: Daemon 启动后未能连通（filaxis daemon status 查看）");
         }
+        // 线协议不一致的 Daemon 不连（REQ-0004 §6.2）：明确报错，不让请求交给旧代码执行
+        await assertDaemonProtocol(client);
+        new McpStdioProxy({
+            daemonDir: o.daemonDir,
+            logger,
+            // 重连时发现 Daemon 换了线协议版本：代理已自行停止。以非零退出告诉 MCP 宿主——
+            // 下次启动时，启动器的握手会给出双方版本与处置办法
+            onFatal: (error) => {
+                stderr(error.message);
+                process.stdout.write("", () => process.exit(1));
+            },
+        }).start();
+        return;
     }
-    const stack = new RuntimeStack({ logger });
-    let opts: Parameters<typeof createAgentToolkit>[1];
+
+    // 进程内：即弃中层。已存层表注入——工具的 layer 参数与 run_batch 的层通配都认
+    // filaxis layer save 保存的层（与 CLI 一致）；按需读取，进程存活期间新保存的层也认。
+    let descriptor = savedDescriptor;
     if (o.host) {
         const config: Record<string, unknown> = {};
         const conn: Record<string, unknown> = {};
@@ -118,17 +157,23 @@ async function main(): Promise<void> {
         });
         if (o.enter.length) config.enterPipeline = o.enter.map((c) => ({ cmd: c }));
         if (o.docker) config.enterPipeline = [...(config.enterPipeline as unknown[] ?? []), { cmd: `docker exec -i ${o.docker} sh` }];
-        const desc: RuntimeDescriptor = { driver: "ssh", target: o.host, ...(Object.keys(config).length ? { config } : {}) };
-        opts = { descriptor: desc };
-    } else {
-        opts = { descriptor: savedDescriptor };
+        descriptor = { driver: "ssh", target: o.host, ...(Object.keys(config).length ? { config } : {}) };
     }
-    // 已存层表注入：run_command 等工具按层名寻址、run_batch 的层通配都认 filaxis layer
-    // save 保存的层（与 CLI 一致）。按需读取，进程存活期间新保存的层也认。
-    const tk = createAgentToolkit(stack, { ...opts, savedLayers: loadLayerStore });
+    const middle = createMiddle({ descriptor, savedLayers: loadLayerStore, logger });
+    const tk = createAgentToolkit(middle.stack, { middle });
     new McpServer({
         toolkit: tk,
         logger,
+    });
+    // 进程内形态：客户端断开即退出。McpServer 在 stdin 关闭时只销毁观察窗注册表；SSH 层的
+    // PTY 子进程（或还在跑的会话）会撑住事件循环——客户端退出后这个进程连同它的子进程
+    // 一直留着，每个客户端会话泄漏一个（0.2.13 即如此）。收尾、等 stdout 排空后退出。
+    // 经 Daemon 的缺省形态没有这个问题：代理进程随 stdin 关闭退出，现场留在 Daemon 里。
+    process.stdin.once("end", () => {
+        void middle.shutdown()
+            .catch(() => undefined)
+            .then(() => new Promise<void>((resolve) => process.stdout.write("", () => resolve())))
+            .then(() => { process.exit(0); });
     });
 }
 

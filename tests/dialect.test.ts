@@ -3,7 +3,7 @@
  * 真机形态用例（OPNsense/Alpine）属集成批次，此处验证判定逻辑。
  */
 import { describe, expect, test } from "bun:test";
-import { probeDialect, DialectCache, NULL_DIALECT, type ExecFn } from "../src/dialect.js";
+import { probeDialect, DialectCache, NULL_DIALECT, type ExecFn } from "../src/core/base/dialect.js";
 
 /** mock exec：按命令片段表回放（模拟某族系统的行为） */
 function mockExec(table: Record<string, { code: number; out: string }>): ExecFn {

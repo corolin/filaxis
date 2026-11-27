@@ -3,9 +3,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverLayer } from "../src/layer-discovery.js";
-import { LayerEnvStore, type LayerEnvironmentSpec } from "../src/layer-env.js";
-import type { RuntimeDriver, RuntimeDescriptor, ExecOptions, ExecResult } from "../src/driver.js";
+import { discoverLayer } from "../src/core/probe/layer-discovery.js";
+import { LayerEnvStore, type LayerEnvironmentSpec } from "../src/core/probe/layer-env.js";
+import type { RuntimeDriver, RuntimeDescriptor, ExecOptions, ExecResult } from "../src/core/base/driver.js";
 
 function mockDriver(out1: string, out2: string | Error): RuntimeDriver {
     return {

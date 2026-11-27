@@ -2,7 +2,7 @@
  * 会话窗口基础件单测（净室平移件回归 + OSS 扩展 evictedCount）
  */
 import { describe, expect, test } from "bun:test";
-import { LineAssembler, OutputRingBuffer, WatchRegistry, sanitizeSessionName } from "../src/session-buffer.js";
+import { LineAssembler, OutputRingBuffer, WatchRegistry, sanitizeSessionName } from "../src/core/base/session-buffer.js";
 
 describe("LineAssembler", () => {
     test("按 \\n 组行并剥 CRLF", () => {

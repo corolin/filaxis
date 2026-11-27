@@ -8,7 +8,7 @@ import { join } from "node:path";
 import {
     parseProbeOutput, layerEnvKey, LayerEnvStore, projectConnection, layerFingerprint, matchLayers,
     type LayerEnvConfigFile, type LayerEnvironmentSpec, type LayerEnvEntry,
-} from "../src/layer-env.js";
+} from "../src/core/probe/layer-env.js";
 
 const CONN = { driver: "ssh", target: "192.0.2.10" };
 
@@ -1468,7 +1468,7 @@ describe("Sol 84：读故障/无 target 自定义驱动/packages 形状", () => 
             }));
             const cfg = await new LayerEnvStore(p).load(true);
             expect(Array.isArray(cfg.layers.one?.environment.packages)).toBe(true); // 修前：字符串覆盖 + matchLayers TypeError
-            const { matchLayers } = await import("../src/layer-env.js");
+            const { matchLayers } = await import("../src/core/probe/layer-env.js");
             expect(() => matchLayers(cfg, ["torch"])).not.toThrow();
             expect(matchLayers(cfg, ["torch"]).length).toBe(1);
         } finally {
@@ -1517,7 +1517,7 @@ describe("Sol 85：写路径故障中止/packages 元素", () => {
             }));
             const cfg = await new LayerEnvStore(p).load(true);
             expect(cfg.layers.one?.environment.packages?.[0]).toBe("torch@2.4"); // 修前：[42] 覆盖
-            const { matchLayers } = await import("../src/layer-env.js");
+            const { matchLayers } = await import("../src/core/probe/layer-env.js");
             expect(() => matchLayers(cfg, ["torch"])).not.toThrow();
         } finally {
             rmSync(dir, { recursive: true, force: true });
@@ -1568,7 +1568,7 @@ describe("Sol 86：主档分诊/版本标量", () => {
             }));
             const cfg = await new LayerEnvStore(p).load(true);
             expect(cfg.layers.one?.environment.python).toBe("3.12.0"); // 修前：42 覆盖
-            const { matchLayers } = await import("../src/layer-env.js");
+            const { matchLayers } = await import("../src/core/probe/layer-env.js");
             expect(() => matchLayers(cfg, ["python>=3.12"])).not.toThrow();
             expect(matchLayers(cfg, ["python>=3.12"]).length).toBe(1);
         } finally {

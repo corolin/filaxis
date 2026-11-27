@@ -2,11 +2,11 @@
  * 流式观察窗测试（local 窗真跑；remote 窗 mock spawnImpl）
  */
 import { describe, expect, test } from "bun:test";
-import { StreamWindow, StreamWindowRegistry } from "../src/stream-window.js";
-import { resolveLocalShell } from "../src/shell-discovery.js";
+import { StreamWindow, StreamWindowRegistry } from "../src/core/stream/stream-window.js";
+import { resolveLocalShell } from "../src/core/base/shell-discovery.js";
 
 const BASH = resolveLocalShell(); // 环境无关（System32 WSL 入口优先的 PATH 下裸 "bash" 会解析到 WSL）
-import { StreamSessionManager, type SpawnImpl } from "../src/stream-session-manager.js";
+import { StreamSessionManager, type SpawnImpl } from "../src/core/stream/stream-session-manager.js";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 
@@ -533,7 +533,7 @@ test.skipIf(process.platform !== "win32")("Windows 关窗会回收祖先进程�
     const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const { shellQuote } = await import("../src/ssh-helpers.js");
+    const { shellQuote } = await import("../src/core/ssh/ssh-helpers.js");
     const dir = await mkdtemp(join(tmpdir(), "fx-window-job-"));
     const fixture = join(dir, "fixture.mjs");
     const pidFile = join(dir, "fixture.pid");

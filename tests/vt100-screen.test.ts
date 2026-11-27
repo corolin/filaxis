@@ -1,9 +1,9 @@
 /** VT100 虚拟屏测试：watch/htop 形态增量重演回放 */
 import { describe, expect, test } from "bun:test";
-import { Vt100Screen } from "../src/vt100-screen.js";
+import { Vt100Screen } from "../src/core/stream/vt100-screen.js";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
-import { StreamSessionManager, type SpawnImpl } from "../src/stream-session-manager.js";
+import { StreamSessionManager, type SpawnImpl } from "../src/core/stream/stream-session-manager.js";
 
 describe("Vt100Screen（状态机）", () => {
     test("普通写入 + LF/CR + SGR 忽略", () => {

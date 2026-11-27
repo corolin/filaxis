@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { RuntimeStack } from "../src/runtime-stack.js";
-import { createAgentToolkit } from "../src/agent-toolkit.js";
-import { enterStepsOf } from "../src/ssh-helpers.js";
-import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
+import { RuntimeStack } from "../src/middle/runtime-stack.js";
+import { createAgentToolkit } from "../src/interface/mcp/agent-toolkit.js";
+import { enterStepsOf } from "../src/core/ssh/ssh-helpers.js";
+import type { RuntimeDriver, RuntimeDescriptor } from "../src/core/base/driver.js";
 
 /** mock ssh 层 driver（层族测试——pushInto 派生镜像真 driver 语义） */
 class MockSshDriver {
@@ -116,7 +116,7 @@ describe("createAgentToolkit（反馈 #3）", () => {
         const fakeOldDriver = {
             descriptor: { driver: "tmux", target: "mock" },
             async stopSession() { return { exitCode: null }; }, // 旧形态：发了 kill，没核实
-        } as unknown as import("../src/driver.js").RuntimeDriver;
+        } as unknown as import("../src/core/base/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: fakeOldDriver });
         const r = await tk.handlers.stop_session({ session_id: "s", layer: "__initial__" });
         expect(r.status).toBe("unknown"); // 修前：stopped（违宪——终止≠已核实）
@@ -289,7 +289,7 @@ describe("start_session ready 超时三态（三十四期）", () => {
         tailSession: async () => ["no-marker-yet"],
         stopSession: async () => stopStatus instanceof Error ? Promise.reject(stopStatus) : { status: stopStatus, exitCode: null },
         verifySession: async () => verify ?? { status: "unknown" },
-    }) as unknown as import("../src/driver.js").RuntimeDriver;
+    }) as unknown as import("../src/core/base/driver.js").RuntimeDriver;
 
     test("stop unknown + verify unknown → outcome:unknown + 会话线索（不再谎称已停）", async () => {
         const tk = createAgentToolkit(new RuntimeStack(), { driver: mkDrv("unknown"), readyTimeoutMs: 150 });
@@ -340,7 +340,7 @@ describe("三十五期", () => {
             tailSession: async () => [],
             stopSession: async () => ({ status: "stopped", exitCode: null }),
             verifySession: async () => ({ status: "unknown" }),
-        } as unknown as import("../src/driver.js").RuntimeDriver;
+        } as unknown as import("../src/core/base/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: drv });
         let caught: (Error & { outcome?: string; sessionId?: string; logBase?: string }) | undefined;
         try { await tk.handlers.start_session({ command: "x", ready_marker: "RDY", error_pattern: "ERR" }); } catch (e) { caught = e as never; }
@@ -360,7 +360,7 @@ describe("三十五期", () => {
             tailSession: async () => { calls++; if (calls >= 2) throw new Error("tail channel broke"); return ["nope"]; },
             stopSession: async () => ({ status: "unknown", exitCode: null }),
             verifySession: async () => ({ status: "running" }),
-        } as unknown as import("../src/driver.js").RuntimeDriver;
+        } as unknown as import("../src/core/base/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: drv, readyTimeoutMs: 10_000 });
         let caught: (Error & { outcome?: string; sessionId?: string }) | undefined;
         try { await tk.handlers.start_session({ command: "x", ready_marker: "RDY" }); } catch (e) { caught = e as never; }
@@ -465,7 +465,7 @@ test("toolkit rebuilds its configured initial layer after that layer is destroye
 
 test("observe_stream opens with initial frames, supports incremental reads, and rejects unsupported layers", async () => {
     const stack = new RuntimeStack();
-    const local = new (await import("../src/local-driver.js")).LocalRuntimeDriver();
+    const local = new (await import("../src/core/local/local-driver.js")).LocalRuntimeDriver();
     await stack.addLayer("selected", local);
     const toolkit = createAgentToolkit(stack, { driver: {} as RuntimeDriver });
     try {
@@ -516,7 +516,7 @@ describe("12-tool convergence coverage (read_path, edit_file write, manage_path,
         const { join } = await import("node:path");
         const dir = mkdtempSync(join(tmpdir(), "fx-edit-write-"));
         const stack = new RuntimeStack();
-        const drv = new (await import("../src/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
+        const drv = new (await import("../src/core/local/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
         await stack.addLayer("w", drv);
         const tk = createAgentToolkit(stack);
         try {
@@ -548,7 +548,7 @@ describe("12-tool convergence coverage (read_path, edit_file write, manage_path,
         const { join } = await import("node:path");
         const dir = mkdtempSync(join(tmpdir(), "fx-manage-path-"));
         const stack = new RuntimeStack();
-        const drv = new (await import("../src/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
+        const drv = new (await import("../src/core/local/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
         await stack.addLayer("fs", drv);
         const tk = createAgentToolkit(stack);
         try {
@@ -604,7 +604,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { basename, join } = await import("node:path");
         const dir = mkdtempSync(join(tmpdir(), "fx-rm-guard-"));
         const stack = new RuntimeStack();
-        const drv = new (await import("../src/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
+        const drv = new (await import("../src/core/local/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
         await stack.addLayer("fs", drv);
         const tk = createAgentToolkit(stack);
         try {
@@ -631,7 +631,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { join } = await import("node:path");
         const dir = mkdtempSync(join(tmpdir(), "fx-excl-write-"));
         const stack = new RuntimeStack();
-        const drv = new (await import("../src/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
+        const drv = new (await import("../src/core/local/local-driver.js")).LocalRuntimeDriver({ cwd: dir });
         await stack.addLayer("w", drv);
         const tk = createAgentToolkit(stack);
         try {
@@ -657,9 +657,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-rename-guard-"));
         const stack = new RuntimeStack();
         const local = new LocalRuntimeDriver({ cwd: dir });
@@ -736,7 +736,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
     });
 
     test("[P3] connect_layer schema oneOf accepts all advertised enter_cmd aliases", async () => {
-        const { TOOL_DEFS } = await import("../src/agent-toolkit.js");
+        const { TOOL_DEFS } = await import("../src/interface/mcp/agent-toolkit.js");
         const connectDef = TOOL_DEFS.find((d) => d.function.name === "connect_layer")!;
         const oneOf = connectDef.function.parameters.oneOf as Array<{
             additionalProperties?: boolean;
@@ -772,8 +772,8 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-excl-posix-"));
         const local = new LocalRuntimeDriver({ cwd: dir });
         const stagesCreated: string[] = [];
@@ -903,8 +903,8 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-nostat-ssh-"));
         const local = new LocalRuntimeDriver({ cwd: dir });
         const ssh = new SshPtyDriver({ driver: "ssh", target: "mock" });
@@ -933,7 +933,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const root = mkdtempSync(join(tmpdir(), "fx-local-symlink-rm-"));
         const ws = join(root, "ws");
         const outside = join(root, "outside");
@@ -985,9 +985,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const root = mkdtempSync(join(tmpdir(), "fx-rm-cdpath-"));
         const decoyBase = join(root, "decoy-cdpath");
         const decoyTarget = join(decoyBase, "subdir");
@@ -1023,7 +1023,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const root = mkdtempSync(join(tmpdir(), "fx-local-symlink-mv-"));
         const ws = join(root, "ws");
         const outside = join(root, "outside");
@@ -1067,9 +1067,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const root = mkdtempSync(join(tmpdir(), "fx-rm-newline-"));
         try {
             if (process.platform !== "win32") {
@@ -1108,9 +1108,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-mv-recreate-src-"));
         const local = new LocalRuntimeDriver({ cwd: dir });
         const recreateAfterMv = (cmd: string) => local.exec(
@@ -1146,7 +1146,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-trail-sep-"));
         const stack = new RuntimeStack();
         const drv = new LocalRuntimeDriver({ cwd: dir });
@@ -1181,9 +1181,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-xdev-mv-"));
         const local = new LocalRuntimeDriver({ cwd: dir });
         let mvCalled = 0;
@@ -1249,7 +1249,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
     test("[P2] default local driver without cwd refuses recursive rm on process.cwd() and its parents via absolute path", async () => {
         const { dirname } = await import("node:path");
         const { existsSync } = await import("node:fs");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const defaultLocal = new LocalRuntimeDriver();
         const tk = createAgentToolkit(new RuntimeStack(), { driver: defaultLocal });
         const selfCwd = process.cwd();
@@ -1264,7 +1264,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, rmSync, realpathSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join, sep } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const root = mkdtempSync(join(tmpdir(), "fx-cwd-sym-"));
         const ws = join(root, "ws");
         const outside = join(root, "outside");
@@ -1308,9 +1308,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-mv-nostat-"));
         const local = new LocalRuntimeDriver({ cwd: dir });
         let mvRan = 0;
@@ -1343,7 +1343,7 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-mv-nopath-"));
         const local = new LocalRuntimeDriver({ cwd: dir });
         const origPath = process.env.PATH;
@@ -1364,9 +1364,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, lstatSync, symlinkSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-rm-symlink-slash-"));
         const realDir = join(dir, "realdir");
         const linkPath = join(dir, "link");
@@ -1404,9 +1404,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
 
         const dir = mkdtempSync(join(tmpdir(), "fx-zero-python-"));
         const local = new LocalRuntimeDriver({ cwd: dir });
@@ -1466,13 +1466,13 @@ describe("audit regression fixes (P1/P2/P3)", () => {
 
     test("real tmux session executes rm/rename, rejects >15.5KB commands without sealing, and runs large scripts via run_batch(put -> after -> exec)", async () => {
         if (process.platform === "win32") return;
-        const { TmuxInvoker } = await import("../src/terminal/tmux-invoker.js");
+        const { TmuxInvoker } = await import("../src/core/tmux/tmux-invoker.js");
         if (!(await TmuxInvoker.isAvailable())) return;
         const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { TerminalManager } = await import("../src/terminal-manager.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TerminalManager } = await import("../src/core/tmux/terminal-manager.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
 
         const dir = mkdtempSync(join(tmpdir(), "fx-real-tmux-slim-"));
         const ws = join(dir, "ws");
@@ -1561,9 +1561,9 @@ describe("audit regression fixes (P1/P2/P3)", () => {
         const { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
 
         const dir = mkdtempSync(join(tmpdir(), "fx-perm-read-"));
         try {
@@ -1677,7 +1677,7 @@ describe("run_batch：command_file 与层通配（DSH 评估 2026-11-26 #6）", 
         const fs = await import("node:fs");
         const os = await import("node:os");
         const path = await import("node:path");
-        const { TOOL_DEFS } = await import("../src/agent-toolkit.js");
+        const { TOOL_DEFS } = await import("../src/interface/mcp/agent-toolkit.js");
         const d = fs.mkdtempSync(path.join(os.tmpdir(), "fx-tk-cf-"));
         try {
             const tk = createAgentToolkit(new RuntimeStack(), {});
@@ -1702,7 +1702,7 @@ describe("run_batch：command_file 与层通配（DSH 评估 2026-11-26 #6）", 
     test("已存层：未注册的层名与层通配命中入口注入的层表时按需加载，且不抢默认层", async () => {
         // 三路互通（用户 2026-11-26 定调：CLI / MCP / SDK 本来就该认同一份层）。
         // 入口注入读取函数；工具集自身不读用户目录。
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const stack = new RuntimeStack();
         await stack.addLayer("q-a", new LocalRuntimeDriver());
         let reads = 0;
@@ -1741,7 +1741,7 @@ describe("run_batch：command_file 与层通配（DSH 评估 2026-11-26 #6）", 
     }, 30_000);
 
     test("layer 通配按已注册层名展开；无匹配则拒绝（不落到默认层）", async () => {
-        const { LocalRuntimeDriver } = await import("../src/local-driver.js");
+        const { LocalRuntimeDriver } = await import("../src/core/local/local-driver.js");
         const stack = new RuntimeStack();
         await stack.addLayer("q-a", new LocalRuntimeDriver());
         await stack.addLayer("q-b", new LocalRuntimeDriver());

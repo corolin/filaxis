@@ -3,11 +3,11 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync, readdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { editFile, editFileMulti, EditConflictError } from "../src/file-edit.js";
-import { createAgentToolkit } from "../src/agent-toolkit.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
-import type { RuntimeDriver } from "../src/driver.js";
+import { LocalRuntimeDriver } from "../src/core/local/local-driver.js";
+import { editFile, editFileMulti, EditConflictError } from "../src/core/file/file-edit.js";
+import { createAgentToolkit } from "../src/interface/mcp/agent-toolkit.js";
+import { RuntimeStack } from "../src/middle/runtime-stack.js";
+import type { RuntimeDriver } from "../src/core/base/driver.js";
 
 const dir = mkdtempSync(join(tmpdir(), "fx-edit-"));
 
@@ -131,7 +131,7 @@ describe("editFile（TOCTOU+精确替换）", () => {
         expect(readFileSync(p, "utf-8")).toBe("$&-NEW_$$\n"); // 字面，不是 OLD_TEXT-NEW_$
         // 多 hunk 单命中分支同款
         writeFileSync(p, "X=1\n");
-        const { editFileMulti } = await import("../src/file-edit.js");
+        const { editFileMulti } = await import("../src/core/file/file-edit.js");
         await editFileMulti(drv, fwd, [{ old: "X=1", new: "$&-$$" }]);
         expect(readFileSync(p, "utf-8")).toBe("$&-$$\n");
         rmSync(d7, { recursive: true, force: true });
@@ -141,7 +141,7 @@ describe("editFile（TOCTOU+精确替换）", () => {
     // head -c 12 截到算法名前缀（不随内容变化，macOS/无 sha256sum 环境全中）。
     // awk '{print $NF}' 取尾字段=纯摘要（真机实证与 sha256sum 逐位一致）
     test("shaCmdOf：openssl 分支 awk 取尾字段摘要（非算法名前缀）", async () => {
-        const { shaCmdOf } = await import("../src/file-edit.js");
+        const { shaCmdOf } = await import("../src/core/file/file-edit.js");
         const cmd = shaCmdOf("/tmp/x");
         expect(cmd).toContain("openssl dgst -sha256");
         expect(cmd).toContain(`awk '{print $NF}'`); // 修前：head -c 12 截 "SHA2-256(path"
@@ -175,7 +175,7 @@ describe("editFile（TOCTOU+精确替换）", () => {
             }
             return await realExec(cmd, o as never);
         };
-        const { editFileMulti } = await import("../src/file-edit.js");
+        const { editFileMulti } = await import("../src/core/file/file-edit.js");
         const r = await editFileMulti(drv, fwd, [{ old: "MM=1", new: "MM=2" }, { old: "MM=2", new: "MM=3" }]);
         expect(r.mutex).toBe("degraded"); // 修前：multi 路径丢弃（undefined）
         rmSync(d11, { recursive: true, force: true });
@@ -348,7 +348,7 @@ describe("toolkit 新工具（read_path/edit_file/observe_stream）", () => {
         const tk = createAgentToolkit(new RuntimeStack(), {});
         const dir = mkdtempSync(join(tmpdir(), "fx-window-test-"));
         const gate = join(dir, "gate");
-        const path = (await import("../src/ssh-helpers.js")).shellQuote(gate.replace(/\\/g, "/"));
+        const path = (await import("../src/core/ssh/ssh-helpers.js")).shellQuote(gate.replace(/\\/g, "/"));
         try {
             const first = await tk.handlers.observe_stream({
                 command: `echo IGNORE; printf 'E1\\nE2\\nE3\\n' >&2; while [ ! -f ${path} ]; do sleep 0.1; done; echo E4 >&2`,
@@ -497,7 +497,7 @@ describe("CLI 冒烟（bun bin/filaxis.ts）", () => {
         try {
             execSync('bun bin/filaxis.ts exec --no-daemon --layer ghost -- "echo 1"', { encoding: "utf-8", env, stdio: "pipe", windowsHide: true });
         } catch (e) { err2 = String((e as { stderr?: string }).stderr ?? e); }
-        expect(err2).toContain("未保存");
+        expect(err2).toContain("未注册，也不在已存层表里");
         // rm 后清单空
         execSync("bun bin/filaxis.ts layer rm nginx", { encoding: "utf-8", env, windowsHide: true });
         const out3 = execSync("bun bin/filaxis.ts layer list", { encoding: "utf-8", env, windowsHide: true });

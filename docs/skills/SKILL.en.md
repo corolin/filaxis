@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.13"
+  version: "0.3.0"
 description: |
   Use Filaxis (@syrkos/filaxis) to run commands across layers, batch inspections, manage background jobs, follow logs, or operate on files.
   Also use it to diagnose SSH aliases and jump hosts or interpret unknown outcomes and write guarantees. Skip for simple local shell commands and tasks unrelated to Filaxis.
@@ -66,7 +66,9 @@ filaxis batch --layer "q-*" --no-stop-on-fail --request-file plan.json
 filaxis exec --layer <name> --json -- "<command>"     # single-line JSON {exitCode, effectiveUser, stdout, stderr}
 ```
 
-Run `filaxis daemon start` to share layers, forwards, and observation windows between the CLI and MCP launchers started without `--host` or `--layer`. Use `filaxis daemon status` to inspect the daemon, `filaxis daemon stop` to stop it, or `--no-daemon` for an individual call. Manage continuous observation with `filaxis stream open/peek/close`. Manage forwarding with `filaxis forward add/list/remove` or the MCP `manage_layers` actions `forward_add`, `forward_list`, and `forward_remove`. Use the returned window or forward ID to inspect and close it. The forward list reports only forwards still in use. Pass `filaxis forward list --all` or `forward_list` with `include_closed: true` to include stopped entries. Forward records use snake_case fields (`forward_id`, `bind_addr`, `bind_port`, …).
+The local daemon gives the CLI and MCP launchers one shared working set: layers, connections, forwards, and observation windows. `filaxis-mcp` runs through the daemon by default and starts one when none is running. With a binding option (`--host`, `--enter`, `--docker`, `--layer`) it serves inside its own process instead, because a shared daemon cannot hold a default layer for one client; `--no-daemon` forces the in-process mode. The CLI uses a running daemon when there is one and otherwise executes in-process on its own; it never starts a daemon implicitly, so run `filaxis daemon start` when state should be shared across commands. Use `filaxis daemon status` to inspect the daemon and `filaxis daemon stop` to stop it. A client whose wire-protocol version differs from the daemon's refuses to execute and asks for a daemon restart (the situation after an upgrade while an old daemon is still running). Manage continuous observation with `filaxis stream open/peek/close`. Manage forwarding with `filaxis forward add/list/remove` or the MCP `manage_layers` actions `forward_add`, `forward_list`, and `forward_remove`. Use the returned window or forward ID to inspect and close it. The forward list reports only forwards still in use. Pass `filaxis forward list --all` or `forward_list` with `include_closed: true` to include stopped entries. CLI `--json` output has the same shape as the middle-layer records (camelCase: `forwardId`, `bindAddr`, `windowId`, …); snake_case field names (`forward_id`, `window_id`, …) appear only in the MCP tool surface.
+
+The SDK's `createAgentToolkit` also reuses connections and PTYs inside the host process and takes structured arguments. The CLI, MCP, and SDK all run the same set of middle-layer operations: `createMiddle()` builds an in-process instance and `connectRemoteMiddle(client)` goes through the daemon, with identical method signatures.
 
 ---
 
@@ -75,6 +77,7 @@ Run `filaxis daemon start` to share layers, forwards, and observation windows be
 - **Batch inspection and multi-step fixes with `run_batch`**: Combine multiple `read`, `exec`, `edit`, `put`, and `get` steps into a single parallel `run_batch` call instead of sequential single-tool loops.
 - **Turn off fail-fast for inspections**: by default the first failing step stops the batch and steps that have not started (including expanded instances on other layers) are marked `skipped` — one host fails and the rest are never checked. Pass `stop_on_fail: false` for read-only batches such as inspections and multi-host evidence collection (CLI: `filaxis batch … --no-stop-on-fail`). Read the per-step status lines first, then drill into the failed layers. Keep the default for chains such as edit config → validate → reload: a failed step should not be followed by the next one.
 - **Less escaping**: an `exec` step can reference a script file with `command_file` instead of `command` — the script goes in as-is, so quotes and newlines need no JSON escaping, and the same script can be reused across steps (the two are mutually exclusive; an unreadable or empty file rejects the whole batch). Relative paths resolve against the server process working directory, so prefer absolute paths when running through the Daemon.
+- **Spill large output to files (CLI)**: `filaxis exec --out <file>` and `filaxis batch --out-dir <dir>` write the complete output to the caller's machine (read back and verified byte for byte) and show only the first 15 lines plus the file path in the terminal; `batch` writes one file per exec step (`step@layer.stdout` after layer fan-out, stderr in a separate `.stderr` file). Whether to use it is the plan's call; without it everything still goes to the terminal. This is the path for consumers that have no harness-level output spilling.
 - **Layer connections (`connect_layer`)**: Connect a single SSH host (`host`), a batch (`{"targets":["web-01",{"host":"db-01","name":"db","jump":"bastion"}]}`), or enter an inner container/shell (`enter_cmd`). Strings can be SSH config aliases resolved in the runtime environment. Batch targets are attempted in order and individual failures are reported without stopping the batch. Pass the deduplicated `layers` from successful and reused connections directly to `run_batch.layer`. `active_layer` reports the default layer at the end of the call.
 - **Layer targeting precedence & multi-layer fan-out**: Both top-level `layer` and per-step `layer` accept either a single layer name or a non-empty array of layer names (top-level sets the batch default; per-step overrides only that step; omitting both uses the active default layer). Multi-layer arrays expand each step into `id@layer` instances that run in parallel up to `max_parallel` (single-element arrays keep the original `id`), and downstream `after` dependencies wait for all expanded instances to succeed (`kind: "get"` rejects multi-layer arrays to avoid overwriting the same `local_path`). `filaxis batch --request-file plan.json` shares the same precedence and array expansion (step `layer` > plan `layer` > `--layer`/`--host` > local). Plan files use camelCase fields (`command` or `commandFile`, `maxParallel`, `stopOnFail`); the `--max-parallel N` and `--no-stop-on-fail` switches override the matching plan fields.
 - **Layer wildcards**: a layer name may contain `*` (any character sequence) or `?` (one character), e.g. `"q-*"`, and expands against registered or saved layer names instead of listing them one by one (MCP, the SDK and the CLI share one saved-layer store: layers written by `filaxis layer save` need no `connect_layer` first and are loaded on demand when addressed by name or matched by a wildcard; `filaxis-mcp --layer NAME` binds a saved layer directly). A pattern with no match rejects the whole batch; it never falls back to the default layer.
@@ -140,6 +143,23 @@ await stack.removeLayer("prod", { destroy: true });
 
 ---
 
+## Upgrade Notes: 0.2.13 → 0.3.0
+
+The MCP tool surface is unchanged: the 12 tool names, their parameter schemas, and the snake_case fields all stay as they were. No CLI subcommand or option was removed or renamed. What did change is listed below — update scripts or habits that relied on the old behavior:
+
+| Change | 0.2.13 | 0.3.0 | What to do |
+|---|---|---|---|
+| Where `filaxis-mcp` runs | Through the daemon only when one is running; never starts one | Through the daemon by default and starts one when none is running; a binding option or `--no-daemon` serves in-process | Layers, connections, forwards, and observation windows are shared across all MCP clients and the CLI, and outlive a disconnected client; add `--no-daemon` for a throwaway in-process server |
+| Protocol handshake | None | 0.2.x and 0.3.0 clients and daemons reject each other (`E_PROTOCOL_MISMATCH`) instead of handing requests to old code | After upgrading, run `filaxis daemon stop` first (either CLI version can stop the other version's daemon), then re-run the command |
+| CLI `--json` field names | Forward records in snake_case (`forward_id`, with `forwardId` kept as an alias) | camelCase throughout (`forwardId`, `bindAddr`, `windowId`, …), likewise for observation windows and `daemon status` | Update scripts that parse CLI JSON; the MCP surface stays snake_case |
+| `--no-daemon` vs. through the daemon | Eight behavioral differences between the two modes (relative local paths, relative key paths, …) | Identical; messages such as "layer not found" are unified | Usually nothing; scripts that relied on an old difference may see different results |
+| Spilling large output | — | New `filaxis exec --out <file>` and `filaxis batch --out-dir <dir>` | Use as needed; behavior is unchanged without the options |
+| MCP proxy process lingering | The proxy process did not exit when the client disconnected before the handshake completed (since 0.2.12) | Fixed | Nothing to do |
+
+Commands without a target still run on the local host. The SDK's `createAgentToolkit(stack, opts)` signature is unchanged and so is the package's import path; `createMiddle` and `connectRemoteMiddle` are new exports.
+
+---
+
 ## Core Execution Contracts (Never Violate These)
 
 | Contract | Rule |
@@ -147,6 +167,7 @@ await stack.removeLayer("prod", { destroy: true });
 | **Tri-state termination** | `stop_session` / `stopSession` returns `exited` (verified exit code), `stopped` (verified termination), or `unknown` (verification unreachable — **neither success nor failure**). Verify with `verifySession(id)` / `stop_session` instead of assuming cleanup succeeded. |
 | **Exit code is data** | Nonzero command exit codes do **not** throw in `exec` / `run_command`. Only execution failures (timeout, abort, dead transport) reject or error. |
 | **Completion sentinel required** | Missing completion markers (disconnect, remote kill, local abort) produce `outcome: "unknown"` — never fabricate exit code `0` and never blindly replay non-idempotent commands. |
+| **Disconnect reason** | `reason: "disconnect"` identifies a detected disconnect on the reported `channel`. `outcome` describes what is known about the command's final state. |
 | **No never-ending commands in `exec`** | `exec` / `run_command` waits for completion — `tail -f` or `top` will time out. Use `observe_stream` (for streaming logs) or `start_session` (for managed background jobs). |
 | **Controlled edits** | CAS stands for compare-and-swap. Filaxis checks modification time, size, and a content fingerprint before writing and rejects a version conflict. Check `mutex` and `write_mode` separately. For file transfers, check `verification`. |
 | **PTY combines stderr** | `channel: "pty"` merges stdout and stderr by terminal semantics; default `exec` keeps them separate. |

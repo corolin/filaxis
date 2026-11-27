@@ -1,16 +1,22 @@
 /**
- * check-boundaries.ts — 内核边界 CI 门禁（AC-01 / AC-03）
+ * check-boundaries.ts — 内核边界 CI 门禁（AC-01 / AC-03 / REQ-0004 §7）
  *
- * 三道断言（任何一道失败退出码 1，阻断提交/发布）：
+ * 四道断言（任何一道失败退出码 1，阻断提交/发布）：
  *   1. 零上游业务概念（REQ-0001 §4.2 红线）：内核源码不得出现上游业务
  *      标识（CoreLite/PolicyEngine/SessionNotifier/SubstrateSecurity/NeuralImpulse…）
  *   2. 零 runtime 专有 API（AC-03）：禁止裸调 Bun.* ——统一 node: 标准库，
  *      Bun 与 Node LTS 双运行时是验收矩阵
  *   3. 零第三方运行时依赖（AC-01）：package.json dependencies 必须为空
  *      （devDependencies 允许——ts/bun-types 是开发面）
+ *   4. 三层依赖方向（REQ-0004 §3.3、§7）：内核只依赖内核；中层可依赖内核但不得
+ *      依赖界面层；界面层从内核只能取类型、且不得经 SDK 总出口取符号。断言本体在
+ *      layering-gate.ts（纯函数，测试用合成例子逐类验证）
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+// 本脚本由 CI 的 Node 作业直接运行（node scripts/check-boundaries.ts，靠类型剥离）：Node 不做
+// 「.js → .ts」的说明符改写，相对导入必须写真实扩展名（.ts）。仓库其余代码仍用 .js 说明符。
+import { layeringViolations } from "./layering-gate.ts";
 
 const SRC = "src";
 /** 代码级上游业务标识（注释中的溯源说明合法——只查剥注释后的代码） */
@@ -57,6 +63,16 @@ for (const file of walk(SRC)) {
     }
 }
 
+// 4. 三层依赖方向：src/ 与 bin/ 全量
+const layeringFiles = [...walk(SRC), ...walk("bin")].map((file) => ({
+    file: file.replace(/\\/g, "/"),
+    text: readFileSync(file, "utf-8"),
+}));
+for (const violation of layeringViolations(layeringFiles)) {
+    console.error(`[边界违规] ${violation}`);
+    failures++;
+}
+
 const pkg = JSON.parse(readFileSync("package.json", "utf-8"));
 const deps = Object.keys(pkg.dependencies ?? {});
 if (deps.length > 0) {
@@ -68,4 +84,4 @@ if (failures > 0) {
     console.error(`\n边界门禁失败：${failures} 处违规`);
     process.exit(1);
 }
-console.log(`边界门禁通过：${SRC}/ 零个人Agent项目概念、零 Bun.* 裸用、零第三方运行时依赖`);
+console.log(`边界门禁通过：${SRC}/ 零个人Agent项目概念、零 Bun.* 裸用、零第三方运行时依赖；src/ 与 bin/ 三层依赖方向零违规（${layeringFiles.length} 个文件）`);

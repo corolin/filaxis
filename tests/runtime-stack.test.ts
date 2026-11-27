@@ -6,16 +6,16 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { EventBus } from "../src/events.js";
-import { RuntimeStack } from "../src/runtime-stack.js";
-import { createAgentToolkit } from "../src/agent-toolkit.js";
-import { RuntimeFactory } from "../src/factory.js";
-import { LocalRuntimeDriver } from "../src/local-driver.js";
-import { TmuxSessionDriver } from "../src/tmux-driver.js";
-import { SshPtyDriver } from "../src/ssh-pty-driver.js";
-import { enterStepsOf } from "../src/ssh-helpers.js";
-import type { RuntimeDriver, RuntimeDescriptor } from "../src/driver.js";
-import type { LayerHandle } from "../src/runtime-stack.js";
+import { EventBus } from "../src/core/base/events.js";
+import { RuntimeStack } from "../src/middle/runtime-stack.js";
+import { createAgentToolkit } from "../src/interface/mcp/agent-toolkit.js";
+import { RuntimeFactory } from "../src/core/base/factory.js";
+import { LocalRuntimeDriver } from "../src/core/local/local-driver.js";
+import { TmuxSessionDriver } from "../src/core/tmux/tmux-driver.js";
+import { SshPtyDriver } from "../src/core/ssh/ssh-pty-driver.js";
+import { enterStepsOf } from "../src/core/ssh/ssh-helpers.js";
+import type { RuntimeDriver, RuntimeDescriptor } from "../src/core/base/driver.js";
+import type { LayerHandle } from "../src/middle/runtime-stack.js";
 
 type Ev = { type: "a" | "b"; v: number };
 
@@ -673,7 +673,7 @@ describe("重复 connect 订阅幂等（二十九期）", () => {
 });
 
 // GPT Astra 三十期：事件总线两件——off(原回调) 退订失效 + once 回调抛错中断分发。
-import { EventBus as EventBusFor30 } from "../src/events.js";
+import { EventBus as EventBusFor30 } from "../src/core/base/events.js";
 describe("EventBus off/once（三十期）", () => {
     const EventBus = EventBusFor30;
     type Ev = { type: "tick"; n: number };
@@ -845,7 +845,7 @@ describe("三十七期", () => {
             tailSession: async () => [],
             stopSession: async () => { throw new Error("stop channel dead"); },
             verifySession: async () => { verifyCalled = true; return { status: "exited", exitCode: 3 }; },
-        } as unknown as import("../src/driver.js").RuntimeDriver;
+        } as unknown as import("../src/core/base/driver.js").RuntimeDriver;
         const tk = createAgentToolkit(new RuntimeStack(), { driver: drv });
         const r = await tk.handlers.stop_session({ session_id: "s34", layer: "__initial__" });
         expect(verifyCalled).toBe(true); // 修前：stop 抛错后 verify 根本不执行
@@ -1403,7 +1403,7 @@ test("driver exit events remain forwarded through named-layer disposal", async (
     const stack = new RuntimeStack();
     const seen: string[] = [];
     stack.events.on("exit", (event) => { if (event.type === "exit") seen.push(event.sessionId); });
-    const sessions = { onEvent: async (_event: import("../src/session-types.js").SessionEvent) => {
+    const sessions = { onEvent: async (_event: import("../src/core/base/session-types.js").SessionEvent) => {
         throw new Error("driver callback rejected");
     } };
     const driver = Object.assign(new MockLayerDriver({ driver: "fixture" }), {
