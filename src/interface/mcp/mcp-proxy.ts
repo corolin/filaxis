@@ -4,7 +4,8 @@
  * 设计要点（REQ-0005 Phase 3）：
  * - 零第三方依赖：仅使用 node:http / node:readline / node:string_decoder；
  * - 单 stdin 读循环：重连时绝不重复创建 readline 监听器；
- * - Watchdog + 退避重连 + Token 轮换重读：每次建连前重读 daemon.addr 与 daemon.token；
+ * - Watchdog + 退避重连 + Token 轮换重读：每次建连前重读 daemon.addr 与 daemon.token，并先过
+ *   线协议握手（Daemon 中途被换成另一个版本时拒绝接入，不把请求交给它）；
  * - 语义不变量（AC-07 零自动重放）：一旦 SSE 断连，在途已 POST 的请求立即回传
  *   JSON-RPC error (outcome="unknown") 并清空 inFlight，绝不自动重放非幂等调用。
  */
@@ -12,8 +13,9 @@ import * as http from "node:http";
 import * as readline from "node:readline";
 import { StringDecoder } from "node:string_decoder";
 import { defaultDaemonDir, readDaemonConnection } from "../daemon/daemon-files.js";
-import { parseAddrToUrl, urlRequestHost, urlRequestPort } from "../daemon/daemon-client.js";
+import { DaemonClient, parseAddrToUrl, ProtocolMismatchError, urlRequestHost, urlRequestPort } from "../daemon/daemon-client.js";
 import { noopLogger, type FilaxisLogger } from "../../shared/logger.js";
+import { PROTOCOL_VERSION } from "../../middle/protocol.js";
 
 export interface McpStdioProxyOptions {
     daemonDir?: string;
@@ -24,6 +26,8 @@ export interface McpStdioProxyOptions {
     initialReconnectDelayMs?: number;
     maxReconnectDelayMs?: number;
     maxInFlight?: number;
+    /** 代理自行终止时调用（重连时发现 Daemon 的线协议版本与自己的不一致）。此后代理不再工作 */
+    onFatal?: (error: Error) => void;
 }
 
 interface PendingMessage {
@@ -66,6 +70,7 @@ export class McpStdioProxy {
     private readonly initialReconnectDelayMs: number;
     private readonly maxReconnectDelayMs: number;
     private readonly maxInFlight: number;
+    private readonly onFatal?: (error: Error) => void;
 
     private rl?: readline.Interface;
     private started = false;
@@ -87,6 +92,7 @@ export class McpStdioProxy {
         this.initialReconnectDelayMs = opts.initialReconnectDelayMs ?? DEFAULT_INITIAL_RECONNECT_MS;
         this.maxReconnectDelayMs = opts.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_MS;
         this.maxInFlight = opts.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+        this.onFatal = opts.onFatal;
         this.reconnectDelayMs = this.initialReconnectDelayMs;
     }
 
@@ -305,6 +311,15 @@ export class McpStdioProxy {
                 await this.waitReconnect();
                 continue;
             }
+            // 每次建连前都过线协议握手，不只是启动器首次连接时：Daemon 中途被换成另一个版本
+            // （升级/回滚后重启），重连不能把请求交给它。没答上来算还没就绪，稍后重试
+            const mismatch = await this.protocolMismatch(conn.addr, conn.token);
+            if (mismatch) {
+                this.failQueued(`Daemon 线协议版本不一致，请求未发出：${mismatch.message}`, "not_sent");
+                this.close();
+                this.onFatal?.(mismatch);
+                return;
+            }
             try {
                 await this.runSseSession(conn.addr, conn.token);
             } catch (err) {
@@ -316,6 +331,31 @@ export class McpStdioProxy {
                 this.failInFlight("Daemon SSE 连接中断");
                 await this.waitReconnect();
             }
+        }
+    }
+
+    /** 建连前的线协议握手：答上来的版本不是自己的就返回错误；没答上来返回 undefined（稍后重试） */
+    private async protocolMismatch(addr: string, token: string): Promise<ProtocolMismatchError | undefined> {
+        try {
+            const status = await new DaemonClient({ addr, token }).status(1500);
+            return status.protocolVersion === PROTOCOL_VERSION
+                ? undefined
+                : new ProtocolMismatchError(status.protocolVersion, status);
+        } catch (err) {
+            if (err instanceof ProtocolMismatchError) return err;
+            return undefined;
+        }
+    }
+
+    /** 排队中还没发出的请求逐个报错——没发出过，不假装执行过；通知没有应答，直接丢弃 */
+    private failQueued(reason: string, outcome: "not_sent"): void {
+        for (const item of this.pendingQueue.splice(0)) {
+            if (item.id === undefined) continue;
+            this.writeStdout({
+                jsonrpc: "2.0",
+                id: item.id,
+                error: { code: -32000, message: reason, data: { method: item.method ?? "unknown", outcome } },
+            });
         }
     }
 

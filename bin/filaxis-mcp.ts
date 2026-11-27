@@ -127,7 +127,16 @@ async function main(): Promise<void> {
         }
         // 线协议不一致的 Daemon 不连（REQ-0004 §6.2）：明确报错，不让请求交给旧代码执行
         await assertDaemonProtocol(client);
-        new McpStdioProxy({ daemonDir: o.daemonDir, logger }).start();
+        new McpStdioProxy({
+            daemonDir: o.daemonDir,
+            logger,
+            // 重连时发现 Daemon 换了线协议版本：代理已自行停止。以非零退出告诉 MCP 宿主——
+            // 下次启动时，启动器的握手会给出双方版本与处置办法
+            onFatal: (error) => {
+                stderr(error.message);
+                process.stdout.write("", () => process.exit(1));
+            },
+        }).start();
         return;
     }
 

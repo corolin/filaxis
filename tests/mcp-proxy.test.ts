@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
+import { ProtocolMismatchError } from "../src/interface/daemon/daemon-client.js";
+import { PROTOCOL_VERSION } from "../src/middle/protocol.js";
 import {
     createAgentToolkit,
     DaemonClient,
@@ -856,6 +858,82 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         }
     }, 15_000);
 
+    test("重连时先过线协议握手：Daemon 换成了别的版本就拒绝接入，不向它发请求", async () => {
+        // 启动器只在首次连接前校验版本；代理断线重连时按新的地址与令牌直接建 SSE。Daemon
+        // 中途被换成另一个版本（升级/回滚后重启）时，请求不能交给它
+        const dir = makeTempDir("fx-mcp-reconnect-handshake-");
+        const real = new DaemonServer({ daemonDir: dir, version: "v3", sseKeepaliveMs: 50 });
+        let sseGets = 0;
+        const posts: string[] = [];
+        let sseChannel: http.ServerResponse | undefined;
+        // 假 Daemon：/status 自报另一个线协议版本；/mcp/sse 是一整套能正常应答的端点
+        const impostor = http.createServer((req, res) => {
+            if (req.method === "GET" && req.url === "/status") {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    ok: true,
+                    result: { pid: 4242, startedAt: 0, uptimeMs: 1, version: "0.2.13", protocolVersion: 2, addr: "", layers: [], forwards: [], streams: [] },
+                }));
+                return;
+            }
+            if (req.method === "GET" && req.url === "/mcp/sse") {
+                sseGets++;
+                sseChannel = res;
+                res.writeHead(200, { "Content-Type": "text/event-stream" });
+                res.write("event: endpoint\ndata: /mcp/message?sessionId=fake\n\n");
+                return;
+            }
+            let body = "";
+            req.on("data", (c: Buffer) => { body += c.toString("utf-8"); });
+            req.on("end", () => {
+                posts.push(`${req.method} ${req.url}`);
+                let id: unknown = null;
+                try { id = (JSON.parse(body) as { id?: unknown }).id; } catch { /* 保持 null */ }
+                res.writeHead(202).end();
+                sseChannel?.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id, result: { tools: [] } })}\n\n`);
+            });
+        });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        const fatal: Error[] = [];
+        try {
+            await new Promise<void>((resolve) => impostor.listen(0, "127.0.0.1", resolve));
+            const impostorAddr = `http://127.0.0.1:${(impostor.address() as { port: number }).port}`;
+            await real.start();
+            fx = attachProxyFixture({
+                daemonDir: dir,
+                initialReconnectDelayMs: 30,
+                maxReconnectDelayMs: 80,
+                onFatal: (e) => { fatal.push(e); },
+            });
+            fx.send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+            expect(((await waitForResponse(fx.responses, 1)).result as { tools: unknown[] }).tools).toHaveLength(12);
+
+            // 真 Daemon 下线；等代理处理完断线、进入重连等待
+            await real.stop();
+            await new Promise((r) => setTimeout(r, 200));
+            // 同一个目录里换成自报旧协议版本的假 Daemon，并在它被发现之前排一个请求
+            const { addrFile, tokenFile } = daemonPaths(dir);
+            writeFileSync(addrFile, impostorAddr);
+            writeFileSync(tokenFile, "impostor-token");
+            fx.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+
+            // 排队的请求没发出过：明确报错，不假装执行过
+            const second = await waitForResponse(fx.responses, 2, 5_000);
+            expect(second.error).toMatchObject({ code: -32000, data: { outcome: "not_sent", method: "tools/list" } });
+            await new Promise((r) => setTimeout(r, 300)); // 超过重连间隔：此后也不该再去连
+            expect(sseGets).toBe(0);
+            expect(posts).toEqual([]);
+            expect(fatal).toHaveLength(1);
+            expect(fatal[0]).toBeInstanceOf(ProtocolMismatchError);
+            expect(fatal[0]!.message).toContain("protocol=3");
+        } finally {
+            fx?.proxy.close();
+            impostor.closeAllConnections();
+            await new Promise<void>((resolve) => impostor.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
     test("stdin 在 SSE 握手完成前关闭：在途的握手请求随即撤下，不转发、不重连、不留连接", async () => {
         // 假 Daemon：/mcp/sse 的请求扣住不回应（握手悬而未决）；其余路径记下并拒绝
         const dir = makeTempDir("fx-mcp-early-eof-");
@@ -865,6 +943,15 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         const posts: string[] = [];
         let sseGets = 0;
         const fake = http.createServer((req, res) => {
+            if (req.method === "GET" && req.url === "/status") {
+                // 线协议握手（代理每次建连前都做）：自报与本客户端一致的版本
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    ok: true,
+                    result: { pid: 4242, startedAt: 0, uptimeMs: 1, version: "fake", protocolVersion: PROTOCOL_VERSION, addr: "", layers: [], forwards: [], streams: [] },
+                }));
+                return;
+            }
             if (req.method === "GET" && req.url === "/mcp/sse") {
                 sseGets++;
                 const socket = req.socket;
