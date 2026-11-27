@@ -825,6 +825,60 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         }
     }, 15_000);
 
+    test("stdin 在 SSE 握手完成前关闭：在途的握手请求随即撤下，不转发、不重连、不留连接", async () => {
+        // 假 Daemon：/mcp/sse 的请求扣住不回应（握手悬而未决）；其余路径记下并拒绝
+        const dir = makeTempDir("fx-mcp-early-eof-");
+        // 观察连接本身。响应尚未开始时，Linux 上的 bun 1.3.12 不给 ServerResponse 发 close，
+        // 只给 socket 发；socket 的 close 四个运行时（bun 1.3.12 / 1.4.4、Node 22 / 26）都发
+        const held = new Set<http.IncomingMessage["socket"]>();
+        const posts: string[] = [];
+        let sseGets = 0;
+        const fake = http.createServer((req, res) => {
+            if (req.method === "GET" && req.url === "/mcp/sse") {
+                sseGets++;
+                const socket = req.socket;
+                held.add(socket);
+                socket.on("close", () => held.delete(socket));
+                return;
+            }
+            posts.push(`${req.method} ${req.url}`);
+            res.writeHead(404).end();
+        });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        try {
+            await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+            const port = (fake.address() as { port: number }).port;
+            writeFileSync(join(dir, "daemon.addr"), `http://127.0.0.1:${port}`);
+            writeFileSync(join(dir, "daemon.token"), "early-eof-token");
+
+            fx = attachProxyFixture({ daemonDir: dir, initialReconnectDelayMs: 50, maxReconnectDelayMs: 100 });
+            fx.send({ jsonrpc: "2.0", id: 1, method: "initialize" });
+            // 握手请求已发出、响应还没回来，客户端这时走了（`filaxis-mcp < /dev/null`、
+            // 探测式调用、宿主启动失败）
+            const gotDeadline = Date.now() + 3_000;
+            while (held.size === 0 && Date.now() < gotDeadline) await new Promise((r) => setTimeout(r, 5));
+            expect(held.size).toBe(1);
+            fx.closeStdin();
+
+            // 修复前：握手请求没人撤（close() 只中止已激活的会话，而会话要等响应头才登记），
+            // 连接一直扣在这里；握手响应迟到后代理已关闭、队列不转发，Node 进程陪着这条
+            // SSE 连接永不退出（真机：`echo … | node dist/bin/filaxis-mcp.js` 滞留超过 12 秒）
+            const heldDeadline = Date.now() + 3_000;
+            while (held.size > 0 && Date.now() < heldDeadline) await new Promise((r) => setTimeout(r, 10));
+            expect([...held]).toHaveLength(0);
+
+            await new Promise((r) => setTimeout(r, 250)); // 超过重连间隔：关闭之后不再重连
+            expect(sseGets).toBe(1);
+            expect(posts).toEqual([]);
+            expect(fx.responses).toEqual([]);
+        } finally {
+            fx?.proxy.close();
+            fake.closeAllConnections();
+            await new Promise<void>((resolve) => fake.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 10_000);
+
     test("connects MCP HTTP/SSE proxy over IPv6 loopback [::1]", async () => {
         const dir = makeTempDir("fx-mcp-ipv6-");
         const srv = new DaemonServer({ daemonDir: dir, host: "::1", version: "ipv6" });

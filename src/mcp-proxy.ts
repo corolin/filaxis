@@ -367,6 +367,12 @@ export class McpStdioProxy {
                 else resolve();
             };
 
+            // 会话在发出握手请求时就登记，不等响应头：握手期间 stdin 关闭（close()）也要能撤下
+            // 这条在途请求。此前要等响应头到达才登记，而 close() 只中止已登记的会话——握手
+            // 响应迟到后会话在一个已关闭的代理上「激活」，连接再没人收，Node 进程陪着它永不
+            // 退出（`filaxis-mcp < /dev/null`、探测式调用、宿主启动失败都会这样）。
+            this.activeSession = session;
+
             const req = http.request({
                 protocol: baseUrl.protocol,
                 hostname: urlRequestHost(baseUrl),
@@ -381,13 +387,17 @@ export class McpStdioProxy {
                 agent: false,
             }, (res) => {
                 resRef = res;
+                if (this.closed) {
+                    // 握手响应迟到：代理已收尾，这条连接不留
+                    res.destroy();
+                    return;
+                }
                 if (res.statusCode !== 200) {
                     res.resume();
                     finish(new Error(`SSE 握手失败: HTTP ${res.statusCode ?? 0}`));
                     return;
                 }
 
-                this.activeSession = session;
                 let lastSeenAt = Date.now();
                 const checkInterval = Math.max(15, Math.min(1000, Math.floor(this.watchdogIdleMs / 3)));
                 watchdog = setInterval(() => {
