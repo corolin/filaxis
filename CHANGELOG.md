@@ -50,6 +50,15 @@
 - **[GPT]** 修复上一批「下载的临时文件名不再折叠路径」引入的回归：POSIX 上反斜杠是普通的文件名字符，下载到含反斜杠的长文件名（如 242 字节）曾报 `ENAMETOOLONG`。分隔符改按平台认（Windows 两种都算，其余只认 `/`）。
 - **[GPT]** 分层门禁：参数默认值表达式里的动态导入（`function f(p = cond ? a : typeof import("…"))`）不再被当成类型；参数表改为逐段判定（标注冒号、默认值的 `=`、参数表是否闭合），回调类型 `cb: (e: X) => typeof import(…)` 这类真类型不再被误拦。
 - **[自挖]** 同构用例集：32 条与语言无关的声明式用例（`tests/isomorphism-corpus.ts`），在即弃进程内、SDK 长驻、Daemon 远程三种宿主上同参同果。1.x 的 Rust 内核将来拿同一份语料对照。
+- **[自挖]** 经 Daemon 的 `filaxis-mcp` 以客户端的工作目录为基准，与进程内形态同参同果。此前相对路径与命令的工作目录都以 Daemon 自己的目录为基准：Daemon 在 A 目录启动、MCP 客户端在 B 目录运行时，同一个 `read_path { path: "marker.txt" }` 进程内读到 B 的文件、经 Daemon 读到 A 的，两边都报成功（`edit_file`、`transfer_file` 的 `local_path`、`run_command` 的工作目录同理）。代理在 SSE 握手时带上自己的工作目录，Daemon 按会话记住；已存本机层用自己的 `cwd`，SSH 层的路径原样。
+- **[自挖]** `~` 展开与 tmux 窗格锁不再折叠调用方给的路径：`~/link/../key` 按 shell 与内核的语义解析（`..` 相对符号链接实际指向的位置），此前被词法折叠成 `~/key`，指向另一个文件；窗格锁文件此前可能落到折叠后的目录，那边不存在就报 `ENOENT`。
+- **[自挖]** 有命令或后台会话在途时 `filaxis daemon stop` 也停得下。此前 Daemon 早已停止服务，但进程要陪在途命令跑完才退：CLI 等 5 秒报「停机核实超时…终态未知」、退出码 1；后台会话动辄几分钟到几小时，旧进程就活那么久，照提示加 `--force` 会把会话进程强杀成没人认领的孤儿。本机驱动销毁时收掉自己起的东西：在途命令中止、后台会话停机并核实（与 SSH 层「销毁即断链」对齐）。
+- **[自挖]** bun 运行时下 Daemon 停机不再等在途请求。有 `/rpc` 请求在处理中时 `DaemonServer.stop()` 在 bun 下（Linux 实测 1.3.12）一直挂着，要等那条命令跑完才返回；Node 下不受影响。停机时连接逐个销毁，`close` 回调加 500ms 兜底。
+- **[自挖]** 分层门禁（`bun run check:boundaries`）不再误拦真类型：类成员的标注（`class C { p: typeof import(…) }`）与带泛型的返回类型标注此前被当成动态取值拦下。补 58 条对抗语料：27 种取值写法全部拦下、31 种类型写法全部放行。
+- **[自挖]** 多个 `filaxis daemon start` 同时冷启动时，输家报「Filaxis Daemon 已在运行 (pid=…, addr=…)」，不再报「Daemon 进程提前退出 (code=1)」。此前真机 5 个并发，最终只有一个 Daemon（结果正确），其余 4 个像是 Daemon 崩了，照着排查会白费工夫。
+- **[自挖]** 调用方断开后，经 Daemon 的在途命令随即停掉。此前 `filaxis exec`（缺省经 Daemon）跑一条 8 秒的命令，中途 Ctrl-C 或杀掉 CLI，命令照跑到结束并写完收尾副作用；现在调用方的连接在应答之前断开，Daemon 就中止这一步的操作（`runCommand` / `runBatch` / `observe`），应答发完之后的断开不触发。
+- **[自挖]** 中止一条本机命令 = 停掉它的整棵进程树。此前中止（以及 Daemon 停机时的收尾）只对外层 shell 发 SIGTERM，而命令本就包在子 shell 里：外层死了，命令照跑到结束（Windows 与 Linux 实测一致）。现在 POSIX 下先把整棵树冻结、按父子表清点、逐个发 SIGTERM 再放开（外层先死的话子孙会被过继给 init，找不回来）；Windows 先按 Git Bash 自己的进程表清点整族再逐个连子树 `taskkill /T`（`taskkill /T` 沿 Windows 父子链找不到 Git Bash exec 出来的程序，`bash -c 'sleep 3; echo …'` 这类会活下来把后面的命令跑完）。命令与宿主的前台进程组关系没有变，终端 Ctrl-C 的语义照旧。**远端层不在其列**：中止杀的是本地 ssh，远端进程树是否停下未核实（两平台实测会跑完），错误里如实标注 `outcome: "unknown"`。
+- **[自挖]** 上一条的运行时前提：bun 1.3.12（Linux 实测）在请求体读完后不再把连接的关闭送到 socket 上，Node 与 Windows 上的 bun 1.4.4 实测不受影响。Daemon 读 `/rpc` 请求体改为「读够 `Content-Length` 就暂停、应答后再放开」，请求流保持未完结才收得到断开；没有 `Content-Length` 的请求退回读完。
 
 ## 0.2.13
 
