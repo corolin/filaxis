@@ -12,10 +12,45 @@
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import * as http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DaemonServer } from "../src/index.js";
+import { PROTOCOL_VERSION } from "../src/middle/protocol.js";
 
 const cli = join(import.meta.dir, "..", "bin", "filaxis.ts");
+
+describe("有请求在途时 DaemonServer.stop()", () => {
+    test("不等在途请求结束：连接逐个销毁，1 秒内返回（bun 1.3 的 closeAllConnections 不终止在途连接）", async () => {
+        // Linux 上 bun 1.3.12 实测：server.close 的回调要等在途请求结束才来，stop() 挂到命令跑完
+        const daemonDir = mkdtempSync(join(tmpdir(), "fx-daemon-stop-rpc-"));
+        const srv = new DaemonServer({ daemonDir, version: "test" });
+        let req: http.ClientRequest | undefined;
+        try {
+            const url = new URL(await srv.start());
+            const body = JSON.stringify({
+                protocol: PROTOCOL_VERSION,
+                op: "runCommand",
+                params: { layer: { descriptor: { driver: "local" } }, command: "sleep 12", timeoutMs: 30_000 },
+            });
+            req = http.request({
+                protocol: url.protocol, hostname: url.hostname, port: url.port, path: "/rpc", method: "POST", agent: false,
+                headers: { "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(body)), Authorization: `Bearer ${srv.token}` },
+            });
+            // 连接被销毁时调用方拿到传输错误；不能变成未处理的 error 事件
+            req.on("error", () => undefined);
+            req.end(body);
+            await Bun.sleep(1200);
+            const t0 = Date.now();
+            await srv.stop();
+            expect(Date.now() - t0).toBeLessThan(2_000);
+        } finally {
+            req?.destroy();
+            await srv.stop().catch(() => undefined);
+            rmSync(daemonDir, { recursive: true, force: true });
+        }
+    }, 20_000);
+});
 
 function run(args: string[], cwd: string, env: Record<string, string>) {
     const p = Bun.spawnSync([process.execPath, cli, ...args], { cwd, stdout: "pipe", stderr: "pipe", env, windowsHide: true });

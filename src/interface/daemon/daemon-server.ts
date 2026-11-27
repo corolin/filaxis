@@ -107,6 +107,8 @@ export class DaemonServer {
     private readonly startedAt = Date.now();
 
     private server?: http.Server;
+    /** 当前连着的客户端连接（停机时逐个销毁） */
+    private readonly sockets = new Set<http.IncomingMessage["socket"]>();
     private listenAddr?: string;
     private starting?: Promise<string>;
     private stopping?: Promise<void>;
@@ -157,6 +159,12 @@ export class DaemonServer {
             void this.handleHttp(req, res);
         });
         this.server = srv;
+        // 记着自己身上的连接：停机时直接销毁。closeAllConnections() 在 bun 1.3（Linux 实测）不终止
+        // 还有请求在处理中的连接，server.close 的回调要等那条请求结束才来——有命令在途时 stop() 挂住
+        srv.on("connection", (socket) => {
+            this.sockets.add(socket);
+            socket.once("close", () => { this.sockets.delete(socket); });
+        });
 
         try {
             await new Promise<void>((resolve, reject) => {
@@ -236,9 +244,21 @@ export class DaemonServer {
             const srv = this.server;
             this.server = undefined;
             if (srv) {
+                for (const socket of [...this.sockets]) {
+                    try { socket.destroy(); } catch { /* 已关闭 */ }
+                }
+                this.sockets.clear();
                 await new Promise<void>((resolve) => {
-                    srv.close(() => resolve());
+                    let settled = false;
+                    const done = (): void => {
+                        if (settled) return;
+                        settled = true;
+                        resolve();
+                    };
+                    srv.close(() => done());
                     (srv as { closeAllConnections?: () => void }).closeAllConnections?.();
+                    // 连接已全部销毁，close 的回调本应立刻就来；万一运行时不给（bun 实测），不等它
+                    setTimeout(done, 500).unref?.();
                 });
             }
             const activeWindows = this.windowRegistry.list().map((w) => w.name);
