@@ -535,6 +535,15 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         let firstSessionRequests = 0;
         let secondSessionRequests = 0;
         const stub = http.createServer((req, res) => {
+            if (req.url === "/status") {
+                // 线协议握手（代理每次建连前都做，没答上来就不开连接）
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    ok: true,
+                    result: { pid: 4242, startedAt: 0, uptimeMs: 1, version: "stub", protocolVersion: PROTOCOL_VERSION, addr: "", layers: [], forwards: [], streams: [] },
+                }));
+                return;
+            }
             if (req.url === "/mcp/sse") {
                 streams.push(res);
                 res.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -933,6 +942,93 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             rmSync(dir, { recursive: true, force: true });
         }
     }, 15_000);
+
+    test("线协议握手没答上来（/status 报错）时不开 SSE、不发请求——稍后再试", async () => {
+        // 握手失败与握手通过不能是同一个结果。此前两者在代理里都得到「undefined」，连接循环
+        // 随即开 SSE——一个 /status 报 503 的对端照样能收到请求
+        const dir = makeTempDir("fx-mcp-handshake-error-");
+        let sseGets = 0;
+        const posts: string[] = [];
+        const fake = http.createServer((req, res) => {
+            if (req.method === "GET" && req.url === "/status") {
+                res.writeHead(503, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "starting" }));
+                return;
+            }
+            if (req.method === "GET" && req.url === "/mcp/sse") {
+                sseGets++;
+                res.writeHead(200, { "Content-Type": "text/event-stream" });
+                res.write("event: endpoint\ndata: /mcp/message?sessionId=fake\n\n");
+                return;
+            }
+            posts.push(`${req.method} ${req.url}`);
+            res.writeHead(202).end();
+        });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        try {
+            await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+            const port = (fake.address() as { port: number }).port;
+            writeFileSync(join(dir, "daemon.addr"), `http://127.0.0.1:${port}`);
+            writeFileSync(join(dir, "daemon.token"), "handshake-error-token");
+            fx = attachProxyFixture({ daemonDir: dir, initialReconnectDelayMs: 30, maxReconnectDelayMs: 80 });
+            fx.send({ jsonrpc: "2.0", id: 1, method: "ping" });
+            await new Promise((r) => setTimeout(r, 600)); // 足够它重试好几轮
+            expect(sseGets).toBe(0);
+            expect(posts).toEqual([]);
+            expect(fx.responses.filter((r) => r.id === 1)).toEqual([]); // 请求一直在排队，没被发出去
+            fx.closeStdin();
+        } finally {
+            fx?.proxy.close();
+            fake.closeAllConnections();
+            await new Promise<void>((resolve) => fake.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 10_000);
+
+    test("stdin 在线协议握手期间关闭：迟到的握手结果不再触发 SSE 请求", async () => {
+        const dir = makeTempDir("fx-mcp-handshake-eof-");
+        let sseGets = 0;
+        const held = new Set<http.IncomingMessage["socket"]>();
+        const fake = http.createServer((req, res) => {
+            if (req.method === "GET" && req.url === "/status") {
+                // 握手答复迟到：客户端等不到就已经走了
+                setTimeout(() => {
+                    if (res.destroyed) return;
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        ok: true,
+                        result: { pid: 4242, startedAt: 0, uptimeMs: 1, version: "fake", protocolVersion: PROTOCOL_VERSION, addr: "", layers: [], forwards: [], streams: [] },
+                    }));
+                }, 400);
+                return;
+            }
+            if (req.method === "GET" && req.url === "/mcp/sse") {
+                sseGets++;
+                const socket = req.socket;
+                held.add(socket);
+                socket.on("close", () => held.delete(socket));
+                return; // 扣住不回应
+            }
+            res.writeHead(404).end();
+        });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        try {
+            await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+            const port = (fake.address() as { port: number }).port;
+            writeFileSync(join(dir, "daemon.addr"), `http://127.0.0.1:${port}`);
+            writeFileSync(join(dir, "daemon.token"), "handshake-eof-token");
+            fx = attachProxyFixture({ daemonDir: dir, initialReconnectDelayMs: 30, maxReconnectDelayMs: 80 });
+            fx.closeStdin(); // 握手还在途，客户端就走了
+            await new Promise((r) => setTimeout(r, 900)); // 迟到的答复已经到达
+            expect(sseGets).toBe(0);
+            expect([...held]).toHaveLength(0);
+        } finally {
+            fx?.proxy.close();
+            fake.closeAllConnections();
+            await new Promise<void>((resolve) => fake.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 10_000);
 
     test("stdin 在 SSE 握手完成前关闭：在途的握手请求随即撤下，不转发、不重连、不留连接", async () => {
         // 假 Daemon：/mcp/sse 的请求扣住不回应（握手悬而未决）；其余路径记下并拒绝

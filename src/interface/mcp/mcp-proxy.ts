@@ -312,12 +312,17 @@ export class McpStdioProxy {
                 continue;
             }
             // 每次建连前都过线协议握手，不只是启动器首次连接时：Daemon 中途被换成另一个版本
-            // （升级/回滚后重启），重连不能把请求交给它。没答上来算还没就绪，稍后重试
-            const mismatch = await this.protocolMismatch(conn.addr, conn.token);
-            if (mismatch) {
-                this.failQueued(`Daemon 线协议版本不一致，请求未发出：${mismatch.message}`, "not_sent");
+            // （升级/回滚后重启），重连不能把请求交给它。握手没答上来同样不开连接——稍后再试
+            const handshake = await this.handshake(conn.addr, conn.token);
+            if (this.closed) return; // 握手在途时 stdin 关闭：迟到的结果不再触发任何连接
+            if (handshake === "unanswered") {
+                await this.waitReconnect();
+                continue;
+            }
+            if (handshake instanceof ProtocolMismatchError) {
+                this.failQueued(`Daemon 线协议版本不一致，请求未发出：${handshake.message}`, "not_sent");
                 this.close();
-                this.onFatal?.(mismatch);
+                this.onFatal?.(handshake);
                 return;
             }
             try {
@@ -334,16 +339,16 @@ export class McpStdioProxy {
         }
     }
 
-    /** 建连前的线协议握手：答上来的版本不是自己的就返回错误；没答上来返回 undefined（稍后重试） */
-    private async protocolMismatch(addr: string, token: string): Promise<ProtocolMismatchError | undefined> {
+    /**
+     * 建连前的线协议握手，三种结果：版本一致；没答上来（连接不上、报错、超时——算还没就绪，
+     * 但绝不在这种情况下开连接）；答了但版本不一致。
+     */
+    private async handshake(addr: string, token: string): Promise<"ok" | "unanswered" | ProtocolMismatchError> {
         try {
             const status = await new DaemonClient({ addr, token }).status(1500);
-            return status.protocolVersion === PROTOCOL_VERSION
-                ? undefined
-                : new ProtocolMismatchError(status.protocolVersion, status);
-        } catch (err) {
-            if (err instanceof ProtocolMismatchError) return err;
-            return undefined;
+            return status.protocolVersion === PROTOCOL_VERSION ? "ok" : new ProtocolMismatchError(status.protocolVersion, status);
+        } catch {
+            return "unanswered";
         }
     }
 
@@ -375,6 +380,7 @@ export class McpStdioProxy {
     }
 
     private runSseSession(addr: string, token: string): Promise<void> {
+        if (this.closed) return Promise.resolve(); // 代理已收尾：不再发出任何连接
         const baseUrl = parseAddrToUrl(addr);
         return new Promise<void>((resolve, reject) => {
             let settled = false;
