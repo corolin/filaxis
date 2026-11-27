@@ -686,9 +686,13 @@ export async function sftpPutFile(
 /** 本地下载临时名（字节口径 NAME_MAX 安全）：suffix 由调用方给（fx-dl/filaxis-get/sftp-get
  *  三条下载路径共用——Sol 73 #5：getFile 内联旧版仍按码元计，252B 中文名
  *  追后缀 ENAMETOOLONG）。目录部分按原样截取：path.join 会把路径里的 `link/..` 词法折叠，
- *  临时文件落到另一个目录——目标目录明明存在也报 ENOENT（0.2.13 即如此） */
+ *  临时文件落到另一个目录——目标目录明明存在也报 ENOENT（0.2.13 即如此）。
+ *  目录与文件名的分界按平台认：Windows 两种分隔符都算，POSIX 上反斜杠是普通的文件名字符——
+ *  把它当分隔符，含反斜杠的长文件名会被从中间切开，截断后拼回去超过 255 字节 */
 function localTmpFor(localPath: string, suffix: string): string {
-    const slash = Math.max(localPath.lastIndexOf("/"), localPath.lastIndexOf("\\"));
+    const slash = process.platform === "win32"
+        ? Math.max(localPath.lastIndexOf("/"), localPath.lastIndexOf("\\"))
+        : localPath.lastIndexOf("/");
     const dir = slash >= 0 ? localPath.slice(0, slash + 1) : "";
     const name = slash >= 0 ? localPath.slice(slash + 1) : localPath;
     const suffixBytes = Buffer.byteLength(suffix, "utf-8");

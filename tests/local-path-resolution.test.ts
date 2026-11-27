@@ -10,7 +10,7 @@
  * 只在有 POSIX 路径语义的平台上跑（Windows 的路径解析本身就是词法的，`..` 不跨符号链接）。
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -100,6 +100,27 @@ describe("调用方机器上的路径：符号链接后面的 .. 按内核语义
             expect(spilledBatch.code).toBe(0);
             expect(readFileSync(join(root, "spilled", "step.stdout"), "utf-8")).toBe("batch-spilled\n");
             expect(existsSync(join(work, "spilled"))).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 60_000);
+
+    test.skipIf(process.platform === "win32")("含反斜杠的长文件名（POSIX 上反斜杠是普通字符）：下载落在那个文件上", () => {
+        // 文件名 = a + \ + 240 个 b，共 242 字节；临时名 = 文件名 + 后缀，超过 255 字节要截断。
+        // 截断必须按整个文件名算——把反斜杠当成分隔符的话，「a\」被划进目录部分，剩下的部分截到
+        // 255 字节再拼回去就是 257 字节，ENAMETOOLONG
+        const root = mkdtempSync(join(tmpdir(), "fx-path-resolution-"));
+        const work = join(root, "work");
+        const name = `a\\${"b".repeat(240)}`;
+        try {
+            mkdirSync(work);
+            writeFileSync(join(root, "source.txt"), "backslash-name\n");
+            expect(Buffer.byteLength(name)).toBe(242);
+            const get = run(["get", "--no-daemon", join(root, "source.txt"), join(work, name)], work);
+            expect(get.err).toBe("");
+            expect(existsSync(join(work, name))).toBe(true);
+            expect(readFileSync(join(work, name), "utf-8")).toBe("backslash-name\n");
+            expect(readdirSync(work)).toEqual([name]); // 没有留下截断错的临时文件
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
