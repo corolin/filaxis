@@ -265,6 +265,11 @@ export const ISO_CASES: IsoCase[] = [
         name: "features：内核能力探测",
         steps: [{ op: "features", params: {} }],
     },
+    {
+        // 参数本身是数组（唯一一个这样的操作）：经 Daemon 时不能被换成空对象
+        name: "connectSshBatch：参数是数组——空数组原样送达",
+        steps: [{ op: "connectSshBatch", params: [] }],
+    },
 
     // ── 转发 ──
     {
@@ -354,6 +359,13 @@ export function scopeLayerListing(step: IsoStep, result: unknown): unknown {
     if (step.op !== "listLayers" || !result || typeof result !== "object") return result;
     const { layers } = result as { layers?: Array<Record<string, unknown>> };
     return { layers: (layers ?? []).filter((l) => String(l.name).startsWith("iso-")).sort((a, b) => String(a.name).localeCompare(String(b.name))) };
+}
+
+/** connectSshBatch 的结果只看这次调用自己的产出：activeLayer 是调用结束时宿主的默认层（环境状态，各宿主可以不同） */
+export function scopeConnectResult(step: IsoStep, result: unknown): unknown {
+    if (step.op !== "connectSshBatch" || !result || typeof result !== "object" || Array.isArray(result)) return result;
+    const { activeLayer: _activeLayer, ...rest } = result as { activeLayer?: unknown };
+    return rest;
 }
 
 /** 操作抛错时的归一形态（错误也是结果的一种：三个宿主报的必须是同一句话） */

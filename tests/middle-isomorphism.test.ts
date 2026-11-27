@@ -20,7 +20,7 @@ import { createMiddle, type LocalMiddle } from "../src/middle/middle.js";
 import type { Middle, MiddleOps } from "../src/middle/types.js";
 import type { RuntimeDescriptor } from "../src/core/base/driver.js";
 import {
-    ISO_CASES, ISO_LAYER_STORE, normalizeError, normalizeResult, scopeLayerListing,
+    ISO_CASES, ISO_LAYER_STORE, normalizeError, normalizeResult, scopeConnectResult, scopeLayerListing,
     type IsoCase, type IsoStep, type Json,
 } from "./isomorphism-corpus.js";
 
@@ -140,7 +140,7 @@ async function runCase(session: HostSession, c: IsoCase, host: Host): Promise<un
         let normalized: unknown;
         try {
             raw = await (session.middle.ops[step.op as keyof MiddleOps] as (p: unknown) => Promise<unknown>)(params);
-            normalized = normalizeResult(scopeLayerListing(step, raw), norm);
+            normalized = normalizeResult(scopeConnectResult(step, scopeLayerListing(step, raw)), norm);
         } catch (e) {
             raw = e;
             normalized = normalizeError(e, norm);

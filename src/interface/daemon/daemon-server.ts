@@ -307,9 +307,12 @@ export class DaemonServer {
                 return;
             }
             const op = typeof payload.op === "string" ? payload.op : "";
-            const params = (payload.params && typeof payload.params === "object" && !Array.isArray(payload.params))
-                ? payload.params as Record<string, unknown>
-                : {};
+            // 参数是对象或数组都原样交给操作（connectSshBatch 的参数就是一个数组——此前数组被换成
+            // 空对象，经 Daemon 调它必报「not iterable」）；缺失或标量按空参数
+            const raw = payload.params;
+            const params: Record<string, unknown> | unknown[] = Array.isArray(raw)
+                ? raw
+                : (raw && typeof raw === "object" ? raw as Record<string, unknown> : {});
             if (!op) {
                 this.sendJson(res, 400, { ok: false, error: "RPC 请求缺少 op 字段" });
                 return;
@@ -330,11 +333,11 @@ export class DaemonServer {
      * 薄转发：取操作 → 调用 → 回结果。这里不认识任何具体操作——参数校验、目标解析、
      * 路径解析与结果整形都在中层（src/middle/）或界面层。
      */
-    private dispatchOp(op: string, params: Record<string, unknown>): Promise<unknown> {
+    private dispatchOp(op: string, params: Record<string, unknown> | unknown[]): Promise<unknown> {
         if (!isRemoteOp(op)) {
             return Promise.reject(new Error(`未知 Daemon 操作: ${op}（可用：${REMOTE_OP_NAMES.join("、")}）`));
         }
-        const fn = (this.middle.ops as unknown as Record<string, (p: Record<string, unknown>) => Promise<unknown>>)[op]!;
+        const fn = (this.middle.ops as unknown as Record<string, (p: Record<string, unknown> | unknown[]) => Promise<unknown>>)[op]!;
         return fn.call(this.middle.ops, params);
     }
 
