@@ -331,22 +331,41 @@ export async function spawnDaemonBackground(opts: SpawnDaemonOptions): Promise<D
         env: { ...process.env, FILAXIS_DAEMON_DIR: daemonDir },
     });
 
-    let earlyExit: string | undefined;
+    let spawnError: string | undefined;
+    let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     child.once("error", (err) => {
-        earlyExit = `Daemon 进程启动失败: ${err.message}`;
+        spawnError = `Daemon 进程启动失败: ${err.message}`;
     });
     child.once("exit", (code, signal) => {
-        earlyExit = `Daemon 进程提前退出 (code=${code ?? "null"} signal=${signal ?? "none"})`;
+        exitInfo = { code, signal };
     });
     child.unref();
 
+    /** 别的启动器同时拉起、它赢了锁：照实说「已在运行」（与顺序启动时的报错同一句），不说「提前退出」 */
+    const alreadyRunning = async (): Promise<Error | undefined> => {
+        const winner = await probeDaemon(daemonDir, 500);
+        if (!winner) return undefined;
+        const status = await winner.status(1500).catch(() => undefined);
+        const pid = status?.pid;
+        return new Error(`Filaxis Daemon 已在运行 (pid=${pid ?? "?"}${status?.addr ? `, addr=${status.addr}` : ""})`);
+    };
+
     const deadline = Date.now() + readyTimeoutMs;
+    // 别人的 Daemon 已经在服务而本进程的子进程还没退：给它一点时间自己退（拿不到锁就会退），不必等到就绪超时
+    let otherSince: number | undefined;
     while (Date.now() < deadline) {
-        if (earlyExit) throw new Error(earlyExit);
+        if (spawnError) throw new Error(spawnError);
+        if (exitInfo) {
+            throw (await alreadyRunning()) ?? new Error(`Daemon 进程提前退出 (code=${exitInfo.code ?? "null"} signal=${exitInfo.signal ?? "none"})`);
+        }
         const client = await probeDaemon(daemonDir, 500);
         if (client) {
             const status = await client.status(1500).catch(() => undefined);
             if (status && status.pid === child.pid) return status;
+            if (status && status.pid !== undefined) {
+                otherSince ??= Date.now();
+                if (Date.now() - otherSince > 1500) throw (await alreadyRunning()) ?? new Error(`等待 Filaxis Daemon 就绪超时 (${readyTimeoutMs}ms)`);
+            }
         }
         await new Promise((r) => setTimeout(r, 80));
     }
