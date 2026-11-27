@@ -190,6 +190,8 @@ export class McpProtocolHandler {
                     // 未命中/unknown 终态可程序化分支，不吞成泛化字符串）
                     const err = (e !== null && typeof e === "object" ? e : {}) as {
                         outcome?: string;
+                        reason?: string;
+                        channel?: string;
                         terminalId?: string;
                         forwardId?: string;
                         sessionId?: string;
@@ -200,6 +202,8 @@ export class McpProtocolHandler {
                     const message = e instanceof Error ? e.message : String(e);
                     const details = {
                         outcome: err.outcome,
+                        reason: err.reason,
+                        channel: err.channel,
                         terminalId: err.terminalId,
                         forwardId: err.forwardId,
                         sessionId: err.sessionId,
@@ -211,6 +215,8 @@ export class McpProtocolHandler {
                     if (typeof err.outcome === "string" && err.outcome) {
                         evidence.push(`outcome=${singleLine(err.outcome)}`);
                     }
+                    if (typeof err.reason === "string" && err.reason) evidence.push(`reason=${singleLine(err.reason)}`);
+                    if (typeof err.channel === "string" && err.channel) evidence.push(`channel=${singleLine(err.channel)}`);
                     if (typeof err.terminalId === "string" && err.terminalId) {
                         evidence.push(`terminal_id=${singleLine(err.terminalId)}`);
                     }
@@ -402,6 +408,8 @@ function summarizeToolResult(name: string, value: unknown, textOnlyBatch: boolea
             if (step.layer !== undefined) header.push(`layer=${step.layer}`);
             if (step.exit_code !== undefined) header.push(`exit_code=${step.exit_code}`);
             if (step.outcome) header.push(`outcome=${step.outcome}`);
+            if (step.reason) header.push(`reason=${singleLine(step.reason)}`);
+            if (step.channel) header.push(`channel=${singleLine(step.channel)}`);
             if (step.edits) {
                 header.push(`replaced=${step.edits.occurrences}`);
                 if (step.edits.write_mode) header.push(`write_mode=${step.edits.write_mode}`);

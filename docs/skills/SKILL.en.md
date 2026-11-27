@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.13"
+  version: "0.3.0"
 description: |
   Use Filaxis (@syrkos/filaxis) to run commands across layers, batch inspections, manage background jobs, follow logs, or operate on files.
   Also use it to diagnose SSH aliases and jump hosts or interpret unknown outcomes and write guarantees. Skip for simple local shell commands and tasks unrelated to Filaxis.
@@ -167,6 +167,7 @@ Commands without a target still run on the local host. The SDK's `createAgentToo
 | **Tri-state termination** | `stop_session` / `stopSession` returns `exited` (verified exit code), `stopped` (verified termination), or `unknown` (verification unreachable — **neither success nor failure**). Verify with `verifySession(id)` / `stop_session` instead of assuming cleanup succeeded. |
 | **Exit code is data** | Nonzero command exit codes do **not** throw in `exec` / `run_command`. Only execution failures (timeout, abort, dead transport) reject or error. |
 | **Completion sentinel required** | Missing completion markers (disconnect, remote kill, local abort) produce `outcome: "unknown"` — never fabricate exit code `0` and never blindly replay non-idempotent commands. |
+| **Disconnect reason** | `reason: "disconnect"` identifies a detected disconnect on the reported `channel`. `outcome` describes what is known about the command's final state. |
 | **No never-ending commands in `exec`** | `exec` / `run_command` waits for completion — `tail -f` or `top` will time out. Use `observe_stream` (for streaming logs) or `start_session` (for managed background jobs). |
 | **Controlled edits** | CAS stands for compare-and-swap. Filaxis checks modification time, size, and a content fingerprint before writing and rejects a version conflict. Check `mutex` and `write_mode` separately. For file transfers, check `verification`. |
 | **PTY combines stderr** | `channel: "pty"` merges stdout and stderr by terminal semantics; default `exec` keeps them separate. |

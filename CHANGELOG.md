@@ -12,9 +12,9 @@
 
 ---
 
-## 未发布（0.3.0-dev）
+## 0.3.0
 
-> 架构级调整，含不兼容变更。设计见 [REQ-0004](./drafts/REQ-0004-layering.md)，长期方向见 [ROADMAP](./ROADMAP.md)。
+> 架构级调整，含不兼容变更。设计见 [REQ-0004](./drafts/REQ-0004-layering.md)。
 
 - **[用户]** 三层架构落地：**interface**（cli、mcp、给大模型用的工具面）/ **middle**（有状态的操作层，唯一实现）/ **core**（无状态执行内核）。中层由 `createMiddle()` 在进程内建立，或由 `connectRemoteMiddle(client)` 经 Daemon 使用，两者是同一个接口 `Middle`、方法签名一致。CLI、MCP、SDK 走的是同一组操作（26 个），不再各写一遍。
 - **[自挖]** **不兼容**：Daemon 线协议改为 `{protocol, op, params}`，操作名即中层操作名（原来的 `exec` / `cat` / `forward.add` / `stream.peek` 等方法名与 `clientCwd` / `target.cwd` 参数取消——与调用方机器相关的路径由调用方解析成绝对路径）。0.2.x 的客户端与 0.3.0 的 Daemon 互相显式拒绝，不会把请求交给对方执行。
@@ -56,8 +56,11 @@
 - **[自挖]** bun 运行时下 Daemon 停机不再等在途请求。有 `/rpc` 请求在处理中时 `DaemonServer.stop()` 在 bun 下（Linux 实测 1.3.12）一直挂着，要等那条命令跑完才返回；Node 下不受影响。停机时连接逐个销毁，`close` 回调加 500ms 兜底。
 - **[自挖]** 分层门禁（`bun run check:boundaries`）不再误拦真类型：类成员的标注（`class C { p: typeof import(…) }`）与带泛型的返回类型标注此前被当成动态取值拦下。补 58 条对抗语料：27 种取值写法全部拦下、31 种类型写法全部放行。
 - **[自挖]** 多个 `filaxis daemon start` 同时冷启动时，输家报「Filaxis Daemon 已在运行 (pid=…, addr=…)」，不再报「Daemon 进程提前退出 (code=1)」。此前真机 5 个并发，最终只有一个 Daemon（结果正确），其余 4 个像是 Daemon 崩了，照着排查会白费工夫。
-- **[自挖]** 调用方断开后，经 Daemon 的在途命令随即停掉。此前 `filaxis exec`（缺省经 Daemon）跑一条 8 秒的命令，中途 Ctrl-C 或杀掉 CLI，命令照跑到结束并写完收尾副作用；现在调用方的连接在应答之前断开，Daemon 就中止这一步的操作（`runCommand` / `runBatch` / `observe`），应答发完之后的断开不触发。
-- **[自挖]** 中止一条本机命令 = 停掉它的整棵进程树。此前中止（以及 Daemon 停机时的收尾）只对外层 shell 发 SIGTERM，而命令本就包在子 shell 里：外层死了，命令照跑到结束（Windows 与 Linux 实测一致）。现在 POSIX 下先把整棵树冻结、按父子表清点、逐个发 SIGTERM 再放开（外层先死的话子孙会被过继给 init，找不回来）；Windows 先按 Git Bash 自己的进程表清点整族再逐个连子树 `taskkill /T`（`taskkill /T` 沿 Windows 父子链找不到 Git Bash exec 出来的程序，`bash -c 'sleep 3; echo …'` 这类会活下来把后面的命令跑完）。命令与宿主的前台进程组关系没有变，终端 Ctrl-C 的语义照旧。**远端层不在其列**：中止杀的是本地 ssh，远端进程树是否停下未核实（两平台实测会跑完），错误里如实标注 `outcome: "unknown"`。
+- **[自挖]** Daemon 的 `/rpc` 在应答前检测到调用方断开时，会向在途的 `runCommand`、`runBatch`、`observe` 传递中止信号。目标命令的终态以所选通道能核实的结果为准。
+- **[GPT]** 断线错误保留 `reason: "disconnect"`、`channel` 和可核实的执行状态。Daemon 的无效 RPC 应答保留 `outcome: "unknown"`。MCP 只接受完整的 SSE 事件，单条 POST 传输失败只影响对应请求，迟到的重复结果会丢弃。SSH PTY 在输出排空后再判定完成哨兵。
+- **[GPT]** 远程 SDK 的 `AbortSignal` 作用于在途请求。信号已经中止时，尚未发出的命令与批次步骤会跳过。显式停止本机会话并确认其结束后返回 `stopped`，会话自然结束时仍可报告命令的退出码。
+- **[GPT]** Windows 本机命令取消时识别 Git Bash 启动器与实际 Bash 的 PID，已有的进程树清理可覆盖嵌套 Bash。
+- **[自挖]** 本机 `exec` 中止时尝试停止能识别到的本机进程。POSIX 按父子关系识别进程并发出 `SIGTERM`，Windows 尽量结合 Git Bash 的进程表执行 `taskkill /T`。忽略信号的进程和 Windows 启动的 WSL 内部进程可能继续运行。SSH exec 通道请求终止本地 SSH 进程，PTY 通道发送 Ctrl-C。命令终态未经核实时，错误携带 `outcome: "unknown"`。
 - **[自挖]** 上一条的运行时前提：bun 1.3.12（Linux 实测）在请求体读完后不再把连接的关闭送到 socket 上，Node 与 Windows 上的 bun 1.4.4 实测不受影响。Daemon 读 `/rpc` 请求体改为「读够 `Content-Length` 就暂停、应答后再放开」，请求流保持未完结才收得到断开；没有 `Content-Length` 的请求退回读完。
 
 ## 0.2.13

@@ -203,6 +203,9 @@ export class LocalRuntimeDriver implements RuntimeDriver {
             if (options?.timeoutMs != null && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) {
                 throw new Error(`timeoutMs 非法（${options.timeoutMs}）——须为正整数毫秒`);
             }
+            if (options?.signal?.aborted) {
+                throw new DOMException("Command aborted by AbortSignal（命令未发送）", "AbortError");
+            }
             const p = spawn(this.shell, ["-s"], {
                 env,
                 cwd,
@@ -308,7 +311,7 @@ export class LocalRuntimeDriver implements RuntimeDriver {
                 logStream?.end();
                 resumeOutput();
                 void writeStatus("aborted", { error: "Aborted by AbortSignal", exitCode: null });
-                const abortErr = new Error("Command aborted by AbortSignal（已向整棵进程树发 SIGTERM，终态未核实——outcome=unknown）") as Error & { name: "AbortError"; outcome: "unknown" };
+                const abortErr = new Error("Command aborted by AbortSignal（已尝试停止本机进程，命令终态未核实，outcome=unknown）") as Error & { name: "AbortError"; outcome: "unknown" };
                 abortErr.name = "AbortError";
                 abortErr.outcome = "unknown";
                 reject(abortErr);
@@ -462,7 +465,8 @@ function reapCommandTree(p: ChildProcess, shell: string): void {
  * 是孤儿，taskkill 找不到；它若是脚本（`bash -c 'sleep 3; echo …'`），会接着把后面的命令跑完
  * （真机复现）。MSYS 自己的进程表（ps -e，带 WINPID 列）认得完整的一族：先按它清点，再对清点到的
  * 每个进程连同各自的 Windows 子树一起 taskkill。清点必须在杀之前——杀了之后父子关系就散了。
- * 不是 Git Bash（ps 没有 WINPID 列）或表里找不到根时，退回只对根做 taskkill /T。
+ * Git for Windows 的 bin/bash.exe 是原生启动器，先查它的原生子进程以找到实际的 MSYS 根。
+ * ps 没有 WINPID 列或仍找不到根时，退回只对启动 PID 做 taskkill /T。
  */
 function reapCommandTreeWindows(rootWinpid: number, shell: string): void {
     const args = ["/T", "/F"];
@@ -471,9 +475,9 @@ function reapCommandTreeWindows(rootWinpid: number, shell: string): void {
     spawn("taskkill", args, { stdio: "ignore", windowsHide: true }).on("error", () => undefined);
 }
 
-/** 根（WINPID = rootWinpid）及其在 MSYS 进程表里的全部子孙的 Windows PID；不是 MSYS 的 ps 或找不到根时返回 null */
+/** 启动 PID 及从 MSYS 进程表查到的子孙 Windows PID。 */
 function msysFamilyWinpids(shell: string, rootWinpid: number): number[] | null {
-    const ps = spawnSync(shell, ["-c", "ps -e"], { encoding: "utf-8", windowsHide: true });
+    const ps = spawnSync(shell, ["-c", "command -p ps -e"], { encoding: "utf-8", windowsHide: true });
     if (ps.error || ps.status !== 0 || !ps.stdout.includes("WINPID")) return null;
     // PID PPID PGID WINPID TTY UID STIME COMMAND：只取前四列数字（STIME 含空格，后面的不再解析）
     const rows: Array<{ pid: number; ppid: number; winpid: number }> = [];
@@ -482,20 +486,22 @@ function msysFamilyWinpids(shell: string, rootWinpid: number): number[] | null {
         if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), winpid: Number(m[4]) });
     }
     const root = rows.find((r) => r.winpid === rootWinpid);
-    if (!root) return null;
-    const out = [rootWinpid];
-    let frontier = [root.pid];
-    while (frontier.length > 0) {
-        const next: number[] = [];
-        for (const r of rows) {
-            if (frontier.includes(r.ppid) && r.pid !== root.pid) {
-                out.push(r.winpid);
-                next.push(r.pid);
-            }
-        }
-        frontier = next;
-    }
-    return out;
+    // The Git launcher is absent from the MSYS table, but its actual Bash child appears there.
+    const launchChildren = root ? undefined : windowsChildPids(rootWinpid);
+    const roots = root ? [root] : rows.filter((r) => launchChildren?.has(r.winpid));
+    if (!roots.length) return null;
+    const parents = new Map(rows.map((r) => [r.pid, r.ppid]));
+    const family = new Set(roots.flatMap((r) => [r.pid, ...descendants(parents, r.pid)]));
+    return [...new Set([rootWinpid, ...rows.filter((r) => family.has(r.pid)).map((r) => r.winpid)])];
+}
+
+function windowsChildPids(pid: number): Set<number> {
+    const result = spawnSync("powershell.exe", [
+        "-NoProfile", "-NonInteractive", "-Command",
+        `Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${pid}' | Select-Object -ExpandProperty ProcessId`,
+    ], { encoding: "utf-8", windowsHide: true, timeout: 2500 });
+    if (result.error || result.status !== 0) return new Set();
+    return new Set(result.stdout.split(/\s+/).filter((value) => /^\d+$/.test(value)).map(Number));
 }
 
 /** pid → 父 pid。Linux 读 /proc，其余 POSIX 用 ps；取不到返回 null */

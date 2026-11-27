@@ -129,11 +129,11 @@ describe("MCP Server（REQ-0003）", () => {
             expect(existsSync(join(previous, "created"))).toBe(false);
 
             previousDriver.fs.rm = async () => {
-                throw Object.assign(new Error("connection lost"), { outcome: "unknown" });
+                throw Object.assign(new Error("connection lost"), { outcome: "unknown", reason: "disconnect", channel: "ssh_pty" });
             };
             expect(await call(11, "manage_path", { action: "delete", path: ".hidden" })).toMatchObject({
-                isError: true, content: [{ text: "outcome=unknown\nconnection lost" }],
-                structuredContent: { outcome: "unknown" },
+                isError: true, content: [{ text: "outcome=unknown\nreason=disconnect\nchannel=ssh_pty\nconnection lost" }],
+                structuredContent: { outcome: "unknown", reason: "disconnect", channel: "ssh_pty" },
             });
             const entries = Array.from({ length: 60 }, (_, i) => ({ name: `entry-${i}-${"雪".repeat(80)}-end`, isDirectory: false }));
             previousDriver.fs.readdir = async () => entries;

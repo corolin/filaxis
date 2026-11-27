@@ -25,5 +25,5 @@ export const REMOTE_OP_NAMES = [
 
 // 中层有、这里没有的操作：应为 never
 type MissingOps = Exclude<keyof MiddleOps, (typeof REMOTE_OP_NAMES)[number]>;
-const exhaustive: MissingOps[] = [];
+const exhaustive: [MissingOps] extends [never] ? true : never = true;
 void exhaustive;

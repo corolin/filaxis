@@ -14,6 +14,7 @@ import * as readline from "node:readline";
 import { StringDecoder } from "node:string_decoder";
 import { defaultDaemonDir, readDaemonConnection } from "../daemon/daemon-files.js";
 import { DaemonClient, parseAddrToUrl, ProtocolMismatchError, urlRequestHost, urlRequestPort } from "../daemon/daemon-client.js";
+import { isDisconnectedSocket } from "../../shared/connection-errors.js";
 import { noopLogger, type FilaxisLogger } from "../../shared/logger.js";
 import { PROTOCOL_VERSION } from "../../middle/protocol.js";
 import { CALLER_CWD_HEADER, encodeCallerCwd } from "./call-context.js";
@@ -185,10 +186,10 @@ export class McpStdioProxy {
         this.pumpQueue();
     }
 
-    private failOneInFlight(entry: InFlightRequest | undefined, message: string, data: { outcome?: "unknown"; statusCode?: number }): void {
-        if (!entry) return;
+    private failOneInFlight(entry: InFlightRequest | undefined, message: string, data: { outcome?: "unknown"; statusCode?: number; reason?: "disconnect"; channel?: "mcp_post" }): boolean {
+        if (!entry) return false;
         const key = idKey(entry.id);
-        if (this.inFlight.get(key) !== entry) return;
+        if (this.inFlight.get(key) !== entry) return false;
         this.inFlight.delete(key);
         this.writeStdout({
             jsonrpc: "2.0",
@@ -199,9 +200,10 @@ export class McpStdioProxy {
                 data: { method: entry.method, ...data },
             },
         });
+        return true;
     }
 
-    private failInFlight(reason: string): void {
+    private failInFlight(message: string, disconnected: boolean): void {
         if (this.inFlight.size === 0) return;
         const entries = [...this.inFlight.values()];
         this.inFlight.clear();
@@ -211,8 +213,12 @@ export class McpStdioProxy {
                 id: entry.id,
                 error: {
                     code: -32000,
-                    message: `${reason}——远端执行状态未知（outcome=unknown），内核不会自动重放该请求，请核实远端状态后由调用方决定是否重试`,
-                    data: { outcome: "unknown", method: entry.method },
+                    message: `${message}——执行终态未知（outcome=unknown），内核不会自动重放该请求，请核实状态后由调用方决定是否重试`,
+                    data: {
+                        outcome: "unknown",
+                        method: entry.method,
+                        ...(disconnected ? { reason: "disconnect", channel: "mcp_sse" } : {}),
+                    },
                 },
             });
         }
@@ -246,6 +252,7 @@ export class McpStdioProxy {
         };
 
         const payload = Buffer.from(item.raw, "utf-8");
+        let timeoutError: Error | undefined;
         const req = http.request({
             protocol: session.baseUrl.protocol,
             hostname: urlRequestHost(session.baseUrl),
@@ -267,41 +274,44 @@ export class McpStdioProxy {
                 if (code < 200 || code >= 300) {
                     const detail = Buffer.concat(chunks).toString("utf-8").slice(0, 200);
                     const rejectedBeforeExecution = code === 413;
-                    this.failOneInFlight(
+                    const failed = this.failOneInFlight(
                         entry,
                         `Daemon POST 失败 (HTTP ${code}): ${detail || "request rejected"}${rejectedBeforeExecution ? "" : "（outcome=unknown，不自动重放）"}`,
                         rejectedBeforeExecution ? { statusCode: code } : { statusCode: code, outcome: "unknown" },
                     );
-                    if (code === 401 || code === 404) {
+                    if ((!entry || failed) && (code === 401 || code === 404)) {
                         if (this.activeSession === session) session.abort();
                     }
                 }
                 this.pumpQueue();
             });
-            res.on("error", (err) => {
+            const onResponseError = (err: Error, disconnected = isDisconnectedSocket(err)) => {
                 releaseNotif();
+                const cause = timeoutError ?? err;
                 this.failOneInFlight(
                     entry,
-                    `Daemon POST 响应读取失败（${err.message}）——远端执行状态未知（outcome=unknown），不自动重放`,
-                    { outcome: "unknown" },
+                    `Daemon POST 响应读取失败（${cause.message}）——执行终态未知（outcome=unknown），不自动重放`,
+                    !timeoutError && disconnected ? { outcome: "unknown", reason: "disconnect", channel: "mcp_post" } : { outcome: "unknown" },
                 );
-                if (this.activeSession === session) session.abort();
                 this.pumpQueue();
-            });
+            };
+            res.on("error", onResponseError);
+            res.on("aborted", () => onResponseError(new Error("Daemon POST 应答中断"), true));
         });
 
         req.setTimeout(POST_TIMEOUT_MS, () => {
-            req.destroy(new Error(`Daemon POST 超时 (${POST_TIMEOUT_MS}ms)`));
+            timeoutError = new Error(`Daemon POST 超时 (${POST_TIMEOUT_MS}ms)`);
+            req.destroy(timeoutError);
         });
 
         req.on("error", (err) => {
             releaseNotif();
+            const cause = timeoutError ?? err;
             this.failOneInFlight(
                 entry,
-                `Daemon POST 连接失败（${err.message}）——远端执行状态未知（outcome=unknown），不自动重放`,
-                { outcome: "unknown" },
+                `Daemon POST 连接失败（${cause.message}）——执行终态未知（outcome=unknown），不自动重放`,
+                !timeoutError && isDisconnectedSocket(err) ? { outcome: "unknown", reason: "disconnect", channel: "mcp_post" } : { outcome: "unknown" },
             );
-            if (this.activeSession === session) session.abort();
             this.pumpQueue();
         });
 
@@ -334,11 +344,12 @@ export class McpStdioProxy {
                 await this.runSseSession(conn.addr, conn.token);
             } catch (err) {
                 if (!this.closed) {
-                    this.log.warn(`[mcp-proxy] SSE 会话断开: ${err instanceof Error ? err.message : String(err)}`);
+                    const message = err instanceof Error ? err.message : String(err);
+                    this.log.warn(`[mcp-proxy] SSE 会话结束: ${message}`);
+                    this.failInFlight(message, err instanceof SseDisconnectError);
                 }
             }
             if (!this.closed) {
-                this.failInFlight("Daemon SSE 连接中断");
                 await this.waitReconnect();
             }
         }
@@ -491,9 +502,10 @@ export class McpStdioProxy {
                     }
                     if (event === "message" || event === "") {
                         try {
-                            const msg = JSON.parse(payload) as { id?: unknown };
-                            if (msg && (typeof msg.id === "number" || typeof msg.id === "string")) {
-                                this.inFlight.delete(idKey(msg.id));
+                            const msg = JSON.parse(payload) as { id?: unknown; method?: unknown };
+                            if (msg && typeof msg.method !== "string" && (typeof msg.id === "number" || typeof msg.id === "string")) {
+                                // A failed POST may still have reached the server and produced a late response.
+                                if (!this.inFlight.delete(idKey(msg.id))) return;
                             }
                         } catch { /* 原样透传 */ }
                         this.writeStdout(payload);
@@ -501,7 +513,7 @@ export class McpStdioProxy {
                     }
                 };
 
-                const processLines = (final: boolean) => {
+                const processLines = () => {
                     for (;;) {
                         const nl = buf.indexOf("\n");
                         if (nl === -1) break;
@@ -519,41 +531,32 @@ export class McpStdioProxy {
                             dataLines.push(val);
                         }
                     }
-                    if (final && buf.length > 0) {
-                        const line = buf.replace(/\r$/, "");
-                        buf = "";
-                        if (line.startsWith("data:")) {
-                            let val = line.slice("data:".length);
-                            if (val.startsWith(" ")) val = val.slice(1);
-                            dataLines.push(val);
-                        }
-                        flushEvent();
-                    }
                 };
 
                 res.on("data", (chunk: Buffer) => {
                     lastSeenAt = Date.now();
                     buf += dec.write(chunk);
-                    processLines(false);
+                    processLines();
                 });
                 res.on("end", () => {
-                    buf += dec.end();
-                    processLines(true);
-                    finish(new Error("SSE 流意外结束"));
+                    // Only the terminating blank line commits an SSE event.
+                    finish(new SseDisconnectError("Daemon SSE 流意外结束"));
                 });
                 res.on("close", () => {
-                    finish(new Error("SSE 连接已关闭"));
+                    finish(new SseDisconnectError("Daemon SSE 连接已关闭"));
                 });
                 res.on("error", (err) => {
-                    finish(err instanceof Error ? err : new Error(String(err)));
+                    finish(isDisconnectedSocket(err) ? new SseDisconnectError(err.message) : err);
                 });
             });
 
             reqRef = req;
             req.on("error", (err) => {
-                finish(err instanceof Error ? err : new Error(String(err)));
+                finish(isDisconnectedSocket(err) ? new SseDisconnectError(err.message) : err);
             });
             req.end();
         });
     }
 }
+
+class SseDisconnectError extends Error {}

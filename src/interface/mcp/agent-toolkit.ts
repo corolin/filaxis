@@ -272,6 +272,7 @@ export interface AgentToolHandlers {
         status: "ok" | "fail"; failed_step?: string;
         steps: Array<{
             id: string; layer?: string; kind: string; status: string; exit_code?: number; outcome?: "unknown"; stdout?: string; stderr?: string; error?: string; skipped_because?: string;
+            reason?: "disconnect"; channel?: string;
             transfer?: AgentFileTransferResult;
             edits?: { path: string; occurrences: number; bytes_before: number; bytes_after: number; hunks: Array<{ old: string; new: string; occurrences: number }>; mutex?: "flock" | "degraded"; write_mode?: "atomic-replace" | "inplace-write" };
         }>;
@@ -989,6 +990,10 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
         const drv = layer === undefined
             ? await middle.resolveLayerRef(undefined)
             : middle.stack.layers.get(layer)?.driver;
+        if (!drv && typeof layer === "string") {
+            const saved = middle.savedLayerDescriptor?.(layer);
+            return saved?.driver === "local" && !saved.cwd;
+        }
         if (!drv || drv.descriptor?.driver !== "local" || drv.descriptor.cwd) return false;
         // 以驱动实例登记的层，描述符里不带 cwd，工作目录只在驱动身上：它的实际目录就是本进程的
         // 缺省目录时才算「没有自己的工作目录」（否则是层自己的，路径相对它）
@@ -1395,6 +1400,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                         ...(s.layer !== undefined ? { layer: s.layer } : {}),
                         ...(s.exitCode != null ? { exit_code: s.exitCode } : {}),
                         ...(s.outcome === "unknown" ? { outcome: "unknown" } : {}),
+                        ...(s.reason ? { reason: s.reason } : {}),
+                        ...(s.channel ? { channel: s.channel } : {}),
                         ...(s.stdout != null ? { stdout: s.stdout } : {}),
                         ...(s.stderr != null ? { stderr: s.stderr } : {}),
                         ...(s.error != null ? { error: s.error } : {}),

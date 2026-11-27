@@ -358,12 +358,13 @@ export class DaemonServer {
             return;
         }
         try {
-            // 调用方在应答之前断开（Ctrl-C、进程被杀、网络断）→ 中止它在途的操作：命令不再陪着一个已经没人等的调用跑完。
-            // 应答发完之后连接自然关闭不触发（监听在应答后摘掉）。此前经 Daemon 的命令活过被中断的 CLI，一次性模式下却随 CLI 一起停
+            // 在应答前检测到调用方断开，就向支持中止的在途操作传递信号。目标终态由对应驱动判断。
+            // 应答发出后摘掉监听，连接自然关闭时不再触发。
             const abort = new AbortController();
             const socket = req.socket;
             const onGone = (): void => abort.abort(new Error("调用方已断开"));
             socket.on("close", onGone);
+            if (socket.destroyed) onGone();
             try {
                 const result = await this.dispatchOp(op, params, abort.signal);
                 this.sendJson(res, 200, { ok: true, protocol: PROTOCOL_VERSION, result });
@@ -377,8 +378,7 @@ export class DaemonServer {
     }
 
     /**
-     * 薄转发：取操作 → 调用 → 回结果。这里不认识任何具体操作——参数校验、目标解析、
-     * 路径解析与结果整形都在中层（src/middle/）或界面层。只有带在途执行的操作收 signal。
+     * 薄转发负责选择操作和注入宿主的中止信号。命令、目标层和执行结果的语义由中层与驱动处理。
      */
     private dispatchOp(op: string, params: Record<string, unknown> | unknown[], signal: AbortSignal): Promise<unknown> {
         if (!isRemoteOp(op)) {
@@ -511,6 +511,8 @@ function isRemoteOp(name: string): name is (typeof REMOTE_OP_NAMES)[number] {
 function serializeRpcError(err: unknown): Record<string, unknown> {
     const obj = (err !== null && typeof err === "object" ? err : {}) as {
         outcome?: unknown;
+        reason?: unknown;
+        channel?: unknown;
         sessionId?: unknown;
         logBase?: unknown;
         exitCode?: unknown;
@@ -526,6 +528,8 @@ function serializeRpcError(err: unknown): Record<string, unknown> {
         ...(typeof obj.code === "string" || typeof obj.code === "number" ? { code: obj.code } : {}),
         ...(typeof obj.partialOutput === "string" ? { partialOutput: obj.partialOutput } : {}),
         ...(obj.outcome !== undefined ? { outcome: obj.outcome } : {}),
+        ...(typeof obj.reason === "string" ? { reason: obj.reason } : {}),
+        ...(typeof obj.channel === "string" ? { channel: obj.channel } : {}),
         ...(obj.sessionId !== undefined ? { sessionId: obj.sessionId } : {}),
         ...(obj.logBase !== undefined ? { logBase: obj.logBase } : {}),
         ...(obj.exitCode !== undefined ? { exitCode: obj.exitCode } : {}),

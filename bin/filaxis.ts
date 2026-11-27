@@ -725,7 +725,9 @@ function printBatchReport(r: BatchReport, outDir?: string): void {
     const usedNames = new Set<string>();
     const spillCount = { n: 0 };
     for (const s of r.steps) {
-        const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})${s.layer === undefined ? "" : ` layer=${s.layer}`}`;
+        const outcome = s.outcome ? ` outcome=${s.outcome}` : "";
+        const disconnect = s.reason === "disconnect" ? ` reason=disconnect${s.channel ? ` channel=${s.channel}` : ""}` : "";
+        const head = `[${s.status}] ${s.id} (${s.kind}${s.durationMs != null ? ` ${s.durationMs}ms` : ""})${s.layer === undefined ? "" : ` layer=${s.layer}`}${outcome}${disconnect}`;
         if (s.status === "skipped") {
             console.log(`${head} — ${s.skippedBecause}`);
             continue;
@@ -1443,8 +1445,9 @@ async function runTargetCommand(
 }
 
 void main().catch((err) => {
-    const { message, outcome, forwardId } = err as Error & { outcome?: string; forwardId?: string };
+    const { message, outcome, reason, channel, forwardId } = err as Error & { outcome?: string; reason?: string; channel?: string; forwardId?: string };
     const detail = outcome === "unknown" && !message.includes("outcome=unknown") ? " (outcome=unknown)" : "";
-    console.error(`[filaxis] ${message}${detail}${forwardId ? ` forward_id=${forwardId}` : ""}`);
+    const disconnect = reason === "disconnect" ? ` (reason=disconnect${channel ? ` channel=${channel}` : ""})` : "";
+    console.error(`[filaxis] ${message}${detail}${disconnect}${forwardId ? ` forward_id=${forwardId}` : ""}`);
     process.exit(1);
 });

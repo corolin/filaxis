@@ -1,7 +1,7 @@
 ---
 name: filaxis-runtime
 metadata:
-  version: "0.2.13"
+  version: "0.3.0"
 description: |
   使用 Filaxis（@syrkos/filaxis）执行跨层命令、批量巡检、管理后台任务、观察日志或操作目标层文件。
   也用于排查 SSH 别名与跳板、解读 unknown 终态或写入保障。纯本机一次性命令和与 Filaxis 无关的任务可跳过。
@@ -154,6 +154,7 @@ MCP 工具面没变：12 个工具名、参数 schema、snake_case 字段都照�
 | **终态三态** | `exited`（有真实退出码）/ `stopped`（死亡已核实）/ `unknown`（核实不可达——**既非成功也非失败**）；unknown 后用 `verifySession(id)` 实测（running/exited/unknown） |
 | **退出码是数据** | exec 非零退出码不抛异常；只有「无法执行」（超时/断链/abort）才 reject |
 | **完成哨兵是唯一凭证** | 无哨兵（断链/远端 kill）= reject + `outcome:"unknown"`——绝不伪造退出码，绝不自动重放非幂等命令 |
+| **断线原因** | `reason: "disconnect"` 表示已检测到 `channel` 指定的通道断开。命令终态仍以 `outcome` 为准 |
 | **永不结束的命令不进 exec** | exec 是「等完成」语义——`tail -f`/`top` 必超时；换 observe / 会话+watcher |
 | **受控编辑** | CAS 全称 Compare-and-Swap（比较后写回）。写前比较文件修改时间、大小和内容指纹，发现冲突就拒绝写回。分别查看 `mutex` 与 `writeMode`。传输校验等级见 `verification` |
 | **PTY 通道 stderr 混流** | 终端物理语义不是 bug；exec 通道才分离 |

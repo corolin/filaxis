@@ -65,7 +65,9 @@ interface SessionEntry {
     supervisor?: ReturnType<typeof startLocalObservation>;
     closed?: Promise<void>;
     confirming?: Promise<boolean>;
-    stopping?: Promise<{ status: "exited" | "unknown"; exitCode?: number | null }>;
+    stopping?: Promise<{ status: "stopped" | "exited" | "unknown"; exitCode?: number | null }>;
+    stopRequested?: boolean;
+    stopped?: boolean;
     commandExitCode?: number | null;
     running: boolean;
     exitCode?: number | null;
@@ -425,19 +427,21 @@ export class LocalSessionManager {
     async stop(sessionId: string): Promise<{ status: "exited" | "stopped" | "unknown"; exitCode?: number | null }> {
         const entry = this.require(sessionId);
         if (!entry.running) {
+            if (entry.stopped) return { status: "stopped" };
             return { status: "exited", exitCode: entry.exitCode };
         }
         if (entry.supervisor) {
             const supervisor = entry.supervisor;
             entry.stopping ??= (async () => {
                 try { supervisor.requestStop("SIGTERM"); } catch { return { status: "unknown" as const }; }
+                entry.stopRequested = true;
                 const escalation = setTimeout(() => {
                     try { supervisor.requestStop(); } catch { /* The confirmation path can still return unknown. */ }
                 }, KILL_GRACE_MS);
                 try {
-                    return await this.confirmSupervisedExit(entry)
-                        ? { status: "exited" as const, exitCode: entry.exitCode }
-                        : { status: "unknown" as const };
+                    if (!await this.confirmSupervisedExit(entry)) return { status: "unknown" as const };
+                    if (entry.stopped) return { status: "stopped" as const };
+                    return { status: "exited" as const, exitCode: entry.exitCode };
                 } finally { clearTimeout(escalation); }
             })().finally(() => { entry.stopping = undefined; });
             return entry.stopping;
@@ -494,7 +498,8 @@ export class LocalSessionManager {
                     timer = setTimeout(() => reject(new Error("session stop confirmation timed out")), timeout);
                 })]);
                 if (this.entries.get(entry.sessionId) !== entry) return false;
-                this.finalize(entry, entry.commandExitCode ?? null);
+                entry.stopped = entry.stopRequested;
+                this.finalize(entry, entry.stopped ? null : entry.commandExitCode ?? null);
                 return true;
             } catch {
                 return false;
@@ -523,7 +528,7 @@ export class LocalSessionManager {
     sessionState(sessionId: string): { status: "running" | "exited" | "stopped"; exitCode: number | null } | undefined {
         const entry = this.entries.get(sessionId);
         if (!entry) return undefined;
-        const status = entry.running ? "running" : "exited";
+        const status = entry.running ? "running" : entry.stopped ? "stopped" : "exited";
         return { status, exitCode: entry.exitCode ?? null };
     }
 

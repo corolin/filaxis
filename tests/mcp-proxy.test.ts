@@ -17,6 +17,7 @@ import { PROTOCOL_VERSION } from "../src/middle/protocol.js";
 import { CALLER_CWD_HEADER, decodeCallerCwd, encodeCallerCwd } from "../src/interface/mcp/call-context.js";
 import {
     createAgentToolkit,
+    createMiddle,
     DaemonClient,
     DaemonServer,
     daemonPaths,
@@ -499,7 +500,7 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             const errResp = await waitForResponse(fx.responses, 99);
             expect(errResp.error).toMatchObject({
                 code: -32000,
-                data: { outcome: "unknown", method: "tools/call" },
+                data: { outcome: "unknown", method: "tools/call", reason: "disconnect", channel: "mcp_sse" },
             });
 
             srv2 = new DaemonServer({ daemonDir: dir, toolkit: makeMockToolkit() });
@@ -596,6 +597,74 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             rmSync(dir, { recursive: true, force: true });
         }
     }, 8_000);
+
+    test("isolates POST failures, drops duplicate responses and discards an incomplete SSE event at EOF", async () => {
+        const dir = makeTempDir("fx-mcp-response-boundaries-");
+        let stream: http.ServerResponse;
+        let firstPost: http.IncomingMessage;
+        let sseConnections = 0;
+        const response = (id: number) => ({ jsonrpc: "2.0", id, result: {} });
+        const event = (id: number) => `event: message\ndata: ${JSON.stringify(response(id))}`;
+        const stub = http.createServer(async (req, res) => {
+            if (req.url === "/status") {
+                res.end(JSON.stringify({ ok: true, result: { protocolVersion: PROTOCOL_VERSION } }));
+            } else if (req.url === "/mcp/sse") {
+                sseConnections++;
+                stream = res;
+                res.writeHead(200, { "Content-Type": "text/event-stream" });
+                res.write("event: endpoint\ndata: /post\n\n");
+            } else {
+                const chunks: Buffer[] = [];
+                for await (const chunk of req) chunks.push(chunk);
+                const { id } = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as { id: number };
+                if (id === 1) {
+                    firstPost = req;
+                    stream.write(`${event(id)}\n\n`);
+                } else if (id === 2) {
+                    res.writeHead(202).end();
+                    firstPost.socket.destroy();
+                    setTimeout(() => stream.write(`${event(id)}\n\n`), 100);
+                } else if (id === 3) {
+                    req.socket.destroy();
+                } else if (id === 4) {
+                    res.writeHead(202).end();
+                    stream.write(`${event(3)}\n\n${event(id)}\n\n`);
+                } else {
+                    res.writeHead(202).end();
+                    stream.end(event(id));
+                }
+            }
+        });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        try {
+            await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
+            const { addrFile, tokenFile } = daemonPaths(dir);
+            writePrivateFileAtomic(addrFile, `127.0.0.1:${(stub.address() as { port: number }).port}`);
+            writePrivateFileAtomic(tokenFile, "fixture");
+            fx = attachProxyFixture({ daemonDir: dir });
+            for (const id of [1, 2]) {
+                fx.send({ jsonrpc: "2.0", id, method: "ping" });
+                expect(await waitForResponse(fx.responses, id)).toEqual(response(id));
+            }
+            fx.send({ jsonrpc: "2.0", id: 3, method: "ping" });
+            expect((await waitForResponse(fx.responses, 3)).error).toMatchObject({
+                data: { outcome: "unknown", reason: "disconnect", channel: "mcp_post" },
+            });
+            fx.send({ jsonrpc: "2.0", id: 4, method: "ping" });
+            expect(await waitForResponse(fx.responses, 4)).toEqual(response(4));
+            expect(sseConnections).toBe(1);
+            expect(fx.responses.filter((msg) => msg.id === 3)).toHaveLength(1);
+            fx.send({ jsonrpc: "2.0", id: 5, method: "ping" });
+            expect((await waitForResponse(fx.responses, 5)).error).toMatchObject({
+                data: { outcome: "unknown", reason: "disconnect", channel: "mcp_sse" },
+            });
+        } finally {
+            fx?.proxy.close();
+            stub.closeAllConnections();
+            await new Promise<void>((resolve) => stub.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
 
     /** 起一个 filaxis-mcp 子进程并收齐它的 JSON-RPC 响应 */
     function spawnMcp(args: string[], extraEnv: Record<string, string> = {}) {
@@ -1175,7 +1244,8 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         const dirB = makeTempDir("fx-mcp-caller-b-");
         writeFileSync(join(dirA, "marker.txt"), "from-a\n");
         writeFileSync(join(dirB, "marker.txt"), "from-b\n");
-        const srv = new DaemonServer({ daemonDir, version: "test" });
+        const middle = createMiddle({ savedLayers: () => ({ savedLocal: { driver: "local" } }) });
+        const srv = new DaemonServer({ daemonDir, version: "test", middle });
         const sessions: Array<{ res: http.IncomingMessage; post: string }> = [];
         try {
             const addr = await srv.start();
@@ -1220,8 +1290,8 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             });
             // 并发：A 读文件 + 报目录，B 读文件 + 写一个文件
             await Promise.all([
-                call(a, 1, "read_path", { path: "marker.txt" }),
-                call(a, 2, "run_command", { command: "pwd" }),
+                call(a, 1, "read_path", { layer: "savedLocal", path: "marker.txt" }),
+                call(a, 2, "run_command", { layer: "savedLocal", command: "pwd" }),
                 call(b, 3, "read_path", { path: "marker.txt" }),
                 call(b, 4, "edit_file", { path: "written-by-b.txt", content: "b\n" }),
             ]);

@@ -125,6 +125,8 @@ export interface BatchStepReport {
      * 据此决定是否可安全重试（非幂等步骤严禁自动重放）。
      */
     outcome?: "unknown";
+    reason?: "disconnect";
+    channel?: string;
     /** edit：多 hunk 明细（old/new 文本即编辑预览） */
     edits?: { path: string; occurrences: number; bytesBefore: number; bytesAfter: number; hunks: EditMultiHunk[]; mutex?: "flock" | "degraded"; writeMode?: "atomic-replace" | "inplace-write" };
     transfer?: LayerFileTransferResult;
@@ -304,7 +306,7 @@ export async function runBatch(
 
     const inflight = new Set<Promise<void>>();
     const pull = (): void => {
-        while (ready.length && inflight.size < maxParallel && !(failedStep && stopOnFail)) {
+        while (ready.length && inflight.size < maxParallel && !signal?.aborted && !(failedStep && stopOnFail)) {
             const group = ready[0]!;
             const step = group.steps[group.nextStep++]!;
             if (group.nextStep === group.steps.length) removeHead();
@@ -327,10 +329,12 @@ export async function runBatch(
     pull();
     while (inflight.size) await Promise.all([...inflight]);
 
+    let skippedOnAbort = false;
     for (const group of groups.values()) {
         const skipped = group.steps.filter((step) => !reports.has(step.id));
         if (!skipped.length) continue;
-        const skippedBecause = failedStep && stopOnFail
+        if (signal?.aborted) skippedOnAbort = true;
+        const skippedBecause = signal?.aborted ? "批次已中止" : failedStep && stopOnFail
             ? `批次失败于 '${failedStep}'（fail-fast）`
             : `依赖步骤未 ok（${group.after.flatMap((dep) => groups.get(dep)!.steps
                 .filter((step) => reports.get(step.id)?.status !== "ok").map((step) => step.id)).join(", ")}）`;
@@ -340,7 +344,7 @@ export async function runBatch(
     }
 
     const steps = expandedSteps.map((s) => reports.get(s.id)!);
-    return { status: failedStep ? "fail" : "ok", steps, failedStep };
+    return { status: failedStep || skippedOnAbort ? "fail" : "ok", steps, failedStep };
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -578,9 +582,11 @@ async function runStep(drv: RuntimeDriver, s: ResolvedBatchStep, previewBytes?: 
         // 判空优先（GPT Astra 四轮 #3）：自定义 driver 可能 throw null/undefined——
         // 直接读 (err as {outcome}).outcome 会再抛 TypeError，catch 块崩掉整份 runBatch
         // 报告。先归一化再提取字段。
-        const outcome = raw != null && typeof raw === "object" && (raw as { outcome?: string }).outcome === "unknown"
+        const details = raw !== null && typeof raw === "object" ? raw as { outcome?: unknown; reason?: unknown; channel?: unknown } : undefined;
+        const outcome = details?.outcome === "unknown"
             ? ("unknown" as const)
             : undefined;
+        const disconnected = details?.reason === "disconnect";
         // outcome:"unknown" 透传（宪法字段）：超时/abort/连接死=远端终态未核实——
         // 调用方须按未知处理（非幂等步骤严禁自动重放），不能当确定失败
         return {
@@ -588,6 +594,8 @@ async function runStep(drv: RuntimeDriver, s: ResolvedBatchStep, previewBytes?: 
             status: "fail",
             durationMs: Date.now() - startedAt,
             ...(outcome ? { outcome } : {}),
+            ...(disconnected ? { reason: "disconnect" as const } : {}),
+            ...(disconnected && typeof details.channel === "string" ? { channel: details.channel } : {}),
             error: raw instanceof Error ? raw.message : String(raw ?? "driver 抛出空异常（null/undefined）"),
         };
     }

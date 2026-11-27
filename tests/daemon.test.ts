@@ -14,6 +14,7 @@ import {
     cleanupDaemonFiles,
     DaemonClient,
     DaemonServer,
+    connectRemoteMiddle,
     daemonPaths,
     generateDaemonToken,
     LocalRuntimeDriver,
@@ -279,6 +280,34 @@ describe("DaemonServer & DaemonClient RPC", () => {
         } finally {
             await srv.stop();
             rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("an invalid RPC result leaves the execution outcome unknown", async () => {
+        const responses = new Map([
+            ["Bearer invalid-json", "invalid JSON"],
+            ["Bearer missing-result", '{"ok":true}'],
+            ["Bearer missing-error", '{"ok":false}'],
+        ]);
+        const stub = http.createServer((req, res) => {
+            req.resume();
+            req.on("end", () => {
+                res.end(responses.get(req.headers.authorization ?? ""));
+            });
+        });
+        try {
+            await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
+            const addr = `127.0.0.1:${(stub.address() as { port: number }).port}`;
+            for (const token of ["invalid-json", "missing-result", "missing-error"]) {
+                const client = new DaemonClient({ addr, token });
+                const error = await client.rpc("runCommand", { command: "fixture" }).catch((error: unknown) => error);
+                expect(error).toBeInstanceOf(Error);
+                expect(error).toHaveProperty("outcome", "unknown");
+                expect(error).not.toHaveProperty("reason");
+            }
+        } finally {
+            stub.closeAllConnections();
+            await new Promise<void>((resolve) => stub.close(() => resolve()));
         }
     });
 
@@ -1013,8 +1042,14 @@ describe("CLI daemon / forward / stream E2E", () => {
 
     test("[P2] RPC mid-flight socket drop preserves error and tags outcome='unknown'", async () => {
         const dir = makeTempDir("fx-daemon-rpc-drop-");
+        let dropConnection = true;
         const stub = http.createServer((req, res) => {
             if (req.method === "GET" && req.url === "/status") {
+                if (!dropConnection) {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.write("{");
+                    return;
+                }
                 // 上报线协议版本（REQ-0004 §6.2）：CLI 过了握手才会发 RPC，这条用例测的才是 RPC 中途断连
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ ok: true, result: { pid: 1, version: "stub", protocolVersion: PROTOCOL_VERSION, layers: [], forwards: [], streams: [] } }));
@@ -1022,7 +1057,7 @@ describe("CLI daemon / forward / stream E2E", () => {
             }
             req.on("data", () => undefined);
             req.on("end", () => {
-                req.socket.destroy();
+                if (dropConnection) req.socket.destroy();
             });
         });
         await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", () => resolve()));
@@ -1036,7 +1071,7 @@ describe("CLI daemon / forward / stream E2E", () => {
                 caught = e as Error & { outcome?: unknown; code?: unknown };
             }
             expect(caught).toBeInstanceOf(Error);
-            expect(caught?.outcome).toBe("unknown");
+            expect(caught).toMatchObject({ outcome: "unknown", reason: "disconnect", channel: "daemon_rpc" });
 
             const paths = daemonPaths(dir);
             writePrivateFileAtomic(paths.addrFile, `127.0.0.1:${port}`);
@@ -1054,11 +1089,57 @@ describe("CLI daemon / forward / stream E2E", () => {
             expect(exitCode).toBe(1);
             expect(stdout).toBe("");
             expect(stderr).toContain("outcome=unknown");
+            expect(stderr).toContain("reason=disconnect channel=daemon_rpc");
+
+            dropConnection = false;
+            const timedOut = client.status(200);
+            await expect(timedOut).rejects.toThrow("Daemon 请求超时");
+            await expect(timedOut).rejects.not.toHaveProperty("reason");
         } finally {
+            stub.closeAllConnections();
             await new Promise<void>((resolve) => stub.close(() => resolve()));
             rmSync(dir, { recursive: true, force: true });
         }
     }, 10_000);
+
+    test("remote SDK AbortSignal cancels the RPC and leaves the issued command outcome unknown", async () => {
+        const srv = new DaemonServer({ writeFiles: false });
+        const driver = new LocalRuntimeDriver();
+        let calls = 0;
+        let markStarted!: () => void;
+        let markAborted!: () => void;
+        const started = new Promise<void>((resolve) => { markStarted = resolve; });
+        const aborted = new Promise<void>((resolve) => { markAborted = resolve; });
+        driver.exec = async (_command, options) => {
+            calls++;
+            await new Promise<void>((resolve) => {
+                options!.signal!.addEventListener("abort", resolve as () => void, { once: true });
+                markStarted();
+            });
+            markAborted();
+            throw new Error("command interrupted");
+        };
+        try {
+            const addr = await srv.start();
+            await srv.stack.addLayer("fixture", driver);
+            const middle = await connectRemoteMiddle(new DaemonClient({ addr, token: srv.token }));
+            const preAborted = middle.ops.runCommand({ layer: "fixture", command: "echo fixture", signal: AbortSignal.abort() });
+            await expect(preAborted).rejects.toMatchObject({ name: "AbortError" });
+            await expect(preAborted).rejects.not.toHaveProperty("outcome");
+            expect(calls).toBe(0);
+
+            const abort = new AbortController();
+            const result = middle.ops.runCommand({ layer: "fixture", command: "echo fixture", signal: abort.signal });
+            const rejection = result.catch((error: unknown) => error);
+            await started;
+            abort.abort("caller disconnected");
+            expect(await rejection).toMatchObject({ name: "AbortError", outcome: "unknown" });
+            await aborted;
+            expect(calls).toBe(1);
+        } finally {
+            await srv.stop();
+        }
+    }, 30_000);
 
     test("preserves confirmed RPC errors without marking their outcome unknown", async () => {
         const srv = new DaemonServer({ writeFiles: false });
@@ -1076,7 +1157,7 @@ describe("CLI daemon / forward / stream E2E", () => {
 
             const driver = new LocalRuntimeDriver();
             const failure = Object.assign(new Error("fixture command interrupted"), {
-                name: "AbortError", code: "ABORT_ERR", outcome: "unknown", partialOutput: "fixture output",
+                code: "E_PTY_CLOSED", outcome: "unknown", reason: "disconnect", channel: "ssh_pty", partialOutput: "fixture output",
             });
             driver.exec = async () => { throw failure; };
             await srv.stack.addLayer("fixture", driver);
@@ -1084,6 +1165,7 @@ describe("CLI daemon / forward / stream E2E", () => {
                 layer: "fixture", command: "fixture",
             })).rejects.toMatchObject({
                 name: failure.name, code: failure.code, outcome: failure.outcome, partialOutput: failure.partialOutput,
+                reason: failure.reason, channel: failure.channel,
             });
 
             driver.exec = async () => { throw { toString: () => "internal error details" }; };

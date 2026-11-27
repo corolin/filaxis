@@ -51,6 +51,7 @@ class PtyLink {
     private assembler = new LineAssembler();
     private lineBuffer: string[] = [];
     private ready = false;
+    private drainingTransport = false;
     private readyWaiter?: () => void;
     private readyRejecter?: (e: Error) => void;
     private rawArrived = false;
@@ -102,6 +103,7 @@ class PtyLink {
         // 递 EPIPE（写入静默缓冲/丢弃）——本监听主要保护 **Node 宿主**（SDK dist
         // 同发 node 包）；Bun 侧同类故障由 markerCycle 发送同步抛路径兜底
         this.proc.stdin.on("error", (e: Error) => {
+            if (this.drainingTransport) return;
             const err = new Error(`ssh stdin 写入失败（${e.message}）——PTY 链已断: ${(e as { code?: string }).code ?? ""}`);
             if (this.readyRejecter) this.readyRejecter(err);
             else if (!this.pendingExitFailure) this.pendingExitFailure = err;
@@ -115,12 +117,13 @@ class PtyLink {
         let sawAnyOutput = false;
         this.proc.stdout.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(outDec.write(d)); });
         this.proc.stderr.on("data", (d: Buffer) => { sawAnyOutput = true; this.onData(errDec.write(d)); });
-        this.proc.on("exit", (code) => {
-            // 退出即断链（Sol 90 P2-3）：ready 只在 kill() 里翻 false——自然退出
-            //（对端关连接/超时）曾保持 ready=true，执行中的 markerCycle 断链感知
-            //（轮询 !this.ready）不触发，调用方干等到自身超时。先翻 false 再分发
+        const child = this.proc;
+        child.on("exit", (code) => {
+            if (this.proc !== child) return;
+            // Stop accepting commands on exit. Buffered output may still hold the active command's sentinel.
             const wasReady = this.ready;
             this.ready = false;
+            this.drainingTransport = wasReady;
             if (!wasReady) {
                 // 沙箱 stdio 管道损坏快速诊断（DeepSeek Harness 反馈）：PTY 常驻通道
                 // 无法降级重试（attach 是长连接），但给明确错误而非「建链期间退出」
@@ -133,6 +136,10 @@ class PtyLink {
                 if (this.readyRejecter) this.readyRejecter(err);
                 else this.pendingExitFailure = err;
             }
+        });
+        child.once("close", () => {
+            if (this.proc !== child) return;
+            this.drainingTransport = false;
             this.onUnexpectedExit?.();
         });
     }
@@ -246,6 +253,11 @@ ${command}
                 cycleDone();
                 return;
             }
+            if (!this.ready) {
+                caller.reject(Object.assign(new Error("PTY 链已断开，命令未发送"), { reason: "disconnect", channel: "ssh_pty" }));
+                cycleDone();
+                return;
+            }
             let notified = false; // 调用方已归（超时/abort）——INTERRUPTING 起点标志
             let drained = false; // DRAINING 兜底定时器已布
             this.lineBuffer = [];
@@ -313,9 +325,8 @@ ${command}
                         return;
                     }
                 }
-                // 断链感知（Gemini Hydrogen 审查 #1）：ready 翻 false=进程退出/kill 已
-                // 触发重连——marker 永不再来，不再空等 timeoutMs+DRAINING 兜底 5s
-                if (!this.ready) {
+                // Once stdout and stderr are closed, no more completion evidence can arrive.
+                if (!this.ready && !this.drainingTransport) {
                     clearInterval(poll);
                     clearTimeout(timer);
                     if (deadline) clearTimeout(deadline);
@@ -324,7 +335,7 @@ ${command}
                         const partialOutput = buf.join("\n").slice(-500);
                         caller.reject(Object.assign(
                             new Error(`PTY 链断开（远端终态未核实）: ${command.slice(0, 60)}\n部分输出:\n${partialOutput}`),
-                            { outcome: "unknown", partialOutput },
+                            { outcome: "unknown", reason: "disconnect", channel: "ssh_pty", partialOutput },
                         ));
                     });
                     cycleDone(); // 链已由 onUnexpectedExit 重建路径接管——不 enterDraining
@@ -355,6 +366,7 @@ ${command}
         this.proc?.kill();
         this.proc = undefined;
         this.ready = false;
+        this.drainingTransport = false;
     }
 
     private async waitQuiet(): Promise<void> {
@@ -382,7 +394,7 @@ ${command}
                 this.fallbackSeen = line.trim().slice(0, 200);
                 if (this.ready) this.onLayerFallback?.(this.fallbackSeen);
             }
-            if (!this.ready) {
+            if (!this.ready && !this.drainingTransport) {
                 // 非行首锚定（容忍与提示符粘连）；字面回显的字面串不含数字与真实用户名，安全
                 // PTYRDY_$$_ 展开值（$$=PID，POSIX 全 shell——$RANDOM 系 bash 特性）+ 顺带
                 // id -un（冷启动锦囊：握手即身份，省一整次独立 ssh 握手）
@@ -818,6 +830,7 @@ export class SshPtyDriver implements RuntimeDriver {
      * nonce marker 实测 effectiveUser（子 shell + $? 变量锁）。
      */
     private async execChannel(command: string, options?: ExecOptions): Promise<ExecResult> {
+        if (options?.signal?.aborted) throw new DOMException("exec aborted by AbortSignal（命令未发送）", "AbortError");
         const hops: SshHop[] = Array.isArray(this.descriptor.config?.sshHops) ? (this.descriptor.config.sshHops as SshHop[]) : [];
         const enterSteps = enterStepsOf(this.descriptor.config as Record<string, unknown> | undefined);
         const connParams = this.descriptor.config?.connParams as SshConnParams | undefined;

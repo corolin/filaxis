@@ -134,9 +134,19 @@ describe("runBatch（DAG + fail-fast + 证据）", () => {
         const hang = r.steps.find((s) => s.id === "hang")!;
         expect(hang.status).toBe("fail");
         expect(hang.outcome).toBe("unknown"); // 修前：字段被 catch 吞掉
+        expect(hang.reason).toBeUndefined();
         expect(hang.error).toContain("timeout");
         expect(r.steps.find((s) => s.id === "after")!.status).toBe("skipped");
     }, 30_000);
+
+    test("断线步骤保留原因、通道和未知终态", async () => {
+        const driver = new LocalRuntimeDriver();
+        driver.exec = async () => {
+            throw Object.assign(new Error("PTY 链断开"), { outcome: "unknown", reason: "disconnect", channel: "ssh_pty" });
+        };
+        const report = await runBatch(driver, { steps: [{ id: "exec", kind: "exec", command: "printf fixture" }] });
+        expect(report.steps[0]).toMatchObject({ status: "fail", outcome: "unknown", reason: "disconnect", channel: "ssh_pty" });
+    });
 
     // GPT Astra 四轮 #3：driver throw null——catch 块读 (err as {outcome}).outcome 再抛
     // TypeError，整份 runBatch reject 报告丢失。修后：判空优先，失败仍进逐步骤报告

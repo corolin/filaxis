@@ -16,6 +16,7 @@
  */
 import * as crypto from "node:crypto";
 import nodePath from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { StreamWindowRegistry, type StreamWindow } from "../core/stream/stream-window.js";
 import { RuntimeStack, type LayerHandle } from "./runtime-stack.js";
 import { SessionOwnership, type StopResult } from "./session-ownership.js";
@@ -65,6 +66,8 @@ export interface LocalMiddle extends Middle {
     readonly stack: RuntimeStack;
     readonly sessionOwner: SessionOwnership;
     readonly resolveLayerRef: (ref: LayerRef) => Promise<RuntimeDriver>;
+    /** Read a saved layer without registering it or opening its connection. */
+    readonly savedLayerDescriptor?: (name: string) => RuntimeDescriptor | undefined;
     /** 观察窗注册表（惰性创建） */
     windowRegistry(): StreamWindowRegistry;
     /** 观察窗清单（同步版，Daemon 状态汇总用） */
@@ -662,12 +665,12 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         },
         async observe({ layer, command, stream, durationMs = 8000, cwd, signal }: { layer?: LayerRef; command: string; stream?: StreamFilter; durationMs?: number; cwd?: string; signal?: AbortSignal }): Promise<ObserveResult> {
             const drv = await resolveLayerRef(layer);
+            if (signal?.aborted) throw new DOMException("观察已中止（命令未发送）", "AbortError");
             const session = await drv.execSession(command, cwd && drv.descriptor?.driver === "local" ? { name: "observe", cwd } : { name: "observe" });
             // 观察期内调用方断开（signal）：不再等到时长结束，直接进入读日志与停机
-            await Promise.race([
-                new Promise((r) => setTimeout(r, durationMs)),
-                signal ? new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })) : new Promise<void>(() => undefined),
-            ]);
+            await delay(durationMs, undefined, { signal }).catch((error: unknown) => {
+                if (!signal?.aborted) throw error;
+            });
             const streams: StreamName[] = stream === "stderr" ? ["stderr"] : stream === "stdout" ? ["stdout"] : ["stdout", "stderr"];
             const lines: ObserveResult["lines"] = [];
             try {
@@ -963,6 +966,7 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
         sessionOwner,
         /** 层引用 → driver（供需要 driver 句柄的宿主逻辑使用，如 Daemon 状态汇总） */
         resolveLayerRef,
+        savedLayerDescriptor: savedDescriptor,
         /** 观察窗注册表（惰性创建；Daemon 用它汇总与收尾） */
         windowRegistry(): StreamWindowRegistry { return windows(); },
         listStreamsSync,

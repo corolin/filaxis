@@ -36,7 +36,8 @@ test.skipIf(process.platform !== "linux")("local stop reaps a redirected backgro
     try {
         expect(alive()).toBe(true);
         expect(m.verify(h.sessionId).status).toBe("running");
-        expect((await m.stop(h.sessionId)).status).toBe("exited");
+        expect(await m.stop(h.sessionId)).toEqual({ status: "stopped" });
+        expect(await m.stop(h.sessionId)).toEqual({ status: "stopped" });
         expect(alive()).toBe(false);
     } finally { if (alive()) process.kill(pid, "SIGKILL"); }
 }, 20_000);

@@ -32,6 +32,10 @@
 - **SDK 使用方**：进程内直接调中层操作；需要跨进程共享时连同一个 Daemon，**方法签名不变**。
 - **维护者**：新能力只写一次（中层），三个界面自动获得；分层违规在 `bun run check:boundaries` 被拦下。
 
+牵丝给 Agent 提供可切换的输入与输出通道。层决定输入发往哪里，驱动按所选通道提交指令，界面回传目标实际写出的内容。`echo`、`print` 等产生的输出按通道回传，静默命令可以没有输出。输出预览和观察窗有各自的采集范围。`exec` 通道的退出码以完成哨兵为凭，PTY 保留终端的混流语义。断线或中止后，终态无法核实就报告 `outcome: "unknown"`，执行层零自动重放。
+
+目标环境负责命令及其后续行为。命令取消沿所选通道传递，覆盖范围取决于 shell、SSH 和操作系统实际提供的能力。牵丝持有的连接、观察窗、转发和显式会话按各自生命周期管理。显式停止会话时，`exited` 需要任务的可信退出码，`stopped` 需要确认停止，证据不足时为 `unknown`。
+
 ---
 
 ## 3. 三层定义
@@ -40,7 +44,7 @@
 
 | 层 | 定义 | 拥有什么 | 不拥有什么 |
 |---|---|---|---|
-| **core（内核）** | 无状态执行内核：给定一个 driver 与一次调用参数，完成一次执行 | driver 实现、批次内核 `runBatch`、文件传输 / 编辑、转发管理器、观察流与窗口、会话管理器、ssh 底座、方言、终端 | 命名层、默认层、连接复用缓存、会话归属、已存层表；**不知道 daemon / mcp / cli 的存在** |
+| **core（内核）** | 执行和通道原语：根据调用参数驱动所选环境 | driver 实现及其通道状态、批次内核 `runBatch`、文件传输 / 编辑、转发管理器、观察流与窗口、会话管理器、ssh 底座、方言、终端 | 命名层、默认层、连接复用缓存、会话归属、已存层表；**不知道 daemon / mcp / cli 的存在** |
 | **middle（中层）** | 有状态的操作层：唯一的操作实现 | `RuntimeStack`（命名层、默认层、连接指纹复用、转发）、观察窗注册表、会话归属、已存层解析、层引用解析、操作集 | 参数语法（argv / JSON-RPC）、文本呈现、daemon 的 token 与传输 |
 | **interface（界面层）** | 中层的适配器：cli、mcp、以及 SDK 里给大模型用的工具面 | 参数语法、调用方本机路径→绝对路径、结果呈现（文本 / JSON / 落盘预览）、Daemon 发现 / 握手 / 传输 / 装配 | 任何操作逻辑 |
 
@@ -56,7 +60,7 @@
 
 ### 3.3 依赖方向（门禁强制，§7）
 
-- **R1** core 只依赖 core 与 node 内置。
+- **R1** core 依赖 core、shared 和 Node 内置模块。
 - **R2** middle 可依赖 core；**不得**依赖任何界面模块（mcp-server、mcp-proxy、daemon-server、daemon-client、agent-toolkit、bin）。
 - **R3** interface 只依赖 middle 的公开 API 与自身的呈现 / 传输；**不得从 core 导入值**（`import type` 除外）。
 - **R4** **界面层不直接碰内核**：一次性模式也过中层（进程内即弃的实例）。CLI 一次性路径自己拼驱动是今天的反例。
@@ -73,7 +77,7 @@
 src/
 ├── index.ts          SDK 总出口（公开 API；包外只从这里导入）
 ├── shared/           各层共用，不含任何一层的知识：logger、async-guard
-├── core/             无状态执行内核，按关注点分七组
+├── core/             执行和通道原语，按关注点分七组
 │   ├── base/         driver 契约、工厂、事件、会话类型与缓冲、输出采集、方言、shell 与 OpenSSH 环境发现
 │   ├── ssh/          ssh 驱动与底座、文件 stdio 中转、远端会话、动态端口转发
 │   ├── local/        本机驱动、本机会话、本机观察进程
@@ -178,12 +182,13 @@ type LayerRef =
 | 本机文件路径（传输的 `localPath`、`commandFile`、落盘输出、SSH 密钥） | 界面层补成绝对路径后再调用（只补基准目录、不折叠 `..`，与下一行同一条规则） |
 | **本机层**上的相对路径（`filaxis cat x.txt` 这种落在 local 层的路径） | 界面层补成绝对路径——只补基准目录，不折叠 `..`（POSIX 上内核逐段解析，符号链接后面的 `..` 相对的是链接实际指向的位置，与 shell 一致；Windows 的路径解析本身就是词法的）。基准是**层自己的工作目录**，没有则取调用方的（经 Daemon 时它的工作目录与调用方无关） |
 | 本机层的命令工作目录 | 显式参数 `cwd`（只在没指定 `--layer` / `--host` 时传；已存层用它自己的） |
-| 已存本机层的 `cwd` | 界面层一律给描述符带上绝对的 `cwd` 再交给中层（层引用、批次随请求带的层表两个入口都是）：层自己的 `cwd`（相对的按调用方工作目录锚定），没有则取调用方的。文件路径的基准（上一行的「层自己的工作目录，没有则取调用方的」）取自同一个函数——两处各算一次时，曾出现 `cat` 读调用方目录、`exec` 经 Daemon 读 Daemon 目录。只覆盖 CLI：经 Daemon 的其它调用方（MCP、远程 SDK）没有「调用方目录」的概念，以 Daemon 的工作目录为基准——已存层的 `cwd` 建议写绝对路径 |
+| CLI 已存本机层的 `cwd` | 层引用与批次层表统一带上绝对 `cwd`。层的相对 `cwd` 按调用方目录锚定，省略时使用调用方目录。文件路径使用同一个基准 |
+| MCP 代理的调用方目录 | stdio 代理开 SSE 时通过 `x-filaxis-caller-cwd` 携带目录。工具适配器用它补齐调用方文件路径，并为没有独立工作目录的本机层设置目录，包括按名首次访问的已存层。远程 SDK 和未带该请求头的 HTTP MCP 使用宿主或层的目录，调用方可显式传入相关操作支持的 `cwd` |
 | SSH 密钥 / known_hosts 路径 | 界面层展开相对路径后再调用 |
 | 调用方眼里的层表 | 批次经 `layers` 参数随请求带给中层：重新保存过的层立刻生效；CLI 用 `FILAXIS_LAYERS` 指向别处时以调用方为准 |
 | 大输出 | `exec --out` / `batch --out-dir` 落盘是界面层的事，中层不感知 |
 
-线协议里没有 `clientCwd` / `target.cwd` 这类「调用方工作目录」参数。
+`/rpc` 信封使用操作参数及层描述符表达路径和目录。MCP 的调用方目录属于 SSE 会话上下文，由工具适配器解释。
 
 ---
 
@@ -195,12 +200,12 @@ type LayerRef =
 POST /rpc   { "protocol": 3, "op": "runCommand", "params": { … } }
         → 200 { "ok": true,  "protocol": 3, "result": … }
         → 200 { "ok": false, "error": "<message>", "name?", "code?", "outcome", "sessionId", "logBase", "exitCode", "forwardId" … }
-        → 400 / 413        // 仅请求体本身有问题
+        → 400 / 413        // 信封或请求体校验失败
 GET /status  含 protocolVersion、version、pid、layers、forwards、streams
 ```
 
 - 操作名 = 中层操作名（camelCase）；不再有 `exec` / `forward.add` / `stream.peek` 这套独立命名。
-- `/rpc` 是薄转发：取操作 → 调用 → 回结果，不认识任何具体操作。操作失败一律 HTTP 200 + 错误体（与「传输失败」区分开），错误体保留 `outcome` 等字段（执行语义宪法不变：结果未知不伪造终态、不自动重放）。
+- `/rpc` 解析信封后调用中层操作，并给支持中止的操作注入宿主信号。操作失败以 HTTP 200 和错误体表达，保留 `outcome` 等字段。执行结果未知时保留未知状态，执行层零自动重放。
 - 传输仍是本机回环 HTTP + Bearer token + SSE（MCP 端点），**0.3.0 不换传输**。MCP 端点与 `/rpc` 调用同一个中层。
 
 ### 6.2 版本握手
@@ -252,7 +257,11 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 8. **`bun run check:boundaries` 多一道断言**（§7）。
 9. **`src/` 按层划分目录**（§4）：`core` / `middle` / `interface` / `shared`，根下只留总出口。包的 `exports` 只暴露总出口，所以这次调整对包外不可见；仓库内按旧路径深层导入的代码（测试、脚本）已随搬迁改写。
 
-**非目标**：跨语言 IPC（Host Protocol PRD / ROADMAP §3）；更换传输层；改动执行语义宪法（完成哨兵 / abort≠已取消 / 零自动重放 / PTY 状态机）；补齐 SDK 公开面里尚未成为独立操作的能力（`ready()`、`verifySession()`、读落盘日志、事件订阅——ROADMAP §6.1 P2）；内核七组之间不加依赖方向断言（驱动要用到文件与流，组只是方便找）。
+**非目标**：跨语言 IPC（Host Protocol PRD / ROADMAP §3）；更换传输层；改动完成哨兵、终态核实、零自动重放和 PTY 状态机；为普通 `exec` 扩展目标环境或原生通道的进程控制能力；补齐 SDK 公开面里尚未成为独立操作的能力（`ready()`、`verifySession()`、读落盘日志、事件订阅——ROADMAP §6.1 P2）；内核七组之间的依赖方向断言。
+
+当前 `/rpc` 在应答前检测到连接关闭时，为 `runCommand`、`runBatch`、`observe` 注入宿主本地的中止信号。远程 SDK 的 `AbortSignal` 在客户端控制 HTTP 请求，Daemon 检测到断开后再传递中止请求。MCP SSE 工具调用由独立的消息端点处理，SSE 断开时代理将已提交请求报告为终态未知。普通命令的目标终态仍依赖对应驱动能取得的证据。
+
+请求发出后，Daemon RPC 应答无效或执行通道无法核实终态时，报告 `outcome: "unknown"`。确认断开时同时携带 `reason: "disconnect"` 和 `channel`。`daemon_rpc`、`mcp_sse`、`mcp_post` 指客户端到 Daemon 的对应通道，`ssh_pty` 指 SSH PTY 执行链。单条 MCP POST 传输失败只影响对应请求，共享 SSE 继续回传其他结果。单凭缺少完成哨兵无法判明断线原因。出现已核实的完成结果时，仍按该结果报告。
 
 ---
 
@@ -326,7 +335,9 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 
 ## 10. 验收标准清单 (Acceptance Criteria / AC Matrix)
 
-- [x] **AC-01 一份操作实现**：`/rpc` 只有「取操作 → 调用 → 回结果」；操作逻辑只存在于 `src/middle/`。
+同构验收以语料中具有相同输入、目标层和调用方目录的操作为准。宿主生命周期和中止事件按 §3.2 与 §8 分别核对。会话停止还需区分任务的自然退出与已核实的主动停止，父 shell 的退出码只能作为该 shell 的退出证据。
+
+- [x] **AC-01 一份操作实现**：`/rpc` 负责信封、分发、应答和宿主中止信号，操作实现由三种宿主共用同一个中层。
 - [x] **AC-02 界面层零内核值依赖**：门禁断言 + 测试；现有 `src/` 与 `bin/` 零违规。
 - [x] **AC-03 同构**：`tests/isomorphism-corpus.ts` 32 条用例覆盖 `runCommand`、`runBatch`（层通配、`commandFile`、失败即停语义、调用方层表）、`readFile` / `writeFile` / `editFile` / `readPath` / `managePath`、`transferFile`、`startSession` / `stopSession`、`observe`、`openStream` / `peekStream` / `closeStream` / `listStreams`（含 `openStream` 的工作目录）、`listLayers` / `activateLayer` / `removeLayer`、`connectSshBatch`（参数是数组）、`probeLayer`、`features`、转发的不支持拒绝；在即弃进程内、SDK 长驻、Daemon 远程三种宿主下结果一致。
 - [x] **AC-04 版本握手**：客户端侧（旧 Daemon 不上报 → 拒绝并报 pid 与处置办法；版本一致放行）有单测；服务端拒绝错配信封；CLI 遇错配不退回一次性模式；MCP 代理每次重连前同样过握手（Daemon 中途换了版本即拒绝接入、不向它发请求；握手没答上来不开连接；握手请求有硬性期限并随代理收尾中止）；控制面请求（`/status`、`/health`、`/shutdown`）一律按硬性期限，操作类 RPC 仍是空闲超时（只杀哑不杀慢）。

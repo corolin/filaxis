@@ -66,7 +66,7 @@ export class SessionOwnership {
             const state = sessions.sessionState(id);
             if (!state) this.entries.delete(id);
             else if (state.status !== "running") {
-                this.remember(id, { status: state.status, exit_code: state.exitCode });
+                this.remember(id, state.status === "stopped" ? { status: "stopped" } : { status: "exited", exit_code: state.exitCode });
             }
             return;
         }

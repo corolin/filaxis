@@ -2,7 +2,8 @@
  * ssh-helpers / 层状态机 / 远端会话引擎 单测（纯逻辑 + mock 远端，真机面属 CI sshd 矩阵）
  */
 import { describe, expect, test } from "bun:test";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1585,28 +1586,40 @@ describe("Sol 89：发送同步抛归 caller/cdTargetArg", () => {
 //——执行中 markerCycle 的断链感知（轮询 !ready）不触发，调用方干等到自身超时。
 // 退出事件先翻 ready=false 再分发。
 describe("Sol 90：PTY 自然退出快速感知", () => {
-    test.skipIf(!Bun.which("ssh"))("P2-3 执行中自然退出：调用快速收 unknown（不等自身超时）", async () => {
+    test.skipIf(!Bun.which("ssh")).each([false, true])("PTY 退出后按排空的输出确认终态（完成哨兵到达：%s）", async (hasMarker) => {
         const { __testPtyLink } = await import("../src/core/ssh/ssh-pty-driver.js");
         const Link = __testPtyLink as unknown as new () => {
             attach(a: string[]): void;
             execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown>;
-            proc?: { emit(ev: string, code: number | null): void };
+            proc: ChildProcessWithoutNullStreams;
             ready: boolean;
             send(s: string): void;
         };
         const link = new Link();
-        link.attach(["-V"]); // 真实 spawn（管线真实；-V 快退不影响——我们手动发事件）
-        (link as unknown as { ready: boolean }).ready = true; // 模拟已建链、执行中
-        (link as unknown as { send(s: string): void }).send = () => { /* noop */ };
+        link.attach(["-V"]);
+        const child = link.proc;
+        // Retain the listener so the fixture can replay exit, data and close in a controlled order.
+        const [close] = child.listeners("close");
+        await once(child, "close");
+        child.on("close", close!);
+        link.ready = true;
+        let sent!: (command: string) => void;
+        const commandSent = new Promise<string>((resolve) => { sent = resolve; });
+        link.send = sent;
         const t0 = Date.now();
         // 创建即挂 handler（reject 到 catch 之间若隔 macrotask 轮，bun 记 unhandled）
-        const p = link.execMarker("long-running-cmd", 5_000)
-            .then(() => { throw new Error("不应 resolve"); }, (err) => err as Error & { outcome?: string });
-        await new Promise((r) => setTimeout(r, 150));
-        link.proc!.emit("exit", 0); // 自然退出事件（对端关连接/超时同路径）
-        const e = await p;
-        expect(e?.outcome).toBe("unknown");
-        expect(e?.message).toMatch(/断开|断链/);
+        const result = link.execMarker("long-running-cmd", 5_000).catch((error: unknown) => error);
+        const command = await commandSent;
+        child.emit("exit", 0);
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        if (hasMarker) {
+            const marker = command.match(/__FX_M_[0-9a-f]+/)![0];
+            child.stdout.emit("data", Buffer.from(`result\n${marker}_0_fixture\n`));
+        }
+        child.emit("close", 0);
+        expect(await result).toMatchObject(hasMarker
+            ? { exitCode: 0, stdout: "result" }
+            : { outcome: "unknown", reason: "disconnect", channel: "ssh_pty" });
         expect(Date.now() - t0).toBeLessThan(3_000); // 修前：ready 不翻 false——干等到 5s 超时
     }, 15_000);
 });

@@ -27,7 +27,7 @@ async function waitfor(path: string, ms: number): Promise<void> {
 
 describe("中止本机命令 → 整棵进程树停", () => {
     // 第二条往下再长两代（子 shell 里的 bash -c 里的 sleep）：清点要沿父子链走到底
-    for (const command of ["echo started > started; sleep 3; echo done > finished", "echo started > started; bash -c 'sleep 3; echo done > finished'; echo done >> finished"]) {
+    for (const command of ["echo started > started; sleep 3; echo done > finished", "bash -c 'echo started > started; sleep 3; echo done > finished'; echo done >> finished"]) {
         test(`驱动层：signal 中止后命令不再跑到收尾（${command.length > 60 ? "多代子孙" : "两代"}）`, async () => {
             const root = mkdtempSync(join(tmpdir(), ROOT));
             const ac = new AbortController();
@@ -37,7 +37,7 @@ describe("中止本机命令 → 整棵进程树停", () => {
                 const outcome = running.then(() => "resolved", (e: Error) => e);
                 await waitfor(join(root, "started"), 20_000);
                 ac.abort(new Error("调用方已断开"));
-                expect(await outcome).toBeInstanceOf(Error);
+                expect(await outcome).toMatchObject({ name: "AbortError", outcome: "unknown" });
                 await Bun.sleep(4200); // the command would have written "finished" at 3 s
                 expect(existsSync(join(root, "finished"))).toBe(false);
             } finally {

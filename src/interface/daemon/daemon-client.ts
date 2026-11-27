@@ -7,6 +7,7 @@
  */
 import { spawn } from "node:child_process";
 import * as http from "node:http";
+import { isDisconnectedSocket } from "../../shared/connection-errors.js";
 import { defaultDaemonDir, isPidAlive, readDaemonConnection } from "./daemon-files.js";
 import type { DaemonStatusInfo } from "./daemon-server.js";
 import { PROTOCOL_VERSION, REMOTE_OP_NAMES } from "../../middle/protocol.js";
@@ -90,22 +91,24 @@ export class DaemonClient {
     }
 
     /** 调用一个中层操作。信封带线协议版本：Daemon 与本客户端不一致时会被明确拒绝，不执行 */
-    async rpc<T = unknown>(op: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
-        const response = await this.rawRequest("POST", "/rpc", { protocol: PROTOCOL_VERSION, op, params }, timeoutMs, true);
-        return this.unwrap<T>(response);
+    async rpc<T = unknown>(op: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
+        const response = await this.rawRequest("POST", "/rpc", { protocol: PROTOCOL_VERSION, op, params }, timeoutMs, true, { signal });
+        return this.unwrap<T>(response, true);
     }
 
-    private unwrap<T>(res: { statusCode: number; raw: string; json?: unknown }): T {
+    private unwrap<T>(res: { statusCode: number; raw: string; json?: unknown }, rpc = false): T {
         if (res.statusCode === 401) {
             throw new Error("Daemon 鉴权失败 (HTTP 401)：Bearer token 不匹配或已失效");
         }
         const parsed = res.json as Record<string, unknown> | undefined;
-        if (parsed && parsed.ok === true) {
+        if (parsed && parsed.ok === true && Object.hasOwn(parsed, "result") && res.statusCode >= 200 && res.statusCode < 300) {
             return parsed.result as T;
         }
-        if (parsed && parsed.ok === false) {
-            const err = new Error(String(parsed.error ?? "Daemon RPC 调用失败")) as Error & {
+        if (parsed && parsed.ok === false && typeof parsed.error === "string") {
+            const err = new Error(parsed.error) as Error & {
                 outcome?: unknown;
+                reason?: string;
+                channel?: string;
                 sessionId?: unknown;
                 logBase?: unknown;
                 exitCode?: unknown;
@@ -120,6 +123,8 @@ export class DaemonClient {
             if (typeof parsed.code === "string" || typeof parsed.code === "number") err.code = parsed.code;
             if (typeof parsed.partialOutput === "string") err.partialOutput = parsed.partialOutput;
             if (parsed.outcome !== undefined) err.outcome = parsed.outcome;
+            if (typeof parsed.reason === "string") err.reason = parsed.reason;
+            if (typeof parsed.channel === "string") err.channel = parsed.channel;
             if (parsed.sessionId !== undefined) err.sessionId = parsed.sessionId;
             if (parsed.logBase !== undefined) err.logBase = parsed.logBase;
             if (parsed.exitCode !== undefined) err.exitCode = parsed.exitCode;
@@ -127,7 +132,8 @@ export class DaemonClient {
             if (typeof parsed.forwardId === "string") err.forwardId = parsed.forwardId;
             throw err;
         }
-        throw new Error(`Daemon HTTP ${res.statusCode}: ${res.raw.slice(0, 200)}`);
+        const error = new Error(`Daemon 应答缺少有效结果 (HTTP ${res.statusCode}): ${res.raw.slice(0, 200)}`);
+        throw rpc ? tagTransportUnknown(error) : error;
     }
 
     private rawRequest(
@@ -170,7 +176,7 @@ export class DaemonClient {
                     if (failure) { onTransportError(failure); return; }
                     // 连接在应答结束前关闭：没有完整的应答，不能当作结果
                     if (res.complete === false) {
-                        onTransportError(new Error(`Daemon 应答不完整（连接在应答结束前关闭）: ${method} ${reqPath}`));
+                        onTransportError(new Error(`Daemon 应答不完整（连接在应答结束前关闭）: ${method} ${reqPath}`), true);
                         return;
                     }
                     const raw = Buffer.concat(chunks).toString("utf-8");
@@ -179,7 +185,7 @@ export class DaemonClient {
                     settle(() => resolve({ statusCode: res.statusCode ?? 0, raw, json }));
                 });
                 res.on("aborted", () => {
-                    onTransportError(failure ?? new Error(`Daemon 应答中断: ${method} ${reqPath}`));
+                    onTransportError(new Error(`Daemon 应答中断: ${method} ${reqPath}`), true);
                 });
                 res.on("error", onTransportError);
             });
@@ -208,9 +214,10 @@ export class DaemonClient {
                 control.signal?.removeEventListener("abort", onAbort);
                 fn();
             }
-            function onTransportError(err: Error): void {
+            function onTransportError(err: Error, disconnected = isDisconnectedSocket(err)): void {
                 // 已判定失败的原因优先：随后连接上的 ECONNRESET 之类只是它的后果
                 const cause = failure ?? err;
+                if (!failure && disconnected) Object.assign(cause, { reason: "disconnect", channel: "daemon_rpc" });
                 settle(() => reject(method === "POST" ? tagTransportUnknown(cause) : cause));
             }
         });
@@ -218,7 +225,11 @@ export class DaemonClient {
 }
 
 function abortReason(signal: AbortSignal): Error {
-    return signal.reason instanceof Error ? signal.reason : new Error("请求已中止");
+    if (signal.reason instanceof Error && signal.reason.name === "AbortError") {
+        // Do not mutate the caller's signal reason when adding transport metadata.
+        return new DOMException(signal.reason.message, "AbortError");
+    }
+    return new DOMException("请求已中止", "AbortError");
 }
 
 /** 握手类请求的附加控制 */
@@ -268,7 +279,13 @@ export async function assertDaemonProtocol(client: DaemonClient, timeoutMs = 300
  */
 export async function connectRemoteMiddle(client: DaemonClient, timeoutMs = 3000): Promise<Middle> {
     const status = await assertDaemonProtocol(client, timeoutMs);
-    const ops = Object.fromEntries(REMOTE_OP_NAMES.map((name) => [name, (params: Record<string, unknown> = {}) => client.rpc(name, params)])) as unknown as MiddleOps;
+    const ops = Object.fromEntries(REMOTE_OP_NAMES.map((name) => [name, (params: Record<string, unknown> = {}) => {
+        if (name === "runCommand" || name === "runBatch" || name === "observe") {
+            const { signal, ...payload } = params;
+            return client.rpc(name, payload, undefined, signal as AbortSignal | undefined);
+        }
+        return client.rpc(name, params);
+    }])) as unknown as MiddleOps;
     return {
         host: { kind: "daemon", version: status.version, protocolVersion: status.protocolVersion, pid: status.pid },
         ops,
