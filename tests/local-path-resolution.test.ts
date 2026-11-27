@@ -10,7 +10,7 @@
  * 只在有 POSIX 路径语义的平台上跑（Windows 的路径解析本身就是词法的，`..` 不跨符号链接）。
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,7 +27,7 @@ function run(args: string[], cwd: string): { code: number; out: string; err: str
     return { code: p.exitCode, out: p.stdout.toString("utf-8"), err: p.stderr.toString("utf-8") };
 }
 
-describe("本机层上的相对路径：符号链接后面的 .. 按内核语义解析", () => {
+describe("调用方机器上的路径：符号链接后面的 .. 按内核语义解析", () => {
     test.skipIf(process.platform === "win32")("cat / edit link/../marker.txt 落在 shell 看到的那个文件上", () => {
         // <root>/work 是调用方的工作目录，<root>/work/link -> ../target。
         // work/link/../marker.txt 内核解析为 <root>/marker.txt；词法折叠会变成 <root>/work/marker.txt
@@ -49,6 +49,55 @@ describe("本机层上的相对路径：符号链接后面的 .. 按内核语义
             expect(edit.code).toBe(0);
             expect(readFileSync(join(root, "marker.txt"), "utf-8")).toBe("kernel-edited\n");
             expect(readFileSync(join(work, "marker.txt"), "utf-8")).toBe("lexical\n");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 60_000);
+
+    test.skipIf(process.platform === "win32")("put / get 的本机侧、批次的 commandFile 与落盘输出：选中的同样是 shell 看到的那个文件", () => {
+        // 同一个规则覆盖所有「调用方机器上的路径」。0.2.13 的一次性模式下这些都是原样往下传
+        // （内核语义）；经 Daemon 的分支才做词法折叠。0.3.0 合并两条路径时合到了折叠的那边：
+        // 上传了另一份文件、执行了另一份脚本，且都退出 0
+        const root = mkdtempSync(join(tmpdir(), "fx-path-resolution-"));
+        const work = join(root, "work");
+        try {
+            mkdirSync(join(root, "target"));
+            mkdirSync(work);
+            mkdirSync(join(root, "dest"));
+            symlinkSync("../target", join(work, "link")); // link/.. = <root>；词法折叠会落到 <root>/work
+            writeFileSync(join(root, "payload.txt"), "kernel-payload\n");
+            writeFileSync(join(work, "payload.txt"), "lexical-payload\n");
+            writeFileSync(join(root, "script.sh"), "echo kernel-script\n");
+            writeFileSync(join(work, "script.sh"), "echo lexical-script\n");
+
+            // put：本机侧文件
+            const put = run(["put", "--no-daemon", "link/../payload.txt", join(root, "dest", "uploaded.txt")], work);
+            expect(put.err).toBe("");
+            expect(readFileSync(join(root, "dest", "uploaded.txt"), "utf-8")).toBe("kernel-payload\n");
+
+            // get：本机侧落点
+            const get = run(["get", "--no-daemon", join(root, "payload.txt"), "link/../downloaded.txt"], work);
+            expect(get.err).toBe("");
+            expect(existsSync(join(root, "downloaded.txt"))).toBe(true);
+            expect(existsSync(join(work, "downloaded.txt"))).toBe(false);
+
+            // batch：exec 步骤的 commandFile（经 --out-dir 落盘后读回，看跑的是哪份脚本）
+            const plan = join(root, "plan.json");
+            writeFileSync(plan, JSON.stringify({ steps: [{ id: "s", kind: "exec", commandFile: "link/../script.sh" }] }));
+            const batch = run(["batch", "--no-daemon", "--request-file", plan, "--out-dir", join(root, "batchout")], work);
+            expect(batch.err).toBe("");
+            expect(readFileSync(join(root, "batchout", "s.stdout"), "utf-8")).toBe("kernel-script\n");
+
+            // exec --out 与 batch --out-dir：落盘位置（--out 模式把退出码与落盘路径打到 stderr，是正常输出）
+            const spilled = run(["exec", "--no-daemon", "--out", "link/../out.txt", "--", "echo spilled"], work);
+            expect(spilled.code).toBe(0);
+            expect(readFileSync(join(root, "out.txt"), "utf-8")).toBe("spilled\n");
+            const plan2 = join(root, "plan2.json");
+            writeFileSync(plan2, JSON.stringify({ steps: [{ id: "step", kind: "exec", command: "echo batch-spilled" }] }));
+            const spilledBatch = run(["batch", "--no-daemon", "--request-file", plan2, "--out-dir", "link/../spilled"], work);
+            expect(spilledBatch.code).toBe(0);
+            expect(readFileSync(join(root, "spilled", "step.stdout"), "utf-8")).toBe("batch-spilled\n");
+            expect(existsSync(join(work, "spilled"))).toBe(false);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

@@ -416,10 +416,11 @@ function defaultCwd(opts: ReturnType<typeof parseOpts>): string | undefined {
 }
 
 /**
- * 把本机层上的相对路径补成绝对路径，但保留它原本的写法——不折叠 `.` 与 `..`。POSIX 上内核是
- * 逐段解析的：`link/../x` 里的 `..` 相对的是符号链接实际指向的位置，和 shell 看到的一致；
- * path.resolve 的词法折叠会把它变成另一个文件（0.3.0 开发中踩过：`edit` 改错了文件且退出 0；
- * 0.2.13 两种模式都是内核语义）。Windows 的路径解析本身就是词法的，照旧用 path.resolve。
+ * 把相对路径补成绝对路径，但保留它原本的写法——不折叠 `.` 与 `..`。POSIX 上内核是逐段解析的：
+ * `link/../x` 里的 `..` 相对的是符号链接实际指向的位置，和 shell 看到的一致；path.resolve 的
+ * 词法折叠会把它变成另一个文件（0.3.0 开发中踩过两次：`edit` 改错了文件、`put` 上传了另一份
+ * 文件、batch 执行了另一份脚本，且都退出 0；0.2.13 的一次性模式下这些都是内核语义）。Windows
+ * 的路径解析本身就是词法的，照旧用 path.resolve。
  */
 function absolutize(base: string, p: string): string {
     if (isAbsolute(p)) return p;
@@ -427,6 +428,19 @@ function absolutize(base: string, p: string): string {
     const proc = process.cwd();
     const absBase = (isAbsolute(base) ? base : `${proc.endsWith("/") ? proc : `${proc}/`}${base}`).replace(/\/+$/, "");
     return `${absBase}/${p}`;
+}
+
+/**
+ * 调用方机器上的文件：传输的本机侧、批次的 commandFile、落盘输出、SSH 密钥。与落在层上的路径
+ * 同一条规则。`--script-file`、`--request-file` 由本进程按相对路径直接读取，本来就是内核语义。
+ */
+function callerPath(p: string): string {
+    return absolutize(process.cwd(), p);
+}
+
+/** 目录下的一个文件名：字符串拼接，不经 path.join——后者会把目录路径里的 `..` 折叠掉 */
+function withinDir(dir: string, name: string): string {
+    return process.platform === "win32" ? join(dir, name) : `${dir.replace(/\/+$/, "")}/${name}`;
 }
 
 function layerPathFor(opts: ReturnType<typeof parseOpts>, p: string): string {
@@ -545,7 +559,7 @@ function resolveCallerSshPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor
 
     const fromCaller = (file: string | undefined): string | undefined => {
         if (typeof file !== "string" || !file || file === "none" || isAbsolute(file) || /^(?:~|%|\$\{)/.test(file)) return file;
-        return resolvePath(file);
+        return callerPath(file);
     };
     const jump = conn.jump;
     return {
@@ -602,7 +616,7 @@ interface SpilledOutput { path: string; bytes: number; lines: number; head: stri
  * 就抛错，绝不报「已落盘」。返回终端预览用的头几行。
  */
 function spillOutput(content: string, file: string): SpilledOutput {
-    const target = resolvePath(file);
+    const target = callerPath(file);
     mkdirSync(dirname(target), { recursive: true });
     const data = Buffer.from(content, "utf-8");
     const temporary = `${target}.tmp-${randomUUID()}`;
@@ -684,7 +698,7 @@ async function printExecResult(
 
 function printBatchReport(r: BatchReport, outDir?: string): void {
     // --out-dir：每个 exec 步骤的 stdout / stderr 各落一个文件（文件名 = 步骤 id），终端只打头几行和路径
-    const dir = outDir === undefined ? undefined : resolvePath(outDir);
+    const dir = outDir === undefined ? undefined : callerPath(outDir);
     if (dir) mkdirSync(dir, { recursive: true });
     const usedNames = new Set<string>();
     const spillCount = { n: 0 };
@@ -699,12 +713,12 @@ function printBatchReport(r: BatchReport, outDir?: string): void {
             if (dir && (s.stdout || s.stderr)) {
                 const name = stepOutputName(s.id, usedNames);
                 if (s.stdout) {
-                    const sp = spillOutput(s.stdout, join(dir, `${name}.stdout`)); spillCount.n++;
+                    const sp = spillOutput(s.stdout, withinDir(dir, `${name}.stdout`)); spillCount.n++;
                     process.stdout.write(sp.head);
                     console.log(sp.truncated ? spillNote(sp, "stdout") : `[out] ${sp.path}（${sp.bytes} 字节，已核对）`);
                 }
                 if (s.stderr) {
-                    const sp = spillOutput(s.stderr, join(dir, `${name}.stderr`)); spillCount.n++;
+                    const sp = spillOutput(s.stderr, withinDir(dir, `${name}.stderr`)); spillCount.n++;
                     process.stderr.write(sp.head);
                     console.error(sp.truncated ? spillNote(sp, "stderr") : `[out] ${sp.path}（${sp.bytes} 字节，已核对）`);
                 }
@@ -782,10 +796,10 @@ async function runCliBatch(o: ReturnType<typeof parseOpts>, middle: Middle): Pro
                     const s = step as unknown as Record<string, unknown>;
                     if ((s.kind === "put" || s.kind === "get")
                         && typeof s.localPath === "string" && s.localPath.length > 0 && !s.localPath.includes("\0")) {
-                        return { ...step, localPath: resolvePath(s.localPath) };
+                        return { ...step, localPath: callerPath(s.localPath) };
                     }
                     if (s.kind === "exec" && typeof s.commandFile === "string" && s.commandFile.trim()) {
-                        return { ...step, commandFile: resolvePath(s.commandFile) };
+                        return { ...step, commandFile: callerPath(s.commandFile) };
                     }
                     return step;
                 }),
@@ -1298,7 +1312,7 @@ async function runTargetCommand(
             const result = await ops.transferFile({
                 layer,
                 direction: cmd as "put" | "get",
-                localPath: resolvePath(cmd === "put" ? source : destination),
+                localPath: callerPath(cmd === "put" ? source : destination),
                 remotePath: layerPath(cmd === "put" ? destination : source),
                 transport: o.transport,
                 timeoutMs: o.timeout,
