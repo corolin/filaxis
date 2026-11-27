@@ -73,8 +73,9 @@ export class DaemonClient {
         }
     }
 
-    async status(timeoutMs = 3000): Promise<DaemonStatusInfo> {
-        return this.unwrap<DaemonStatusInfo>(await this.rawRequest("GET", "/status", undefined, timeoutMs, true));
+    /** `control`：握手类请求可要求硬性期限、可被外部中止（见 RequestControl） */
+    async status(timeoutMs = 3000, control: RequestControl = {}): Promise<DaemonStatusInfo> {
+        return this.unwrap<DaemonStatusInfo>(await this.rawRequest("GET", "/status", undefined, timeoutMs, true, control));
     }
 
     async shutdown(timeoutMs = 5000): Promise<{ ok: true }> {
@@ -129,8 +130,13 @@ export class DaemonClient {
         body: unknown,
         timeoutMs: number | undefined,
         withAuth: boolean,
+        control: RequestControl = {},
     ): Promise<{ statusCode: number; raw: string; json?: unknown }> {
         return new Promise((resolve, reject) => {
+            if (control.signal?.aborted) {
+                reject(abortReason(control.signal));
+                return;
+            }
             const payload = body !== undefined ? Buffer.from(JSON.stringify(body), "utf-8") : undefined;
             const headers: Record<string, string> = {};
             if (withAuth) headers.Authorization = `Bearer ${this.token}`;
@@ -154,25 +160,48 @@ export class DaemonClient {
                     const raw = Buffer.concat(chunks).toString("utf-8");
                     let json: unknown;
                     try { json = JSON.parse(raw); } catch { /* non-json */ }
-                    resolve({ statusCode: res.statusCode ?? 0, raw, json });
+                    settle(() => resolve({ statusCode: res.statusCode ?? 0, raw, json }));
                 });
                 res.on("error", onTransportError);
             });
 
+            // 缺省是空闲超时：长操作靠它做到「只杀哑不杀慢」。握手这类必须有限的请求另加硬性期限
+            let deadline: ReturnType<typeof setTimeout> | undefined;
             if (timeoutMs !== undefined && timeoutMs > 0) {
-                req.setTimeout(timeoutMs, () => {
+                const expire = (): void => {
                     req.destroy(new Error(`Daemon 请求超时 (${timeoutMs}ms): ${method} ${reqPath}`));
-                });
+                };
+                if (control.absoluteTimeout) deadline = setTimeout(expire, timeoutMs);
+                else req.setTimeout(timeoutMs, expire);
             }
+            const onAbort = (): void => { req.destroy(abortReason(control.signal!)); };
+            control.signal?.addEventListener("abort", onAbort, { once: true });
             req.on("error", onTransportError);
             if (payload) req.write(payload);
             req.end();
 
+            function settle(fn: () => void): void {
+                if (deadline) clearTimeout(deadline);
+                control.signal?.removeEventListener("abort", onAbort);
+                fn();
+            }
             function onTransportError(err: Error): void {
-                reject(method === "POST" ? tagTransportUnknown(err) : err);
+                settle(() => reject(method === "POST" ? tagTransportUnknown(err) : err));
             }
         });
     }
+}
+
+function abortReason(signal: AbortSignal): Error {
+    return signal.reason instanceof Error ? signal.reason : new Error("请求已中止");
+}
+
+/** 握手类请求的附加控制 */
+export interface RequestControl {
+    /** 超时按绝对时间算，而不是「空闲多久」 */
+    absoluteTimeout?: boolean;
+    /** 触发即中止请求 */
+    signal?: AbortSignal;
 }
 
 /** Daemon 的线协议与本客户端不一致（REQ-0004 §6.2）。绝不向错配的 Daemon 发操作。 */

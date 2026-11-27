@@ -1030,6 +1030,72 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         }
     }, 10_000);
 
+    /** 一个 /status 永不完整应答的假 Daemon：每隔 100ms 滴一个空格，让「空闲超时」永远不触发 */
+    function trickleStatusDaemon(onStatus: (socket: http.IncomingMessage["socket"]) => void) {
+        const timers: NodeJS.Timeout[] = [];
+        const server = http.createServer((req, res) => {
+            if (req.method === "GET" && req.url === "/status") {
+                onStatus(req.socket);
+                res.writeHead(200, { "Content-Type": "application/json" });
+                timers.push(setInterval(() => { if (!res.destroyed) res.write(" "); }, 100));
+                return;
+            }
+            res.writeHead(404).end();
+        });
+        return { server, stop: () => { for (const t of timers) clearInterval(t); } };
+    }
+
+    test("握手在途时 stdin 关闭：在途的 /status 请求随即中止——对端一直滴数据也拖不住", async () => {
+        // 代理收尾后不再开 SSE（上一笔），但握手请求本身还在等；而它的 1.5 秒是空闲超时，
+        // 对端持续滴数据就永不触发——进程被这一条请求拖住
+        const dir = makeTempDir("fx-mcp-handshake-abort-");
+        const held = new Set<http.IncomingMessage["socket"]>();
+        const fake = trickleStatusDaemon((socket) => { held.add(socket); socket.on("close", () => held.delete(socket)); });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        try {
+            await new Promise<void>((resolve) => fake.server.listen(0, "127.0.0.1", resolve));
+            const port = (fake.server.address() as { port: number }).port;
+            writeFileSync(join(dir, "daemon.addr"), `http://127.0.0.1:${port}`);
+            writeFileSync(join(dir, "daemon.token"), "handshake-abort-token");
+            fx = attachProxyFixture({ daemonDir: dir, initialReconnectDelayMs: 30, maxReconnectDelayMs: 80 });
+            const statusDeadline = Date.now() + 3_000;
+            while (held.size === 0 && Date.now() < statusDeadline) await new Promise((r) => setTimeout(r, 10));
+            expect(held.size).toBe(1); // 握手请求确实在途
+            fx.closeStdin();
+            const closeDeadline = Date.now() + 1_200; // 远小于 1.5 秒的握手期限：靠的是收尾时主动中止
+            while (held.size > 0 && Date.now() < closeDeadline) await new Promise((r) => setTimeout(r, 10));
+            expect([...held]).toHaveLength(0);
+        } finally {
+            fake.stop();
+            fx?.proxy.close();
+            fake.server.closeAllConnections();
+            await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 10_000);
+
+    test("握手有硬性期限：对端一直不完整应答，到点放弃这一次、稍后重试", async () => {
+        const dir = makeTempDir("fx-mcp-handshake-deadline-");
+        let statusGets = 0;
+        const fake = trickleStatusDaemon(() => { statusGets++; });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        try {
+            await new Promise<void>((resolve) => fake.server.listen(0, "127.0.0.1", resolve));
+            const port = (fake.server.address() as { port: number }).port;
+            writeFileSync(join(dir, "daemon.addr"), `http://127.0.0.1:${port}`);
+            writeFileSync(join(dir, "daemon.token"), "handshake-deadline-token");
+            fx = attachProxyFixture({ daemonDir: dir, initialReconnectDelayMs: 30, maxReconnectDelayMs: 80 });
+            await new Promise((r) => setTimeout(r, 2_600)); // 第一次 1.5 秒到点被放弃，之后又试过
+            expect(statusGets).toBeGreaterThanOrEqual(2);
+        } finally {
+            fake.stop();
+            fx?.proxy.close();
+            fake.server.closeAllConnections();
+            await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 10_000);
+
     test("stdin 在 SSE 握手完成前关闭：在途的握手请求随即撤下，不转发、不重连、不留连接", async () => {
         // 假 Daemon：/mcp/sse 的请求扣住不回应（握手悬而未决）；其余路径记下并拒绝
         const dir = makeTempDir("fx-mcp-early-eof-");

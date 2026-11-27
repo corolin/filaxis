@@ -76,6 +76,8 @@ export class McpStdioProxy {
     private started = false;
     private closed = false;
     private activeSession: ActiveSseSession | null = null;
+    /** 在途的线协议握手请求：代理收尾时中止它，不让它把进程拖住 */
+    private handshakeAbort: AbortController | null = null;
     private sleepTimer: ReturnType<typeof setTimeout> | null = null;
     private wakeSleep: (() => void) | null = null;
     private reconnectDelayMs: number;
@@ -119,6 +121,8 @@ export class McpStdioProxy {
         this.wakeSleep = null;
         this.activeSession?.abort();
         this.activeSession = null;
+        this.handshakeAbort?.abort();
+        this.handshakeAbort = null;
         this.rl?.close();
     }
 
@@ -342,13 +346,18 @@ export class McpStdioProxy {
     /**
      * 建连前的线协议握手，三种结果：版本一致；没答上来（连接不上、报错、超时——算还没就绪，
      * 但绝不在这种情况下开连接）；答了但版本不一致。
+     * 1.5 秒是硬性期限（不是「空闲多久」：对端一直滴数据也得放弃），且随代理收尾一起中止。
      */
     private async handshake(addr: string, token: string): Promise<"ok" | "unanswered" | ProtocolMismatchError> {
+        const abort = new AbortController();
+        this.handshakeAbort = abort;
         try {
-            const status = await new DaemonClient({ addr, token }).status(1500);
+            const status = await new DaemonClient({ addr, token }).status(1500, { absoluteTimeout: true, signal: abort.signal });
             return status.protocolVersion === PROTOCOL_VERSION ? "ok" : new ProtocolMismatchError(status.protocolVersion, status);
         } catch {
             return "unanswered";
+        } finally {
+            if (this.handshakeAbort === abort) this.handshakeAbort = null;
         }
     }
 
