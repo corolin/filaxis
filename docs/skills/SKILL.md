@@ -132,6 +132,21 @@ await stack.removeLayer("prod", { destroy: true });
 ```
 
 
+## 升级要点：0.2.13 → 0.3.0
+
+MCP 工具面没变：12 个工具名、参数 schema、snake_case 字段都照旧，已有的调用方式不用改。CLI 没有删除或改名任何子命令与参数。变的是下面几处，脚本或习惯依赖旧行为的要跟着改：
+
+| 变化 | 0.2.13 | 0.3.0 | 要做什么 |
+|---|---|---|---|
+| `filaxis-mcp` 的宿主 | 有 Daemon 在跑才经它，绝不自己启动 | 缺省经 Daemon，没有就自动启动；绑定参数或 `--no-daemon` 走进程内 | 层、连接、转发、观察窗在所有 MCP 客户端与 CLI 之间共享，客户端断开后现场仍留在 Daemon 里；要即弃就加 `--no-daemon` |
+| 版本握手 | 无 | 0.2.x 与 0.3.0 的客户端、Daemon 互相拒绝（`E_PROTOCOL_MISMATCH`），不把请求交给旧代码执行 | 升级后先 `filaxis daemon stop`（新旧 CLI 都能停对方版本的 Daemon），再重新发起命令 |
+| CLI `--json` 字段名 | 转发记录是 snake_case（`forward_id`，`forwardId` 留作别名） | 统一 camelCase（`forwardId`、`bindAddr`、`windowId`…），观察窗与 `daemon status` 同理 | 解析 CLI JSON 的脚本改字段名；MCP 面仍是 snake_case |
+| 一次性模式与经 Daemon | 两种模式有 8 处行为差异（相对的本机路径、相对的密钥路径等） | 一致；「层不存在」这类报错文案统一 | 一般不用改；依赖旧差异的脚本，结果可能不同 |
+| 大输出落盘 | 无 | 新增 `filaxis exec --out <文件>`、`filaxis batch --out-dir <目录>` | 按需使用；不加参数行为不变 |
+| MCP 代理进程滞留 | 客户端在握手完成前断开时，代理进程不退出（0.2.12 起） | 已修 | 无需处理 |
+
+没写目标的命令仍在本机执行。SDK 的 `createAgentToolkit(stack, opts)` 签名不变，包的导入路径不变，另新增 `createMiddle` / `connectRemoteMiddle` 导出。
+
 ## 核心契约速查（违者=生产事故）
 
 | 契约 | 一句话 |

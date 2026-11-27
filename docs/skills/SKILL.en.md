@@ -143,6 +143,23 @@ await stack.removeLayer("prod", { destroy: true });
 
 ---
 
+## Upgrade Notes: 0.2.13 → 0.3.0
+
+The MCP tool surface is unchanged: the 12 tool names, their parameter schemas, and the snake_case fields all stay as they were. No CLI subcommand or option was removed or renamed. What did change is listed below — update scripts or habits that relied on the old behavior:
+
+| Change | 0.2.13 | 0.3.0 | What to do |
+|---|---|---|---|
+| Where `filaxis-mcp` runs | Through the daemon only when one is running; never starts one | Through the daemon by default and starts one when none is running; a binding option or `--no-daemon` serves in-process | Layers, connections, forwards, and observation windows are shared across all MCP clients and the CLI, and outlive a disconnected client; add `--no-daemon` for a throwaway in-process server |
+| Protocol handshake | None | 0.2.x and 0.3.0 clients and daemons reject each other (`E_PROTOCOL_MISMATCH`) instead of handing requests to old code | After upgrading, run `filaxis daemon stop` first (either CLI version can stop the other version's daemon), then re-run the command |
+| CLI `--json` field names | Forward records in snake_case (`forward_id`, with `forwardId` kept as an alias) | camelCase throughout (`forwardId`, `bindAddr`, `windowId`, …), likewise for observation windows and `daemon status` | Update scripts that parse CLI JSON; the MCP surface stays snake_case |
+| `--no-daemon` vs. through the daemon | Eight behavioral differences between the two modes (relative local paths, relative key paths, …) | Identical; messages such as "layer not found" are unified | Usually nothing; scripts that relied on an old difference may see different results |
+| Spilling large output | — | New `filaxis exec --out <file>` and `filaxis batch --out-dir <dir>` | Use as needed; behavior is unchanged without the options |
+| MCP proxy process lingering | The proxy process did not exit when the client disconnected before the handshake completed (since 0.2.12) | Fixed | Nothing to do |
+
+Commands without a target still run on the local host. The SDK's `createAgentToolkit(stack, opts)` signature is unchanged and so is the package's import path; `createMiddle` and `connectRemoteMiddle` are new exports.
+
+---
+
 ## Core Execution Contracts (Never Violate These)
 
 | Contract | Rule |
