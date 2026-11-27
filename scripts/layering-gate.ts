@@ -146,12 +146,16 @@ export function importsOf(text: string): ImportEdge[] {
             else pending = { clause: trimmed, line: index + 1, keyword: "export" };
             return;
         }
-        // 动态 import 与 require：类型位置的 import("x")（typeof import("x")、import("x").T）只取类型
+        // 动态 import 与 require：类型位置的 import("x")（typeof import("x")、import("x").T）只取类型。
+        // 点号后面是方法调用（import("x").then(…)）或 default 的是取值——存疑时按取值算
         const dynamic = /\bimport\(\s*(["'])([^"']+)\1\s*\)/g;
         for (const m of trimmed.matchAll(dynamic)) {
             const after = trimmed.slice(m.index! + m[0].length);
             const before = trimmed.slice(0, m.index!);
-            const typePosition = /^\s*\.\s*[A-Za-z_$]/.test(after) || /typeof\s*$/.test(before);
+            const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(after);
+            const valueMember = member !== null
+                && (member[1] === "default" || /^\s*(?:<[^<>()]*>)?\s*\(/.test(after.slice(member[0].length)));
+            const typePosition = !valueMember && (member !== null || /typeof\s*$/.test(before));
             out.push({ spec: m[2]!, typeOnly: typePosition, line: index + 1 });
         }
         for (const m of trimmed.matchAll(/\brequire\(\s*(["'])([^"']+)\1\s*\)/g)) {

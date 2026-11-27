@@ -104,6 +104,11 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one("bin/filaxis.ts", 'import { SshPtyDriver } from "../src/core/ssh/ssh-pty-driver.js";')).toHaveLength(1);
         expect(one("bin/filaxis.ts", 'const m = await import("../src/core/ssh/ssh-pty-driver.js");')).toHaveLength(1);
         expect(one("bin/filaxis.ts", 'const m = require("../src/core/ssh/ssh-pty-driver.js");')).toHaveLength(1);
+        // 动态导入取值的几种写法：点号后面是方法调用、default，或什么都没有
+        expect(one(toolFace, 'import("../../core/file/batch.js").then((m) => m.runBatch);')).toHaveLength(1);
+        expect(one(toolFace, 'import("../../core/file/batch.js").catch((e) => console.error(e));')).toHaveLength(1);
+        expect(one(toolFace, 'const x = import("../../core/file/batch.js").default;')).toHaveLength(1);
+        expect(one(toolFace, 'void import("../../core/file/batch.js");')).toHaveLength(1);
         expect(one(toolFace, 'import { BATCH_STEP_KINDS } from "../../core/file/batch.js";')).toHaveLength(1);
         // 混合写法里取了一个值也算
         expect(one(toolFace, 'import { BATCH_STEP_KINDS, type BatchPlan } from "../../core/file/batch.js";')).toHaveLength(1);
@@ -118,6 +123,8 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one(toolFace, 'import type { BatchPlan, BatchReport } from "../../core/file/batch.js";')).toEqual([]);
         expect(one(toolFace, 'type T = typeof import("../../core/base/driver.js");')).toEqual([]);
         expect(one(toolFace, 'type D = import("../../core/base/driver.js").RuntimeDriver;')).toEqual([]);
+        expect(one(toolFace, 'let d: import("../../core/base/driver.js").RuntimeDriver;')).toEqual([]);
+        expect(one(toolFace, 'type D = typeof import("../../core/base/driver.js").RuntimeDriver;')).toEqual([]);
         expect(one("src/interface/mcp/mcp-server.ts", 'export type { StreamResult } from "../../middle/types.js";')).toEqual([]);
     });
 
