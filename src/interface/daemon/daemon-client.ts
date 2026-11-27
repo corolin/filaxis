@@ -237,6 +237,20 @@ export async function probeDaemon(daemonDir = defaultDaemonDir(), timeoutMs = 80
     }
 }
 
+/**
+ * 等控制面就绪（每 100ms 探一次），超时返回 null。用于「别的进程正在拉起 Daemon」的情形：
+ * 多个客户端同时冷启动时，输家的子进程因锁被占而退出，赢家还在启动途中。
+ */
+export async function waitForDaemon(daemonDir = defaultDaemonDir(), timeoutMs = 10_000): Promise<DaemonClient | null> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        const client = await probeDaemon(daemonDir, 500);
+        if (client) return client;
+        if (Date.now() >= deadline) return null;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+}
+
 export interface SpawnDaemonOptions {
     cliEntryPath: string;
     daemonDir?: string;
@@ -244,7 +258,7 @@ export interface SpawnDaemonOptions {
     readyTimeoutMs?: number;
 }
 
-/** 仅由 `filaxis daemon start` 显式调用：后台独立拉起 Daemon 并等待控制面就绪 */
+/** 由 `filaxis daemon start` 与 filaxis-mcp 的自动启动调用：后台独立拉起 Daemon 并等待控制面就绪 */
 export async function spawnDaemonBackground(opts: SpawnDaemonOptions): Promise<DaemonStatusInfo> {
     const daemonDir = opts.daemonDir ?? defaultDaemonDir();
     const readyTimeoutMs = opts.readyTimeoutMs ?? 10_000;

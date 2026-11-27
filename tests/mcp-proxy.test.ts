@@ -662,6 +662,37 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
         }
     }, 90_000);
 
+    test("多个 filaxis-mcp 客户端同时冷启动：都接得上同一个 Daemon", async () => {
+        // 并发首启：只有一个客户端的子进程拿得到锁，其余的子进程因锁被占而退出、只上报退出码。
+        // 启动器此前只在报错文案含「已在运行」时才接纳别人拉起的实例——构建产物实测四成一
+        const dir = makeTempDir("fx-mcp-bin-cold-");
+        const clients = Array.from({ length: 4 }, () => spawnMcp(["--daemon-dir", dir]));
+        const settled = (c: ReturnType<typeof spawnMcp>): Promise<"responded" | "exited"> => Promise.race([
+            waitForResponse(c.responses, 1, 60_000).then(() => "responded" as const),
+            new Promise<"exited">((resolve) => {
+                if (c.child.exitCode !== null) resolve("exited");
+                else c.child.once("close", () => resolve("exited"));
+            }),
+        ]);
+        try {
+            for (const c of clients) c.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) + "\n");
+            const outcomes = await Promise.all(clients.map(settled));
+            const detail = clients
+                .map((c, i) => `客户端 ${i + 1}: ${outcomes[i]}${outcomes[i] === "exited" ? `（${c.stderrText().trim().slice(0, 160)}）` : ""}`)
+                .join("；");
+            expect(outcomes.filter((o) => o === "responded"), detail).toHaveLength(clients.length);
+            for (const c of clients) {
+                expect((c.responses.find((r) => r.id === 1)!.result as { tools: unknown[] }).tools).toHaveLength(12);
+            }
+            // 接的是同一个 Daemon：只拉起了一个
+            expect(await probeDaemon(dir)).not.toBeNull();
+        } finally {
+            for (const c of clients) if (c.child.exitCode === null) c.child.kill("SIGTERM");
+            await stopDaemonIn(dir);
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 120_000);
+
     test("filaxis-mcp --no-daemon：不启动 Daemon，在本进程内服务", async () => {
         const dir = makeTempDir("fx-mcp-bin-nod-");
         const { child, responses, stderrText } = spawnMcp(["--daemon-dir", dir, "--no-daemon"]);

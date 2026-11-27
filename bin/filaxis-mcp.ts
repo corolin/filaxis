@@ -18,7 +18,8 @@
  */
 import { McpServer } from "../src/interface/mcp/mcp-server.js";
 import { McpStdioProxy } from "../src/interface/mcp/mcp-proxy.js";
-import { probeDaemon, spawnDaemonBackground, assertDaemonProtocol } from "../src/interface/daemon/daemon-client.js";
+import { probeDaemon, spawnDaemonBackground, waitForDaemon, assertDaemonProtocol } from "../src/interface/daemon/daemon-client.js";
+import { isPidAlive, readDaemonLock } from "../src/interface/daemon/daemon-files.js";
 import { createAgentToolkit } from "../src/interface/mcp/agent-toolkit.js";
 import { createMiddle } from "../src/middle/middle.js";
 import { loadLayerStore } from "../src/middle/layer-store.js";
@@ -108,16 +109,20 @@ async function main(): Promise<void> {
 
     const bound = Boolean(o.layer || o.host || hasSshPathOpts);
     if (!o.noDaemon && process.env.FILAXIS_NO_DAEMON !== "1" && !bound) {
-        // 缺省经 Daemon；没有在跑就启动一个。两个 MCP 客户端同时首启时只有一个拉起成功，
-        // 另一个拿到「已在运行」——那就用它。
+        // 缺省经 Daemon；没有在跑就启动一个。多个 MCP 客户端同时首启时只有一个拉起成功，
+        // 其余的子进程因锁被占而退出、只上报退出码——那就接入赢家拉起的那个。
         let client = await probeDaemon(o.daemonDir);
         if (!client) {
             try {
                 await spawnDaemonBackground({ cliEntryPath: cliEntryPath(), daemonDir: o.daemonDir });
             } catch (e) {
-                if (!/已在运行/.test(String((e as Error).message))) throw e;
+                // 锁被别的活进程持有 = 它正在启动（或已在运行）：等它就绪后接入。不是这种情况
+                // （子进程自己崩了、锁是死的）就如实报原来的错。
+                const lock = readDaemonLock(o.daemonDir);
+                client = lock && isPidAlive(lock.pid) ? await waitForDaemon(o.daemonDir) : null;
+                if (!client) throw e;
             }
-            client = await probeDaemon(o.daemonDir);
+            client ??= await probeDaemon(o.daemonDir);
             if (!client) throw new Error("filaxis-mcp: Daemon 启动后未能连通（filaxis daemon status 查看）");
         }
         // 线协议不一致的 Daemon 不连（REQ-0004 §6.2）：明确报错，不让请求交给旧代码执行
