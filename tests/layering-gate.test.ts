@@ -119,6 +119,14 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one(toolFace, 'const entry = { load: import("../../core/file/batch.js").runBatch };')).toHaveLength(1);
         expect(one(toolFace, 'call({ kind: typeof import("../../core/file/batch.js") });')).toHaveLength(1);
         expect(one(toolFace, 'let x: T = { kind: typeof import("../../core/file/batch.js") };')).toHaveLength(1);
+        // 参数的默认值是表达式：三元分支、对象字面量里的冒号都不是类型标注；标注之后再写默认值也是值
+        expect(one(toolFace, 'function f(p = cond ? a : typeof import("../../core/file/batch.js")) {}')).toHaveLength(1);
+        expect(one(toolFace, 'const g = (p = cond ? a : typeof import("../../core/file/batch.js")) => p;')).toHaveLength(1);
+        expect(one(toolFace, 'function f(p: X = cond ? a : typeof import("../../core/file/batch.js")) {}')).toHaveLength(1);
+        expect(one(toolFace, 'const h = (p = { kind: typeof import("../../core/file/batch.js") }) => p;')).toHaveLength(1);
+        expect(one(toolFace, 'const k = (p: X) => cond ? a : typeof import("../../core/file/batch.js");')).toHaveLength(1);
+        // 参数表已闭合、箭头之后是函数体：括号体里直接写 typeof import 也是取值（与回调类型的区别在参数表是否闭合）
+        expect(one(toolFace, 'const k = (p: X) => typeof import("../../core/file/batch.js");')).toHaveLength(1);
         expect(one(toolFace, 'import { BATCH_STEP_KINDS } from "../../core/file/batch.js";')).toHaveLength(1);
         // 混合写法里取了一个值也算
         expect(one(toolFace, 'import { BATCH_STEP_KINDS, type BatchPlan } from "../../core/file/batch.js";')).toHaveLength(1);
@@ -146,6 +154,15 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one(toolFace, 'const f = (p: typeof import("../../core/base/driver.js")) => p;')).toEqual([]);
         expect(one(toolFace, 'let m: Map<string, typeof import("../../core/base/driver.js")>;')).toEqual([]);
         expect(one(toolFace, 'interface I { kind: typeof import("../../core/base/driver.js") }')).toEqual([]);
+        // 参数表里的类型位置：多个参数、类型实参、回调类型、条件类型、返回类型标注
+        expect(one(toolFace, 'function f(a, b: typeof import("../../core/base/driver.js")) {}')).toEqual([]);
+        expect(one(toolFace, 'function f(p: Map<string, typeof import("../../core/base/driver.js")) {}')).toEqual([]);
+        expect(one(toolFace, 'function f(cb: (e: { kind: number }) => typeof import("../../core/base/driver.js")) {}')).toEqual([]);
+        expect(one(toolFace, 'function f(p: T extends U ? A : typeof import("../../core/base/driver.js")) {}')).toEqual([]);
+        expect(one(toolFace, 'function f(p: X): typeof import("../../core/base/driver.js") { return p; }')).toEqual([]);
+        expect(one(toolFace, 'let x: { a: { b: typeof import("../../core/base/driver.js") } };')).toEqual([]);
+        expect(one(toolFace, 'type T = { a: 1 } | typeof import("../../core/base/driver.js");')).toEqual([]);
+        expect(one(toolFace, 'type Loader = (p: X) => typeof import("../../core/base/driver.js");')).toEqual([]);
         expect(one("src/interface/mcp/mcp-server.ts", 'export type { StreamResult } from "../../middle/types.js";')).toEqual([]);
     });
 

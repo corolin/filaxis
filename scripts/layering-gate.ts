@@ -88,19 +88,84 @@ function inTypePosition(before: string): boolean {
     const b = before.replace(/\s+$/, "").replace(/typeof$/, "").replace(/\s+$/, "");
     if (/\bas$/.test(b) || /\bsatisfies$/.test(b)) return true;
     if (/^\s*(?:export\s+)?type\s+[\w$]+\s*(?:<[^<>()]*>)?\s*=\s*$/.test(b)) return true;
-    if (!/:$/.test(b) && !/[<,|&]$/.test(b)) return false;
-    // 这一句：从上一个分号或右花括号之后起
-    const s = b.slice(Math.max(b.lastIndexOf(";"), b.lastIndexOf("}")) + 1).trimStart();
+    // 值得细看的结尾：标注冒号、类型实参/联合/交叉，或箭头（回调类型的返回类型；箭头函数体里的那种由参数表扫描判为值）
+    if (!/:$/.test(b) && !/[<,|&]$/.test(b) && !/=>$/.test(b)) return false;
+    // 这一句：从 statementStart 找到的边界之后起
+    const s = b.slice(statementStart(b)).trimStart();
     if (/^(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?(?:type|interface|enum)\b/.test(s)) return true;
     const decl = /^(?:(?:export|declare)\s+)?(?:let|const|var)\s+[\w$]+\s*:/.exec(s);
     if (decl) return !s.slice(decl[0].length).includes("=");
-    // 参数表尚未闭合（圆括号没配平——参数里的对象类型字面量也带花括号，不能拿花括号判）
-    const inParams = (s.match(/\(/g) ?? []).length > (s.match(/\)/g) ?? []).length;
-    // 箭头函数：语句以参数表起头（或 `const f = (`），且最后一个参数已标注
-    if (/^(?:(?:const|let|var)\s+[\w$]+\s*=\s*)?(?:async\s+)?\(/.test(s)) {
-        return inParams && /:[^:]*$/.test(s.slice(s.lastIndexOf("(")));
+    // 函数声明 / 箭头函数：看它的参数表
+    const sig = /^(?:(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*[\w$]*\s*\(|(?:(?:const|let|var)\s+[\w$]+\s*=\s*)?(?:async\s+)?\()/.exec(s);
+    return sig !== null && paramListIsTypePosition(s.slice(sig[0].length - 1));
+}
+
+/**
+ * 这一句的起点。只认顶层（圆/方/花括号深度为 0）的 `;`、`}`，以及不属于类型上下文的 `{`
+ * （对象字面量、代码块）。类型上下文里的花括号不切断语句：标注冒号之后的对象类型字面量、
+ * type / interface 头之后的花括号、以及嵌在括号里的任何花括号（回调类型
+ * `(e: { kind: number }) => …`）——否则 `function f(cb:` 这段头会被回调类型自己的 `}` 切掉。
+ */
+function statementStart(b: string): number {
+    let depth = 0;
+    let start = 0;
+    const typeBrace: boolean[] = [];
+    for (let i = 0; i < b.length; i++) {
+        const c = b[i]!;
+        if ("([{".includes(c)) {
+            if (c === "{" && depth === 0) {
+                const head = b.slice(0, i);
+                const inType = /:\s*$/.test(head) || /(?:^|[;}\s])(?:type|interface)\s+[\w$]+\s*(?:<[^<>]*>)?\s*(?:=\s*)?$/.test(head);
+                typeBrace.push(inType);
+                if (!inType) start = i + 1;
+            }
+            depth++;
+        } else if (")]}".includes(c)) {
+            depth--;
+            if (c === "}" && depth === 0) {
+                if (typeBrace.pop() !== true) start = i + 1;
+            }
+        } else if (c === ";" && depth === 0) start = i + 1;
     }
-    return inParams && /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*[\w$]*\s*\(/.test(s);
+    return start;
+}
+
+/**
+ * 参数表（从它的左括号起、到 import 之前）是否处在类型位置：最后一个「标注冒号」之后，且它后面
+ * 没有顶层的初始化（`=`）。标注冒号 = 段首是一个裸参数名（可带修饰符、`...`、`?`）、紧跟其后
+ * 的冒号；参数默认值里的冒号（三元分支）前面是表达式，不算。嵌套在圆括号/花括号/方括号/
+ * 尖括号里的内容不在顶层：回调类型 `(e: X) => typeof import(…)` 整体处在标注之后，是类型。
+ * 参数表闭合之后只有返回类型标注（恰好一个冒号）才算类型，其余是函数体。
+ */
+function paramListIsTypePosition(list: string): boolean {
+    let depth = 0;
+    let lastColon = -1;
+    let initAfter = false;
+    let segStart = 1;
+    let closeIndex = -1;
+    for (let i = 0; i < list.length; i++) {
+        const c = list[i]!;
+        const next = list[i + 1];
+        const prev = list[i - 1];
+        if ("([{<".includes(c)) depth++;
+        else if (")]}>".includes(c)) {
+            if (c === ">" && prev === "=") continue; // 箭头 `=>` 的 > 不是闭合的尖括号
+            depth--;
+            if (depth === 0) closeIndex = i;
+        } else if (depth === 1) {
+            if (c === ",") segStart = i + 1;
+            else if (c === "=" && next !== "=" && next !== ">" && prev !== "!" && prev !== "<" && prev !== ">" && prev !== "=") {
+                if (lastColon >= 0) initAfter = true;
+            } else if (c === ":" && next !== ":" && prev !== ":") {
+                const segment = list.slice(segStart, i).trim();
+                // `(?:\.{3})?`：可选的三个点。写成 `\.{3}?` 是「恰好三个点、惰性」，普通的参数名反而配不上
+                if (/^(?:(?:readonly|public|private|protected|override)\s+)?(?:\.{3})?[\w$]+\??$/.test(segment)) lastColon = i;
+            }
+        }
+    }
+    if (closeIndex >= 0 && list.slice(closeIndex + 1).trim() !== ":") return false;
+    if (closeIndex >= 0) return true; // 返回类型标注
+    return lastColon >= 0 && !initAfter;
 }
 
 export function importsOf(text: string): ImportEdge[] {
