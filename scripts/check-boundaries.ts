@@ -14,7 +14,9 @@
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { layeringViolations } from "./layering-gate.js";
+// 本脚本由 CI 的 Node 作业直接运行（node scripts/check-boundaries.ts，靠类型剥离）：Node 不做
+// 「.js → .ts」的说明符改写，相对导入必须写真实扩展名（.ts）。仓库其余代码仍用 .js 说明符。
+import { layeringViolations } from "./layering-gate.ts";
 
 const SRC = "src";
 /** 代码级上游业务标识（注释中的溯源说明合法——只查剥注释后的代码） */
