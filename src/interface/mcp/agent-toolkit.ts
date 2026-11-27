@@ -23,6 +23,8 @@ import type {
     ConnectSshResult as MiddleConnectSshResult,
     StreamResult,
 } from "../../middle/types.js";
+import { isAbsolute as pathIsAbsolute, resolve as pathResolve } from "node:path";
+import { callerCwd } from "./call-context.js";
 
 // ── 转发记录的工具面投影（REQ-0004 §5.2）──
 // snake_case 只属于 MCP 工具面：中层的记录与 CLI --json 是 camelCase，这里是唯一的
@@ -975,19 +977,58 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
     });
     const { ops } = middle;
 
+    // ── 调用方基准目录（REQ-0004 §5.5）──
+    // 工具面可能在 Daemon 进程里执行（MCP 经 Daemon），它的工作目录与客户端无关；相对路径与命令
+    // 的工作目录该以谁为基准是界面层的事：客户端一侧的代理把工作目录随会话带来（callerCwd）。
+    // 只有「没有自己工作目录的本机层」才用它：已存本机层用自己的 cwd，SSH 层的路径原样。
+    // 不在工具调用上下文里（SDK 直接调 handlers）时 callerCwd 为 undefined，一切照旧。
+    const callerLocal = async (layer: unknown): Promise<boolean> => {
+        if (callerCwd() === undefined) return false;
+        if (layer !== undefined && typeof layer !== "string") return false;
+        // 具名层只查登记表（不触发任何建层动作）；没写层才解析（缺省层或隐式本机层）
+        const drv = layer === undefined
+            ? await middle.resolveLayerRef(undefined)
+            : middle.stack.layers.get(layer)?.driver;
+        if (!drv || drv.descriptor?.driver !== "local" || drv.descriptor.cwd) return false;
+        // 以驱动实例登记的层，描述符里不带 cwd，工作目录只在驱动身上：它的实际目录就是本进程的
+        // 缺省目录时才算「没有自己的工作目录」（否则是层自己的，路径相对它）
+        const sameDir = (a: string, b: string): boolean => {
+            const norm = (p: string) => pathResolve(p).replace(/[/\\]+$/, "").toLowerCase();
+            return norm(a) === norm(b);
+        };
+        try {
+            return typeof drv.getCwd === "function" && sameDir(await drv.getCwd(), process.cwd());
+        } catch {
+            return false;
+        }
+    };
+    /** 相对路径补上调用方目录（只补前缀、不折叠 `..`——与 CLI 的 callerPath 同一条规则） */
+    const anchor = (p: unknown): unknown => {
+        const base = callerCwd();
+        return typeof p === "string" && p && base && !pathIsAbsolute(p) ? `${base.replace(/[/\\]+$/, "")}/${p}` : p;
+    };
+    /** 命令的工作目录：目标是没有自己工作目录的本机层时才给 */
+    const commandCwd = async (layer: unknown): Promise<string | undefined> =>
+        (await callerLocal(layer)) ? callerCwd() : undefined;
+
     const transferFile = async (operation: "put" | "get", args: AgentFilePutArgs): Promise<AgentFileTransferResult> => {
         const { local_path, remote_path, layer: layerName, transport, timeout_ms, write_mode, ...unknownFields } = args;
         const extra = Object.keys(unknownFields);
         if (extra.length) throw new Error(`transfer_file 未知参数：${extra.join(", ")}`);
         if (layerName !== undefined && (typeof layerName !== "string" || !layerName.trim())) throw new Error("layer 需为非空字符串");
+        // local_path 永远在调用方机器上；remote_path 只有目标也是调用方的本机层时才是
+        const localSide = await callerLocal(layerName);
         return agentTransferResult(await ops.transferFile({
-            layer: layerName, direction: operation, localPath: local_path, remotePath: remote_path,
+            layer: layerName, direction: operation,
+            localPath: anchor(local_path) as string,
+            remotePath: (localSide ? anchor(remote_path) : remote_path) as string,
             transport, timeoutMs: timeout_ms, writeMode: write_mode,
         }));
     };
 
     const startSession: AgentToolHandlers["start_session"] = async ({ command, ready_marker, error_pattern, name, layer: layerName }) => {
-        const h = await ops.startSession({ layer: layerName, command, name, readyMarker: ready_marker, errorPattern: error_pattern });
+        const cwd = await commandCwd(layerName);
+        const h = await ops.startSession({ layer: layerName, command, name, readyMarker: ready_marker, errorPattern: error_pattern, ...(cwd ? { cwd } : {}) });
         return { session_id: h.sessionId, log_base: h.logBase, ...(h.note !== undefined ? { note: h.note } : {}) };
     };
     const stopSession: AgentToolHandlers["stop_session"] = async ({ session_id, layer: layerName, ...extra }) => {
@@ -1071,7 +1112,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 }
                 if (Object.keys(extra).length) throw new Error("run_command 含未知参数，目标层字段为 layer");
                 if (typeof command !== "string" || !command.trim()) throw new Error("command 需为非空字符串");
-                const r = await ops.runCommand({ layer: layerName, command, timeoutMs: timeout_ms });
+                const cwd = await commandCwd(layerName);
+                const r = await ops.runCommand({ layer: layerName, command, timeoutMs: timeout_ms, ...(cwd ? { cwd } : {}) });
                 return {
                     stdout: r.stdout, stderr: r.stderr, exit_code: r.exitCode,
                     effective_user: r.effectiveUser,
@@ -1080,7 +1122,8 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
             start_session: startSession,
             async read_path(args) {
                 const { path, layer: layerName } = layerPathArgs(args);
-                const r = await ops.readPath({ layer: layerName, path });
+                const anchored = await callerLocal(layerName);
+                const r = await ops.readPath({ layer: layerName, path: (anchored ? anchor(path) : path) as string });
                 return r.type === "file"
                     ? { path: r.path, type: "file" as const, content: r.content, size: r.size, mtime_ms: r.mtimeMs }
                     : { path: r.path, type: "directory" as const, entries: r.entries };
@@ -1101,7 +1144,7 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     assertOptionalLayerName(layerName);
                     if (typeof content !== "string") throw new Error("edit_file 的 content 需为字符串");
                     const r = await ops.writeFile({
-                        layer: layerName, path, content,
+                        layer: layerName, path: (await callerLocal(layerName)) ? anchor(path) as string : path, content,
                         overwrite: boolOrUndefined(overwrite, "edit_file 的 overwrite"),
                         createDirs: boolOrUndefined(createDirs, "edit_file 的 create_dirs"),
                     });
@@ -1118,7 +1161,9 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 if (old === undefined || newStr === undefined) {
                     throw new Error("edit_file 需传 old 和 new（CAS 替换），或传 content（直接写入/创建）");
                 }
-                const r = await ops.editFile({ layer: layerName, path, old, new: newStr, all, writeMode });
+                const r = await ops.editFile({
+                    layer: layerName, path: (await callerLocal(layerName)) ? anchor(path) as string : path, old, new: newStr, all, writeMode,
+                });
                 return {
                     mode: "edit" as const,
                     path: r.path, occurrences: r.occurrences,
@@ -1133,23 +1178,25 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 }
                 assertValidPath(path);
                 assertOptionalLayerName(layerName);
+                const anchored = await callerLocal(layerName);
+                const anchoredPath = (anchored ? anchor(path) : path) as string;
                 if (action === "mkdir") {
                     const { parents, ...extra } = rest;
                     const unknown = Object.keys(extra);
                     if (unknown.length) throw new Error(`manage_path(mkdir) 未知参数：${unknown.join(", ")}`);
-                    return await ops.managePath({ layer: layerName, action: "mkdir", path, parents: boolOrUndefined(parents, "parents") });
+                    return await ops.managePath({ layer: layerName, action: "mkdir", path: anchoredPath, parents: boolOrUndefined(parents, "parents") });
                 }
                 if (action === "move") {
                     const { destination, ...extra } = rest;
                     const unknown = Object.keys(extra);
                     if (unknown.length) throw new Error(`manage_path(move) 未知参数：${unknown.join(", ")}`);
                     assertValidPath(destination, "destination");
-                    return await ops.managePath({ layer: layerName, action: "move", path, destination });
+                    return await ops.managePath({ layer: layerName, action: "move", path: anchoredPath, destination: (anchored ? anchor(destination) : destination) as string });
                 }
                 const { recursive, ...extra } = rest;
                 const unknown = Object.keys(extra);
                 if (unknown.length) throw new Error(`manage_path(delete) 未知参数：${unknown.join(", ")}`);
-                return await ops.managePath({ layer: layerName, action: "delete", path, recursive: boolOrUndefined(recursive, "recursive") });
+                return await ops.managePath({ layer: layerName, action: "delete", path: anchoredPath, recursive: boolOrUndefined(recursive, "recursive") });
             }) as AgentToolHandlers["manage_path"],
             transfer_file: (async (args: Record<string, unknown>) => {
                 const { direction, ...rest } = args;
@@ -1190,9 +1237,11 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                     if (!Number.isSafeInteger(wait_ms) || (wait_ms as number) < 0 || (wait_ms as number) > 30000) {
                         throw new Error("wait_ms 须在 0–30000 之间");
                     }
+                    const streamCwd = await commandCwd(layerName);
                     return publicStream(await ops.openStream({
                         layer: layerName, command, stream: stream as "stdout" | "stderr" | "both" | undefined,
                         name: name as string | undefined, limit: limit as number, waitMs: wait_ms as number,
+                        ...(streamCwd ? { cwd: streamCwd } : {}),
                     }));
                 }
                 const { window_id, limit = 20, since_seq, before_seq, window_ms, wait_ms = 0, ...extra } = args as {
@@ -1307,25 +1356,35 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const extra = Object.keys(unknownArgs);
                 if (extra.length) throw new Error(`run_batch 未知参数：${extra.join(", ")}（支持 steps、layer、stop_on_fail、max_parallel、output）`);
                 if (output !== undefined && output !== "text" && output !== "full") throw new Error('output 需为 "text" 或 "full"');
+                // 仅转换字段名，实际类型由内核 runBatch 在执行前统一校验。
+                // 调用方基准：local_path / command_file 永远在调用方机器上；path / remote_path 只在
+                // 这一步的目标是没有自己工作目录的本机层时（层名通配展开的目标不确定，不锚定）
                 const plan: BatchPlan = {
-                    // 仅转换字段名，实际类型由内核 runBatch 在执行前统一校验。
-                    steps: steps.map((raw, stepIdx): BatchStepWithDeps => {
+                    steps: await Promise.all(steps.map(async (raw, stepIdx): Promise<BatchStepWithDeps> => {
                         if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`steps[${stepIdx}] 需为对象`);
                         const { id, kind, layer, after, command, command_file, path, hunks, expect_exit, timeout_ms, write_mode, local_path, remote_path, transport, ...unknownFields } = raw;
                         const extra = Object.keys(unknownFields);
                         if (extra.length) throw new Error(`steps[${stepIdx}] 含未知字段：${extra.join(", ")}（目标层字段为 layer）`);
+                        const localSide = await callerLocal(layer ?? layerName);
                         return {
-                            id, kind, layer, after, command, path, hunks, transport,
-                            commandFile: command_file,
+                            id, kind, layer, after, command, transport,
+                            path: (localSide ? anchor(path) : path) as string | undefined,
+                            hunks,
+                            commandFile: anchor(command_file) as string | undefined,
                             expectExit: expect_exit, timeoutMs: timeout_ms, writeMode: write_mode,
-                            localPath: local_path, remotePath: remote_path,
+                            localPath: anchor(local_path) as string | undefined,
+                            remotePath: (localSide ? anchor(remote_path) : remote_path) as string | undefined,
                         } as BatchStepWithDeps;
-                    }),
+                    })),
                     stopOnFail: stop_on_fail,
                     maxParallel: max_parallel,
                 };
+                const batchCwd = await commandCwd(layerName);
                 const r = await ops.runBatch({
                     plan, layer: layerName === undefined ? undefined : layerName,
+                    // 目标是没有自己工作目录的本机层时带上调用方 cwd：exec 步骤仍由这一步所选的驱动
+                    // 执行，只是在该目录执行（与 run_command 同一规则；具名层的身份不变）
+                    ...(batchCwd !== undefined ? { cwd: batchCwd } : {}),
                     previewBudgetBytes: output === "text" ? 4096 : undefined,
                 });
                 return {
@@ -1362,19 +1421,24 @@ export function createAgentToolkit(stack: RuntimeStack, opts: AgentToolkitOption
                 const { path, layer: layerName } = layerPathArgs(args);
                 const drv = await middle.resolveLayerRef(layerName);
                 if (!drv.fs.stat) throw new Error("该层不支持 read_file 的元数据（fs.stat 缺席）");
-                const st = await drv.fs.stat(path);
+                const target = ((await callerLocal(layerName)) ? anchor(path) : path) as string;
+                const st = await drv.fs.stat(target);
                 if (!st) throw new Error(`文件不存在: ${path}`);
                 if (st.isDirectory === true) throw new Error(`目标是目录（请使用 read_path 或 list_directory）: ${path}`);
-                const content = await drv.fs.readFile(path);
+                const content = await drv.fs.readFile(target);
                 return { path, content, size: st.size, mtime_ms: st.mtimeMs };
             },
             async list_directory(args) {
                 const { path, layer: layerName } = layerPathArgs(args);
-                return { path, entries: await (await middle.resolveLayerRef(layerName)).fs.readdir(path) };
+                const target = ((await callerLocal(layerName)) ? anchor(path) : path) as string;
+                return { path, entries: await (await middle.resolveLayerRef(layerName)).fs.readdir(target) };
             },
             async delete_file(args) {
                 const { path, layer: layerName } = layerPathArgs(args);
-                await ops.managePath({ layer: layerName, action: "delete", path, recursive: false });
+                await ops.managePath({
+                    layer: layerName, action: "delete",
+                    path: ((await callerLocal(layerName)) ? anchor(path) : path) as string, recursive: false,
+                });
                 return { path, deleted: true as const };
             },
             put_file: (args) => transferFile("put", args),

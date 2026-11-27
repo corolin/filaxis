@@ -16,6 +16,7 @@ import { defaultDaemonDir, readDaemonConnection } from "../daemon/daemon-files.j
 import { DaemonClient, parseAddrToUrl, ProtocolMismatchError, urlRequestHost, urlRequestPort } from "../daemon/daemon-client.js";
 import { noopLogger, type FilaxisLogger } from "../../shared/logger.js";
 import { PROTOCOL_VERSION } from "../../middle/protocol.js";
+import { CALLER_CWD_HEADER, encodeCallerCwd } from "./call-context.js";
 
 export interface McpStdioProxyOptions {
     daemonDir?: string;
@@ -438,6 +439,9 @@ export class McpStdioProxy {
                     Accept: "text/event-stream",
                     "Cache-Control": "no-cache",
                     Authorization: `Bearer ${token}`,
+                    // 调用方基准目录：代理进程跑在客户端那一侧、就在客户端的工作目录里。Daemon 侧的
+                    // 工具面据此给相对路径与命令工作目录定基准——与进程内形态同参同果（REQ-0004 §5.5）
+                    [CALLER_CWD_HEADER]: encodeCallerCwd(process.cwd()),
                 },
                 agent: false,
             }, (res) => {

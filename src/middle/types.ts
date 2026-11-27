@@ -169,7 +169,8 @@ export interface MiddleOps {
         defaultLayer?: LayerRef;
         /** 调用方已知的层描述符（已存层表的当前内容，路径已按调用方解析）：命中时优先于中层自己的层表 */
         layers?: Record<string, RuntimeDescriptor>;
-        /** 默认层是本机层时的命令工作目录 */
+        /** 命令工作目录：exec 步骤落在「没有自己工作目录的本机层」上时（含具名的），由该步所选的驱动
+         *  在此目录执行——不另建驱动。带 defaultLayer 时另建不登记的本机驱动承载它（文件步骤也相对它） */
         cwd?: string;
     }): Promise<BatchReport>;
     startSession(args: { layer?: LayerRef; command: string; name?: string; cwd?: string; readyMarker?: string; errorPattern?: string }): Promise<SessionHandle>;

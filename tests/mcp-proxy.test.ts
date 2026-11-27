@@ -9,11 +9,12 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as http from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
-import { assertDaemonProtocol, ProtocolMismatchError } from "../src/interface/daemon/daemon-client.js";
+import { assertDaemonProtocol, parseAddrToUrl, ProtocolMismatchError, urlRequestHost, urlRequestPort } from "../src/interface/daemon/daemon-client.js";
 import { PROTOCOL_VERSION } from "../src/middle/protocol.js";
+import { CALLER_CWD_HEADER, decodeCallerCwd, encodeCallerCwd } from "../src/interface/mcp/call-context.js";
 import {
     createAgentToolkit,
     DaemonClient,
@@ -1126,6 +1127,122 @@ describe("DaemonServer MCP HTTP/SSE & McpStdioProxy", () => {
             rmSync(dir, { recursive: true, force: true });
         }
     }, 10_000);
+
+    test("代理在 SSE 握手时带上自己的工作目录（调用方基准）", async () => {
+        const dir = makeTempDir("fx-mcp-caller-cwd-hdr-");
+        let sseHeader: string | string[] | undefined;
+        const fake = http.createServer((req, res) => {
+            if (req.method === "GET" && req.url === "/status") {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    ok: true,
+                    result: { pid: 4242, startedAt: 0, uptimeMs: 1, version: "fake", protocolVersion: PROTOCOL_VERSION, addr: "", layers: [], forwards: [], streams: [] },
+                }));
+                return;
+            }
+            if (req.method === "GET" && req.url === "/mcp/sse") {
+                sseHeader = req.headers[CALLER_CWD_HEADER];
+                res.writeHead(200, { "Content-Type": "text/event-stream" });
+                res.write("event: endpoint\ndata: /mcp/message?sessionId=fake\n\n");
+                return;
+            }
+            res.writeHead(202).end();
+        });
+        let fx: ReturnType<typeof attachProxyFixture> | undefined;
+        try {
+            await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+            const port = (fake.address() as { port: number }).port;
+            writeFileSync(join(dir, "daemon.addr"), `http://127.0.0.1:${port}`);
+            writeFileSync(join(dir, "daemon.token"), "caller-cwd-token");
+            fx = attachProxyFixture({ daemonDir: dir, initialReconnectDelayMs: 30, maxReconnectDelayMs: 80 });
+            const deadline = Date.now() + 3_000;
+            while (sseHeader === undefined && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+            expect(sseHeader).toBeDefined();
+            expect(decodeCallerCwd(sseHeader)).toBe(process.cwd());
+        } finally {
+            fx?.proxy.close();
+            fake.closeAllConnections();
+            await new Promise<void>((resolve) => fake.close(() => resolve()));
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 10_000);
+
+    test("Daemon 按会话取用调用方目录：两条会话带不同的目录、并发调用，各读各的文件", async () => {
+        // 工具集在 Daemon 进程里执行（测试进程，目录是仓库根）。两条 SSE 会话各自在握手时带了
+        // 客户端的工作目录：相对路径与命令目录以各自带来的为准，互不串线
+        const daemonDir = makeTempDir("fx-mcp-caller-cwd-sessions-");
+        const dirA = makeTempDir("fx-mcp-caller-a-");
+        const dirB = makeTempDir("fx-mcp-caller-b-");
+        writeFileSync(join(dirA, "marker.txt"), "from-a\n");
+        writeFileSync(join(dirB, "marker.txt"), "from-b\n");
+        const srv = new DaemonServer({ daemonDir, version: "test" });
+        const sessions: Array<{ res: http.IncomingMessage; post: string }> = [];
+        try {
+            const addr = await srv.start();
+            const base = parseAddrToUrl(addr);
+            const openSession = (callerCwd?: string) => new Promise<{ res: http.IncomingMessage; post: string }>((resolve, reject) => {
+                const headers: Record<string, string> = { Accept: "text/event-stream", Authorization: `Bearer ${srv.token}` };
+                if (callerCwd) headers[CALLER_CWD_HEADER] = encodeCallerCwd(callerCwd);
+                const req = http.get({
+                    protocol: base.protocol, hostname: urlRequestHost(base), port: urlRequestPort(base), path: "/mcp/sse", headers, agent: false,
+                }, (res) => {
+                    let buf = "";
+                    res.setEncoding("utf-8");
+                    res.on("data", (d: string) => {
+                        buf += d;
+                        const m = /event: endpoint\ndata: (.+)\n/.exec(buf);
+                        if (m) resolve({ res, post: m[1]!.trim() });
+                    });
+                    res.on("error", reject);
+                });
+                req.on("error", reject);
+            });
+            const a = await openSession(dirA);
+            const b = await openSession(dirB);
+            sessions.push(a, b);
+            // 两条会话上的应答经各自的 SSE 通道回来：按请求 id 收集
+            const answers = new Map<string, string>();
+            for (const [label, s] of [["a", a], ["b", b]] as const) {
+                s.res.on("data", (d: string) => {
+                    for (const m of d.matchAll(/data: (\{.*\})\n/g)) {
+                        try { answers.set(`${label}:${(JSON.parse(m[1]!) as { id?: unknown }).id}`, m[1]!); } catch { /* ignore */ }
+                    }
+                });
+            }
+            const call = (s: { post: string }, id: number, name: string, args: Record<string, unknown>) => new Promise<void>((resolve, reject) => {
+                const payload = JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+                const req = http.request({
+                    protocol: base.protocol, hostname: urlRequestHost(base), port: urlRequestPort(base), path: s.post, method: "POST",
+                    headers: { "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(payload)), Authorization: `Bearer ${srv.token}` }, agent: false,
+                }, (res) => { res.resume(); res.on("end", () => resolve()); });
+                req.on("error", reject);
+                req.end(payload);
+            });
+            // 并发：A 读文件 + 报目录，B 读文件 + 写一个文件
+            await Promise.all([
+                call(a, 1, "read_path", { path: "marker.txt" }),
+                call(a, 2, "run_command", { command: "pwd" }),
+                call(b, 3, "read_path", { path: "marker.txt" }),
+                call(b, 4, "edit_file", { path: "written-by-b.txt", content: "b\n" }),
+            ]);
+            const deadline = Date.now() + 10_000;
+            while (answers.size < 4 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+            expect(answers.size).toBe(4);
+            const content = (key: string) => ((JSON.parse(answers.get(key)!) as { result?: { structuredContent?: { content?: string } } }).result?.structuredContent?.content);
+            expect(content("a:1")).toBe("from-a\n");
+            expect(content("b:3")).toBe("from-b\n");
+            const pwd = (key: string) => ((JSON.parse(answers.get(key)!) as { result?: { structuredContent?: { stdout?: string } } }).result?.structuredContent?.stdout ?? "");
+            expect(pwd("a:2").trim().replace(/\\/g, "/").replace(/\/+$/, "").endsWith("/" + basename(dirA))).toBe(true);
+            expect(existsSync(join(dirB, "written-by-b.txt"))).toBe(true);
+            expect(existsSync(join(dirA, "written-by-b.txt"))).toBe(false);
+        } finally {
+            for (const s of sessions) s.res.destroy();
+            await srv.stop().catch(() => undefined);
+            rmSync(daemonDir, { recursive: true, force: true });
+            rmSync(dirA, { recursive: true, force: true });
+            rmSync(dirB, { recursive: true, force: true });
+        }
+    }, 30_000);
 
     test("stdin 在 SSE 握手完成前关闭：在途的握手请求随即撤下，不转发、不重连、不留连接", async () => {
         // 假 Daemon：/mcp/sse 的请求扣住不回应（握手悬而未决）；其余路径记下并拒绝

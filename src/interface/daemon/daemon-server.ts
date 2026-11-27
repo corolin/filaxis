@@ -16,6 +16,7 @@ import type { RuntimeStack } from "../../middle/runtime-stack.js";
 import type { StreamWindowRegistry } from "../../core/stream/stream-window.js";
 import { createAgentToolkit, type AgentToolkit } from "../mcp/agent-toolkit.js";
 import { McpProtocolHandler } from "../mcp/mcp-server.js";
+import { CALLER_CWD_HEADER, decodeCallerCwd } from "../mcp/call-context.js";
 import { noopLogger, type FilaxisLogger } from "../../shared/logger.js";
 import { loadLayerStore } from "../../middle/layer-store.js";
 import { createMiddle, type LocalMiddle } from "../../middle/middle.js";
@@ -75,6 +76,9 @@ interface McpSseClient {
     res: http.ServerResponse;
     sendEvent: (event: string, data: string) => void;
     close: () => void;
+    /** 这条会话的客户端工作目录（代理在 SSE 握手时带来）：本会话的工具调用里，落在没有自己工作
+     * 目录的本机层上的相对路径与命令目录以它为基准。没带（旧代理）为 undefined——照旧以本进程目录为基准 */
+    callerCwd?: string;
 }
 
 class HttpStatusError extends Error {
@@ -386,6 +390,7 @@ export class DaemonServer {
                     try { res.destroy(); } catch { /* ignore */ }
                 }
             },
+            callerCwd: decodeCallerCwd(req.headers[CALLER_CWD_HEADER]),
         };
 
         this.mcpSseClients.set(sessionId, client);
@@ -416,7 +421,9 @@ export class DaemonServer {
                 return;
             }
             this.sendJson(res, 202, { ok: true });
-            void this.mcpHandler.handleMessage(body).then((resp) => {
+            // 这条会话的调用方基准（客户端工作目录）随请求进入工具调用；会话没带就是本进程目录之外无从得知
+            const ctx = client.callerCwd ? { cwd: client.callerCwd } : undefined;
+            void this.mcpHandler.handleMessage(body, ctx).then((resp) => {
                 if (resp) {
                     client.sendEvent("message", JSON.stringify(resp));
                 }

@@ -31,6 +31,7 @@ import {
     type ReadPathResult,
 } from "./agent-toolkit.js";
 import { noopLogger, type FilaxisLogger } from "../../shared/logger.js";
+import { runWithToolCallContext, type ToolCallContext } from "./call-context.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const JSONRPC_VERSION = "2.0";
@@ -94,7 +95,8 @@ export class McpProtocolHandler {
         this.version = opts.serverVersion ?? version;
     }
 
-    async handleRawLine(line: string): Promise<Record<string, unknown> | null> {
+    /** `ctx`：本次请求的调用方基准（进程内形态＝本进程目录）。Daemon 侧按会话传入客户端目录 */
+    async handleRawLine(line: string, ctx: ToolCallContext = { cwd: process.cwd() }): Promise<Record<string, unknown> | null> {
         const trimmed = line.trim();
         if (trimmed === "") return null;
         let msg: unknown;
@@ -103,7 +105,7 @@ export class McpProtocolHandler {
         } catch {
             // 解析失败：若可提取 id 则按规范回 Parse error（-32700）
             const idMatch = trimmed.match(/"id"\s*:\s*(\d+|"[^"]*")/);
-            // 兜底 parse 防炸（Sol 55 P1-B）：畸形串的 id 片段可能截出半个字符串——
+            // 兜底 parse 防炸（Sol 55 P1-B）：畸形串的 id 片段可能切出半个字符串——
             // 二次 JSON.parse 再抛即逃出监听器崩进程；失败 id=null 照常回错
             let id: number | string | null = null;
             if (idMatch) {
@@ -111,10 +113,10 @@ export class McpProtocolHandler {
             }
             return makeReplyErr(id, -32700, "Parse error: invalid JSON");
         }
-        return this.handleMessage(msg);
+        return this.handleMessage(msg, ctx);
     }
 
-    async handleMessage(msg: unknown): Promise<Record<string, unknown> | null> {
+    async handleMessage(msg: unknown, ctx?: ToolCallContext): Promise<Record<string, unknown> | null> {
         if (msg === null || typeof msg !== "object") {
             // JSON null/标量防御（Sol 五十四期 P1-4）：null 是合法 JSON——解析成功
             // 后 `"id" in null` 抛 TypeError 逃出监听器崩进程
@@ -125,13 +127,13 @@ export class McpProtocolHandler {
         const req = obj as unknown as JsonRpcRequest;
         const id = (req.id ?? 0) as number | string;
         try {
-            return await this.dispatch(req, id);
+            return await this.dispatch(req, id, ctx);
         } catch (e) {
             return makeReplyErr(id, -32603, `Internal error: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
-    private async dispatch(req: JsonRpcRequest, id: number | string): Promise<Record<string, unknown>> {
+    private async dispatch(req: JsonRpcRequest, id: number | string, ctx?: ToolCallContext): Promise<Record<string, unknown>> {
         const { method } = req;
         const params = req.params ?? {};
         switch (method) {
@@ -174,7 +176,9 @@ export class McpProtocolHandler {
                 const textOnlyBatch = name === "run_batch" && args.output === "text";
                 try {
                     if (typeof args !== "object" || Array.isArray(args)) throw new Error(`${name} 的 arguments 需为对象`);
-                    const r = await (handler as (a: Record<string, unknown>) => Promise<unknown>)(args);
+                    // 工具处理函数从上下文里取调用方基准目录（相对路径、命令工作目录），处理函数签名不变
+                    const r = await runWithToolCallContext(ctx, () =>
+                        (handler as (a: Record<string, unknown>) => Promise<unknown>)(args));
                     // Some clients only expose content, so include bounded command output there.
                     return makeReply(id, {
                         content: [{ type: "text", text: summarizeToolResult(name, r, textOnlyBatch) }],

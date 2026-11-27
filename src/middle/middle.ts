@@ -557,7 +557,12 @@ export function createMiddle(opts: MiddleOptions = {}): LocalMiddle {
                 return resolveNamed();
             };
             try {
-                return await runBatch(resolver, expanded, previewBudgetBytes !== undefined ? { previewBudgetBytes } : {});
+                // cwd 另外交给内核：exec 步骤落在「没有自己工作目录的本机层」上时（含具名的），由这一步
+                // 所选的驱动在该目录执行——不另建驱动（那会绕过所选驱动）
+                return await runBatch(resolver, expanded, {
+                    ...(previewBudgetBytes !== undefined ? { previewBudgetBytes } : {}),
+                    ...(cwd !== undefined ? { commandCwd: cwd } : {}),
+                });
             } finally {
                 if (scoped) await scoped.destroy().catch(() => undefined);
             }

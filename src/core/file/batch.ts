@@ -149,7 +149,7 @@ export interface BatchReport {
 export async function runBatch(
     target: RuntimeDriver | ((layer?: string) => RuntimeDriver | Promise<RuntimeDriver>),
     plan: BatchPlan,
-    options: { previewBudgetBytes?: number } = {},
+    options: { previewBudgetBytes?: number; commandCwd?: string } = {},
 ): Promise<BatchReport> {
     // ── 计划校验（零副作用阶段）──
     // 未知顶层键拒绝（DSH 真机巡检踩中：`layers` 与 `layer` 一字之差被静默忽略，
@@ -268,6 +268,7 @@ export async function runBatch(
         }
         previewBytes = Math.floor(previewBudgetBytes / Math.max(1, streams));
     }
+    const { commandCwd } = options;
     const stepIdentity = (step: ResolvedBatchStep) => ({
         id: step.id,
         kind: step.kind,
@@ -307,7 +308,7 @@ export async function runBatch(
             const group = ready[0]!;
             const step = group.steps[group.nextStep++]!;
             if (group.nextStep === group.steps.length) removeHead();
-            const task = runStep(drivers.get(step.layer)!, step, previewBytes).then((report) => {
+            const task = runStep(drivers.get(step.layer)!, step, previewBytes, commandCwd).then((report) => {
                 reports.set(step.id, { ...stepIdentity(step), ...report });
                 if (report.status === "fail") {
                     failedStep ??= step.id;
@@ -507,7 +508,7 @@ function validateStep(step: BatchStepWithDeps): string[] | undefined {
     return stepLayers;
 }
 
-async function runStep(drv: RuntimeDriver, s: ResolvedBatchStep, previewBytes?: number): Promise<BatchStepReport> {
+async function runStep(drv: RuntimeDriver, s: ResolvedBatchStep, previewBytes?: number, commandCwd?: string): Promise<BatchStepReport> {
     const startedAt = Date.now();
     const base = { id: s.id, kind: s.kind, startedAt };
     try {
@@ -515,7 +516,10 @@ async function runStep(drv: RuntimeDriver, s: ResolvedBatchStep, previewBytes?: 
             // command 在校验阶段已由 resolveExecCommand 保证在场（commandFile 已内联）
             const command = s.command;
             if (command === undefined) throw new Error(`步骤 '${s.id}' 缺少 command（内部错误：commandFile 未解析）`);
-            const r = await drv.exec(command, { timeoutMs: s.timeoutMs, maxOutputBytes: previewBytes });
+            // 命令工作目录只对「没有自己工作目录的本机层」生效：仍由这一步所选的驱动执行（不另建、
+            // 不绕过），只是告诉它这次在哪里执行。层有自己的 cwd 或不是本机层时原样
+            const withCwd = commandCwd !== undefined && drv.descriptor?.driver === "local" && !drv.descriptor.cwd;
+            const r = await drv.exec(command, { timeoutMs: s.timeoutMs, maxOutputBytes: previewBytes, ...(withCwd ? { cwd: commandCwd } : {}) });
             const expect = s.expectExit ?? [0];
             const ok = expect.includes(r.exitCode);
             return {
