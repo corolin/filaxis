@@ -8,9 +8,45 @@
 
 简体中文 · [English](https://github.com/corolin/filaxis/blob/main/README.en.md)
 
+**为 AI Agent 构建的无屏幕多屏运维工作台。**\
 **千里一线，执行有迹。—— Connect · Execute · Observe · Reattach**
 
-面向自动化与 Agent 的远程执行运行时 SDK（Syrkos · 漩核旗下）。TypeScript 编写，Bun 与 Node LTS 双运行时，Windows 与 Linux 同构。**CLI / SDK / MCP Server 三入口**（`filaxis` / `createAgentToolkit` / `filaxis-mcp`）共享同一工具词汇表；CI 覆盖（均在 Ubuntu runner）：Bun 侧跑全量测试与 SSH 自环集成，Node 侧跑类型检查、边界检查、构建与编译版 CLI 冒烟（Node 不重复运行完整测试套）。
+面向自动化与 Agent 的远程执行运行时（Syrkos · 漩核旗下）。TypeScript 编写，零第三方运行时依赖，Bun 与 Node LTS 双运行时，Windows 与 Linux 同构。**CLI / MCP Server / SDK 三种宿主**（`filaxis` / `filaxis-mcp` / `createMiddle` · `RuntimeStack` · `createAgentToolkit`）共用中层操作。MCP 缺省经本机 Daemon 运行，CLI 可复用已运行的 Daemon，SDK 可用 `connectRemoteMiddle` 接入共享工作空间。
+
+## 为什么给 AI 配一套「屏幕」？
+
+> 人类运维工程师拥有多个终端窗口、多块屏幕，以及持续存在的工作空间。
+>
+> 为什么普通 AI Agent 每执行一条远程命令，都要重新描述一遍自己如何 `ssh -> ssh -> docker exec` 抵达那个环境？
+>
+> **为什么不给 AI 也配一套可以切屏的工作台？**
+
+Filaxis 的出发点不是重新发明 SSH，而是把人类运维工程师习以为常的多窗口工作环境，抽象成 Agent 可以寻址、切换、持续观察的运行时上下文（这里的「屏幕」不是物理显示器，而是持续存活、按需读取的执行上下文）：
+
+- **人类运维工程师**：人 + 多块屏幕 + N 个常驻终端窗口 —— 命名标签页、`Alt + Tab` 切屏操作、副屏挂着 `tail -f` 按需扫一眼。
+- **普通 Agent**：没有工作台，每次调用都从零拼装 `ssh -> ssh -> ...`，多跳引号层层转义；一旦直接跑 `tail -f` 就卡死工具调用或把输出灌满上下文。
+- **牵丝 Filaxis**：给 Agent 配齐命名层（虚拟终端窗口）、滚动观察窗（虚拟副屏）与本机 Daemon（常驻工作台），建连一次即可跨轮次、跨宿主按名切屏操作。
+
+| 人类的运维工作台 | 牵丝 Filaxis（MCP / CLI / SDK） |
+|---|---|
+| 打开 SSH 客户端（含跳板或批量连多机） | `connect_layer` / `filaxis layer save` / `stack.addLayer` |
+| 从宿主机进入容器或内网二次跳转 | `connect_layer(enter_cmd)` / `--enter` / `stack.layerInto` |
+| 给终端窗口命名 | 命名层（Named Layer） |
+| 查看当前打开了哪些窗口 | `manage_layers(list)` / `filaxis layer list` |
+| `Alt + Tab` 切换当前操作窗口 | 指定 `layer` 执行，或 `manage_layers(activate)` 切换默认层 |
+| 敲完一条命令不关掉整个终端工作台 | **本机 Daemon**（跨 CLI 与多 MCP 客户端维持层、连接、转发与观察窗） |
+| 副屏开着 `tail -f` 持续盯日志 | **持续观察窗**（`observe_stream` / `filaxis stream open`） |
+| 回看终端历史输出 | **本地滚动窗口缓冲 + 游标续读**（完整历史查已有落盘日志） |
+| 多块屏幕并行观察、批量下发操作 | 多层独立观察窗 + `run_batch` / `filaxis batch`（支持 `"web-*"` 通配扇出） |
+| 打通本地到远端内层的调试隧道 | 动态端口转发（`manage_layers(forward_add)` / `filaxis forward add`） |
+| 关闭不再需要的终端窗口 | `manage_layers(remove)` / `close_stream` |
+
+这套模型还同时解决了 Agent 运维的两个核心矛盾：
+
+1. **人类不会每敲完一条命令，就关闭整个终端工作台再重新打开所有窗口。** Daemon 承担的正是维持工作空间生命周期的职责——`0.3.0` 起 `filaxis-mcp` 缺省经本机 Daemon 执行（未运行则自动拉起），多个 MCP 客户端与 CLI 共享同一份层、SSH 连接、端口转发和观察窗。
+2. **屏幕一直存在，不代表人类一直盯着屏幕；观察窗一直运行，也不代表 Agent 必须持续消耗 Token。** Agent 不受物理屏幕面积与视觉注意力限制，可同时挂载数十个环境的观察窗。远端流进入本地滚动缓冲，Agent 只在需要时按游标 `peek` 读取增量或检索异常。
+
+## 快速上手（SDK）
 
 ```ts
 import { RuntimeStack } from "@syrkos/filaxis";
@@ -18,7 +54,7 @@ import { RuntimeStack } from "@syrkos/filaxis";
 const stack = new RuntimeStack();
 const host = await stack.connect({ driver: "ssh", target: "my-server" });
 
-// exec：退出码是数据，失败是异常；stdout/stderr 物理分离
+// exec：退出码是数据，无法执行才抛异常；stdout/stderr 物理分离
 const r = await host.exec("uname -a", { timeoutMs: 10_000 });
 console.log(r.stdout, r.stderr, r.exitCode, r.effectiveUser);
 
@@ -36,22 +72,23 @@ if (stop.status === "unknown") {
 stack.events.on("exit", (e) => console.log("session", e.sessionId, "exit", e.exitCode));
 ```
 
+含命名层、容器内层穿透（`layerInto`）、CAS 受控编辑、跨层 `runBatch` 与 `createAgentToolkit` 的完整编码配方见 [docs/skills/SKILL.md](docs/skills/SKILL.md)。
+
 ## 能力矩阵
 
-「成熟度」列：**内置**=开箱即用且 CI 真机覆盖；**可接入**=经配置/适配层支持（示例或文档指引）；**实验**=有实现但真机覆盖薄，欢迎试用与反馈。
+「成熟度」列：**内置**=开箱即用且 CI 真机覆盖；**可接入**=经配置/适配层支持（示例或文档指引）。
 
 | 能力 | 成熟度 | 说明 |
 |---|---|---|
-| 多 Transport 统一语义 | 内置（local/ssh）/ 可接入（docker/k8s/teleport） | `local` / `ssh` / `tmux` 内置 + `registerDriver()` 开放注册；docker/k8s/teleport 经 `launchCmd`（如 `"docker exec -it <ctr> bash"`）接入——能力同权，语义契约一致 |
+| 多层环境统一语义 | 内置（local/ssh/tmux）/ 可接入（docker/k8s/teleport） | `local` / `ssh` / `tmux` 内置 + `registerDriver()` 开放注册；docker/k8s/teleport 经进入管线（如 `"docker exec -i <ctr> sh"`）派生命名内层——能力同权，语义契约一致 |
+| 共享工作台（Daemon）与同构中层 | 内置 | `interface / middle / core` 三层架构：CLI、MCP、SDK（`createMiddle` / `connectRemoteMiddle`）共用同一组 26 个中层操作；经 Daemon 跨进程共享层、连接、转发与观察窗，带线协议版本握手 |
 | exec 双通道 | 内置 | 缺省非 PTY 通道（stdout/stderr 物理分离 + **层上下文拼装**：cwd/env/enter 进入管线在独立通道按需重放——`docker exec` 进的容器 exec 也直达）；`channel:"pty"` 继承层内交互状态 |
-| 长跑会话生命周期 | 内置 | `execSession` 即返、双文件 `.out/.err` 落盘、热窗口、行级 watcher、**终态三态** `exited/stopped/unknown` + `verifySession` 核实原语 |
-| ready() 就绪握手 | 内置 | 回溯匹配热窗口（快输出进程竞态根治）；滚出判定**有据**（evictedCount） |
-| 观察流 | 内置 | 独立 SSH channel 真流式直推（无轮询）；ControlMaster 复用；注意力衰减回收 |
-| 持久会话 | 内置 | tmux 后端 terminalId 跨进程 re-attach + cwd 恢复 |
-| 文件传输 | 内置 | `putFile/getFile` base64 管道分块 + size/sha256 双校验 + **方言适配**（GNU/BSD/busybox——OPNsense/Alpine 不再必错） |
-| 受控编辑 | 内置 | `editFile` 用 Compare-and-Swap（CAS）在写回前核对文件版本。结果分别报告锁保护和写入方式，详见 AGENTS.md 第 8 条。 |
-| 环境规格 | 内置 | 两段式自发现（语言/GPU/关键包）蒸馏落盘；`matchLayers({needs})` 按需选层；指纹漂移标 stale |
-| 连接治理 | 内置 | 连接拓扑指纹复用（同拓扑零重建）；3 次退避自动重连；层状态机与退化哨兵 |
+| 跨层并行批次 | 内置 | `runBatch` / `run_batch` / `filaxis batch` 支持多层数组与 `*` / `?` 通配扇出、`after` 依赖编排、巡检 `stopOnFail: false`，以及 CLI 批次输出落盘（`--out-dir`） |
+| 长跑会话生命周期 | 内置 | `execSession` 即返、双文件 `.out/.err` 落盘、热窗口、`ready()` 回溯就绪握手（`evictedCount` 滚出有据）、行级 watcher。停止结果为 `exited/stopped/unknown`，可用 `verifySession` 核实会话状态 |
+| 观察流与滚动观察窗 | 内置 | 独立 SSH channel 真流式直推（ControlMaster 复用）；本地反转为推模式滚动窗（单调递增帧号、非破坏游标续读、多消费者互不干扰、关窗自动收割流进程） |
+| 持久会话与动态转发 | 内置 | tmux 后端 `terminalId` 跨进程 re-attach + cwd 恢复；SSH 本地 `-L`、远端 `-R`、SOCKS 动态端口转发（支持经可重放进入管线穿透内层） |
+| 文件传输与受控编辑 | 内置 | `putFile/getFile`（及 SFTP 快路径）size/sha256 校验 + **方言适配**（GNU/BSD/busybox）；`editFile` 用 Compare-and-Swap（CAS）写前核对版本，分别报告锁保护与写入方式（见 AGENTS.md 第 8 条） |
+| 环境规格与连接治理 | 内置 | 两段式自发现（语言/GPU/关键包）+ `matchLayers({needs})` 按需选层 + 指纹漂移标 stale；连接拓扑指纹复用、退避重连与退化哨兵 |
 | 安全边界 | 内置 | host key 策略显式（tofu 缺省/strict+known_hosts）；凭据只传路径永不外泄；渲染永不含密钥内容 |
 
 ## 安装与运行时
@@ -60,9 +97,9 @@ stack.events.on("exit", (e) => console.log("session", e.sessionId, "exit", e.exi
 bun add @syrkos/filaxis    # 或 npm install @syrkos/filaxis
 ```
 
-- 运行时：Bun ≥1.x / Node LTS（内核统一 `node:` 标准库，零 runtime 专有 API——CI lint 断言）
-- npm 依赖：**零**（`dependencies` 为空是 AC 门禁项，见 `bun run check:boundaries`）
-- 系统依赖按能力分列（`stack.features()` **探测本机视角**——Agent 在容器里跑 filaxis 时探测的是容器内的 `ssh`/`tmux`/`sftp`，目标主机的能力经 `launchCmd` 层的 shell 自行确认）：`ssh`≥7.3 全功能（`-J`）、`tmux` 仅持久会话（缺席自动降级非持久）、`sftp` 仅传输快路径
+- 运行时：Bun ≥1.x / Node LTS（内核统一 `node:` 标准库，零 runtime 专有 API——CI 门禁断言；CI 在 Ubuntu 上覆盖 Bun 全量测试 + SSH 自环集成，以及 Node LTS 类型检查、分层边界门禁、构建与 CLI 冒烟）
+- npm 依赖：**零**（`dependencies` 为空是门禁项，见 `bun run check:boundaries`）
+- 系统依赖按能力分列（`stack.features()` **探测本机视角**——Agent 在容器里跑 filaxis 时探测的是容器内的 `ssh`/`tmux`/`sftp`，目标主机的能力经目标层自行确认）：`ssh`≥7.3 全功能（`-J`）、`tmux` 仅持久会话（缺席自动降级非持久）、`sftp` 仅传输快路径
 
 ## MCP 配置与 Agent Skill
 
@@ -86,6 +123,8 @@ filaxis mcp-config --format toml  # TOML，使用 mcp_servers（Codex）
   }
 }
 ```
+
+`0.3.0` 起，`filaxis-mcp` 缺省经本机 Daemon 执行（未运行则自动启动），使多个 MCP 客户端之间、CLI 与 MCP 之间共享同一套层、连接、端口转发与观察窗；若带 `--host` / `--enter` / `--docker` / `--layer` 绑定参数或显式传 `--no-daemon`，则在本进程内独立运行。跨版本升级后若旧 Daemon 仍在跑，线协议握手会显式拒绝，先执行 `filaxis daemon stop` 再发起命令即可（详见 [0.3.0 升级要点](docs/skills/SKILL.md)）。
 
 暴露的 12 个 MCP 工具速览：
 
