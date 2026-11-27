@@ -3,9 +3,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { StreamSessionManager, type SpawnImpl } from "../src/stream-session-manager.js";
-import type { SessionEvent } from "../src/session-types.js";
-import type { SessionLine } from "../src/session-buffer.js";
+import { StreamSessionManager, type SpawnImpl } from "../src/core/stream/stream-session-manager.js";
+import type { SessionEvent } from "../src/core/base/session-types.js";
+import type { SessionLine } from "../src/core/base/session-buffer.js";
 
 /** fake ssh 进程：可编程推流/退出的 EventEmitter 型 ChildProcess 替身 */
 function fakeSpawn(): { impl: SpawnImpl; procs: FakeChild[] } {
@@ -156,7 +156,7 @@ describe("StreamSessionManager（AC-06）", () => {
     test("分块安全：READY 跨两块 watcher 仍命中；中文跨块无替换符；无尾换行 exit flush", async () => {
         const { impl, procs } = fakeSpawn();
         const m = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
-        const lines: import("../src/session-buffer.js").SessionLine[] = [];
+        const lines: import("../src/core/base/session-buffer.js").SessionLine[] = [];
         const evs = collect(m);
         const id = await m.start("x", {
             onLine: (l) => lines.push(l),
@@ -182,7 +182,7 @@ describe("StreamSessionManager（AC-06）", () => {
     test("exit 后尾数据不丢（close 兜底 flush）：data→exit→data→close", async () => {
         const { impl, procs } = fakeSpawn();
         const m = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
-        const lines: import("../src/session-buffer.js").SessionLine[] = [];
+        const lines: import("../src/core/base/session-buffer.js").SessionLine[] = [];
         await m.start("x", { onLine: (l) => lines.push(l) });
         const c = procs[0]!;
         c.emitOut("HEAD\n");
@@ -200,7 +200,7 @@ describe("StreamSessionManager（AC-06）", () => {
     test("跨 exit 的半行合回：RE→exit→ADY\\n→close → READY 单行命中", async () => {
         const { impl, procs } = fakeSpawn();
         const m = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
-        const lines: import("../src/session-buffer.js").SessionLine[] = [];
+        const lines: import("../src/core/base/session-buffer.js").SessionLine[] = [];
         const evs = collect(m);
         await m.start("x", { onLine: (l) => lines.push(l), watchPattern: "READY" });
         const c = procs[0]!;
@@ -237,7 +237,7 @@ describe("StreamSessionManager（AC-06）", () => {
     test("pending 上限：4MiB 无换行不无限累积，保尾截断入窗", async () => {
         const { impl, procs } = fakeSpawn();
         const m = new StreamSessionManager(["host"], { spawnImpl: impl, disableMux: true });
-        const lines: import("../src/session-buffer.js").SessionLine[] = [];
+        const lines: import("../src/core/base/session-buffer.js").SessionLine[] = [];
         await m.start("x", { onLine: (l) => lines.push(l) });
         const c = procs[0]!;
         for (let i = 0; i < 64; i++) c.emitOut("X".repeat(64 * 1024)); // 4MiB 无换行

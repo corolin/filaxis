@@ -22,8 +22,9 @@
 - **[自挖]** **不兼容**：CLI `--json` 输出与中层记录同形，统一 camelCase（`forwardId`、`bindAddr`、`windowId`…）。0.2.13 把转发记录改成 snake_case 是在「两套命名并存」上打的补丁；现在 snake_case 只属于 MCP 工具面，MCP 的 12 个工具名与 schema 不变。
 - **[自挖]** **不兼容**：裸 RPC 不带层 = 中层当前默认层（与 MCP 一致）；CLI 的「命令行没写目标」在界面层显式翻译成本机层——Daemon 里若有人把一个 SSH 层登记成默认层（甚至就叫 `local`），无目标的 CLI 命令不会被它吸走。「层不存在」「不认识的 driver」经 Daemon 与一次性模式不再是两句不同的提示，由中层统一报错并带补救办法。
 - **[自挖]** CLI 每个子命令只剩一份实现：原来「经 Daemon」与「一次性模式」两条路径有 8 处行为差异（本机文件路径、相对的密钥路径只在经 Daemon 时解析等），现在一致。本机层上的相对路径以层自己的工作目录为基准，没有则取调用方的；批次把调用方眼里的层表随请求带给中层，重新保存过的层立刻生效，不必等 Daemon 重启。
-- **[自挖]** SDK 新增导出：`createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及各操作的结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`。`createAgentToolkit(stack, opts)` 签名不变（内部代建中层，也可用 `opts.middle` 传入已建好的）。`src/runtime-stack.ts`、`layer-store.ts`、`session-ownership.ts` 迁入 `src/operations/`，原有导出名不变。
-- **[自挖]** `bun run check:boundaries` 新增第四道断言——三层依赖方向：内核只依赖内核；中层可依赖内核但不得依赖界面层；界面层从内核只能取类型，且不得经 SDK 总出口取符号。
+- **[自挖]** SDK 新增导出：`createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及各操作的结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`。`createAgentToolkit(stack, opts)` 签名不变（内部代建中层，也可用 `opts.middle` 传入已建好的）。从包外导入的路径只有总出口 `@syrkos/filaxis`，不受下面的目录调整影响；原有导出名不变。
+- **[用户]** `src/` 按层划分目录，目录就是分层：`src/core/`（内核，内部按关注点分 `base` / `ssh` / `local` / `stream` / `tmux` / `file` / `probe`）、`src/middle/`（中层）、`src/interface/`（界面层：`mcp/` 与 `daemon/`）、`src/shared/`（各层共用），根下只留总出口 `src/index.ts`。`runtime-stack`、`layer-store`、`session-ownership` 归入 `src/middle/`。
+- **[自挖]** `bun run check:boundaries` 新增第四道断言——三层依赖方向，按目录判层：内核只依赖内核；中层可依赖内核但不得依赖界面层；界面层从内核只能取类型；任何一层都不得经 SDK 总出口取符号；`src/` 下没归进任何一层目录的源文件直接拦下。
 - **[自挖]** 进程内形态的 `filaxis-mcp`（带绑定参数或 `--no-daemon`）在客户端断开后即退出。此前只销毁观察窗注册表，绑定 SSH 层时 PTY 子进程撑住事件循环，客户端退出后这个进程连同它的 ssh 一直留着，每个客户端会话泄漏一个（0.2.13 即如此）。经 Daemon 的缺省形态没有这个问题。
 - **[自挖]** 本机层的工作目录不存在时，命令不再报成 `ENOENT … uv_spawn 'bash'`（看着像没装 bash，其实与 bash 无关），而是直接说明「本机层的工作目录不存在」并点名目录。已存层的工作目录被删或填错时最常见。
 - **[自挖]** `bun run build` 恢复为零错误退出。打包的最后一步（tsc 生成类型声明）此前不用项目配置、参数单独写，与日常的 `bun run typecheck` 是两套判断：0.3.0 重构工具集时留下 5 个类型错误（校验前的值直接传给了类型化参数），日常检查靠严格模式的控制流收窄放行，打包则以退出码 2 失败（0.2.13 没有这个问题）。现在这一步用 `tsconfig.build.json`（继承项目配置，只改输出），工具集里对应的五处取值改为显式校验，并由测试真的跑一遍。

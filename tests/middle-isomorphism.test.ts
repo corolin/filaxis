@@ -15,10 +15,10 @@ import { dumpResults } from "./isomorphism-dump.js";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DaemonClient, DaemonServer } from "../src/index.js";
-import { connectRemoteMiddle } from "../src/daemon-client.js";
-import { createMiddle, type LocalMiddle } from "../src/operations/middle.js";
-import type { Middle, MiddleOps } from "../src/operations/types.js";
-import type { RuntimeDescriptor } from "../src/driver.js";
+import { connectRemoteMiddle } from "../src/interface/daemon/daemon-client.js";
+import { createMiddle, type LocalMiddle } from "../src/middle/middle.js";
+import type { Middle, MiddleOps } from "../src/middle/types.js";
+import type { RuntimeDescriptor } from "../src/core/base/driver.js";
 import {
     ISO_CASES, ISO_LAYER_STORE, normalizeError, normalizeResult, scopeLayerListing,
     type IsoCase, type IsoStep, type Json,
@@ -184,7 +184,7 @@ describe("中层同构用例集（REQ-0004 AC-03）：三种宿主同参同果",
 
 describe("中层同构用例集：语料自身的约束", () => {
     test("每条用例都有名字，且互不重复；每一步的操作名都在中层操作集里", async () => {
-        const { REMOTE_OP_NAMES } = await import("../src/operations/protocol.js");
+        const { REMOTE_OP_NAMES } = await import("../src/middle/protocol.js");
         const names = ISO_CASES.map((c) => c.name);
         expect(new Set(names).size).toBe(names.length);
         for (const c of ISO_CASES) {

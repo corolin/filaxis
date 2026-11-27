@@ -67,13 +67,39 @@
 
 ## 4. 模块归属
 
-| 层 | 模块 | 备注 |
-|---|---|---|
-| core | `src/driver.ts` `local-driver.ts` `ssh-pty-driver.ts` `tmux-driver.ts` `terminal/*` `ssh-helpers.ts` `ssh-forward.ts` `ssh-file-stdio.ts` `batch.ts`（内核 `runBatch`）`file-transfer.ts` `file-edit.ts` `file-placement.ts` `layer-file-transfer.ts` `layer-env.ts` `layer-discovery.ts` `dialect.ts` `stream-window.ts` `stream-session-manager.ts` `remote-session-manager.ts` `local-session-manager.ts` `local-observation-process.ts` `session-buffer.ts` `events.ts` `logger.ts` `exec-capture.ts` `vt100-screen.ts` `shell-discovery.ts` `openssh-environment.ts` `windows-upload-acl.ts` `factory.ts` | 物理位置不动（0.3.0 不做内核文件搬迁，避免大面积改动导入路径） |
-| middle | `src/operations/` ：`runtime-stack.ts`（自 `src/` 迁入）`layer-store.ts`（迁入）`session-ownership.ts`（迁入）`middle.ts`（`createMiddle` 与操作集）`protocol.ts`（线协议版本）`types.ts`（操作参数 / 结果类型、`LayerRef`） | 新目录 |
-| interface | **cli**：`bin/filaxis.ts` ；**mcp**：`bin/filaxis-mcp.ts` `src/mcp-server.ts` `src/mcp-proxy.ts` ；**LLM 工具面**：`src/agent-toolkit.ts`（工具定义 + snake_case 投影 + 旧名兼容） ；**daemon 宿主与传输**：`src/daemon-server.ts` `src/daemon-client.ts` `src/daemon-files.ts` | daemon 进程 = 中层的宿主进程，可同时装载 RPC 端点与 MCP 端点 |
+目录就是分层——`src/` 根下只有总出口和四个层目录，门禁按目录判层（§7）：
 
-SDK 导出（`src/index.ts`）保持扁平：迁入 `operations/` 的模块改导出路径，符号名不变。
+```
+src/
+├── index.ts          SDK 总出口（公开 API；包外只从这里导入）
+├── shared/           各层共用，不含任何一层的知识：logger、async-guard
+├── core/             无状态执行内核，按关注点分七组
+│   ├── base/         driver 契约、工厂、事件、会话类型与缓冲、输出采集、方言、shell 与 OpenSSH 环境发现
+│   ├── ssh/          ssh 驱动与底座、文件 stdio 中转、远端会话、动态端口转发
+│   ├── local/        本机驱动、本机会话、本机观察进程
+│   ├── stream/       观察流会话、滚动窗口、VT100 屏幕
+│   ├── tmux/         tmux 驱动、终端管理器、terminal/
+│   ├── file/         批次内核 runBatch、文件传输 / 受控编辑 / 落位、Windows 上传 ACL
+│   └── probe/        层环境规格与自发现
+├── middle/           有状态的操作层：middle（createMiddle 与 26 个操作）、runtime-stack、
+│                     layer-store、session-ownership、protocol、types
+└── interface/        界面层
+    ├── mcp/          mcp-server、mcp-proxy、agent-toolkit（LLM 工具面：工具定义 + snake_case 投影）
+    └── daemon/       daemon-server、daemon-client、daemon-files（中层的常驻宿主与线协议客户端）
+
+bin/                  入口脚本（界面层）：filaxis（CLI）、filaxis-mcp、local-write-lock
+```
+
+| 层 | 是什么 | 不拥有什么 |
+|---|---|---|
+| core | driver 实现、批次内核、文件传输 / 编辑、转发管理器、观察流与窗口、会话管理器、ssh 底座、方言、终端 | 命名层、默认层、连接复用缓存、会话归属、已存层表；不知道 daemon / mcp / cli 的存在 |
+| middle | `RuntimeStack`（命名层、默认层、连接指纹复用、转发）、观察窗注册表、会话归属、已存层解析、层引用解析、操作集 | 参数语法、文本呈现、Daemon 的 token 与传输 |
+| interface | 中层的适配器：参数语法、调用方本机路径 → 绝对路径、结果呈现、Daemon 发现 / 握手 / 传输 / 装配 | 任何操作逻辑 |
+| shared | 日志器、异步收口这类不含层知识的小件 | — |
+
+内核的七组沿用 ROADMAP §7「换核对账表」的分组（基础、SSH、本机层、观察流、tmux、批次与文件），探测单独成组。组之间有交叉引用（驱动要用到文件与流），没有强加组间依赖方向——内核的边界是「层」，组只是方便找。
+
+SDK 导出（`src/index.ts`）保持扁平：包外的导入路径只有 `@syrkos/filaxis`，目录调整对外不可见；符号名不变。
 
 ---
 
@@ -126,7 +152,7 @@ connectRemoteMiddle(client: DaemonClient): Promise<Middle> // 同形客户端；
 | 观察窗 | `openStream` `peekStream` `closeStream` `listStreams` | 开窗、三种游标读（`afterSeq` / `beforeSeq` / 末尾，可按 `stream` 过滤）、关窗、清单 |
 | 转发 | `openForward` `listForwards` `closeForward` | `-L` / `-R` / `-D`；缺省只列在用；关闭三态 |
 
-`REMOTE_OP_NAMES`（`src/operations/protocol.ts`）是客户端与服务端共用的操作清单，带穷举检查：中层增删操作而忘了同步，typecheck 报错。
+`REMOTE_OP_NAMES`（`src/middle/protocol.ts`）是客户端与服务端共用的操作清单，带穷举检查：中层增删操作而忘了同步，typecheck 报错。
 
 ### 5.4 层引用 `LayerRef`
 
@@ -178,7 +204,7 @@ GET /status  含 protocolVersion、version、pid、layers、forwards、streams
 
 ### 6.2 版本握手
 
-- `PROTOCOL_VERSION`（`src/operations/protocol.ts`）是线协议版本，与包版本分离；不兼容的线协议变更才递增。
+- `PROTOCOL_VERSION`（`src/middle/protocol.ts`）是线协议版本，与包版本分离；不兼容的线协议变更才递增。
 - **客户端**：连上先取 `/status`，`protocolVersion` 不等于自己的（或缺失——那是 0.2.x 的 Daemon）即抛 `ProtocolMismatchError`（`code: E_PROTOCOL_MISMATCH`），报双方版本、Daemon pid 与处置办法（`filaxis daemon stop` 后重启）。**绝不向错配的 Daemon 发操作**，也不退回另一条执行路径。
 - **服务端**：信封 `protocol` 不等于自己的即拒绝（`code: E_PROTOCOL_MISMATCH`），不执行。
 - 0.2.x 客户端 × 0.3 Daemon：旧客户端不带 `protocol` 字段 → 被拒并看到上面的错误。
@@ -201,12 +227,13 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 
 | 规则 | 断言 |
 |---|---|
-| R1 | 内核只依赖内核与各层共用的日志器——不依赖中层或界面层，**连类型也不取**（依赖方向不许倒过来） |
+| R0 | `src/` 下的源文件必须归到某一层的目录里——直接堆在 `src/` 根下的不算（总出口 `src/index.ts` 除外）。归位先于一切：堆在根下的文件看不出属于哪层，依赖方向也无从谈起 |
+| R1 | 内核只依赖内核与各层共用件——不依赖中层或界面层，**连类型也不取**（依赖方向不许倒过来） |
 | R2 | 中层可依赖内核，不得依赖界面层 |
 | R3 | 界面层从内核只能取类型（`import type`） |
-| R3b | 界面层与中层不得经 SDK 总出口（`src/index.ts`）取符号——总出口再导出了整个内核，从它取符号等于绕过逐模块判断 |
+| R3b | 任何一层都不得经 SDK 总出口（`src/index.ts`）取符号——总出口再导出了整个内核、自己又依赖各层：界面层与中层由此绕过逐模块判断，内核与共用件则和总出口成环 |
 
-归属：`src/operations/**` 是中层；`src/agent-toolkit.ts`、`mcp-server.ts`、`mcp-proxy.ts`、`daemon-server.ts`、`daemon-client.ts`、`daemon-files.ts` 与 `bin/**` 是界面层；`src/logger.ts` 各层共用；其余 `src/**` 是内核。测试与示例不在门禁范围内。
+层按目录判，不靠文件名清单：`src/core/**` 是内核；`src/middle/**` 是中层；`src/interface/**` 与 `bin/**` 是界面层；`src/shared/**` 各层共用；不在这些目录里的 `src/**` 文件按 R0 报出。测试、示例、脚本不在门禁范围内。
 
 原有三条（零上游业务概念 / 零裸 `Bun.*` / 零第三方运行时依赖）不变。
 
@@ -220,10 +247,11 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 4. **CLI `--json` 统一 camelCase**：转发记录从 0.2.13 的 snake_case 改回，观察窗、Daemon 状态同理。snake_case 只属于 MCP 工具面；MCP 的 12 个工具名与 schema 不变。
 5. **一次性模式与经 Daemon 的行为一致**：相对的本机文件路径、相对的密钥路径在两种模式下不再有差别（原 0.2.x 有 8 处差异）。
 6. **提示文案统一**：「层不存在」「不认识的 driver」由中层报错并带补救办法，经 Daemon 与一次性模式不再是两句。
-7. **SDK**：`createAgentToolkit(stack, opts)` 签名不变（内部代建中层；`opts.middle` 可传入已建好的），handler 不再含操作逻辑；新增导出 `createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`；`src/runtime-stack.ts`、`layer-store.ts`、`session-ownership.ts` 迁入 `src/operations/`，符号名不变。
+7. **SDK**：`createAgentToolkit(stack, opts)` 签名不变（内部代建中层；`opts.middle` 可传入已建好的），handler 不再含操作逻辑；新增导出 `createMiddle`、`connectRemoteMiddle`、`Middle` / `MiddleOps` / `LayerRef` 及结果类型、`PROTOCOL_VERSION` / `REMOTE_OP_NAMES`；符号名不变。`runtime-stack`、`layer-store`、`session-ownership` 归入中层，包外导入路径不受影响。
 8. **`bun run check:boundaries` 多一道断言**（§7）。
+9. **`src/` 按层划分目录**（§4）：`core` / `middle` / `interface` / `shared`，根下只留总出口。包的 `exports` 只暴露总出口，所以这次调整对包外不可见；仓库内按旧路径深层导入的代码（测试、脚本）已随搬迁改写。
 
-**非目标**：跨语言 IPC（Host Protocol PRD / ROADMAP §3）；内核文件物理搬迁；更换传输层；改动执行语义宪法（完成哨兵 / abort≠已取消 / 零自动重放 / PTY 状态机）；补齐 SDK 公开面里尚未成为独立操作的能力（`ready()`、`verifySession()`、读落盘日志、事件订阅——ROADMAP §6.1 P2）。
+**非目标**：跨语言 IPC（Host Protocol PRD / ROADMAP §3）；更换传输层；改动执行语义宪法（完成哨兵 / abort≠已取消 / 零自动重放 / PTY 状态机）；补齐 SDK 公开面里尚未成为独立操作的能力（`ready()`、`verifySession()`、读落盘日志、事件订阅——ROADMAP §6.1 P2）；内核七组之间不加依赖方向断言（驱动要用到文件与流，组只是方便找）。
 
 ---
 
@@ -239,6 +267,7 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 | **M5** | 分层门禁的四条断言 + 清掉界面层最后三处内核值依赖 | `76d0b10` |
 | **M6** | 同构用例集：30 条声明式用例 × 三种宿主 | `af0c5f5` |
 | **M7** | 文档修订、全量回归、真机复验（23 项） | `66accc4` |
+| **M8** | `src/` 按层划分目录（§4）：52 个源文件进 `core` / `middle` / `interface` / `shared`，422 处相对引用由脚本按「解析旧位置 → 查搬迁表 → 按新位置重算」改写；门禁改为按目录判层并加 R0 | 本提交 |
 
 复验过程中顺带修掉的两个原有缺陷（0.2.13 即有，不是本轮引入）：
 
@@ -253,7 +282,7 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 
 ## 10. 验收标准清单 (Acceptance Criteria / AC Matrix)
 
-- [x] **AC-01 一份操作实现**：`/rpc` 只有「取操作 → 调用 → 回结果」；操作逻辑只存在于 `src/operations/`。
+- [x] **AC-01 一份操作实现**：`/rpc` 只有「取操作 → 调用 → 回结果」；操作逻辑只存在于 `src/middle/`。
 - [x] **AC-02 界面层零内核值依赖**：门禁断言 + 测试；现有 `src/` 与 `bin/` 零违规。
 - [x] **AC-03 同构**：`tests/isomorphism-corpus.ts` 30 条用例覆盖 `runCommand`、`runBatch`（层通配、`commandFile`、失败即停语义、调用方层表）、`readFile` / `writeFile` / `editFile` / `readPath` / `managePath`、`transferFile`、`startSession` / `stopSession`、`observe`、`openStream` / `peekStream` / `closeStream` / `listStreams`、`listLayers` / `activateLayer` / `removeLayer`、`probeLayer`、`features`、转发的不支持拒绝；在即弃进程内、SDK 长驻、Daemon 远程三种宿主下结果一致。
 - [x] **AC-04 版本握手**：客户端侧（旧 Daemon 不上报 → 拒绝并报 pid 与处置办法；版本一致放行）有单测；服务端拒绝错配信封；CLI 遇错配不退回一次性模式。
@@ -261,3 +290,4 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 - [x] **AC-06 零回归**：除 §8 有意变更对应的用例外全部通过。最终代码全量——Windows 796 通过 / 45 跳过 / 0 失败，Linux（真机集成打开）834 通过 / 7 跳过 / 0 失败（各 841 条）。真机复验 23 项全部通过：协议错配的两个方向（新客户端 × 旧 Daemon 拒绝且不发操作；旧客户端 × 新 Daemon 被拒不执行）；homelab（一次性、经 Daemon、两跳进入管线、put/get 往返、observe）；腾讯云集群（层通配 `q-*` 9 台经 Daemon、一次性批次、跳板层转发）；多跳管线（三段 ssh → ssh → docker 的穿层转发、两跳 ssh 的穿层转发）；MCP 经 Daemon（三个已存层不必先 connect_layer、层通配、forward_add、MCP 开的观察窗 CLI 接得上）；绑定参数走进程内。
 - [x] **AC-07 分层门禁**：四类违规各有测试证明会被拦下；现有代码零违规。
 - [x] **AC-08 文档**：本文档、SKILL 中英文版、包说明书 AGENTS.md、CHANGELOG 已按新宿主策略与命名约定修订。
+- [x] **AC-09 目录就是分层**：`src/` 根下只有总出口与四个层目录；门禁按目录判层，未归位的源文件被拦下——合成用例逐类验证，并用一个真放在 `src/` 根下的文件实测门禁脚本失败退出。

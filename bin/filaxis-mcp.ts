@@ -16,14 +16,14 @@
  *   filaxis-mcp --layer web-01                     # 本进程内，已存层为默认层
  *   # 不论怎么启动，工具的 layer 参数与 run_batch 的层通配都认已存层表
  */
-import { McpServer } from "../src/mcp-server.js";
-import { McpStdioProxy } from "../src/mcp-proxy.js";
-import { probeDaemon, spawnDaemonBackground, assertDaemonProtocol } from "../src/daemon-client.js";
-import { createAgentToolkit } from "../src/agent-toolkit.js";
-import { createMiddle } from "../src/operations/middle.js";
-import { loadLayerStore } from "../src/operations/layer-store.js";
-import type { RuntimeDescriptor } from "../src/driver.js";
-import type { FilaxisLogger } from "../src/logger.js";
+import { McpServer } from "../src/interface/mcp/mcp-server.js";
+import { McpStdioProxy } from "../src/interface/mcp/mcp-proxy.js";
+import { probeDaemon, spawnDaemonBackground, assertDaemonProtocol } from "../src/interface/daemon/daemon-client.js";
+import { createAgentToolkit } from "../src/interface/mcp/agent-toolkit.js";
+import { createMiddle } from "../src/middle/middle.js";
+import { loadLayerStore } from "../src/middle/layer-store.js";
+import type { RuntimeDescriptor } from "../src/core/base/driver.js";
+import type { FilaxisLogger } from "../src/shared/logger.js";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 

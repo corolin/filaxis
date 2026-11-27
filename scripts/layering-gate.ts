@@ -3,7 +3,15 @@
  *
  *     interface = cli | mcp        middle = daemon | sdk        core = non-daemon
  *
- *   R1  内核只依赖内核（与各层共用的日志器）
+ * 层按目录判（不是按文件名清单）：
+ *     src/core/**        内核
+ *     src/middle/**      中层
+ *     src/interface/**   界面层（bin/ 下的入口脚本也是）
+ *     src/shared/**      各层共用：不含任何一层的知识
+ *     src/index.ts       SDK 总出口
+ *
+ *   R0  src/ 下的源文件必须归到某一层的目录里——直接堆在 src/ 根下的不算
+ *   R1  内核只依赖内核（与各层共用件）
  *   R2  中层可依赖内核，不得依赖界面层
  *   R3  界面层只依赖中层与自身；从内核只能取类型（import type）
  *   R3b 界面层与中层不得经 SDK 总出口（src/index.ts）取符号——总出口再导出了整个内核
@@ -11,28 +19,22 @@
  * 纯函数：输入「文件路径 → 源码」，输出违规清单。门禁脚本 check-boundaries.ts 用真文件
  * 调它；测试用合成的例子证明每一类违规都会被拦下、放行的方向不被误伤。
  */
-export type Layer = "core" | "middle" | "interface" | "shared" | "barrel" | "other";
+export type Layer = "core" | "middle" | "interface" | "shared" | "barrel" | "unclassified" | "other";
 
-const INTERFACE_FILES = new Set([
-    "src/agent-toolkit.ts",
-    "src/mcp-server.ts",
-    "src/mcp-proxy.ts",
-    "src/daemon-server.ts",
-    "src/daemon-client.ts",
-    "src/daemon-files.ts",
-]);
-
-/** 各层共用的基础设施：不含任何一层的知识，谁都可以依赖 */
-const SHARED_FILES = new Set(["src/logger.ts"]);
+const LAYER_DIRS: Array<[string, Layer]> = [
+    ["src/core/", "core"],
+    ["src/middle/", "middle"],
+    ["src/interface/", "interface"],
+    ["src/shared/", "shared"],
+];
 
 export function layerOf(file: string): Layer {
     const f = file.replace(/\\/g, "/");
     if (f === "src/index.ts") return "barrel";
-    if (f.startsWith("src/operations/")) return "middle";
-    if (INTERFACE_FILES.has(f) || f.startsWith("bin/")) return "interface";
-    if (SHARED_FILES.has(f)) return "shared";
-    if (f.startsWith("src/")) return "core";
-    return "other";
+    for (const [dir, layer] of LAYER_DIRS) if (f.startsWith(dir)) return layer;
+    if (f.startsWith("bin/")) return "interface";
+    if (f.startsWith("src/")) return "unclassified"; // 堆在 src/ 根下，没归进任何一层
+    return "other"; // 测试、示例、脚本：不在门禁范围内
 }
 
 export interface ImportEdge {
@@ -176,12 +178,19 @@ export function layeringViolations(entries: Array<{ file: string; text: string }
     for (const { file, text } of entries) {
         const from = layerOf(file);
         if (from === "other") continue;
+        if (from === "unclassified") {
+            // R0：归位先于一切——堆在 src/ 根下的文件既看不出属于哪层，依赖方向的断言也无从谈起
+            out.push(`${file}: 源文件没有归到任何一层的目录里（src/core、src/middle、src/interface、src/shared；总出口 src/index.ts 除外）——REQ-0004 §4`);
+            continue;
+        }
         for (const edge of importsOf(text)) {
             const target = resolveSpec(file, edge.spec);
             if (target === undefined) continue;
             const to = layerOf(target);
             const where = `${file}:${edge.line}`;
-            if (to === "barrel" && (from === "interface" || from === "middle")) {
+            if (to === "barrel" && from !== "barrel") {
+                // 总出口再导出了整个内核，而且它自己依赖各层：谁都不得反过来经它取符号——
+                // 界面层与中层由此绕过逐模块判断，内核与共用件则和总出口成环
                 out.push(`${where}: ${from} 层不得经 SDK 总出口（${edge.spec}）取符号——总出口再导出了整个内核；请从具体模块导入（REQ-0004 R3）`);
             } else if (from === "core" && (to === "middle" || to === "interface")) {
                 // 连类型也不许：依赖方向不许倒过来（界面层取内核类型是 R3 明确放行的另一个方向）

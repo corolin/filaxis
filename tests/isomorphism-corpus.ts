@@ -12,7 +12,7 @@
  *   "$ref:<名字>.<字段>" 前面某一步 save 下来的结果里的字段
  *   "$=<字面量>"        以 $ 开头又不是记号的字面量
  */
-import type { MiddleOps } from "../src/operations/types.js";
+import type { MiddleOps } from "../src/middle/types.js";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 

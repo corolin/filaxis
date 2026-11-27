@@ -144,7 +144,7 @@ describe("DaemonServer & DaemonClient RPC", () => {
             let result: Record<string, unknown> = {};
             if (req.method === "GET" && req.url === "/status") {
                 // 合规的 Daemon 会上报线协议版本（REQ-0004 §6.2）；不上报的会被客户端拒绝
-                const { PROTOCOL_VERSION } = await import("../src/operations/protocol.js");
+                const { PROTOCOL_VERSION } = await import("../src/middle/protocol.js");
                 result = { pid: 1, protocolVersion: PROTOCOL_VERSION, version: "stub", layers: [], forwards: [], streams: [] };
             }
             if (req.method === "POST") {
@@ -1191,8 +1191,8 @@ describe("CLI forward list（DSH 评估 2026-11-26 #5a/#5b）", () => {
 // ---------------------------------------------------------------------------
 describe("REQ-0004 M0：Daemon 线协议版本握手", () => {
     test("status 上报协议版本，与 PROTOCOL_VERSION 一致", async () => {
-        const { DaemonServer } = await import("../src/daemon-server.js");
-        const { PROTOCOL_VERSION } = await import("../src/operations/protocol.js");
+        const { DaemonServer } = await import("../src/interface/daemon/daemon-server.js");
+        const { PROTOCOL_VERSION } = await import("../src/middle/protocol.js");
         const dir = mkdtempSync(join(tmpdir(), "fx-proto-"));
         const srv = new DaemonServer({ daemonDir: dir, version: "0.3.0-test" });
         try {
@@ -1207,8 +1207,8 @@ describe("REQ-0004 M0：Daemon 线协议版本握手", () => {
     });
 
     test("旧 Daemon（不上报协议版本）或不同协议版本 → ProtocolMismatchError，带 pid 与处置办法", async () => {
-        const { DaemonClient, assertDaemonProtocol, ProtocolMismatchError } = await import("../src/daemon-client.js");
-        const { PROTOCOL_VERSION } = await import("../src/operations/protocol.js");
+        const { DaemonClient, assertDaemonProtocol, ProtocolMismatchError } = await import("../src/interface/daemon/daemon-client.js");
+        const { PROTOCOL_VERSION } = await import("../src/middle/protocol.js");
         type Status = Record<string, unknown> & { protocolVersion?: number };
         const fake = (status: Status) => ({ status: async () => status }) as unknown as DaemonClient;
 

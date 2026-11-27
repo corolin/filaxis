@@ -6,10 +6,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalRuntimeDriver } from "../src/local-driver.js";
+import { LocalRuntimeDriver } from "../src/core/local/local-driver.js";
 import { runBatch, expandBatchLayerWildcards, expandLayerPattern, hasLayerWildcard, editFileMulti, type RuntimeDriver, type BatchPlan } from "../src/index.js";
-import { createAgentToolkit } from "../src/agent-toolkit.js";
-import { RuntimeStack } from "../src/operations/runtime-stack.js";
+import { createAgentToolkit } from "../src/interface/mcp/agent-toolkit.js";
+import { RuntimeStack } from "../src/middle/runtime-stack.js";
 
 const dir = mkdtempSync(join(tmpdir(), "fx-batch-"));
 
@@ -144,7 +144,7 @@ describe("runBatch（DAG + fail-fast + 证据）", () => {
         const nullDriver = {
             descriptor: { driver: "local" },
             async exec(): Promise<never> { throw null; }, // 恶意/异常 driver
-        } as unknown as import("../src/local-driver.js").LocalRuntimeDriver;
+        } as unknown as import("../src/core/local/local-driver.js").LocalRuntimeDriver;
         const r = await runBatch(nullDriver, {
             steps: [
                 { id: "boom", kind: "exec", command: "x" },

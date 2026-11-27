@@ -30,6 +30,10 @@ describe("打包的类型声明一步", () => {
             const declared = (pkg.types ?? "").replace(/^\.\/dist\//, "");
             expect(existsSync(join(out, declared))).toBe(true);
             expect(readFileSync(join(out, declared), "utf-8")).toContain("createMiddle");
+            // 声明树与源码树同形：每一层目录都有声明
+            for (const dir of ["core", "middle", "interface", "shared"]) {
+                expect(existsSync(join(out, dir)), dir).toBe(true);
+            }
         } finally {
             rmSync(out, { recursive: true, force: true });
         }

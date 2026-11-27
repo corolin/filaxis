@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalRuntimeDriver } from "../src/local-driver.js";
+import { LocalRuntimeDriver } from "../src/core/local/local-driver.js";
 
 const execDir = join(tmpdir(), "filaxis-test-exec");
 

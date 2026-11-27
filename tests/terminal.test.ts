@@ -5,15 +5,15 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { OutputBuffer } from "../src/terminal/output-buffer.js";
-import { SessionRegistry, type TerminalProfile } from "../src/terminal/session-registry.js";
-import { SessionLauncher } from "../src/terminal/session-launcher.js";
-import { CommandExecuter, isBinaryChunk } from "../src/terminal/command-executer.js";
-import { TmuxInvoker } from "../src/terminal/tmux-invoker.js";
-import { compilePromptPatterns, TmuxError } from "../src/terminal/types.js";
-import { TerminalManager } from "../src/terminal-manager.js";
-import { TmuxSessionDriver } from "../src/tmux-driver.js";
-import { resolveLocalShell } from "../src/shell-discovery.js";
+import { OutputBuffer } from "../src/core/tmux/output-buffer.js";
+import { SessionRegistry, type TerminalProfile } from "../src/core/tmux/session-registry.js";
+import { SessionLauncher } from "../src/core/tmux/session-launcher.js";
+import { CommandExecuter, isBinaryChunk } from "../src/core/tmux/command-executer.js";
+import { TmuxInvoker } from "../src/core/tmux/tmux-invoker.js";
+import { compilePromptPatterns, TmuxError } from "../src/core/tmux/types.js";
+import { TerminalManager } from "../src/core/tmux/terminal-manager.js";
+import { TmuxSessionDriver } from "../src/core/tmux/tmux-driver.js";
+import { resolveLocalShell } from "../src/core/base/shell-discovery.js";
 
 test("tmux small file reads reject damaged Base64 and short decoded output", async () => {
     const driver = new TmuxSessionDriver({ driver: "tmux" });
@@ -716,7 +716,7 @@ describe("TerminalManager（无 tmux 环境降级路径）", () => {
         if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
         const dir = mkdtempSync(join(tmpdir(), "fx-tm-big"));
         const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 80, spawn_poll_ms: 50 } });
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         // launchCmd 必须显式（SessionLauncher 只认 local/launchCmd——裸 driver:"tmux" 抛 Unknown driver）
         const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
         await drv.init();
@@ -741,7 +741,7 @@ describe("TerminalManager（无 tmux 环境降级路径）", () => {
         if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
         const dir = mkdtempSync(join(tmpdir(), "fx-tm-4k"));
         const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 80, spawn_poll_ms: 50 } });
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "sh" } }, { terminalManager: tm }); // sh=无 readline（canonical 事实面）
         await drv.init();
         try {
@@ -762,7 +762,7 @@ describe("TerminalManager（无 tmux 环境降级路径）", () => {
         if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
         const dir = mkdtempSync(join(tmpdir(), "fx-tm-bin"));
         const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 80, spawn_poll_ms: 50 } });
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
         await drv.init();
         try {
@@ -1741,7 +1741,7 @@ describe("Sol 85：cd exitCode 判定", () => {
 // 输出全被截掉。回显判定提前。
 describe("Sol 86：回显先于 marker", () => {
     test("首执行带回显（echo ---CMD_DONE 在场）：真实输出保留", async () => {
-        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const { CommandExecuter } = await import("../src/core/tmux/command-executer.js");
         const strip = (CommandExecuter as unknown as { __testStrip?: (log: string, prefix: string, needle: string) => string }).__testStrip;
         if (!strip) return; // 导出面缺席
         const prefix = "---CMD_DONE_abc12345_";
@@ -1763,7 +1763,7 @@ describe("Sol 86：回显先于 marker", () => {
 // 成功放行（destroyConfirmed 闸）；P1-7 中途死亡补 outcome unknown。
 describe("Sol 87：折行退出码/销毁确认闸/outcome", () => {
     test("P1-3 折行退出码：80/23/22 列都解析出完整 127", async () => {
-        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const { CommandExecuter } = await import("../src/core/tmux/command-executer.js");
         const parse = (CommandExecuter as unknown as { __testParseExit?: (t: string, p: string) => number | null }).__testParseExit;
         if (!parse) return;
         const prefix = "---CMD_DONE_tk87_";
@@ -1783,7 +1783,7 @@ describe("Sol 87：折行退出码/销毁确认闸/outcome", () => {
 // 永不命中（完成分支进不来→超时假象）。终止符 # 收口数字段 + flat 判据。
 describe("Sol 88：哨兵终止符/前缀折断", () => {
     test("P1-2 提示符数字接龙：PS1=123 下退出码 1 ≠ 1123", async () => {
-        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const { CommandExecuter } = await import("../src/core/tmux/command-executer.js");
         const parse = (CommandExecuter as unknown as { __testParseExit?: (t: string, p: string) => number | null }).__testParseExit;
         if (!parse) return;
         const prefix = "---CMD_DONE_ps1x_";
@@ -1796,7 +1796,7 @@ describe("Sol 88：哨兵终止符/前缀折断", () => {
     }, 10_000);
 
     test("P1-2 前缀本身折断（20 列）：回显折段不误配、执行输出跨行还原", async () => {
-        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const { CommandExecuter } = await import("../src/core/tmux/command-executer.js");
         const parse = (CommandExecuter as unknown as { __testParseExit?: (t: string, p: string) => number | null }).__testParseExit;
         if (!parse) return;
         // 20 列：回显行折成两段（needle 不全在任何单行——滤不掉，但含 $__fx_ec
@@ -1810,7 +1810,7 @@ describe("Sol 88：哨兵终止符/前缀折断", () => {
     }, 10_000);
 
     test("P1-2 strip 折断哨兵：残段不漏进 stdout（真机 20 列实锤形态）", async () => {
-        const { CommandExecuter } = await import("../src/terminal/command-executer.js");
+        const { CommandExecuter } = await import("../src/core/tmux/command-executer.js");
         const strip = (CommandExecuter as unknown as { __testStrip?: (log: string, prefix: string, needle: string) => string }).__testStrip;
         if (!strip) return;
         const prefix = "---CMD_DONE_c505g50d_";
@@ -2030,7 +2030,7 @@ describe("Sol 89：哨兵失败封存/跨执行器互斥/清洗收窄", () => {
         if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
         const dir = mkdtempSync(join(tmpdir(), "fx-cdpath89"));
         const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 60 } });
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
         await drv.init();
         try {
@@ -2054,7 +2054,7 @@ describe("Sol 89：哨兵失败封存/跨执行器互斥/清洗收窄", () => {
         if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
         const dir = mkdtempSync(join(tmpdir(), "fx-ls89"));
         const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 60 } });
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
         await drv.init();
         try {
@@ -2077,7 +2077,7 @@ describe("Sol 89：哨兵失败封存/跨执行器互斥/清洗收窄", () => {
     test("P1-3 双 TerminalManager 同会话串行（有 tmux 才跑）", async () => {
         if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
         const dir = mkdtempSync(join(tmpdir(), "fx-dual89"));
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const tmA = new TerminalManager({ terminalDir: join(dir, "a"), config: { poll_interval_ms: 60 } });
         const drvA = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tmA });
         await drvA.init();
@@ -2158,7 +2158,7 @@ describe("Sol 90：首发失败封存/跨进程锁/readdir 补全", () => {
             expect(await p1).toMatchObject({ outcome: "unknown", message: expect.stringMatching(/发送失败|封存/) });
             expect(await p2).toMatchObject({ message: expect.stringContaining("销毁结果未确认") });
             expect(sentTexts.some((t) => t.includes("second-must-not-run"))).toBe(false);
-            const source = new URL("../src/terminal/command-executer.ts", import.meta.url).href;
+            const source = new URL("../src/core/tmux/command-executer.ts", import.meta.url).href;
             const child = Bun.spawn([process.execPath, "-e",
                 `import { CommandExecuter } from ${JSON.stringify(source)}; ` +
                 `try { await new CommandExecuter({resolvePane: async id => ({target:id, lockPath:CommandExecuter.__testSessLockPath(id), assertIdle: async () => {}, setInput: async () => {}})}).execute("S90F", "true", { timeoutMs: 20 }); process.exitCode = 1; } ` +
@@ -2174,7 +2174,7 @@ describe("Sol 90：首发失败封存/跨进程锁/readdir 补全", () => {
     }, 15_000);
 
     test("跨进程会话锁等待未发布的持有者，已退出的持有者保留隔离", async () => {
-        const { CommandExecuter: CE } = await import("../src/terminal/command-executer.js");
+        const { CommandExecuter: CE } = await import("../src/core/tmux/command-executer.js");
         const { writeFileSync, rmSync: rm90 } = await import("node:fs");
         const lockPath = (CE as unknown as { __testSessLockPath(id: string): string }).__testSessLockPath("S90X");
         // An empty file from an older client may still be acquiring the lock.
@@ -2222,7 +2222,7 @@ describe("Sol 90：首发失败封存/跨进程锁/readdir 补全", () => {
         if (!(await TmuxInvoker.isAvailable())) return console.log("[skip] 本机无 tmux——集成用例属 CI Linux 矩阵");
         const dir = mkdtempSync(join(tmpdir(), "fx-ls90"));
         const tm = new TerminalManager({ terminalDir: dir, config: { poll_interval_ms: 60 } });
-        const { TmuxSessionDriver } = await import("../src/tmux-driver.js");
+        const { TmuxSessionDriver } = await import("../src/core/tmux/tmux-driver.js");
         const drv = new TmuxSessionDriver({ driver: "tmux", config: { launchCmd: "bash" } }, { terminalManager: tm });
         await drv.init();
         try {

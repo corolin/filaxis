@@ -8,13 +8,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     sshArgsFor, hopSshCommand, hopLabel, enterStepsOf, renderExecChannel, envPrefixOf, parseJumpSpec,
-} from "../src/ssh-helpers.js";
-import { __testBrokenStdioExit, __testFileRedirect, resolveLayerState, SshPtyDriver } from "../src/ssh-pty-driver.js";
-import { RemoteSessionManager } from "../src/remote-session-manager.js";
-import type { SessionEvent } from "../src/session-types.js";
-import { resolveLocalShell } from "../src/shell-discovery.js";
-import { openSshEnvironment } from "../src/openssh-environment.js";
-import { noopLogger } from "../src/logger.js";
+} from "../src/core/ssh/ssh-helpers.js";
+import { __testBrokenStdioExit, __testFileRedirect, resolveLayerState, SshPtyDriver } from "../src/core/ssh/ssh-pty-driver.js";
+import { RemoteSessionManager } from "../src/core/ssh/remote-session-manager.js";
+import type { SessionEvent } from "../src/core/base/session-types.js";
+import { resolveLocalShell } from "../src/core/base/shell-discovery.js";
+import { openSshEnvironment } from "../src/core/base/openssh-environment.js";
+import { noopLogger } from "../src/shared/logger.js";
 
 test.skipIf(process.platform !== "linux")("SSH writeFile 解码器写出一部分再失败时保留原文件", async () => {
     const dir = mkdtempSync(join(tmpdir(), "fx-ssh-write-"));
@@ -128,7 +128,7 @@ describe("ssh-helpers", () => {
         if (!shPath) return; // CI Linux / Git Bash
         const pwnFile = join(process.cwd(), "FXS_QUOTED_PWN");
         rmSync(pwnFile, { force: true });
-        const { sshArgsQuoted } = await import("../src/ssh-helpers.js");
+        const { sshArgsQuoted } = await import("../src/core/ssh/ssh-helpers.js");
         const line = sshArgsQuoted({
             host: "target.example",
             conn: { jump: { host: "jump.example", keyFile: "$(touch FXS_QUOTED_PWN)" } },
@@ -742,7 +742,7 @@ describe("RemoteSessionManager（mock 远端）", () => {
     }, 25_000);
 });
 
-import { autonomousSshOpts } from "../src/ssh-helpers.js";
+import { autonomousSshOpts } from "../src/core/ssh/ssh-helpers.js";
 
 describe("host key 策略可配（AC-12）", () => {
     test("renders a known_hosts path with spaces as one OpenSSH config value", () => {
@@ -996,7 +996,7 @@ describe("RemoteSessionManager 组杀（四十三期）", () => {
 // Gemini Hydrogen 审查批回归：tokenizeArgv 引号分词（#4）/ local verify pid 实测（#7）。
 describe("Gemini 审查批回归", () => {
     test("#4 tokenizeArgv：引号内空格/转义不截断，字面引号不残留", async () => {
-        const { tokenizeArgv } = await import("../src/ssh-helpers.js");
+        const { tokenizeArgv } = await import("../src/core/ssh/ssh-helpers.js");
         expect(tokenizeArgv('ssh -i "/path/with space/key" host')).toEqual(["ssh", "-i", "/path/with space/key", "host"]); // 修前：截断+残留引号
         expect(tokenizeArgv("docker exec -i ctr sh -c 'echo hi'")).toEqual(["docker", "exec", "-i", "ctr", "sh", "-c", "echo hi"]);
         expect(tokenizeArgv("a '' b")).toEqual(["a", "", "b"]); // 空串参数保留
@@ -1464,7 +1464,7 @@ describe("Sol 85：中转本地拒启直报", () => {
 // 事件——崩宿主（调用方 try/catch 收不到）。归 readyRejecter。
 describe("Sol 87：attach spawn error", () => {
     test.skipIf(!Bun.which("ssh"))("PATH 置空真 ENOENT：握手拒绝带 code，不崩宿主", async () => {
-        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const { __testPtyLink } = await import("../src/core/ssh/ssh-pty-driver.js");
         const Link = __testPtyLink as unknown as new () => { attach(args: string[]): void; handshake(w: string): Promise<void> };
         // 真实 ENOENT：env.PATH 置空让 spawn("ssh") 拒启——error 事件异步到达
         //（node:fs/promises 不可 monkey-patch 同理——用环境真实故障，不做 stub）
@@ -1486,7 +1486,7 @@ describe("Sol 87：attach spawn error", () => {
 // 静默丢弃 cwd；P1-10 销毁后排程中的重连到期曾照样新建链拉起 ssh 进程。
 describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
     test.skipIf(!Bun.which("ssh"))("P1-7 stdin 断裂写 EPIPE：归链失败语义，不崩宿主", async () => {
-        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const { __testPtyLink } = await import("../src/core/ssh/ssh-pty-driver.js");
         const Link = __testPtyLink as unknown as new () => { attach(a: string[]): void; send(s: string): void; handshake(w: string): Promise<void> };
         // 真实 EPIPE：ssh -V 立即退出（读端关闭）→ 对已死管道 write
         const link = new Link();
@@ -1504,7 +1504,7 @@ describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
     }, 15_000);
 
     test("P1-8 预触发 AbortSignal：命令零发送（未执行，可安全重试）", async () => {
-        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const { __testPtyLink } = await import("../src/core/ssh/ssh-pty-driver.js");
         const Link = __testPtyLink as unknown as new () => { execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
         const link = new Link() as unknown as { ready: boolean; send(s: string): void; execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
         link.ready = true;
@@ -1519,7 +1519,7 @@ describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
     }, 10_000);
 
     test("P1-9 PTY exec cwd 单次覆盖：子 shell+上下换行包裹；无 cwd 不包裹", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
         const drv = new SshPtyDriver({ driver: "ssh", target: "t88" } as never);
         const cmds: string[] = [];
         (drv as unknown as { link: unknown }).link = {
@@ -1537,7 +1537,7 @@ describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
     }, 10_000);
 
     test("P1-10 销毁后排程中的重连不拉新进程（到期复查+定时器清理）", async () => {
-        const { SshPtyDriver } = await import("../src/ssh-pty-driver.js");
+        const { SshPtyDriver } = await import("../src/core/ssh/ssh-pty-driver.js");
         const realDelays = (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS;
         (SshPtyDriver as unknown as { RECONNECT_DELAYS_MS: number[] }).RECONNECT_DELAYS_MS = [80];
         const drv = new SshPtyDriver({ driver: "ssh", target: "t88r" } as never);
@@ -1560,7 +1560,7 @@ describe("Sol 88：stdin EPIPE/预触发 abort/PTY cwd/销毁后重连", () => {
 // 超时；cd 落点 CDPATH 防改写（相对路径强制 ./，含斜杠操作数不搜 CDPATH）。
 describe("Sol 89：发送同步抛归 caller/cdTargetArg", () => {
     test("P1-6 markerCycle 发送同步抛：caller 收 outcome unknown（不悬空到自身超时）", async () => {
-        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const { __testPtyLink } = await import("../src/core/ssh/ssh-pty-driver.js");
         const Link = __testPtyLink as unknown as new () => { execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
         const link = new Link() as unknown as { ready: boolean; send(s: string): void; execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown> };
         link.ready = true;
@@ -1572,7 +1572,7 @@ describe("Sol 89：发送同步抛归 caller/cdTargetArg", () => {
     }, 10_000);
 
     test("P1-7 cdTargetArg：相对路径强制 ./（CDPATH 不搜含斜杠操作数）", async () => {
-        const { cdTargetArg } = await import("../src/ssh-helpers.js");
+        const { cdTargetArg } = await import("../src/core/ssh/ssh-helpers.js");
         expect(cdTargetArg("sub")).toBe("./sub");
         expect(cdTargetArg("a/b")).toBe("./a/b");
         expect(cdTargetArg("/abs/path")).toBe("/abs/path"); // 绝对路径本就不搜 CDPATH——原样
@@ -1586,7 +1586,7 @@ describe("Sol 89：发送同步抛归 caller/cdTargetArg", () => {
 // 退出事件先翻 ready=false 再分发。
 describe("Sol 90：PTY 自然退出快速感知", () => {
     test.skipIf(!Bun.which("ssh"))("P2-3 执行中自然退出：调用快速收 unknown（不等自身超时）", async () => {
-        const { __testPtyLink } = await import("../src/ssh-pty-driver.js");
+        const { __testPtyLink } = await import("../src/core/ssh/ssh-pty-driver.js");
         const Link = __testPtyLink as unknown as new () => {
             attach(a: string[]): void;
             execMarker(c: string, t: number, s?: AbortSignal): Promise<unknown>;
@@ -1619,7 +1619,7 @@ describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
     const pairs = (opts: string[]) => opts.filter((_, i) => i % 2 === 0).map((k, j) => `${k} ${opts[j * 2 + 1]}`);
 
     test("非交互子进程缺省 BatchMode=yes；PTY 登录链（root attach / hop 登录）不带", async () => {
-        const h = await import("../src/ssh-helpers.js");
+        const h = await import("../src/core/ssh/ssh-helpers.js");
         // exec 通道 / 观察窗 / 转发 / 文件传输都从这一处取选项——无终端的 ssh 遇到口令提示
         // 应答不了，让它当场失败而不是零输出挂到调用方超时
         expect(pairs(h.autonomousSshOpts())).toContain("-o BatchMode=yes");
@@ -1638,7 +1638,7 @@ describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
     });
 
     test("mux socket 目录名哈希锚点（参数间以 NUL 分隔——防拼接歧义）", async () => {
-        const { muxSocketPath } = await import("../src/ssh-helpers.js");
+        const { muxSocketPath } = await import("../src/core/ssh/ssh-helpers.js");
         const os = await import("node:os");
         const path = await import("node:path");
         const fs = await import("node:fs");
@@ -1658,7 +1658,7 @@ describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
     });
 
     test.skipIf(!Bun.which("ssh"))("describeSshIdentitySource：本地 ssh -v -G 解析（不连网）给出用户/主机/端口与身份文件在场情况", async () => {
-        const { describeSshIdentitySource } = await import("../src/ssh-helpers.js");
+        const { describeSshIdentitySource } = await import("../src/core/ssh/ssh-helpers.js");
         const src = await describeSshIdentitySource("localhost");
         expect(src).not.toBeNull();
         expect(src!.hostname).toBe("localhost");
@@ -1671,7 +1671,7 @@ describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
     }, 20_000);
 
     test("formatAuthFailureDiagnosis：跳板角色点明 --key 不传给跳板并给三条出路；无在场身份文件时点破", async () => {
-        const { formatAuthFailureDiagnosis } = await import("../src/ssh-helpers.js");
+        const { formatAuthFailureDiagnosis } = await import("../src/core/ssh/ssh-helpers.js");
         const mk = (exists: boolean) => ({
             configFiles: ["C:/Users/u/.ssh/config"], user: "root", hostname: "10.0.0.1", port: "22",
             identityFiles: [{ path: "~/.ssh/id_ed25519", exists }, { path: "~/.ssh/id_rsa", exists: false }],
@@ -1704,8 +1704,8 @@ describe("DSH 评估 2026-11-26：ssh 自主化选项与认证诊断", () => {
     });
 
     test.skipIf(!Bun.which("ssh"))("connFailureDiagnosis：按被拒的角色分流；非认证类连接失败保持通用提示", async () => {
-        const { __testConnFailureDiagnosis } = await import("../src/ssh-pty-driver.js");
-        const { noopLogger } = await import("../src/logger.js");
+        const { __testConnFailureDiagnosis } = await import("../src/core/ssh/ssh-pty-driver.js");
+        const { noopLogger } = await import("../src/shared/logger.js");
         const conn = { jump: "root@jump.example.invalid" } as never;
         const jumpDenied = await __testConnFailureDiagnosis("root@target.example.invalid", conn,
             "root@jump.example.invalid: Permission denied (publickey).\n\nConnection closed by UNKNOWN port 65535\n", noopLogger);
@@ -1743,7 +1743,7 @@ describe("DSH 评估 2026-11-26 #4：一次性 PTY 进程不被握手定时器�
         const { pathToFileURL } = await import("node:url");
         const d = fs.mkdtempSync(path.join(os.tmpdir(), "fx-oneshot-"));
         const script = path.join(d, "oneshot.ts");
-        const modUrl = pathToFileURL(path.join(process.cwd(), "src", "ssh-pty-driver.ts")).href;
+        const modUrl = pathToFileURL(path.join(process.cwd(), "src", "core", "ssh", "ssh-pty-driver.ts")).href;
         fs.writeFileSync(script, [
             `const { __testPtyLink } = await import(${JSON.stringify(modUrl)});`,
             "const link = new __testPtyLink();",
@@ -1774,7 +1774,7 @@ describe("DSH 评估 2026-11-26 #4：一次性 PTY 进程不被握手定时器�
 // ---------------------------------------------------------------------------
 describe("DSH 评估 2026-11-26：ssh 报错行归属判定（classifySshFailure）", () => {
     test("跳板被拒：不带主机的重试提示排在前面时，仍归到跳板段", async () => {
-        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        const { classifySshFailure } = await import("../src/core/ssh/ssh-helpers.js");
         // 真机实录（vm-homelab，跳板 nosuchuser@127.0.0.1:3322）：首版只看第一条报错行——
         // 「Permission denied, please try again.」不带主机名，被归给了目标
         const v = classifySshFailure([
@@ -1793,7 +1793,7 @@ describe("DSH 评估 2026-11-26：ssh 报错行归属判定（classifySshFailure
     });
 
     test("跳板别名解析不出 / 跳板端口不通：归跳板段，类别分别为 resolve / unreachable", async () => {
-        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        const { classifySshFailure } = await import("../src/core/ssh/ssh-helpers.js");
         const unresolved = classifySshFailure(
             "debug1: Reading configuration data /root/.ssh/config\nssh: Could not resolve hostname no-such-alias-xyz: Name or service not known\nkex_exchange_identification: Connection closed by remote host\n",
             "no-such-alias-xyz",
@@ -1811,7 +1811,7 @@ describe("DSH 评估 2026-11-26：ssh 报错行归属判定（classifySshFailure
     });
 
     test("跳板已连通、目标被拒：归目标段；无跳板时一律目标段", async () => {
-        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        const { classifySshFailure } = await import("../src/core/ssh/ssh-helpers.js");
         const targetDenied = classifySshFailure("nosuchuser@localhost: Permission denied (publickey,password).\n", "127.0.0.1");
         expect(targetDenied.stage).toBe("target");
         expect(targetDenied.kind).toBe("auth");
@@ -1825,7 +1825,7 @@ describe("DSH 评估 2026-11-26：ssh 报错行归属判定（classifySshFailure
     });
 
     test("没有可判读的报错行：stage=none（连接探测成功时不附误导诊断）；最多带回 8 行", async () => {
-        const { classifySshFailure } = await import("../src/ssh-helpers.js");
+        const { classifySshFailure } = await import("../src/core/ssh/ssh-helpers.js");
         const ok = classifySshFailure("debug1: Authentication succeeded (publickey).\ndebug1: channel 0: new session\n", "j");
         expect(ok).toEqual({ stage: "none", kind: null, lines: [] });
         const many = classifySshFailure(Array.from({ length: 20 }, (_, i) => `h${i}: Permission denied (publickey).`).join("\n"), "j");

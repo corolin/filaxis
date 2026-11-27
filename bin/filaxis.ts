@@ -16,25 +16,25 @@
  * --known-hosts）+ sshHops 逐跳链（--hop 可重复）+ enterPipeline（--enter 可重复
  * + --docker 糖）。每跳独立密钥等极端拓扑走 SDK descriptor 全量描述。
  */
-import { DaemonServer } from "../src/daemon-server.js";
+import { DaemonServer } from "../src/interface/daemon/daemon-server.js";
 import {
     DaemonClient, assertDaemonProtocol, connectRemoteMiddle, parseAddrToUrl, probeDaemon, spawnDaemonBackground,
     urlRequestHost, urlRequestPort,
-} from "../src/daemon-client.js";
-import { cleanupDaemonFiles, defaultDaemonDir, isPidAlive, readDaemonConnection, readDaemonLock } from "../src/daemon-files.js";
-import { createMiddle, describeLayer } from "../src/operations/middle.js";
-import type { LayerRef, Middle, StreamResult } from "../src/operations/types.js";
-import type { OpenForwardSpec } from "../src/ssh-forward.js";
-import type { BatchPlan, BatchReport } from "../src/batch.js";
-import type { RuntimeDescriptor } from "../src/driver.js";
-import type { FilaxisLogger } from "../src/logger.js";
+} from "../src/interface/daemon/daemon-client.js";
+import { cleanupDaemonFiles, defaultDaemonDir, isPidAlive, readDaemonConnection, readDaemonLock } from "../src/interface/daemon/daemon-files.js";
+import { createMiddle, describeLayer } from "../src/middle/middle.js";
+import type { LayerRef, Middle, StreamResult } from "../src/middle/types.js";
+import type { OpenForwardSpec } from "../src/core/ssh/ssh-forward.js";
+import type { BatchPlan, BatchReport } from "../src/core/file/batch.js";
+import type { RuntimeDescriptor } from "../src/core/base/driver.js";
+import type { FilaxisLogger } from "../src/shared/logger.js";
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, extname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withLocalWriteLock } from "./local-write-lock.js";
-import { layerStorePath, loadLayerStore } from "../src/operations/layer-store.js";
-import type { SshConnParams } from "../src/ssh-helpers.js";
+import { layerStorePath, loadLayerStore } from "../src/middle/layer-store.js";
+import type { SshConnParams } from "../src/core/ssh/ssh-helpers.js";
 import { version as pkgVersion } from "../package.json" with { type: "json" };
 
 const args = process.argv.slice(2);
@@ -289,7 +289,7 @@ function buildSshDescriptor(opts: ReturnType<typeof parseOpts>): RuntimeDescript
 }
 
 // ── 层快照存储（CLI 跨调用共享——A 方案；FILAXIS_LAYERS 可覆盖路径） ──
-// 读取在 src/layer-store.ts（MCP 入口与 Daemon 同源——三路对层名与层通配的解析一致）
+// 读取在 src/middle/layer-store.ts（MCP 入口与 Daemon 同源——三路对层名与层通配的解析一致）
 function updateLayerStore<T>(update: (store: Record<string, RuntimeDescriptor>) => T): T {
     const path = layerStorePath();
     mkdirSync(dirname(path), { recursive: true });
