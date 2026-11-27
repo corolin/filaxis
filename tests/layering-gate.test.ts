@@ -268,4 +268,79 @@ describe("分层门禁（REQ-0004 §7）：现有代码", () => {
             .map((e) => `${file} -> ${e.spec}`));
         expect(shared.length).toBeGreaterThan(0);
     });
+
+    test("动态导入对抗语料：27 种取值写法全部拦下，31 种类型写法全部放行", () => {
+        // 自挖第 4 轮。按「运行时会不会加载模块」分两组；类成员（属性、构造函数与方法参数、访问器返回
+        // 类型）与带泛型的返回类型标注是真类型，此前被误拦
+        const toolFace = "src/interface/mcp/agent-toolkit.ts";
+        const core = '"../../core/file/batch.js"';
+        const value = [
+            'export const load = () => import(CORE);',
+            'import(CORE).then((x) => x);',
+            'const then = import(CORE).then;',
+            'const kind = typeof import(CORE);',
+            'try { await import(CORE); } catch {}',
+            'const a = import(CORE), b = import(CORE);',
+            'if (x) import(CORE); else import(CORE);',
+            'const obj = { async load() { return import(CORE) } };',
+            'foo(function () { return import(CORE) });',
+            'function f() { return typeof import(CORE); }',
+            'const s = `${import(CORE).x}`;',
+            '@decorator(import(CORE)) class C {}',
+            'function f(p = cond ? a : typeof import(CORE)) {}',
+            'const g = (p = cond ? a : typeof import(CORE)) => p;',
+            'function f(p: X = cond ? a : typeof import(CORE)) {}',
+            'const h = (p = { kind: typeof import(CORE) }) => p;',
+            'const k = (p: X) => cond ? a : typeof import(CORE);',
+            'const k = (p: X) => typeof import(CORE);',
+            'const f = (p = { toString: typeof import(CORE) }) => p;',
+            'const f = (p: X = cond ? a : typeof import(CORE)) => p;',
+            'const entry = { kind: typeof import(CORE) };',
+            'let x: T = { kind: typeof import(CORE) };',
+            'call({ kind: typeof import(CORE) });',
+            'function f(p = typeof import(CORE)) {}',
+            'class C { m() { return import(CORE) } }',
+            'class C { p = import(CORE) }',
+            'class C { m() { const o = { kind: typeof import(CORE) } } }',
+        ];
+        const type = [
+            'function f(p: typeof import(CORE)) {}',
+            'function f(a, b: typeof import(CORE)) {}',
+            'function f(p: Map<string, typeof import(CORE)>) {}',
+            'function f(cb: (e: { kind: number }) => typeof import(CORE)) {}',
+            'function f(p: T extends U ? A : typeof import(CORE)) {}',
+            'function f(p: X): typeof import(CORE) { return p; }',
+            'function f(): X<typeof import(CORE)> { return null as never; }',
+            'function f(this: typeof import(CORE)) {}',
+            'const f = (p: typeof import(CORE)) => p;',
+            'const f = (p: X): Y<typeof import(CORE)> => p;',
+            'let v: X | typeof import(CORE);',
+            'type T = typeof import(CORE);',
+            'type Loader = (p: X) => typeof import(CORE);',
+            'let x: { m(p: typeof import(CORE)) };',
+            'interface I { m(p: typeof import(CORE)): void }',
+            'class C { p: typeof import(CORE) }',
+            'class C { private readonly p?: typeof import(CORE) }',
+            'class C { constructor(dep: typeof import(CORE)) {} }',
+            'class C { constructor(private dep: typeof import(CORE)) {} }',
+            'class C { m(x: typeof import(CORE)) {} }',
+            'x as typeof import(CORE)',
+            'x satisfies typeof import(CORE)',
+            'let x: { a: { b: typeof import(CORE) } };',
+            'type T = { a: 1 } | typeof import(CORE);',
+            'const C = class { p: typeof import(CORE) }',
+            'class C { get x(): typeof import(CORE) { return null as never; } }',
+            'class C { onClick: (e: X) => typeof import(CORE) }',
+            'class C { m(): Y<typeof import(CORE) { return null as never; } }',
+            'class C extends B implements I { p: typeof import(CORE) }',
+            'export abstract class C { protected p?: typeof import(CORE) }',
+            'function f(): T extends U ? A : typeof import(CORE) { return null as never; }',
+        ];
+        expect(value.length).toBe(27);
+        expect(type.length).toBe(31);
+        const missed = value.filter((code) => one(toolFace, code.replace(/CORE/g, core)).length === 0);
+        const falsePositives = type.filter((code) => one(toolFace, code.replace(/CORE/g, core)).length > 0);
+        expect(missed, "取值写法漏判：\n" + missed.join("\n")).toEqual([]);
+        expect(falsePositives, "类型写法误拦：\n" + falsePositives.join("\n")).toEqual([]);
+    });
 });

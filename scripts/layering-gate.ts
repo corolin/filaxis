@@ -97,7 +97,31 @@ function inTypePosition(before: string): boolean {
     if (decl) return !s.slice(decl[0].length).includes("=");
     // 函数声明 / 箭头函数：看它的参数表
     const sig = /^(?:(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*[\w$]*\s*\(|(?:(?:const|let|var)\s+[\w$]+\s*=\s*)?(?:async\s+)?\()/.exec(s);
-    return sig !== null && paramListIsTypePosition(s.slice(sig[0].length - 1));
+    if (sig !== null) return paramListIsTypePosition(s.slice(sig[0].length - 1));
+    // 类声明 / 类表达式的成员：类体 `{` 不切断语句，s 带着类的头。类属性的类型标注、构造函数与方法的
+    // 参数表、访问器的返回类型都是类型位置；一旦进了方法体（类体之后还有花括号）就是值
+    const cls = /(?:^|[;}\s=])(?:(?:export|declare|abstract|default)\s+)*class\b[^{]*\{/.exec(s);
+    if (cls !== null) {
+        const tail = s.slice(cls.index + cls[0].length); // 匹配的结束位置（类表达式前面还有 `const C = `）
+        if (tail.includes("{")) return false;
+        let rest = tail.trimStart();
+        for (let guard = 0; guard < 8; guard++) {
+            const mod = /^(?:(?:public|private|protected|readonly|override|abstract|declare|static|get|set|async)\s+|\*\s*)/.exec(rest);
+            if (mod === null) break;
+            rest = rest.slice(mod[0].length);
+        }
+        const member = /^[\w$]+(\??)(.*)$/s.exec(rest);
+        if (member === null) return false;
+        const after = member[2]!;
+        if (after.startsWith("(")) return paramListIsTypePosition(after);
+        if (member[1] || after.startsWith(":")) {
+            // 属性类型标注：冒号之后到 import 为止是类型表达式——没有花括号、没有初始化（箭头 `=>` 不算）
+            const typePart = after.replace(/^\??\s*:\s*/, "");
+            return !typePart.includes("{") && !/=/.test(typePart.replace(/=>/g, ""));
+        }
+        return false;
+    }
+    return false;
 }
 
 /**
@@ -115,7 +139,10 @@ function statementStart(b: string): number {
         if ("([{".includes(c)) {
             if (c === "{" && depth === 0) {
                 const head = b.slice(0, i);
-                const inType = /:\s*$/.test(head) || /(?:^|[;}\s])(?:type|interface)\s+[\w$]+\s*(?:<[^<>]*>)?\s*(?:=\s*)?$/.test(head);
+                // 类体的花括号也不切断：成员的类型位置要带着类的头来判（见 inTypePosition）
+                const inType = /:\s*$/.test(head)
+                    || /(?:^|[;}\s])(?:type|interface)\s+[\w$]+\s*(?:<[^<>]*>)?\s*(?:=\s*)?$/.test(head)
+                    || /(?:^|[;}\s=])(?:(?:export|declare|abstract|default)\s+)*class\b[^{;]*$/.test(head);
                 typeBrace.push(inType);
                 if (!inType) start = i + 1;
             }
@@ -163,8 +190,11 @@ function paramListIsTypePosition(list: string): boolean {
             }
         }
     }
-    if (closeIndex >= 0 && list.slice(closeIndex + 1).trim() !== ":") return false;
-    if (closeIndex >= 0) return true; // 返回类型标注
+    if (closeIndex >= 0) {
+        // 参数表已闭合：后面是函数体或箭头。只有返回类型标注才算类型——以冒号起、到 import 为止没有
+        // 初始化（`T extends U ? A : typeof import(…)` 这种条件类型也在其中）
+        return /^:\s*/.test(list.slice(closeIndex + 1)) && !/=/.test(list.slice(closeIndex + 1).replace(/=>/g, ""));
+    }
     return lastColon >= 0 && !initAfter;
 }
 
