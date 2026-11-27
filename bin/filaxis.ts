@@ -415,9 +415,23 @@ function defaultCwd(opts: ReturnType<typeof parseOpts>): string | undefined {
     return opts.host || opts.layer ? undefined : process.cwd();
 }
 
+/**
+ * 把本机层上的相对路径补成绝对路径，但保留它原本的写法——不折叠 `.` 与 `..`。POSIX 上内核是
+ * 逐段解析的：`link/../x` 里的 `..` 相对的是符号链接实际指向的位置，和 shell 看到的一致；
+ * path.resolve 的词法折叠会把它变成另一个文件（0.3.0 开发中踩过：`edit` 改错了文件且退出 0；
+ * 0.2.13 两种模式都是内核语义）。Windows 的路径解析本身就是词法的，照旧用 path.resolve。
+ */
+function absolutize(base: string, p: string): string {
+    if (isAbsolute(p)) return p;
+    if (process.platform === "win32") return resolvePath(base, p);
+    const proc = process.cwd();
+    const absBase = (isAbsolute(base) ? base : `${proc.endsWith("/") ? proc : `${proc}/`}${base}`).replace(/\/+$/, "");
+    return `${absBase}/${p}`;
+}
+
 function layerPathFor(opts: ReturnType<typeof parseOpts>, p: string): string {
     const base = layerPathBase(opts);
-    return p && base !== undefined && !isAbsolute(p) ? resolvePath(base, p) : p;
+    return p && base !== undefined && !isAbsolute(p) ? absolutize(base, p) : p;
 }
 /** 读尽管道 stdin（TTY 直接报用法——绝不挂起等输入；process.stdin 双运行时兼容） */
 async function readStdinAll(): Promise<string> {
