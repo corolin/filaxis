@@ -178,6 +178,7 @@ type LayerRef =
 | 本机文件路径（传输的 `localPath`、`commandFile`、落盘输出、SSH 密钥） | 界面层补成绝对路径后再调用（只补基准目录、不折叠 `..`，与下一行同一条规则） |
 | **本机层**上的相对路径（`filaxis cat x.txt` 这种落在 local 层的路径） | 界面层补成绝对路径——只补基准目录，不折叠 `..`（POSIX 上内核逐段解析，符号链接后面的 `..` 相对的是链接实际指向的位置，与 shell 一致；Windows 的路径解析本身就是词法的）。基准是**层自己的工作目录**，没有则取调用方的（经 Daemon 时它的工作目录与调用方无关） |
 | 本机层的命令工作目录 | 显式参数 `cwd`（只在没指定 `--layer` / `--host` 时传；已存层用它自己的） |
+| 已存本机层的 `cwd` | 界面层一律给描述符带上绝对的 `cwd` 再交给中层（层引用、批次随请求带的层表两个入口都是）：层自己的 `cwd`（相对的按调用方工作目录锚定），没有则取调用方的。文件路径的基准（上一行的「层自己的工作目录，没有则取调用方的」）取自同一个函数——两处各算一次时，曾出现 `cat` 读调用方目录、`exec` 经 Daemon 读 Daemon 目录。只覆盖 CLI：经 Daemon 的其它调用方（MCP、远程 SDK）没有「调用方目录」的概念，以 Daemon 的工作目录为基准——已存层的 `cwd` 建议写绝对路径 |
 | SSH 密钥 / known_hosts 路径 | 界面层展开相对路径后再调用 |
 | 调用方眼里的层表 | 批次经 `layers` 参数随请求带给中层：重新保存过的层立刻生效；CLI 用 `FILAXIS_LAYERS` 指向别处时以调用方为准 |
 | 大输出 | `exec --out` / `batch --out-dir` 落盘是界面层的事，中层不感知 |
@@ -300,6 +301,25 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 | `openStream({ cwd })` 另建缺省驱动，绕过所选驱动（注入的、带 shell 配置的） | `8e55e9b` |
 | 分层门禁放行 `const then = import("x").then` 与值位置的 `typeof import("x")` | `01b60fc` |
 
+第三轮复审（对象 `98fc064`）又翻出四处，同样逐条复现属实，均已修：
+
+| 缺陷 | 提交 |
+|---|---|
+| 已存本机层带相对 `cwd` 时，同一个层上 `exec`（经 Daemon，以 Daemon 目录为基准）与 `cat`（以调用方为基准）读到不同文件——`8ba8a9f` 修 `cat` 的基准时引入的不一致 | `4bec662` |
+| 下载的本地临时文件名经 `path.join` 折叠了 `link/..`，目标目录在也报 `ENOENT`（0.2.13 即有） | `97362e6` |
+| 线协议握手请求是空闲超时且不随代理收尾中止：对端持续滴数据就卡住，stdin 关闭后进程被拖住 | `b342699` |
+| 同类（复核时自查翻出）：控制面请求 `/status`、`/health`、`/shutdown` 也是空闲超时——`probeDaemon`、启动器握手、`daemon status` / `stop` 对着只滴数据不应答的对端被无限期拖住 | `e86ebcd` |
+| 配套（Linux 真机全量抓出）：请求被销毁后 bun 1.3.12 先给应答对象发 `end`，半截应答被当成 HTTP 200；到点或中止之后的「结束」一律按失败算 | `5c68fa9` |
+| 分层门禁把表达式里的冒号（对象字面量、三元）当成类型标注 | `a7386ef` |
+
+第四轮复审（对象 `5c68fa9`）又翻出三处，逐条复现属实，均已修；其中两处是上一批修复带出来的：
+
+| 缺陷 | 提交 |
+|---|---|
+| 不写 `cwd` 的已存本机层：`4bec662` 只锚定了带相对 `cwd` 的层；不写的层经 Daemon 时 `exec` 落在 Daemon 的进程目录，而 `cat` 按调用方解析——同一个层上两条命令读到不同文件 | `700c9ed` |
+| `97362e6` 的回归：下载临时名把反斜杠也当成分隔符，POSIX 上含反斜杠的长文件名 `ENAMETOOLONG` | `7d63724` |
+| 分层门禁把参数默认值表达式里的三元冒号当成类型标注（`function f(p = c ? a : typeof import("…"))`）；判定改逐段扫描时又照出回调类型被误拦，一并修 | `93b56f5` |
+
 重写过程中被既有用例与同构用例抓回的回归（均已修）：批次已存层改由 Daemon 自己读层表；「没写目标」落到中层默认层；带工作目录的本机层相对路径基准取错；开在未登记本机层上的观察窗被算到同名命名层头上；多行 import 的类型说明符被判成值导入。
 
 ---
@@ -309,9 +329,9 @@ CLI 的转发与观察窗子命令需要常驻宿主（进程一退状态就没�
 - [x] **AC-01 一份操作实现**：`/rpc` 只有「取操作 → 调用 → 回结果」；操作逻辑只存在于 `src/middle/`。
 - [x] **AC-02 界面层零内核值依赖**：门禁断言 + 测试；现有 `src/` 与 `bin/` 零违规。
 - [x] **AC-03 同构**：`tests/isomorphism-corpus.ts` 32 条用例覆盖 `runCommand`、`runBatch`（层通配、`commandFile`、失败即停语义、调用方层表）、`readFile` / `writeFile` / `editFile` / `readPath` / `managePath`、`transferFile`、`startSession` / `stopSession`、`observe`、`openStream` / `peekStream` / `closeStream` / `listStreams`（含 `openStream` 的工作目录）、`listLayers` / `activateLayer` / `removeLayer`、`connectSshBatch`（参数是数组）、`probeLayer`、`features`、转发的不支持拒绝；在即弃进程内、SDK 长驻、Daemon 远程三种宿主下结果一致。
-- [x] **AC-04 版本握手**：客户端侧（旧 Daemon 不上报 → 拒绝并报 pid 与处置办法；版本一致放行）有单测；服务端拒绝错配信封；CLI 遇错配不退回一次性模式；MCP 代理每次重连前同样过握手（Daemon 中途换了版本即拒绝接入、不向它发请求；握手没答上来不开连接）。
+- [x] **AC-04 版本握手**：客户端侧（旧 Daemon 不上报 → 拒绝并报 pid 与处置办法；版本一致放行）有单测；服务端拒绝错配信封；CLI 遇错配不退回一次性模式；MCP 代理每次重连前同样过握手（Daemon 中途换了版本即拒绝接入、不向它发请求；握手没答上来不开连接；握手请求有硬性期限并随代理收尾中止）；控制面请求（`/status`、`/health`、`/shutdown`）一律按硬性期限，操作类 RPC 仍是空闲超时（只杀哑不杀慢）。
 - [x] **AC-05 MCP 宿主策略**：缺省自动启动并经其执行、另一客户端接得上同一 Daemon、多个客户端同时冷启动都接得上、MCP 退出后 Daemon 仍在；`--no-daemon` 不启动且功能可用；`--layer` 绑定时走进程内。
-- [x] **AC-06 零回归**：除 §8 有意变更对应的用例外全部通过。最终代码全量（含 M8 与其后全部修复）——Windows 808 通过 / 47 跳过 / 0 失败，Linux（真机集成打开）848 通过 / 7 跳过 / 0 失败（各 855 条；Windows 多跳过的两条是只在 POSIX 上跑的符号链接路径用例）。真机复验 23 项全部通过：协议错配的两个方向（新客户端 × 旧 Daemon 拒绝且不发操作；旧客户端 × 新 Daemon 被拒不执行）；homelab（一次性、经 Daemon、两跳进入管线、put/get 往返、observe）；腾讯云集群（层通配 `q-*` 9 台经 Daemon、一次性批次、跳板层转发）；多跳管线（三段 ssh → ssh → docker 的穿层转发、两跳 ssh 的穿层转发）；MCP 经 Daemon（三个已存层不必先 connect_layer、层通配、forward_add、MCP 开的观察窗 CLI 接得上）；绑定参数走进程内。M8 之后另做真机产物复核（VM 上构建，Node 22）：CLI 经 Daemon 与一次性模式正常；MCP 经 Daemon 三轮应答齐全、12 个工具；客户端在握手完成前关闭 stdin 的三种形态均即时退出，无残留进程。外部审查七处修完后的真机复核：WSL（已发布的 0.2.13 与本分支对照）——`edit link/../marker.txt` 在一次性与经 Daemon 两种模式下都落在 shell 看到的那个文件上；本机真 Daemon——`stream open` 落在调用方目录；构建产物——四个 MCP 客户端并发冷启动三轮 12/12（修复前 3/12），客户端连着时 Daemon 被换成版本不符的假 Daemon → 客户端以 1 退出、假 Daemon 零接触（Linux，Node 22）；CI 的 Node 作业各步在本机 Node 26 下逐步通过。第二轮修复后的真机复核：WSL——`put`、batch 的 `commandFile`、`--script-file`、`--request-file` 四个入口同 0.2.13 逐项一致；Linux 产物（Node 22）——四个 MCP 客户端并发冷启动 12/12，连着客户端时换成版本不符的假 Daemon → 客户端以 1 退出、排队请求报 `not_sent`、假 Daemon 零接触，换成 `/status` 报 503 的假 Daemon → 不开连接、假 Daemon 零接触。
-- [x] **AC-07 分层门禁**：四类违规各有测试证明会被拦下；动态导入的取值写法（`import("x").then(…)`、`.catch(…)`、`.default`、`const then = import("x").then`、值位置的 `typeof import("x")`）同样拦下——是否只取类型按所处位置判定；现有代码零违规；门禁脚本在 Bun 与 Node 下都能直接运行（CI 的 Node 作业跑的就是后者）。
+- [x] **AC-06 零回归**：除 §8 有意变更对应的用例外全部通过。最终代码全量（含 M8 与其后全部修复）——Windows 812 通过 / 48 跳过 / 0 失败，Linux（真机集成打开）853 通过 / 7 跳过 / 0 失败（各 860 条；Windows 多跳过的三条是只在 POSIX 上跑的路径用例）。真机复验 23 项全部通过：协议错配的两个方向（新客户端 × 旧 Daemon 拒绝且不发操作；旧客户端 × 新 Daemon 被拒不执行）；homelab（一次性、经 Daemon、两跳进入管线、put/get 往返、observe）；腾讯云集群（层通配 `q-*` 9 台经 Daemon、一次性批次、跳板层转发）；多跳管线（三段 ssh → ssh → docker 的穿层转发、两跳 ssh 的穿层转发）；MCP 经 Daemon（三个已存层不必先 connect_layer、层通配、forward_add、MCP 开的观察窗 CLI 接得上）；绑定参数走进程内。M8 之后另做真机产物复核（VM 上构建，Node 22）：CLI 经 Daemon 与一次性模式正常；MCP 经 Daemon 三轮应答齐全、12 个工具；客户端在握手完成前关闭 stdin 的三种形态均即时退出，无残留进程。外部审查七处修完后的真机复核：WSL（已发布的 0.2.13 与本分支对照）——`edit link/../marker.txt` 在一次性与经 Daemon 两种模式下都落在 shell 看到的那个文件上；本机真 Daemon——`stream open` 落在调用方目录；构建产物——四个 MCP 客户端并发冷启动三轮 12/12（修复前 3/12），客户端连着时 Daemon 被换成版本不符的假 Daemon → 客户端以 1 退出、假 Daemon 零接触（Linux，Node 22）；CI 的 Node 作业各步在本机 Node 26 下逐步通过。第二轮修复后的真机复核：WSL——`put`、batch 的 `commandFile`、`--script-file`、`--request-file` 四个入口同 0.2.13 逐项一致；Linux 产物（Node 22）——四个 MCP 客户端并发冷启动 12/12，连着客户端时换成版本不符的假 Daemon → 客户端以 1 退出、排队请求报 `not_sent`、假 Daemon 零接触，换成 `/status` 报 503 的假 Daemon → 不开连接、假 Daemon 零接触。第三、四轮修复后的真机复核：本机真 Daemon——已存本机层（带相对 `cwd` 的、不带 `cwd` 的）在一次性与经 Daemon 两种模式下 `exec`、`cat`、`batch` 都读调用方目录的文件（八种组合）；WSL——`get` 到 `link/../newdir/…`（0.2.13 同样 `ENOENT`）与 242 字节含反斜杠的文件名均成功；Linux 产物（Node 22）——并发冷启动 12/12，版本不符的假 Daemon → 客户端以 1 退出，`/status` 报 503 的假 Daemon → 不开连接，均零接触；没有 Daemon 而目录指向只滴数据不应答的假 Daemon 时，`filaxis-mcp` 2.4 秒内自行拉起真 Daemon 开始服务，CLI 的 `daemon status` / `stop` 不再被拖住；CI 的 Node 作业各步在本机 Node 26 下逐步通过。
+- [x] **AC-07 分层门禁**：四类违规各有测试证明会被拦下；动态导入的取值写法（`import("x").then(…)`、`.catch(…)`、`.default`、`const then = import("x").then`、值位置的 `typeof import("x")`、对象字面量属性与三元分支里的 `typeof import("x")`、参数默认值表达式里的 `typeof import("x")`、箭头函数体里的 `typeof import("x")`）同样拦下——是否只取类型按所处语句与参数表逐段判定，表达式里的冒号不算类型标注；回调类型、条件类型、返回类型标注等真类型不被误拦；现有代码零违规；门禁脚本在 Bun 与 Node 下都能直接运行（CI 的 Node 作业跑的就是后者）。
 - [x] **AC-08 文档**：本文档、SKILL 中英文版、包说明书 AGENTS.md、CHANGELOG 已按新宿主策略与命名约定修订。
 - [x] **AC-09 目录就是分层**：`src/` 根下只有总出口与四个层目录；门禁按目录判层，未归位的源文件被拦下——合成用例逐类验证，并用一个真放在 `src/` 根下的文件实测门禁脚本失败退出。
