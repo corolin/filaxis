@@ -18,7 +18,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 export interface ProgressSnapshot {
     tail: string;
@@ -132,6 +132,14 @@ interface ExecutionPane {
 
 const execFileAsync = promisify(execFile);
 
+/** 窗格锁：与 socket 并排。socket 路径按原样截取目录（字符串切片，不经 path.join——后者会把
+ *  路径里的 `link/..` 词法折叠，锁文件落到另一个目录） */
+export function paneLockPath(socket: string, key: string): string {
+    const slash = socket.lastIndexOf("/");
+    const dir = slash >= 0 ? socket.slice(0, slash + 1) : "";
+    return `${dir}.filaxis-pane-${key}.lock`;
+}
+
 async function resolveExecutionPane(id: string): Promise<ExecutionPane> {
     const format = "#{pid}\t#{pane_id}\t#{pane_pid}\t#{socket_path}";
     const { stdout } = await TmuxInvoker.invoke(["display-message", "-p", "-t", id, format]);
@@ -141,7 +149,7 @@ async function resolveExecutionPane(id: string): Promise<ExecutionPane> {
     const key = createHash("sha256").update(JSON.stringify([socket, serverPid, target, panePid])).digest("hex");
     return {
         target,
-        lockPath: join(dirname(socket), `.filaxis-pane-${key}.lock`),
+        lockPath: paneLockPath(socket, key),
         async assertIdle() {
             const state = await TmuxInvoker.invoke([
                 "display-message", "-p", "-t", target,

@@ -221,10 +221,12 @@ export function sshArgsQuoted(hop: SshHop): string {
     return renderSshArgs(hop, false, true).map(quoteSshShellArg).join(" ");
 }
 
-/** `~` 展开——spawn 参数数组不经过 shell，tilde 不会被展开（生产实证：公钥认证被拒 exit 255） */
+/** `~` 展开——spawn 参数数组不经过 shell，tilde 不会被展开（生产实证：公钥认证被拒 exit 255）。
+ *  ~ 之后原样保留（字符串拼接，不经 path.join）：shell 里 ~ 展开后是交给内核解析的，
+ *  `~/link/../key` 里的 `..` 相对的是符号链接实际指向的位置 */
 export function expandHomePath(p: string): string {
     if (p === "~") return homedir();
-    if (p.startsWith("~/") || p.startsWith("~\\")) return join(homedir(), p.slice(2));
+    if (p.startsWith("~/") || p.startsWith("~\\")) return `${homedir()}/${p.slice(2)}`;
     return p;
 }
 
