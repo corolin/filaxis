@@ -75,17 +75,32 @@ function namedSpecifiersAreAllTypes(clause: string): boolean {
 }
 
 /**
- * `import("x")` 之前是否处在类型位置：类型别名（`type X = …`）、冒号后的类型标注、`as` 之后，
- * 或类型实参/联合/交叉里（同一句里得已经有类型标注或别名头——实参列表里的逗号不算）。
- * 其余一律算值位置。
+ * `import("x")` 之前是否处在类型位置。按行判断，看它所在的这一句（从上一个 `;` 或 `}` 起）：
+ *   - 类型别名 / 接口 / 枚举声明的内部；
+ *   - 变量声明的类型标注之后、且还没到初始化表达式（`let x: … = …` 的 `=` 之后是值）；
+ *   - 函数的参数表（还没到函数体）、箭头函数尚未闭合的参数表里已标注的参数；
+ *   - `as` / `satisfies` 之后；类型实参、联合、交叉（同一句已处于上面的类型上下文）。
+ * 表达式里的冒号不算类型标注：对象字面量的属性（`{ kind: … }`）、三元表达式的分支、case 标签。
+ * 其余一律算值位置（存疑宁可误报——多行书写的接口成员看不出外层声明，也会被当成值）。
  */
 function inTypePosition(before: string): boolean {
     // `typeof import("x")` 的位置由 typeof 之前的上下文决定
     const b = before.replace(/\s+$/, "").replace(/typeof$/, "").replace(/\s+$/, "");
-    if (/:$/.test(b) || /\bas$/.test(b)) return true;
+    if (/\bas$/.test(b) || /\bsatisfies$/.test(b)) return true;
     if (/^\s*(?:export\s+)?type\s+[\w$]+\s*(?:<[^<>()]*>)?\s*=\s*$/.test(b)) return true;
-    if (/[<,|&]$/.test(b)) return /:/.test(b) || /^\s*(?:export\s+)?type\s+[\w$]+\s*(?:<[^<>()]*>)?\s*=/.test(b);
-    return false;
+    if (!/:$/.test(b) && !/[<,|&]$/.test(b)) return false;
+    // 这一句：从上一个分号或右花括号之后起
+    const s = b.slice(Math.max(b.lastIndexOf(";"), b.lastIndexOf("}")) + 1).trimStart();
+    if (/^(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?(?:type|interface|enum)\b/.test(s)) return true;
+    const decl = /^(?:(?:export|declare)\s+)?(?:let|const|var)\s+[\w$]+\s*:/.exec(s);
+    if (decl) return !s.slice(decl[0].length).includes("=");
+    // 参数表尚未闭合（圆括号没配平——参数里的对象类型字面量也带花括号，不能拿花括号判）
+    const inParams = (s.match(/\(/g) ?? []).length > (s.match(/\)/g) ?? []).length;
+    // 箭头函数：语句以参数表起头（或 `const f = (`），且最后一个参数已标注
+    if (/^(?:(?:const|let|var)\s+[\w$]+\s*=\s*)?(?:async\s+)?\(/.test(s)) {
+        return inParams && /:[^:]*$/.test(s.slice(s.lastIndexOf("(")));
+    }
+    return inParams && /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*[\w$]*\s*\(/.test(s);
 }
 
 export function importsOf(text: string): ImportEdge[] {

@@ -113,6 +113,12 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one(toolFace, 'const then = import("../../core/file/batch.js").then;')).toHaveLength(1);
         expect(one(toolFace, 'const kind = typeof import("../../core/file/batch.js");')).toHaveLength(1);
         expect(one(toolFace, 'load(import("../../core/file/batch.js").runBatch);')).toHaveLength(1);
+        // 表达式里的冒号不是类型标注：对象字面量的属性、三元表达式的分支、已初始化的声明
+        expect(one(toolFace, 'const entry = { kind: typeof import("../../core/file/batch.js") };')).toHaveLength(1);
+        expect(one(toolFace, 'const t = cond ? a : typeof import("../../core/file/batch.js");')).toHaveLength(1);
+        expect(one(toolFace, 'const entry = { load: import("../../core/file/batch.js").runBatch };')).toHaveLength(1);
+        expect(one(toolFace, 'call({ kind: typeof import("../../core/file/batch.js") });')).toHaveLength(1);
+        expect(one(toolFace, 'let x: T = { kind: typeof import("../../core/file/batch.js") };')).toHaveLength(1);
         expect(one(toolFace, 'import { BATCH_STEP_KINDS } from "../../core/file/batch.js";')).toHaveLength(1);
         // 混合写法里取了一个值也算
         expect(one(toolFace, 'import { BATCH_STEP_KINDS, type BatchPlan } from "../../core/file/batch.js";')).toHaveLength(1);
@@ -133,6 +139,13 @@ describe("分层门禁（REQ-0004 §7）：每一类违规都会被拦下", () =
         expect(one(toolFace, 'export type Loader = typeof import("../../core/base/driver.js");')).toEqual([]);
         expect(one(toolFace, 'type Registry = Record<string, typeof import("../../core/base/driver.js")>;')).toEqual([]);
         expect(one(toolFace, 'function f(p: typeof import("../../core/base/driver.js")) {}')).toEqual([]);
+        // 冒号确实是类型标注的几种位置：变量标注后的对象类型字面量、类型别名、函数与箭头的参数表
+        expect(one(toolFace, 'let x: { kind: typeof import("../../core/base/driver.js") };')).toEqual([]);
+        expect(one(toolFace, 'type T = { kind: typeof import("../../core/base/driver.js") };')).toEqual([]);
+        expect(one(toolFace, 'function f(p: { kind: typeof import("../../core/base/driver.js") }) {}')).toEqual([]);
+        expect(one(toolFace, 'const f = (p: typeof import("../../core/base/driver.js")) => p;')).toEqual([]);
+        expect(one(toolFace, 'let m: Map<string, typeof import("../../core/base/driver.js")>;')).toEqual([]);
+        expect(one(toolFace, 'interface I { kind: typeof import("../../core/base/driver.js") }')).toEqual([]);
         expect(one("src/interface/mcp/mcp-server.ts", 'export type { StreamResult } from "../../middle/types.js";')).toEqual([]);
     });
 
