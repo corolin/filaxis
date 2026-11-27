@@ -381,7 +381,7 @@ function layerRefFor(opts: ReturnType<typeof parseOpts>): LayerRef {
     if (opts.layer) {
         const layers = loadLayerStore();
         if (Object.hasOwn(layers, opts.layer)) {
-            return { descriptor: resolveCallerSshPaths(layers[opts.layer]!), name: opts.layer };
+            return { descriptor: resolveCallerLayerPaths(layers[opts.layer]!), name: opts.layer };
         }
         return opts.layer;
     }
@@ -391,10 +391,10 @@ function layerRefFor(opts: ReturnType<typeof parseOpts>): LayerRef {
     return { descriptor: { driver: "local" } };
 }
 
-/** 已存层表的当前内容，密钥 / known_hosts 的相对路径按调用方工作目录展开（随批次请求带给中层） */
+/** 已存层表的当前内容：其中相对于调用方工作目录的东西先锚定（随批次请求带给中层） */
 function callerLayerDescriptors(): Record<string, RuntimeDescriptor> {
     return Object.fromEntries(
-        Object.entries(loadLayerStore()).map(([name, descriptor]) => [name, resolveCallerSshPaths(descriptor)]),
+        Object.entries(loadLayerStore()).map(([name, descriptor]) => [name, resolveCallerLayerPaths(descriptor)]),
     );
 }
 
@@ -576,6 +576,19 @@ function resolveCallerSshPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor
             },
         },
     };
+}
+
+/**
+ * 已存层描述符里相对于调用方工作目录的东西，在界面层锚定后再交给中层（经 Daemon 时它的工作
+ * 目录与调用方无关）。SSH 层是密钥 / known_hosts；本机层是它自己的 `cwd`——`cwd: "project"`
+ * 这种相对值不锚定的话，经 Daemon 时会变成相对于 Daemon 的目录：同一个层上 `exec` 读 Daemon
+ * 目录下的文件、`cat` 读调用方目录下的文件（cat 的路径基准本来就按调用方解析）。
+ */
+function resolveCallerLayerPaths(descriptor: RuntimeDescriptor): RuntimeDescriptor {
+    const anchored = resolveCallerSshPaths(descriptor);
+    if (anchored?.driver !== "local") return anchored;
+    const cwd = anchored.cwd;
+    return typeof cwd === "string" && cwd && !isAbsolute(cwd) ? { ...anchored, cwd: callerPath(cwd) } : anchored;
 }
 
 async function tryDaemon(opts: ReturnType<typeof parseOpts>): Promise<DaemonClient | null> {

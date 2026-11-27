@@ -104,4 +104,51 @@ describe("调用方机器上的路径：符号链接后面的 .. 按内核语义
             rmSync(root, { recursive: true, force: true });
         }
     }, 60_000);
+
+    test("已存本机层带相对 cwd：经 Daemon 时也以调用方目录为基准——同一个层上 exec 与 cat 读到同一个文件", () => {
+        // 层表里的 cwd: "project" 是相对路径。一次性模式下它相对于调用方；经 Daemon 时描述符此前
+        // 原样交给中层，变成相对于 Daemon 自己的目录——同一个层上 exec 读 Daemon 目录下的文件、
+        // cat 读调用方目录下的文件（两版都退出 0）。Daemon 在 a 目录启动，客户端在 b 目录运行
+        const root = mkdtempSync(join(tmpdir(), "fx-layer-cwd-"));
+        const daemonHome = join(root, "a");
+        const caller = join(root, "b");
+        const daemonDir = join(root, "daemon");
+        const store = join(root, "layers.json");
+        const env = { ...process.env, FILAXIS_LAYERS: store, FILAXIS_DAEMON_DIR: daemonDir };
+        const spawnCli = (args: string[], cwd: string) => {
+            const p = Bun.spawnSync([process.execPath, cli, ...args], { cwd, stdout: "pipe", stderr: "pipe", env });
+            return { code: p.exitCode, out: p.stdout.toString("utf-8"), err: p.stderr.toString("utf-8") };
+        };
+        try {
+            for (const d of [daemonHome, caller]) mkdirSync(join(d, "project"), { recursive: true });
+            writeFileSync(join(daemonHome, "project", "marker.txt"), "daemon\n");
+            writeFileSync(join(caller, "project", "marker.txt"), "caller\n");
+            writeFileSync(store, JSON.stringify({ proj: { driver: "local", cwd: "project" } }));
+
+            const started = spawnCli(["daemon", "start"], daemonHome);
+            expect(started.err).toBe("");
+            let ready = false;
+            for (let i = 0; i < 80 && !ready; i++) {
+                ready = spawnCli(["daemon", "status"], caller).code === 0;
+                if (!ready) Bun.sleepSync(250);
+            }
+            expect(ready).toBe(true);
+
+            const exec = spawnCli(["exec", "--layer", "proj", "--json", "--", "cat marker.txt"], caller);
+            expect(exec.err).toBe("");
+            expect(JSON.parse(exec.out).stdout).toBe("caller\n");
+            const cat = spawnCli(["cat", "--layer", "proj", "marker.txt"], caller);
+            expect(cat.err).toBe("");
+            expect(cat.out).toBe("caller\n");
+            // batch 走的是另一个入口：整张层表随请求带给中层
+            const plan = join(root, "plan.json");
+            writeFileSync(plan, JSON.stringify({ steps: [{ id: "s", kind: "exec", command: "cat marker.txt" }] }));
+            const batch = spawnCli(["batch", "--layer", "proj", "--request-file", plan, "--out-dir", join(root, "out")], caller);
+            expect(batch.err).toBe("");
+            expect(readFileSync(join(root, "out", "s.stdout"), "utf-8")).toBe("caller\n");
+        } finally {
+            spawnCli(["daemon", "stop"], root);
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 90_000);
 });
