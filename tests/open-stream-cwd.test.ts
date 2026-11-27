@@ -13,10 +13,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DaemonClient, DaemonServer } from "../src/index.js";
+import { DaemonClient, DaemonServer, LocalRuntimeDriver } from "../src/index.js";
 import { connectRemoteMiddle } from "../src/interface/daemon/daemon-client.js";
 import { createMiddle, type LocalMiddle } from "../src/middle/middle.js";
 import type { MiddleOps } from "../src/middle/types.js";
+import type { RuntimeDriver } from "../src/core/base/driver.js";
+import type { ObservationWindowOptions, StreamWindowRegistry } from "../src/core/stream/stream-window.js";
 
 const LOCAL = { descriptor: { driver: "local" } } as const;
 
@@ -54,4 +56,35 @@ describe("openStream 的工作目录", () => {
             rmSync(root, { recursive: true, force: true });
         }
     }, 60_000);
+
+    test("带 cwd 时不另建驱动：所选驱动照样开窗，cwd 经选项交给它", async () => {
+        // 工作目录是「这次开窗的参数」，该交给所选驱动自己处理。此前为了给命令一个工作目录，
+        // 中层另建了一个缺省的本机驱动——注入的驱动、带 shell 配置的驱动都被绕过
+        const root = mkdtempSync(join(tmpdir(), "fx-stream-cwd-driver-"));
+        const m: LocalMiddle = createMiddle({ version: "test" });
+        const real = new LocalRuntimeDriver();
+        const seen: ObservationWindowOptions[] = [];
+        const injected = {
+            descriptor: { driver: "local", config: { shell: "configured-by-the-layer" } },
+            // 运行栈靠「有没有 exec」判别驱动实例；其余行为转发给一个真的本机驱动
+            exec: real.exec.bind(real),
+            destroy: real.destroy.bind(real),
+            openStreamWindow(registry: StreamWindowRegistry, opts: ObservationWindowOptions) {
+                seen.push(opts);
+                return real.openStreamWindow(registry, opts);
+            },
+        } as unknown as RuntimeDriver;
+        try {
+            await m.stack.addLayer("injected-local", injected);
+            // 观察窗按行成帧：命令要输出完整的一行
+            const w = await m.ops.openStream({ layer: "injected-local", command: "echo INJECTED; sleep 20", cwd: root, waitMs: 4000 });
+            await m.ops.closeStream({ windowId: w.windowId });
+            expect(seen).toHaveLength(1);
+            expect(seen[0]).toMatchObject({ command: "echo INJECTED; sleep 20", cwd: root });
+            expect(w.frames.map((f) => f.text).join("")).toContain("INJECTED");
+        } finally {
+            await m.shutdown().catch(() => undefined);
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 30_000);
 });

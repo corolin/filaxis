@@ -97,7 +97,8 @@ export class LocalRuntimeDriver implements RuntimeDriver {
     }
 
     openStreamWindow(registry: StreamWindowRegistry, opts: ObservationWindowOptions) {
-        return registry.open({ ...opts, shell: this.shell, cwd: this.defaultCwd });
+        // 调用方给了这次的工作目录就用它，否则用驱动自己的缺省目录（shell 等配置仍是本驱动的）
+        return registry.open({ ...opts, shell: this.shell, cwd: opts.cwd ?? this.defaultCwd });
     }
 
     async getCwd(): Promise<string> {

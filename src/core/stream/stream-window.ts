@@ -29,6 +29,8 @@ export interface ObservationWindowOptions {
     command: string;
     stream?: "stdout" | "stderr" | "both";
     retainSequence?: boolean;
+    /** 这次开窗的命令工作目录（本机层有意义）；不给则用驱动自己的缺省目录。由驱动决定怎么用 */
+    cwd?: string;
 }
 
 export interface StreamFrame {
